@@ -7,8 +7,11 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <syscall.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <stdlib.h>
 #else
 #include <processthreadsapi.h>
 #endif
@@ -16,8 +19,13 @@
 #include <unistd.h>
 
 namespace FHU::Syscalls {
-#ifndef MAP_FIXED_NOREPLACE
+#if !defined(MAP_FIXED_NOREPLACE)
+#ifdef __APPLE__
+// MAP_FIXED_NOREPLACE doesn't exist on macOS; define to 0 so it's a no-op flag
+#define MAP_FIXED_NOREPLACE 0
+#else
 #define MAP_FIXED_NOREPLACE 0x100000
+#endif
 #endif
 
 #ifndef SEM_STAT_ANY
@@ -51,7 +59,7 @@ namespace FHU::Syscalls {
 #define SYS_pidfd_open 434
 #endif
 
-#ifndef _WIN32
+#if defined(__linux__)
 inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
   // Third argument is unused
 #if defined(HAS_SYSCALL_GETCPU) && HAS_SYSCALL_GETCPU
@@ -99,6 +107,27 @@ inline int32_t pidfd_open(pid_t pid, unsigned int flags) {
 
 inline ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
   return ::syscall(SYS_getrandom, buf, buflen, flags);
+}
+#elif defined(__APPLE__)
+inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
+  if (cpu) *cpu = 0;
+  if (node) *node = 0;
+  return 0;
+}
+
+inline int32_t gettid() {
+  uint64_t tid;
+  pthread_threadid_np(nullptr, &tid);
+  return static_cast<int32_t>(tid);
+}
+
+inline ssize_t getrandom(void* buf, size_t buflen, unsigned int) {
+  arc4random_buf(buf, buflen);
+  return static_cast<ssize_t>(buflen);
+}
+
+inline int32_t tgkill(pid_t tgid, pid_t tid, int sig) {
+  return pthread_kill(pthread_self(), sig);
 }
 #else
 

@@ -57,7 +57,7 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
-#ifndef _WIN32
+#if defined(__linux__)
   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
   //

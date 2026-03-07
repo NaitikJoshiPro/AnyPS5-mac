@@ -4,10 +4,13 @@
 #include <cstdint>
 #include <limits.h>
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 #include <linux/futex.h> /* Definition of FUTEX_* constants */
 #include <sys/syscall.h> /* Definition of SYS_* constants */
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <unistd.h>
+#include <os/lock.h>
 #else
 #include <synchapi.h>
 // Don't pull in all WIN32 headers for INFINITE. Causes too many problems.
@@ -271,7 +274,7 @@ public:
 
 private:
 
-#if !defined(_WIN32)
+#if defined(__linux__)
   void FutexWaitForWriteAvailable(uint32_t Expected) {
     ::syscall(SYS_futex, &Futex, FUTEX_PRIVATE_FLAG | FUTEX_WAIT_BITSET, Expected, nullptr, nullptr, FUTEX_BITSET_WAIT_WRITERS);
   }
@@ -292,6 +295,29 @@ private:
   void FutexWakeReaders() {
     // Wake all readers.
     ::syscall(SYS_futex, &Futex, FUTEX_PRIVATE_FLAG | FUTEX_WAKE_BITSET, INT_MAX, nullptr, nullptr, FUTEX_BITSET_WAIT_READERS);
+  }
+#elif defined(__APPLE__)
+  // Apple: spin-wait fallback (WFE handles the fast path on arm64)
+  void FutexWaitForWriteAvailable(uint32_t Expected) {
+    auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+    while (AtomicFutex.load(std::memory_order_relaxed) == Expected) {
+      usleep(10);
+    }
+  }
+
+  void FutexWaitForReadAvailable(uint32_t Expected) {
+    auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+    while (AtomicFutex.load(std::memory_order_relaxed) == Expected) {
+      usleep(10);
+    }
+  }
+
+  void FutexWakeWriter() {
+    // No-op: spin-waiters will see the change
+  }
+
+  void FutexWakeReaders() {
+    // No-op: spin-waiters will see the change
   }
 #else
   // Writers wait for the full 32-bit futex.

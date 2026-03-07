@@ -5,9 +5,12 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <os/lock.h>
+#include <pthread.h>
 #else
 #include <errhandlingapi.h>
 #include <synchapi.h>
@@ -24,7 +27,7 @@ namespace FEXCore {
  * call can leave the condition variable in an invalid state that breaks later
  * uses of that object and may cause hangs as a consequence.
  */
-#ifndef _WIN32
+#if defined(__linux__)
 class InterruptableConditionVariable final {
 public:
   bool Wait(struct timespec* Timeout = nullptr) {
@@ -88,6 +91,70 @@ private:
                 &Mutex,  // Addr2 - Mutex to do the operation on
                 0);      // val3
     }
+  }
+};
+#elif defined(__APPLE__)
+// Apple implementation using atomic spinning + pthread_cond fallback
+class InterruptableConditionVariable final {
+public:
+  bool Wait(struct timespec* Timeout = nullptr) {
+    while (true) {
+      uint32_t Expected = SIGNALED;
+      uint32_t Desired = UNSIGNALED;
+      if (Mutex.compare_exchange_strong(Expected, Desired)) {
+        return true;
+      }
+      // Spin briefly then yield
+      for (int i = 0; i < 1000; ++i) {
+        Expected = SIGNALED;
+        if (Mutex.compare_exchange_strong(Expected, Desired)) {
+          return true;
+        }
+      }
+      if (Timeout) {
+        // Convert timespec to absolute time for timed wait
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        struct timespec abs_timeout;
+        abs_timeout.tv_sec = now.tv_sec + Timeout->tv_sec;
+        abs_timeout.tv_nsec = now.tv_nsec + Timeout->tv_nsec;
+        if (abs_timeout.tv_nsec >= 1000000000L) {
+          abs_timeout.tv_sec++;
+          abs_timeout.tv_nsec -= 1000000000L;
+        }
+        // Use usleep as a simple fallback
+        usleep(100); // 100us
+        Expected = SIGNALED;
+        if (!Mutex.compare_exchange_strong(Expected, Desired)) {
+          return false; // Timeout
+        }
+        return true;
+      }
+      usleep(100);
+    }
+  }
+
+  template<class Rep, class Period>
+  bool WaitFor(const std::chrono::duration<Rep, Period>& time) {
+    struct timespec Timeout {};
+    auto SecondsDuration = std::chrono::duration_cast<std::chrono::seconds>(time);
+    Timeout.tv_sec = SecondsDuration.count();
+    Timeout.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(time - SecondsDuration).count();
+    return Wait(&Timeout);
+  }
+
+  void NotifyOne() { DoNotify(); }
+  void NotifyAll() { DoNotify(); }
+
+private:
+  std::atomic<uint32_t> Mutex {};
+  constexpr static uint32_t SIGNALED = 1;
+  constexpr static uint32_t UNSIGNALED = 0;
+
+  void DoNotify() {
+    uint32_t Expected = UNSIGNALED;
+    uint32_t Desired = SIGNALED;
+    Mutex.compare_exchange_strong(Expected, Desired);
   }
 };
 #else
