@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-#ifdef __APPLE__
+// libkern/OSCacheControl.h is for cache invalidation when building NATIVE
+// iOS FEXCore (Phase 1 standalone .a path). When cross-compiling to a Windows
+// ARM64EC PE for iOS hosting, the target is Windows; libkern isn't available
+// and we use Windows cache-flush APIs instead. Gate this on the *build host*
+// being Apple (`__APPLE__` is defined when compiling natively on macOS) AND
+// not building for an arm64ec target.
+#if defined(__APPLE__) && !defined(__arm64ec__)
 #include <libkern/OSCacheControl.h>
 #endif
 
@@ -671,7 +677,10 @@ void Dispatcher::EmitDispatcher() {
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();
-#ifdef __APPLE__
+  // sys_icache_invalidate is from libkern (Apple-native only). When cross-
+  // compiling to Windows ARM64EC PE, libkern isn't available — use the
+  // portable ClearICache path instead. Gate on build host AND target.
+#if defined(__APPLE__) && !defined(__arm64ec__)
   {
     auto DispatchSize = End - reinterpret_cast<uint64_t>(DispatchPtr);
     auto* RWPtr = WritePtr(reinterpret_cast<uint8_t*>(DispatchPtr));
