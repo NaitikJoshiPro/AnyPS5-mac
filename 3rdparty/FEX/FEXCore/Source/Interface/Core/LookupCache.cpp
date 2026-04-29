@@ -68,6 +68,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
     // Start at maximum instead.
     L1PointerMask = MAX_L1_ENTRIES - 1;
   }
+
 }
 
 LookupCache::~LookupCache() {
