@@ -427,9 +427,12 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
   Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this, Thread);
   Thread->OpDispatcher->SetMultiblock(Config.Multiblock);
+  LogMan::Msg::EFmt("[TI-IC] lookupcache");
   Thread->LookupCache = fextl::make_unique<FEXCore::LookupCache>(this);
+  LogMan::Msg::EFmt("[TI-IC] decoder");
   Thread->FrontendDecoder = fextl::make_unique<FEXCore::Frontend::Decoder>(Thread);
   Thread->PassManager = fextl::make_unique<FEXCore::IR::PassManager>(this);
+  LogMan::Msg::EFmt("[TI-IC] passmanager");
 
   Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
   Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
@@ -439,7 +442,9 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
   Dispatcher->InitThreadPointers(Thread);
 
   // Create CPU backend
+  LogMan::Msg::EFmt("[TI-IC] jitcore");
   Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
+  LogMan::Msg::EFmt("[TI-IC] jitcore-done");
 
   // We finalize *after* the CPU backend is initialized, as the CPU backend will
   // provide necessary register information to the register allocation pass.
@@ -447,9 +452,11 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
 }
 
 FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Core::CPUState* NewThreadState) {
+  LogMan::Msg::EFmt("[TI-IC] createthread-enter");
   FEXCore::Core::InternalThreadState* Thread = new FEXCore::Core::InternalThreadState {
     .CTX = this,
   };
+  LogMan::Msg::EFmt("[TI-IC] threadstate-alloc");
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
   // Copy over the new thread state to the new object
