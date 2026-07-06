@@ -607,6 +607,18 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
+  /* iOS-Mythic diag: companion to [fex-entry] in Core.cpp — scream when the
+   * link target the blocks will be patched to jump at starts with the NOP
+   * prefill or decodes as block-tail data (upper 16 bits all zero — no real
+   * ARM64 instruction looks like that). */
+  if (HostCode) {
+    uint32_t FirstInsn = *reinterpret_cast<uint32_t*>(HostCode);
+    if (FirstInsn == 0xd503201fu || (FirstInsn >> 16) == 0) {
+      LogMan::Msg::EFmt("[fex-link] SUSPICIOUS resolved target: rip=0x{:x} host=0x{:x} first_insn=0x{:08x}",
+                        GuestRip, HostCode, FirstInsn);
+    }
+  }
+
   // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
