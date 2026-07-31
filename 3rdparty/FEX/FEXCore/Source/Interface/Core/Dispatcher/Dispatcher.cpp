@@ -724,6 +724,7 @@ void Dispatcher::EmitDispatcher() {
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();
+
   // sys_icache_invalidate is from libkern (Apple-native only). When cross-
   // compiling to Windows ARM64EC PE, libkern isn't available — use the
   // portable ClearICache path instead. Gate on build host AND target.
