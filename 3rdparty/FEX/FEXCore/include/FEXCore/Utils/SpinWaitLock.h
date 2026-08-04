@@ -331,6 +331,11 @@ static inline void unlock(T* Futex) {
 #undef SPINLOOP_16BIT
 #undef SPINLOOP_32BIT
 #undef SPINLOOP_64BIT
+// iOS-Mythic ml472: tag type for adopting a futex already acquired by the
+// caller (e.g. a bounded/stamped acquire); the destructor still releases.
+struct adopt_lock_t {};
+inline constexpr adopt_lock_t adopt_lock {};
+
 template<typename T>
 class UniqueSpinMutex final {
 public:
@@ -344,6 +349,9 @@ public:
     : Futex {Futex} {
     FEXCore::Utils::SpinWaitLock::lock(Futex);
   }
+
+  UniqueSpinMutex(T* Futex, adopt_lock_t)
+    : Futex {Futex} {}
 
   ~UniqueSpinMutex() {
     FEXCore::Utils::SpinWaitLock::unlock(Futex);

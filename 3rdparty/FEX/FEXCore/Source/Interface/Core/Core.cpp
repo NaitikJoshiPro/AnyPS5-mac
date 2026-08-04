@@ -885,7 +885,9 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // We could lock CodeBufferWriteMutex earlier to prevent this from happening,
   // but this would increase lock contention. Redundant frontend runs aren't
   // as expensive and are easily reverted.
-  if (MaxInst != 1) {
+  /* ml455 (#74): skip the recheck under a delivery compile — FindBlock takes
+   * the lookup read lock our interrupted frame may write-own. */
+  if (MaxInst != 1 && !FEXCore::Utils::WritePriorityMutex::IosUnpublishedCompileActive()) {
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
       Thread->OpDispatcher->DelayedDisownBuffer();
