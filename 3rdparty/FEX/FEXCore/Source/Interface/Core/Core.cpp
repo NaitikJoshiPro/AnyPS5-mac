@@ -2099,16 +2099,19 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
   SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
 
+
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
+    uint64_t Dest = Address;
+
     if (Size == 8) {
-      *reinterpret_cast<uint64_t*>(Address) = Value;
+      *reinterpret_cast<uint64_t*>(Dest) = Value;
     } else if (Size == 4) {
-      *reinterpret_cast<uint32_t*>(Address) = Value;
+      *reinterpret_cast<uint32_t*>(Dest) = Value;
     } else {
       ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
     }
