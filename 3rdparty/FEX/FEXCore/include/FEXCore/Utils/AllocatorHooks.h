@@ -55,6 +55,14 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 FEX_DEFAULT_VISIBILITY void ClearHooks();
 
 #ifdef _WIN32
+/* iOS-Mythic ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
+ * (the earliest allocator in the process) and followed by every other
+ * consumer. C linkage: it is chosen from C. */
+extern "C" {
+extern uintptr_t ios_fex_band_base;
+extern uintptr_t ios_fex_band_end;
+}
+
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
