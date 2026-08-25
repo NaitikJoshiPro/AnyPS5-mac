@@ -21,7 +21,7 @@ GuestToHostMap::GuestToHostMap()
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
 }
 
-// iOS-Mythic ml606: live/cumulative census for the L1-only A/B. `live` is what
+// iOS-Madeira ml606: live/cumulative census for the L1-only A/B. `live` is what
 // matters — footprints must be compared at equal live-cache counts, not at equal
 // elapsed time, because caches are created and destroyed throughout a run.
 static std::atomic<uint64_t> LookupCacheLive {0};

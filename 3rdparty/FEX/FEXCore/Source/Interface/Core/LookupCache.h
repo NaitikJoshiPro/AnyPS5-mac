@@ -29,7 +29,7 @@ struct LookupCacheWriteLockToken : public LookupCacheBaseLockToken {
 private:
   // Only constructible by GuestToHostMap
   friend struct GuestToHostMap;
-  /* iOS-Mythic ml452 (#74): manual RAII instead of lock_guard so a token
+  /* iOS-Madeira ml452 (#74): manual RAII instead of lock_guard so a token
    * constructed while this thread ALREADY write-owns the mutex no-ops (the
    * fault-handler re-entry chain: outer swap holds L'-write → nested compile
    * → nested swap re-acquires — the write→write self-park that stalled
@@ -486,7 +486,7 @@ private:
 
   size_t TotalCacheSize;
 
-  // iOS-Mythic ml606: L1-ONLY LAYOUT when the L2 cache is disabled.
+  // iOS-Madeira ml606: L1-ONLY LAYOUT when the L2 cache is disabled.
   //
   // The full layout is [L2 page table][CODE_SIZE arena][L1] contiguous — on iOS
   // 16MB + 32MB + 2MB = 50MB per guest thread, and FEX_IOS_HOST COMMITS it all

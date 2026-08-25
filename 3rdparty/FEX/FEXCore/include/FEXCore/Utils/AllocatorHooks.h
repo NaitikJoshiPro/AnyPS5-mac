@@ -55,7 +55,7 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 FEX_DEFAULT_VISIBILITY void ClearHooks();
 
 #ifdef _WIN32
-/* iOS-Mythic ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
+/* iOS-Madeira ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
  * (the earliest allocator in the process) and followed by every other
  * consumer. C linkage: it is chosen from C. */
 extern "C" {
@@ -172,7 +172,7 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 
 #endif
 
-/* iOS-Mythic ml362: zero a region without dirtying pages that are already
+/* iOS-Madeira ml362: zero a region without dirtying pages that are already
  * zero. The defensive full memsets added for stale-content bugs (LookupCache
  * L2/L1, CallRetStack) each commit their whole range as private-dirty pages;
  * at ~40 guest threads that is ~1.9GB of phys_footprint against the 4096MB

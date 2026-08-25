@@ -607,7 +607,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
-  /* iOS-Mythic diag: companion to [fex-entry] in Core.cpp — scream when the
+  /* iOS-Madeira diag: companion to [fex-entry] in Core.cpp — scream when the
    * link target the blocks will be patched to jump at starts with the NOP
    * prefill or decodes as block-tail data (upper 16 bits all zero — no real
    * ARM64 instruction looks like that). */

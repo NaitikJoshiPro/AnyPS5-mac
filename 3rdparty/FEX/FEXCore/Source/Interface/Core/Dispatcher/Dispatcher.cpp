@@ -186,7 +186,7 @@ void Dispatcher::EmitDispatcher() {
 
   ARMEmitter::ForwardLabel NoBlock;
 
-  /* iOS-Mythic 2026-07-03 perf: probe the L1 cache FIRST at loop top.
+  /* iOS-Madeira 2026-07-03 perf: probe the L1 cache FIRST at loop top.
    *
    * Upstream's loop-top lookup goes straight to the L2 page table, which
    * masks addresses to Config.VirtualMemSize (64GB). Wine on iOS maps PE
@@ -551,7 +551,7 @@ void Dispatcher::EmitDispatcher() {
     // load static regs
     FillStaticRegs();
 #ifdef ARCHITECTURE_arm64ec
-    // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2). The JITCallback
+    // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). The JITCallback
     // sentinel push uses REG_CALLRET_SP after FillStaticRegs, which on iOS
     // ARM64EC reloads x17 from State.callret_sp. If State has drifted OOB
     // (e.g. underflow during prior dispatch), reset before stp to avoid
