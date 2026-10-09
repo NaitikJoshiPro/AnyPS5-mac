@@ -1201,32 +1201,6 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * reached via its x64 fast-forward sequence -- preserves the x4/x5 varargs contract that
    * the emulation round trip destroys; see Module.S). Same change-detection pattern as
    * [cb-entry] below: CompileBlock runs often enough to notice promptly. */
-  {
-    static uint64_t FfsLastCount = 0;
-    static uint32_t FfsReports = 0;
-    const uint64_t FfsCount = IosFfsBypassLog[0] + IosFfsBypassLog[2];
-    if (FfsCount != FfsLastCount && FfsReports < 12) {
-      FfsLastCount = FfsCount;
-      FfsReports++;
-      LogMan::Msg::EFmt("[ffs-bypass] taken={} (last EC target {:#x} called natively, x4/x5 preserved) "
-                        "rejected={} (last non-EC target {:#x} emulated normally)",
-                        IosFfsBypassLog[0], IosFfsBypassLog[1], IosFfsBypassLog[2], IosFfsBypassLog[3]);
-    }
-  }
-
-  {
-    static uint64_t CBLastCount = 0;
-    static uint32_t CBReports = 0;
-    const uint64_t CBCount = IosCbEntryLog[6];
-    if (CBCount != CBLastCount && CBReports < 8) {
-      CBLastCount = CBCount;
-      CBReports++;
-      LogMan::Msg::EFmt("[cb-entry] CallbackPtr entered (count={}) -- unreachable by design on ARM64EC: "
-                        "x0(Frame)={:#x} x1(RIP)={:#x} x16={:#x} x17={:#x} x30={:#x} nsp={:#x} guestRSP(x23)={:#x}",
-                        CBCount, IosCbEntryLog[0], IosCbEntryLog[1], IosCbEntryLog[2], IosCbEntryLog[3],
-                        IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);
-    }
-  }
 
   /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
@@ -1636,19 +1610,6 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
        * automatically healthy contention — it can equally be page reuse or a
        * foreign writer, so check block_index/list_size against block_count before
        * concluding anything. */
-      {
-        rpm_cas_snapshot Snap;
-        if (rpm_cas_snapshot_take(&Snap)) {
-          LogMan::Msg::EFmt("[rpm-cas] ml622 loop={} {} page=0x{:x} block=0x{:x} heap=0x{:x} atomic=0x{:x} "
-                            "teb=0x{:x} ret=0x{:x} class={} ptype={} idx={}/{} list_size={} used={} is_full={} "
-                            "prev_token=0x{:x} cur_token=0x{:x} | fail changed={} unchanged={} invalid={}",
-                            Snap.which_loop, Snap.quarantined ? "QUARANTINED (block leaked, spin abandoned)" : "spinning",
-                            Snap.page_addr, Snap.block_addr, Snap.heap_addr, Snap.atomic_addr, Snap.owner_teb,
-                            Snap.ret_addr, Snap.size_class, Snap.page_type, Snap.block_index, Snap.block_count,
-                            Snap.list_size, Snap.block_used, Snap.is_full, Snap.prev_token, Snap.cur_token,
-                            Snap.fail_changed, Snap.fail_unchanged, Snap.fail_invalid);
-        }
-      }
     }
   }
 
