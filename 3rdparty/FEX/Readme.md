@@ -1,3 +1,10 @@
+> **This is not FEX.** This tree is [FEX-Emu/FEX](https://github.com/FEX-Emu/FEX) at tag `FEX-2610` with the macOS
+> changes of [Madeira](https://github.com/willfaust/FEX) up to `ac555dd8`, its last MIT-licensed commit, and changes
+> for running FEXCore inside [AnyPS5](https://github.com/boykopovar/AnyPS5)'s macOS runner. The ported commits keep their
+> authors and name the commit they come from. The port to `FEX-2610` and the commits starting with `Apple:` and `AnyPS5:`
+> were made with AI assistance: FEX-Emu and Madeira do not accept such code, so they are not contributions to either
+> project and are not to be submitted there.
+
 [中文](https://github.com/FEX-Emu/FEX/blob/main/docs/Readme_CN.md)
 # FEX: Emulate x86 Programs on ARM64
 FEX allows you to run x86 applications on ARM64 Linux devices, similar to qemu-user and box64.
