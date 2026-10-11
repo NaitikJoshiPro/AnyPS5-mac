@@ -227,6 +227,7 @@ static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nb
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/time.h>
@@ -397,7 +398,7 @@ static int NativeFstatfs(int descriptor, KernelStatfs* fs) {
 #endif
     struct stat file{};
     if (::fstat(descriptor, &file) != 0) return SceErrorFromErrno(errno) & 0xffff;
-    if (S_ISSOCK(file.st_mode)) return GUEST_EINVAL;
+    if (S_ISSOCK(file.st_mode) && (::fcntl(descriptor, F_GETFL) & O_PATH) == 0) return GUEST_EINVAL;
     if (S_ISFIFO(file.st_mode)) {
 #ifdef __APPLE__
         return GUEST_EINVAL;
