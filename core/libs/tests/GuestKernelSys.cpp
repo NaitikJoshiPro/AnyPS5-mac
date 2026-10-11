@@ -27,6 +27,7 @@ int APS5_VABI _fstatfs_nid_postfix(int, void*);
 int APS5_VABI open_nid_postfix(const char*, int, int);
 int APS5_VABI close_nid_postfix(int);
 std::int64_t APS5_VABI readlink_nid_postfix(const char*, char*, std::size_t);
+std::int64_t APS5_VABI pathconf_nid_postfix(const char*, int);
 int APS5_VABI fchdir_nid_postfix(int);
 int APS5_VABI chdir_nid_postfix(const char*);
 char* APS5_VABI getcwd_nid_postfix(char*, std::size_t);
@@ -53,6 +54,48 @@ int Error() {
     return *__error_nid_postfix();
 }
 
+bool PathconfThrows(const char* path, int name) {
+    try {
+        pathconf_nid_postfix(path, name);
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+void CheckPathconf(const std::filesystem::path& root, const std::string& file) {
+    const auto directory = root.generic_string();
+    for (const auto& path : {file, directory}) {
+        Require(pathconf_nid_postfix(path.c_str(), 1) == 32767);
+        Require(pathconf_nid_postfix(path.c_str(), 4) == 255);
+        Require(pathconf_nid_postfix(path.c_str(), 5) == 1024);
+        Require(pathconf_nid_postfix(path.c_str(), 6) == 512);
+        Require(pathconf_nid_postfix(path.c_str(), 7) == 1);
+        Require(pathconf_nid_postfix(path.c_str(), 8) == 1);
+        Require(pathconf_nid_postfix(path.c_str(), 12) == 64);
+        *__error_nid_postfix() = 0;
+        Require(pathconf_nid_postfix(path.c_str(), 15) == -1 && Error() == 0);
+        Require(pathconf_nid_postfix(path.c_str(), 18) == 1024);
+        Require(pathconf_nid_postfix(path.c_str(), 54) == 0);
+        Require(pathconf_nid_postfix(path.c_str(), 55) == 0);
+    }
+    for (const int name : {0, 11, 61, 62, 65, -1})
+        Require(pathconf_nid_postfix(file.c_str(), name) == -1 && Error() == 22);
+    for (const int name : {2, 3, 9, 10, 14, 16, 17, 21, 53, 59, 60, 63, 64})
+        Require(PathconfThrows(file.c_str(), name));
+    const auto missing = (root / "missing").string();
+    Require(pathconf_nid_postfix(missing.c_str(), 4) == -1 && Error() == 2);
+    Require(pathconf_nid_postfix(missing.c_str(), 0) == -1 && Error() == 2);
+    Require(pathconf_nid_postfix((root / "missing" / "file").string().c_str(), 4) == -1 && Error() == 2);
+    Require(pathconf_nid_postfix("", 4) == -1 && Error() == 2);
+    Require(pathconf_nid_postfix(nullptr, 4) == -1 && Error() == 14);
+    const auto longName = directory + "/" + std::string(256, 'n');
+    Require(pathconf_nid_postfix(longName.c_str(), 4) == -1 && Error() == 63);
+    Require(pathconf_nid_postfix((directory + "/missing/" + std::string(256, 'n')).c_str(), 4) == -1 && Error() == 2);
+    const auto longPath = directory + "/" + std::string(1024, 'p');
+    Require(pathconf_nid_postfix(longPath.c_str(), 4) == -1 && Error() == 63);
+}
+
 int main() {
     Require(setsid_nid_postfix() == -1 && Error() == 1);
     Require(umask_nid_postfix(0) == 022);
@@ -63,6 +106,7 @@ int main() {
     Require(std::filesystem::create_directory(root));
     const auto file = (root / "file.txt").string();
     std::ofstream(file).put('x');
+    CheckPathconf(root, file);
     const int descriptor = open_nid_postfix(file.c_str(), 0, 0);
     Require(descriptor >= 0);
     unsigned char viaPublic[472] = {};
