@@ -373,6 +373,18 @@ int APS5_VABI fchdir_nid_postfix(int fd) {
     return 0;
 }
 
+int APS5_VABI chroot_nid_postfix(const char* path) {
+    if (path == nullptr) return static_cast<int>(Fail(GuestEfault));
+    if (*path == ' ') return static_cast<int>(Fail(GuestEnoent));
+    const auto native = ResolvePath_nid_no_patch(path);
+    std::error_code error;
+    const auto status = std::filesystem::status(native, error);
+    if (status.type() == std::filesystem::file_type::not_found) return static_cast<int>(Fail(HasNonDirectoryPrefix(native) ? GuestEnotdir : GuestEnoent));
+    if (error) return static_cast<int>(Fail(GuestError(error)));
+    if (!std::filesystem::is_directory(status)) return static_cast<int>(Fail(GuestEnotdir));
+    throw std::runtime_error(std::string("chroot: changing the root directory to ") + path + " is not supported, the guest path resolver keeps a fixed root");
+}
+
 int APS5_VABI symlink_nid_postfix(const char* target, const char* created) {
     if (target == nullptr || created == nullptr) return static_cast<int>(Fail(GuestEfault));
     if (*target == '\0' || *created == '\0') return static_cast<int>(Fail(GuestEnoent));
