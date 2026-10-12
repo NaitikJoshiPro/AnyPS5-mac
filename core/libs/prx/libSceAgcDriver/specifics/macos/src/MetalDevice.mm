@@ -5,10 +5,7 @@
 // lands (docs/mac/M2_DESIGN.md). Command model: one MTL4 command queue, a MTLSharedEvent timeline,
 // every command buffer ordered after all earlier work by a queue barrier (bring-up policy).
 
-#import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
-
-#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "MetalDeviceState.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -36,23 +33,18 @@ struct PreparedDispatch {};
 struct RecipeHit {};
 struct RecordedDispatch {};
 
+using Metal::Describe;
+using Metal::Unimplemented;
+
 namespace {
 
 constexpr std::uint64_t HostPage = 16384u;
 constexpr std::size_t RingBytes = 8u << 20u;
 constexpr std::uint64_t WaitTimeoutMs = 20000u;
 
-[[noreturn]] void Unimplemented(const char* what, const char* package) {
-    throw std::runtime_error(std::string("Metal device: ") + what + " is not implemented yet (" + package + ", docs/mac/M2_DESIGN.md)");
-}
-
 std::uint64_t NextSerial() {
     static std::atomic<std::uint64_t> serials{0};
     return serials.fetch_add(1, std::memory_order_relaxed) + 1;
-}
-
-std::string Describe(NSError* error) {
-    return error != nil ? std::string(error.localizedDescription.UTF8String) : std::string("unknown error");
 }
 
 std::uint32_t LoopGuardLimit() {
@@ -79,52 +71,6 @@ GuestBufferRange DecodeBuffer(std::span<const std::uint32_t> words) {
 }
 
 }
-
-struct VulkanDevice::State {
-    id<MTLDevice> device = nil;
-    id<MTL4CommandQueue> queue = nil;
-    id<MTL4Compiler> compiler = nil;
-    id<MTLSharedEvent> event = nil;
-    id<MTLResidencySet> residency = nil;
-    id<MTL4ArgumentTable> arguments = nil;
-    id<MTLBuffer> ring = nil;
-    id<MTLBuffer> faults = nil;
-    std::size_t ringUsed = 0;
-    std::uint64_t submitted = 0;
-    std::vector<std::uint32_t> capabilities;
-    std::vector<std::string_view> extensions;
-
-    struct Batch {
-        std::uint64_t value;
-        id<MTL4CommandAllocator> allocator;
-    };
-    std::deque<Batch> inflight;
-    std::vector<id<MTL4CommandAllocator>> freeAllocators;
-    // Command buffer errors reported by commit feedback, which may arrive after the device is gone.
-    struct Errors {
-        std::mutex mutex;
-        std::vector<std::string> messages;
-    };
-    std::shared_ptr<Errors> errors = std::make_shared<Errors>();
-
-    struct Wrapper {
-        std::uint64_t begin;
-        std::uint64_t end;
-        id<MTLBuffer> buffer;
-    };
-    std::vector<Wrapper> wrappers;
-
-    std::mutex pipelinesMutex;
-    std::unordered_map<std::string, id<MTLLibrary>> libraries;
-    std::unordered_map<std::string, id<MTLComputePipelineState>> computePipelines;
-
-    std::uint64_t Allocate(std::size_t bytes, std::size_t alignment, void** host);
-    std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
-    id<MTLLibrary> Library(const ShaderRecompiler::MslShader& shader);
-    id<MTLComputePipelineState> ComputePipeline(const ShaderRecompiler::RecompileResult& shader);
-    void Retire(bool wait);
-    void CheckFaults();
-};
 
 std::uint64_t VulkanDevice::State::Allocate(std::size_t bytes, std::size_t alignment, void** host) {
     auto offset = (ringUsed + alignment - 1u) & ~(alignment - 1u);
@@ -330,10 +276,6 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     return target;
 }
 
-std::optional<ShaderRecompiler::GeometryStageLimits> VulkanDevice::GeometryLimits() const {
-    return std::nullopt;
-}
-
 const std::uint32_t* VulkanDevice::WorkGroupCountLimit() const {
     static constexpr std::uint32_t limits[3] = {65535u, 65535u, 65535u};
     return limits;
@@ -436,90 +378,6 @@ VulkanDevice::CopyVerification VulkanDevice::CopyVerifyCounts() {
 }
 
 VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
-    return {};
-}
-
-void* VulkanDevice::Window() const {
-    return nullptr;
-}
-
-void VulkanDevice::Resize(std::uint32_t, std::uint32_t) {
-}
-
-bool VulkanDevice::Presentable() const {
-    return false;
-}
-
-bool VulkanDevice::DualSrcBlend() const {
-    return true;
-}
-
-bool VulkanDevice::PrimitiveListRestart() const {
-    return false;
-}
-
-bool VulkanDevice::SamplerFilterMinmax() const {
-    return false;
-}
-
-bool VulkanDevice::ConservativeRasterization() const {
-    return false;
-}
-
-VkShaderStageFlags VulkanDevice::SubgroupStages() const {
-    return VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-}
-
-bool VulkanDevice::ProvokingVertexLast() const {
-    return false;
-}
-
-bool VulkanDevice::GraphicsPipelineLibraries() const {
-    return false;
-}
-
-std::size_t VulkanDevice::FlipInFlight() {
-    return 1u;
-}
-
-double VulkanDevice::RetirePresents(std::size_t) {
-    return 0.0;
-}
-
-bool VulkanDevice::PresentWaitsForSlots(const DisplayBuffer*) const {
-    return false;
-}
-
-bool VulkanDevice::AcquireImage() {
-    Unimplemented("presentation (AcquireImage)", "work package D6");
-}
-
-bool VulkanDevice::PresentClear(std::uint32_t, std::uint32_t, bool) {
-    Unimplemented("presentation (PresentClear)", "work package D6");
-}
-
-void VulkanDevice::PresentPixels(std::uint32_t, std::uint32_t, std::span<const std::byte>) {
-    Unimplemented("presentation (PresentPixels)", "work package D6");
-}
-
-bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer&) {
-    Unimplemented("presentation (PresentDisplayBuffer)", "work package D6");
-}
-
-double VulkanDevice::FinishPresent() {
-    return 0.0;
-}
-
-void VulkanDevice::QueuePresent() {
-    Unimplemented("presentation (QueuePresent)", "work package D6");
-}
-
-void VulkanDevice::FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const {
-    submissions = state->submitted;
-    unsignaled = state->inflight.size();
-}
-
-VulkanDevice::PresentStatistics VulkanDevice::PresentCounts() {
     return {};
 }
 
@@ -668,33 +526,6 @@ void VulkanDevice::NoteRecipe(RecipeEvent, bool) {
 }
 
 void VulkanDevice::NoteRecipe(RecipeEvent, RecipeKind) {
-}
-
-void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck) {
-}
-
-void VulkanDevice::Draw(const Graphics::State&, const Pm4::DrawParameters&, std::span<const Graphics::CompiledShader>, std::span<const Graphics::GuestMemorySnapshot>, std::shared_ptr<const DrawRecipe>*) {
-    Unimplemented("Draw", "work package D5");
-}
-
-std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State&, std::span<const Graphics::CompiledShader>) const {
-    return std::string("draws are not implemented on the Metal device yet (work package D5)");
-}
-
-void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass&) {
-    Unimplemented("ColorMetadataPass", "work package D4");
-}
-
-RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State&, const Pm4::DrawParameters&, std::span<const Graphics::CompiledShader>, std::span<const Graphics::GuestMemorySnapshot>, const std::shared_ptr<const DrawRecipe>&) {
-    return RecipeOutcome::Rebuild;
-}
-
-VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
-    return {false, false, false};
-}
-
-bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages&, std::span<const Graphics::CompiledShader>) {
-    return false;
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
