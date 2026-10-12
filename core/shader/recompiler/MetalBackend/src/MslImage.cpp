@@ -901,9 +901,87 @@ std::optional<MslAtomicOp> AtomicOp(IrOpcode opcode) {
     }
 }
 
+std::optional<std::uint32_t> Atomic64Op(IrOpcode opcode) {
+    switch (opcode) {
+    case IrOpcode::ImageAtomicSwap64: return 0u;
+    case IrOpcode::ImageAtomicCmpSwap64: return 1u;
+    case IrOpcode::ImageAtomicIAdd64: return 2u;
+    case IrOpcode::ImageAtomicISub64: return 3u;
+    case IrOpcode::ImageAtomicSMin64: return 4u;
+    case IrOpcode::ImageAtomicUMin64: return 5u;
+    case IrOpcode::ImageAtomicSMax64: return 6u;
+    case IrOpcode::ImageAtomicUMax64: return 7u;
+    case IrOpcode::ImageAtomicAnd64: return 8u;
+    case IrOpcode::ImageAtomicOr64: return 9u;
+    case IrOpcode::ImageAtomicXor64: return 10u;
+    default: return std::nullopt;
+    }
+}
+
+// 64-bit image atomics: Apple9 has only atomic_max/min (no result) on 64-bit (RG32Uint) textures,
+// so every read-modify-write of a texel takes a lock word of the driver's lock table
+// (DriverData.atomicLocks, the Atomics64 chunk of MslMemory.cpp), one elected invocation per SIMD
+// group per round as MslDeviceAtomic64; the new value is committed with a max or min so a texel
+// is never seen half-written.
+void EmitAtomic64(MslEmitterState& state, const Access& access) {
+    const auto op = Atomic64Op(access.inst.Opcode());
+    if (!op) state.Fail(access.inst, "is a 64-bit image atomic the MSL backend does not know");
+    if (Multisampled(access.image.dimension)) state.Fail(access.inst, "is an atomic on a multisampled image, which Metal does not support");
+    state.RequirePrelude(MslPreludeChunk::Atomics64);
+    state.usesDriverData = true;
+    const auto condition = state.Arg(access.inst, access.inst.ArgumentCount() - 1u);
+    const auto value = state.Arg(access.inst, 2);
+    const auto comparator = *op == 1u ? state.Arg(access.inst, 3) : std::string("0ul");
+    const auto result = state.Name(access.inst);
+    state.Line(result + " = 0ul;");
+    const auto texture = Texture(state, access);
+    const auto coord = CoordU32(state, access);
+    const auto where = coord.coord + (coord.slice.empty() ? "" : ", " + coord.slice);
+    const auto tag = state.Temporary("aps5_ia64");
+    state.Line("bool " + tag + "_done = !(" + condition + ");");
+    state.Line("if (!" + tag + "_done) {");
+    state.Indent();
+    const auto inside = BoundsCheck(state, texture, access.image.dimension, coord, "0u", true, "0u");
+    state.Line("if (!" + inside + ") " + tag + "_done = true;");
+    state.Outdent();
+    state.Line("}");
+    // The lock is hashed from the image resource and the texel.
+    std::string key = "((ulong(" + U(access.mem.resource) + ") << 40u) ^ ulong(" + coord.coord + ".x) ^ (ulong(" + coord.coord + ".y) << 16u)";
+    if (!coord.slice.empty()) key += " ^ (ulong(" + coord.slice + ") << 28u)";
+    if (access.image.dimension == RdnaImageDimension::Dim3D) key += " ^ (ulong(" + coord.coord + ".z) << 28u)";
+    key += ")";
+    state.Line("device atomic_uint* " + tag + "_lock = aps5_atomic64_lock(aps5_driver.atomicLocks, " + key + " << 3u);");
+    state.Line("if (aps5_driver.atomicLocks == 0ul) " + tag + "_done = true;");
+    state.Line("for (uint " + tag + "_round = 0u; " + tag + "_round < 1048576u; ++" + tag + "_round) {");
+    state.Indent();
+    state.Line("if (!" + tag + "_done && simd_is_first()) {");
+    state.Indent();
+    state.Line("uint " + tag + "_expected = 0u;");
+    state.Line("if (atomic_compare_exchange_weak_explicit(" + tag + "_lock, &" + tag + "_expected, 1u, memory_order_relaxed, memory_order_relaxed)) {");
+    state.Indent();
+    state.Line("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);");
+    state.Line(result + " = " + texture + ".read(" + where + ").x;");
+    state.Line("const ulong " + tag + "_next = aps5_atomic64_next(" + U(*op) + ", " + result + ", ulong(" + value + "), ulong(" + comparator + "));");
+    state.Line("if (" + tag + "_next > " + result + ") " + texture + ".atomic_max(" + where + ", " + tag + "_next);");
+    state.Line("else if (" + tag + "_next < " + result + ") " + texture + ".atomic_min(" + where + ", " + tag + "_next);");
+    state.Line("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);");
+    state.Line("atomic_store_explicit(" + tag + "_lock, 0u, memory_order_relaxed);");
+    state.Line(tag + "_done = true;");
+    state.Outdent();
+    state.Line("}");
+    state.Outdent();
+    state.Line("}");
+    state.Line("if (!simd_any(!" + tag + "_done)) break;");
+    state.Outdent();
+    state.Line("}");
+}
+
 void EmitAtomic(MslEmitterState& state, const Access& access) {
     const auto opcode = access.inst.Opcode();
-    if (IsImageAtomic64Opcode(opcode)) state.Fail(access.inst, "is a 64-bit image atomic, which the MSL backend does not implement yet (work packages B3/B4, group G6)");
+    if (IsImageAtomic64Opcode(opcode)) {
+        EmitAtomic64(state, access);
+        return;
+    }
     const auto op = AtomicOp(opcode);
     if (!op) state.Fail(access.inst, "is an image atomic the MSL backend does not know");
     if (Multisampled(access.image.dimension)) state.Fail(access.inst, "is an atomic on a multisampled image, which Metal does not support");
