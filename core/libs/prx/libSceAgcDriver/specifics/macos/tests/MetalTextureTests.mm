@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -210,6 +211,64 @@ int DetileGpu() {
     return 0;
 }
 
+
+// The GpuColorTransfer twin (MSL ColorTransfer.comp): a 256x128 RGBA8 surface in the render-target
+// layout detiles on the GPU to the linear pixels ColorTargetLayout tiled, with and without the
+// red/blue swap, and tiles back to the guest bytes.
+int ColorTransfer() {
+    AgcDriver::Graphics::MetalTest::Device device;
+    constexpr std::uint32_t width = 256u;
+    constexpr std::uint32_t height = 128u;
+    const ColorTargetLayout layout(width, height, ColorTileMode::RenderTarget, 4u);
+    const auto linear = Pattern(static_cast<std::size_t>(width) * height * 4u, 77u);
+    std::vector<std::byte> tiled(layout.Bytes());
+    layout.Tile(linear, tiled);
+    std::vector<std::byte> guest(tiled.size() + 0x10000u);
+    auto* aligned = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(guest.data()) + 0xffffu) & ~std::uintptr_t{0xffffu});
+    std::memcpy(aligned, tiled.data(), tiled.size());
+    GpuColorTransfer transfer(device.context);
+    for (const bool swap : {false, true}) {
+        transfer.Upload(reinterpret_cast<std::uintptr_t>(aligned), width, height, ColorTileMode::RenderTarget);
+        Buffer readback(device.context, linear.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            CommandBatch batch(device.context);
+            transfer.Detile(batch.Handle(), swap);
+            AgcDriver::Graphics::CopyBuffer(device.context, batch.Handle(), transfer.LinearBuffer(), 0, readback.Handle(), 0, linear.size());
+            batch.SubmitAndWait();
+        }
+        bool same = true;
+        const auto* pixels = reinterpret_cast<const std::uint32_t*>(readback.Bytes().data());
+        const auto* expected = reinterpret_cast<const std::uint32_t*>(linear.data());
+        for (std::size_t index = 0; index < linear.size() / 4u && same; ++index) {
+            auto pixel = expected[index];
+            if (swap) pixel = (pixel & 0xff00ff00u) | ((pixel & 0xffu) << 16u) | ((pixel >> 16u) & 0xffu);
+            same = pixels[index] == pixel;
+        }
+        Check(same, std::string("GPU color transfer detile") + (swap ? " with the red/blue swap" : ""));
+    }
+    // Tile: the linear pixels go back into the tiled layout (the guest bytes after WriteBack).
+    std::memset(aligned, 0, tiled.size());
+    {
+        CommandBatch batch(device.context);
+        transfer.Tile(batch.Handle());
+        batch.SubmitAndWait();
+    }
+    transfer.WriteBack(reinterpret_cast<std::uintptr_t>(aligned));
+    // The linear buffer holds the last (red/blue swapped) detile: its tiling is what lands.
+    auto swapped = linear;
+    for (std::size_t index = 0; index < swapped.size(); index += 4u) std::swap(swapped[index], swapped[index + 2u]);
+    std::vector<std::byte> expectedTiled(layout.Bytes());
+    layout.Tile(swapped, expectedTiled);
+    bool tiledSame = true;
+    for (std::uint32_t y = 0; y < height && tiledSame; ++y) {
+        for (std::uint32_t x = 0; x < width && tiledSame; ++x) tiledSame = std::memcmp(aligned + layout.Offset(x, y), expectedTiled.data() + layout.Offset(x, y), 4u) == 0;
+    }
+    Check(tiledSame, "GPU color transfer tile and write-back");
+    if (failures != 0) return 1;
+    std::printf("PASS: agc_metal_color_transfer\n");
+    return 0;
+}
+
 int Images() {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (device == nil || ![device supportsFamily:MTLGPUFamilyMetal4]) {
@@ -376,6 +435,7 @@ int main(int argc, char** argv) {
             if (argc == 2 && std::strcmp(argv[1], "--images") == 0) return Images();
             if (argc == 2 && std::strcmp(argv[1], "--reduction") == 0) return Reduction();
             if (argc == 2 && std::strcmp(argv[1], "--detile-gpu") == 0) return DetileGpu();
+            if (argc == 2 && std::strcmp(argv[1], "--color-transfer") == 0) return ColorTransfer();
             std::fprintf(stderr, "usage: agc_metal_texture_tests --detile | --images\n");
             return 1;
         } catch (const std::exception& error) {
