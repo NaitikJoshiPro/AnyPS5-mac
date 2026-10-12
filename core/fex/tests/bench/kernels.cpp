@@ -847,7 +847,7 @@ const BenchKernel BenchKernels[] = {
     {"atomic_private_t4", PrepareAtomics, Atomic<4, PrivateBody>, 1 << 22, 4},
     {"bridge_call", nullptr, BridgeCall, 1 << 18, 1},
     {"bridge_qsort", PrepareSort, BridgeQsort, 16, 1},
-    {"bridge_thread", nullptr, BridgeThread, 32, 1},
+    {"bridge_thread", nullptr, BridgeThread, 32, 2},
 };
 
 const u32 BenchKernelCount = sizeof(BenchKernels) / sizeof(BenchKernels[0]);
