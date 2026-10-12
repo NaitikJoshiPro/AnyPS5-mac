@@ -675,8 +675,21 @@ VkDevice VulkanDevice::Device() const {
     return state->context.device;
 }
 
+namespace {
+
+// Debug aid (APS5_TRACE_GDS=1): GDS dwords 4-7 (the append/consume counters of the GDS tests).
+void TraceGds(const char* where) {
+    static const bool enabled = std::getenv("APS5_TRACE_GDS") != nullptr;
+    if (!enabled) return;
+    const auto* words = reinterpret_cast<const std::uint32_t*>(Pm4::GdsAddress());
+    std::fprintf(stderr, "[gds] %s: %u %u %u %u\n", where, words[4], words[5], words[6], words[7]);
+}
+
+}
+
 void VulkanDevice::WaitIdle() {
     state->Sync();
+    TraceGds("after WaitIdle");
 }
 
 void VulkanDevice::PrepareForReplacement() {
@@ -1305,6 +1318,7 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
     if (recipe != nullptr) *recipe = nullptr;
     state->RequireDispatchable(shader);
     if (x == 0u || y == 0u || z == 0u) return;
+    TraceGds("before Dispatch");
     @autoreleasepool {
         state->RecordCompute(shader, x, y, z, 0u, snapshots);
     }
