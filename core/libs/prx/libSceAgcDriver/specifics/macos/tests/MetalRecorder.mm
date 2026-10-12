@@ -4,7 +4,8 @@
 // DCC key stores fill and seed; SyncThrough finishes only up to the batch that writes a range;
 // completions run in batch order; the timeline serves unlocked waits; the pending-write snapshot
 // follows the batches; the fill and mesh-argument kernels compute what their GLSL originals do;
-// occlusion samples counted by a render pass reach a ZPASS_DONE dump and SamplesTotal.
+// occlusion samples counted by a render pass reach a ZPASS_DONE dump and SamplesTotal; the flush
+// hook waits for a batch's writes; hundreds of random batches keep program order.
 // `--timing` (APS5_PROFILE_GPU=1): batch and range timestamps from MTL4 counter heaps.
 
 #include "MetalTestDevice.h"
@@ -361,6 +362,115 @@ void CommandBatchAfterRecorded(const Context& context) {
     Expect(recorder.Idle(), "the command batch's wait did not reap the finished recorded batch");
 }
 
+// The flush hook (GuestMemory::FlushGpuWrites, which every guest read makes): a CPU access to a
+// range a submitted batch writes waits for that batch, with the GPU mutex released, and then sees
+// the GPU's bytes. This is what lets the PM4 core read results without draining the device.
+void FlushHookWaitsForGpuWrites(const Context& context) {
+    constexpr std::size_t bytes = std::size_t{32} << 20u;
+    Buffer target(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memset(target.Bytes().data(), 0, bytes);
+    const auto address = AddressOf(target);
+    std::unique_ptr<Recorder> recorder;
+    {
+        Lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder = std::make_unique<Recorder>(context);
+        recorder->Activate();
+        auto& stream = recorder->Stream();
+        // Eight ordered fills of 32 MiB: long enough that the batch usually still runs at the read.
+        for (std::uint32_t fill = 1; fill <= 8; ++fill) {
+            if (fill != 1) stream.Barrier(MTLStageBlit, MTLStageBlit);
+            stream.FillBuffer(Metal::BufferOf(target.Handle()), 0, bytes, 0x11111111u * fill);
+        }
+        recorder->NotePendingWrite(address, bytes);
+        recorder->Submit();
+        Expect(Recorder::SnapshotWriteOverlaps(address + bytes - 64, 64), "the submitted fill is not in the pending-write snapshot");
+    }
+    const auto waitsBefore = Recorder::ThreadHookWaits();
+    AgcDriver::GuestMemory::FlushGpuWrites(address + bytes - 64, 64);
+    const auto* words = WordsOf(target);
+    Expect(words[bytes / 4 - 1] == 0x88888888u && words[0] == 0x88888888u, "the CPU read after the flush hook saw " + Hex(words[bytes / 4 - 1]) + ", not the last fill");
+    std::printf("flush hook: the read %s for the GPU\n", Recorder::ThreadHookWaits() != waitsBefore ? "waited" : "found the batch finished and did not wait");
+    {
+        Lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        Expect(recorder->Idle() && !Recorder::SnapshotWriteOverlaps(address, bytes), "the hook's sync did not finish the batch and retire its write");
+        recorder.reset();
+    }
+}
+
+// Hundreds of batches of label stores and fills in random program order, with reaps, targeted
+// syncs and full syncs between them: memory ends as program order leaves it, every completion runs
+// once, and the batch objects and upload memory are recycled without corruption.
+void ManyBatches(const Context& context) {
+    constexpr std::size_t dwords = 16384;
+    constexpr int batches = 600;
+    Buffer target(context, dwords * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memset(target.Bytes().data(), 0, dwords * 4);
+    std::vector<std::uint32_t> expected(dwords, 0);
+    std::uint64_t seed = 0x2545f4914f6cdd1dull;
+    const auto next = [&](std::uint64_t bound) {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return seed % bound;
+    };
+    int completions = 0;
+    std::uint32_t value = 1;
+    {
+        Lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        for (int batch = 0; batch < batches; ++batch) {
+            const auto stores = 1 + next(4);
+            for (std::uint64_t store = 0; store < stores; ++store) {
+                const auto first = static_cast<std::size_t>(next(dwords - 8));
+                const auto count = static_cast<std::size_t>(1 + next(6));
+                std::vector<std::uint32_t> words(count);
+                for (auto& word : words) word = value++;
+                recorder.RecordStore(target.Handle(), first * 4, Words(words), AddressOf(target, first * 4));
+                std::copy(words.begin(), words.end(), expected.begin() + static_cast<std::ptrdiff_t>(first));
+            }
+            if (next(3) == 0) {
+                const auto first = static_cast<std::size_t>(next(dwords - 256));
+                const auto count = static_cast<std::size_t>(1 + next(256));
+                const auto byte = static_cast<std::uint32_t>(1 + next(255));
+                // A later command over queued stores records them first (as the device's fills do).
+                recorder.FlushStoresOverlapping(AddressOf(target, first * 4), count * 4);
+                auto& stream = recorder.Stream();
+                stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                stream.FillBuffer(Metal::BufferOf(target.Handle()), first * 4, count * 4, byte * 0x01010101u);
+                std::fill(expected.begin() + static_cast<std::ptrdiff_t>(first), expected.begin() + static_cast<std::ptrdiff_t>(first + count), byte * 0x01010101u);
+            }
+            recorder.OnComplete([&completions] { ++completions; });
+            recorder.Submit();
+            switch (next(4)) {
+            case 0:
+                recorder.Reap();
+                break;
+            case 1: {
+                const auto first = static_cast<std::size_t>(next(dwords - 64));
+                recorder.NotePendingWrite(AddressOf(target, first * 4), 256);
+                recorder.Submit();
+                recorder.SyncThrough(AddressOf(target, first * 4), 256);
+                break;
+            }
+            case 2:
+                if (next(8) == 0) recorder.Sync();
+                break;
+            default:
+                break;
+            }
+        }
+        recorder.Sync();
+        Expect(recorder.Idle() && completions == batches, "after " + std::to_string(batches) + " batches " + std::to_string(completions) + " completions ran and the recorder is " + (recorder.Idle() ? "idle" : "busy"));
+    }
+    const auto* words = WordsOf(target);
+    std::size_t wrong = 0, firstWrong = dwords;
+    for (std::size_t i = 0; i < dwords; ++i) {
+        if (words[i] == expected[i]) continue;
+        if (wrong++ == 0) firstWrong = i;
+    }
+    Expect(wrong == 0, std::to_string(wrong) + " dwords differ from program order after many batches (first at " + std::to_string(firstWrong) + ": " + (firstWrong < dwords ? Hex(words[firstWrong]) + " instead of " + Hex(expected[firstWrong]) : std::string("-")) + ")");
+}
+
 // An overrunning update fails at record time with the package's message, not on the GPU.
 void RecordTimeChecks(const Context& context) {
     Buffer target(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -414,6 +524,8 @@ int main(int argc, char** argv) {
                 MeshArguments(device.context);
                 OcclusionSamples(device);
                 CommandBatchAfterRecorded(device.context);
+                FlushHookWaitsForGpuWrites(device.context);
+                ManyBatches(device.context);
                 RecordTimeChecks(device.context);
             }
         } catch (const std::exception& error) {
