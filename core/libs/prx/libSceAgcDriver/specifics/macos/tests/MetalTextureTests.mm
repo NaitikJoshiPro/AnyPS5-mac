@@ -9,9 +9,11 @@
 #import <Metal/Metal.h>
 
 #include "../src/MetalImages.h"
+#include "../src/MetalVulkanImages.h"
 #include "MetalTestDevice.h"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
@@ -245,6 +247,18 @@ int Images() {
             Check(cache.Placeholder(heap) != nil, "placeholder of heap " + std::to_string(heap));
         } catch (const std::exception& error) {
             Check(false, "placeholder of heap " + std::to_string(heap) + ": " + error.what());
+        }
+    }
+    // The PlaceholderImages twin (what ShaderResources binds for absent images): every heap's
+    // placeholder is a valid Metal texture of the heap's type (under MTL_DEBUG_LAYER a bad
+    // descriptor aborts here).
+    {
+        AgcDriver::Graphics::MetalTest::Device testDevice;
+        ImageCache attached(testDevice.device, nil);
+        PlaceholderImages placeholders(testDevice.context);
+        for (std::uint32_t heap = ShaderRecompiler::RuntimeAbi::FirstImageBinding; heap < static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers); ++heap) {
+            id<MTLTexture> view = Metal::TextureOfView(placeholders.View(heap));
+            Check(view != nil, "PlaceholderImages view of heap " + std::to_string(heap));
         }
     }
     // Samplers: equal words share one sampler state; different words do not.
