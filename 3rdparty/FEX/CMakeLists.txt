@@ -512,8 +512,9 @@ if (NOT TUNE_ARCH STREQUAL "generic")
   else()
     message(FATAL_ERROR "Trying to compile arch type '${TUNE_ARCH_STRING}' but the compiler doesn't support this")
   endif()
-elseif(ARCHITECTURE_arm64)
+elseif(ARCHITECTURE_arm64 AND NOT APPLE)
   # Need to always append crc
+  # Apple's arm64 target already has CRC and is newer than armv8-a, so it keeps the toolchain default.
   check_cxx_compiler_flag("-march=armv8-a+crc" COMPILER_SUPPORTS_ARCH_TYPE)
   list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=armv8-a+crc")
 endif()
