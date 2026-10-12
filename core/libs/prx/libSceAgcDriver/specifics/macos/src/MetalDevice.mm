@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +137,26 @@ std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
         cursor = region + size;
     }
     return {};
+}
+
+// The Metal device: the system default, or with ANYPS5_GPU set the first device whose name
+// contains it (case-insensitive), as upstream picks a Vulkan device.
+id<MTLDevice> SelectDevice() {
+    const char* requested = std::getenv("ANYPS5_GPU");
+    if (requested == nullptr || *requested == '\0') return MTLCreateSystemDefaultDevice();
+    const auto lower = [](std::string text) {
+        for (auto& character : text) character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+        return text;
+    };
+    const auto request = lower(requested);
+    std::string names;
+    for (id<MTLDevice> candidate in MTLCopyAllDevices()) {
+        const std::string name = candidate.name.UTF8String;
+        if (!names.empty()) names += ", ";
+        names += name;
+        if (lower(name).find(request) != std::string::npos) return candidate;
+    }
+    throw std::runtime_error(std::string("Metal device: no usable device whose name contains ANYPS5_GPU=\"") + requested + "\"; devices: " + names);
 }
 
 std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
@@ -526,7 +547,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     try {
         if (window != nullptr) Unimplemented("presentation to a window", "work package D6");
         @autoreleasepool {
-            state->device = MTLCreateSystemDefaultDevice();
+            state->device = SelectDevice();
             if (state->device == nil) throw std::runtime_error("Metal device: no Metal device");
             if (![state->device supportsFamily:MTLGPUFamilyMetal4] || ![state->device supportsFamily:MTLGPUFamilyApple7]) throw std::runtime_error("Metal device: the GPU lacks the Metal 4 / Apple7 feature set this driver needs");
             NSError* error = nil;
