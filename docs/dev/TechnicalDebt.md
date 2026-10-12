@@ -813,6 +813,16 @@ Gaps and costs of the MSL wave, LDS/GDS and atomic families ([MslWave.cpp](../..
 - <a id="metal-b3-store-order"></a>Stores of several lanes to one address: RDNA keeps the highest lane's data, Apple GPUs an unspecified lane's. Stores whose address operands are wave-uniform store from the highest active lane only. Per-lane addresses that happen to coincide keep an unspecified lane's data
 - <a id="metal-b3-permute"></a>`ds_permute_b32` runs 32 shuffles per lane (a uniform loop over source lanes); `ds_bpermute`, swizzles, DPP and readlane are one or two shuffles (two per read for wave64 at two lanes per invocation)
 
+### MetalBackend stage interfaces (macOS)
+
+Gaps of the MSL vertex and fragment functions ([MslStageIo.cpp](../../core/shader/recompiler/MetalBackend/src/MslStageIo.cpp), [MslEntryPoint.cpp](../../core/shader/recompiler/MetalBackend/src/MslEntryPoint.cpp); work package B6, interface in [M2_DESIGN.md](../mac/M2_DESIGN.md) "B6/D6 interface"). Checked on the CPU by `agc_metal_msl_stage_io`.
+
+- <a id="metal-b6-stages"></a>Only vertex (VS) and pixel programs: local/export, hull, domain, mesh and geometry-emulation stages throw naming B6; tessellation follows D-M2-1 (Metal 3 side queue)
+- <a id="metal-b6-half-wave"></a>Wave64 vertex/pixel programs run at one lane per invocation, and Apple's SIMD groups are 32 wide: each SIMD group acts as a 32-lane view of the guest wave (ballots in the low word, votes over the group). `v_readlane` of lanes 32-63 throws unless it is the read of a matched half-wave reduction scan (as on the SPIR-V path for 32-lane hosts). Bit counts of whole-wave masks see one half only. Vertex functions have no `[[thread_index_in_simdgroup]]`, so the lane id is `simd_prefix_exclusive_sum(1)`, which is the hardware lane only while the group is full
+- <a id="metal-b6-per-vertex"></a>Per-vertex pixel inputs (barycentric-mode interpolation, `GetInterpolationParameter*`) throw: Metal reads per-vertex values in fragment functions only on Apple10 (`vertex_value`)
+- <a id="metal-b6-rect-flat"></a>Rect lists expand in the vertex function (6 host vertices, 3 guest vertex invocations each). The vertex function cannot see which parameters the fragment reads flat, so the fourth corner interpolates every parameter, and Metal's flat shading takes each triangle's first vertex
+- <a id="metal-b6-gaps"></a>Not yet: cull distances (no Metal vertex output), primitive-ordered pixel shaders (raster order groups), LDS in pixel and vertex programs, `PackedAncillary`, dual-source blending, stencil export capability checks
+
 ### Metal recorder and buffer primitives (macOS)
 
 Gaps of the Metal twins of the recorder and the buffer primitives ([Recorder.mm](../../core/libs/prx/libSceAgcDriver/specifics/macos/src/Recorder.mm), [MetalCommandStream.mm](../../core/libs/prx/libSceAgcDriver/specifics/macos/src/MetalCommandStream.mm), [Resources.mm](../../core/libs/prx/libSceAgcDriver/specifics/macos/src/Resources.mm), [BufferPool.mm](../../core/libs/prx/libSceAgcDriver/specifics/macos/src/BufferPool.mm); work package D2 in [M2_DESIGN.md](../mac/M2_DESIGN.md)). Unsupported states throw `Metal recorder (work package D2): ...`.
