@@ -11,6 +11,10 @@
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
+#if !APS5_GUEST_VA_LIST_IS_HOST
+#include "prx/libc/include/WindowsFormatting.hpp"
+#endif
 
 #include <cerrno>
 #include <cstdarg>
@@ -316,11 +320,10 @@ int APS5_VABI sceKernelFcntl(int d, int command, ...) {
     }
     int result;
     if (command == GuestSetFlags) {
-#ifdef _WIN32
-        __builtin_sysv_va_list arguments;
-        __builtin_sysv_va_start(arguments, command);
-        const int flags = __builtin_va_arg(arguments, int);
-        __builtin_sysv_va_end(arguments);
+#if !APS5_GUEST_VA_LIST_IS_HOST
+        APS5_VA_BEGIN(command);
+        const int flags = LibcDetail::FormatArguments(args).Next<int>();
+        APS5_VA_END();
 #else
         std::va_list arguments;
         va_start(arguments, command);
