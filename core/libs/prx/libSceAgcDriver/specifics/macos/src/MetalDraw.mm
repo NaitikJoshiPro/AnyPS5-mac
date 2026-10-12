@@ -23,6 +23,8 @@
 #include "MetalPipelineCache.h"
 #include "MetalImages.h"
 #include "MetalVulkanImages.h"
+#include "MetalDepthSurfaces.h"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
@@ -199,15 +201,15 @@ struct DrawCache {
     id<MTL4ArgumentTable> vertexArguments = nil;
     id<MTL4ArgumentTable> fragmentArguments = nil;
 
-    // GPU-only depth/stencil surfaces by target (upstream DepthSurface: cleared at creation, kept
-    // for the device's life, never written back to guest memory).
+    // The depth/stencil surface of one draw (DepthSurface.mm's registry holds the surfaces: GPU-only,
+    // cleared at creation and after HTILE fast clears, never written back to guest memory).
     struct DepthSurface {
         Graphics::DepthTarget target;
         MTLPixelFormat format;
         id<MTLTexture> texture;
-        bool pendingClear = true;
+        bool clearDepth = false;
+        bool clearStencil = false;
     };
-    std::vector<DepthSurface> depths;
 
     // Private textures of tiled color targets. `gpuNewer`: passes whose write-back has not landed
     // yet (the texture then holds the newest contents and is not reloaded from guest memory).
@@ -232,8 +234,8 @@ struct DrawCache {
     std::vector<id<MTLTexture>> passTextures;
 
     ~DrawCache() {
-        std::vector<id<MTLTexture>> textures;
-        for (const auto& depth : depths) textures.push_back(depth.texture);
+        std::vector<id<MTLTexture>> textures = Graphics::Metal::DepthSurfaceTextures(device);
+        Graphics::ClearDepthSurfaces(Graphics::Metal::DeviceHandle(device));
         for (const auto& target : tiled) textures.push_back(target->texture);
         if (images != nullptr && !textures.empty()) images->Release(textures);
     }
@@ -508,31 +510,21 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (attachment.load) state.SettleRange(attachment.begin, attachment.end - attachment.begin);
     }
 
-    // Depth/stencil surface.
+    // Depth/stencil surface (with the clears its pass must perform: a new surface, an HTILE clear).
+    std::optional<DrawCache::DepthSurface> depthSurface;
     DrawCache::DepthSurface* depth = nullptr;
     if (graphics.depth) {
         const auto& target = *graphics.depth;
         if (target.samples > 1u) Fail("multisampled depth targets");
         const auto format = DepthFormat(target);
-        for (auto& surface : cache.depths) {
-            if (surface.target.address == target.address && surface.target.stencilAddress == target.stencilAddress && surface.target.extent.width == target.extent.width && surface.target.extent.height == target.extent.height && surface.format == format) {
-                depth = &surface;
-                break;
-            }
-        }
-        if (depth == nullptr) {
-            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:target.extent.width height:target.extent.height mipmapped:NO];
-            descriptor.storageMode = MTLStorageModePrivate;
-            descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            id<MTLTexture> texture = [state.device newTextureWithDescriptor:descriptor];
-            if (texture == nil) Fail("cannot create a depth surface");
-            const std::array<id<MTLTexture>, 1> resident {texture};
+        bool created = false;
+        const auto use = Graphics::Metal::AcquireDepthSurface(state.device, target, format, &created);
+        if (created) {
+            const std::array<id<MTLTexture>, 1> resident {use.texture};
             state.images->MakeResident(resident);
-            cache.depths.push_back({target, format, texture, true});
-            depth = &cache.depths.back();
         }
-        depth->target.clearDepth = target.clearDepth;
-        depth->target.clearStencil = target.clearStencil;
+        depthSurface = DrawCache::DepthSurface{target, format, use.texture, use.clearDepth, use.clearStencil};
+        depth = &*depthSurface;
         passKey = Mix(Mix(passKey, target.address), static_cast<std::uint64_t>(format));
     }
 
@@ -702,7 +694,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     access.writes = passWrites;
     access.anyReads = !passReads.empty();
     access.anyWrites = !passWrites.empty();
-    const auto start = recorder.StartDrawPass(passKey, false, false, access);
+    // A pending depth/stencil clear is a load action: it needs a new pass.
+    const bool clears = depth != nullptr && (depth->clearDepth || depth->clearStencil);
+    const auto start = recorder.StartDrawPass(passKey, clears, false, access);
     auto& stream = Graphics::Metal::Stream(start.commands);
     const bool continued = start.continued && cache.passKey == passKey && !cache.passTextures.empty();
     auto held = std::make_shared<Held>();
@@ -763,17 +757,16 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             height = std::min<std::uint32_t>(height, depth->target.extent.height);
             if (HasDepth(depth->format)) {
                 pass.depthAttachment.texture = depth->texture;
-                pass.depthAttachment.loadAction = depth->pendingClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.depthAttachment.loadAction = depth->clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
                 pass.depthAttachment.clearDepth = depth->target.clearDepth;
                 pass.depthAttachment.storeAction = MTLStoreActionStore;
             }
             if (HasStencil(depth->format)) {
                 pass.stencilAttachment.texture = depth->texture;
-                pass.stencilAttachment.loadAction = depth->pendingClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.stencilAttachment.loadAction = depth->clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
                 pass.stencilAttachment.clearStencil = depth->target.clearStencil;
                 pass.stencilAttachment.storeAction = MTLStoreActionStore;
             }
-            depth->pendingClear = false;
         }
         if (width == 0u || height == 0u) Fail("a render pass without an extent");
         pass.renderTargetWidth = width;
