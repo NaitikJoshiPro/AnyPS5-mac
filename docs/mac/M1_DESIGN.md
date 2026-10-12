@@ -300,6 +300,13 @@ For stack arguments: 14 exports take more than 8 integer-class arguments (`.mac-
 - **Bridge:** R/BridgeSignatures.{hpp,cpp} hold the table types and lookup. With `-DAPS5_FEX_BRIDGE_SIGNATURES=ON` (off by default) the table is compiled into the runner and `StubFor` attaches `Function::signature`; marshalling is unchanged (D2).
 - **Tests** (replace `fex_bridge_tables`): `fex_bridge_signatures` (no unclassified export, no conflicting definitions, VariadicExports and X87Results equal to the generated data, prints the list above), `fex_bridge_signatures_table` (the C++ table and lookups), `fex_bridge_signatures_abi` (`verify`, 1 s), `fex_bridge_signatures_units` (`verify` with library units, `slow`), `fex_bridge_signatures_generator` (11 unit tests: the models, a generated tree, cache, `check`, `verify`, the `.inc` compiling). `fex_fixtures` passes with the flag off and on.
 
+**D2 result (2026-10-12, `6d04bc6b`, `7dd8018f`):**
+- **Marshalling:** the generator also emits per-value layouts for both conventions (`BridgePiece`/`BridgeLayout`: register, vector byte, stack offset, st(0), hidden pointer). Exports with a reason other than `variadic` go through `MarshalArguments`/`UnmarshalResult` (R/Bridge.cpp); the rest stay positional, copying only the stack slots and vector registers their signature uses. `long double` is converted x87 ↔ double at the boundary (R/X87Convert.hpp, round to nearest even; `fex_x87_convert`). The table is on by default.
+- **Correction to D1:** Apple's arm64 convention does not start `__int128` or a 16-byte aligned struct at an even register (clang `-target arm64-apple-macos14`: `f(int, __int128, int)` takes x1:x2, w3); `verify` caught the old rule on the test library.
+- **Tests:** test-only library `T/prx/libAps5BridgeAbi` (NID-patched, staged per fixture, its exports in the table); fixtures `abi-registers`, `abi-stack` (incl. a `sceAgcCbReleaseMem` packet), `abi-memory`, `abi-long-double` (all 16 math exports, `strtold`, `wcstold`, `__signbitl`), `abi-variadic` (`swprintf` now bridged), `abi-callbacks`.
+- **Reverse thunks:** 4,096 static thunks (`mov w17, #k; b _Aps5GuestThunkEntry`), R/GuestCall.cpp. Only function pointers whose callback shape positional mapping gets wrong are swapped: libSceFiber hands a fiber's entry back to the guest as its rip, so swapping every guest pointer broke `fibers`. Thunks coming back as results or resumed rips map to the guest function. Positional callbacks keep the fault path (or `CallProgram`).
+- **Bridge cost** (`run_fex_bench.py --variants avx2 --kernels '^bridge_(call|qsort)$'`, CPU time, load 2-4): guest→native was 45 ns at the start of this wave (105 ns was the pin under load 40-99). The trampolines now call the bridge through FEX's thunk instruction (`0f 3f` + 32-byte name, `ThunkHandler`): FEXCore calls it from JIT code with spilled static registers, no dispatcher exit, no block lookups. Same build, `APS5_FEX_BRIDGE_SYSCALL=1` against default: 46-54 → 41-42 ns. native→guest through `qsort`: 66-68 ns, unchanged. `sample` of `bridge_call`: about a third of the samples sit on the two `msr FPCR` of FEXCore's spill/fill around host calls (AFP's AH/NEP/FIZ off for host code, on again), FEXCore code we do not change (D13); the bridge itself is about 15%.
+
 ### E. Guest image registration, `sceKernelDlsym`, low-address mappings
 **Guest image registration:**
 - **Problem:**
@@ -400,6 +407,12 @@ So discovery must combine all the seeds, and libraries without unwind tables dep
 - **Tests:** fixtures `T/context.cpp` (`getcontext`/`setcontext`/`makecontext`/`swapcontext` round trips, including xmm and flags) and `T/raise.cpp`. The libkernel tests that exit 77 run under `aps5-fex`.
 - **Size:** 350 LOC; G2 another 300. 1.5 d.
 - **Dependencies:** M0's guest-state commits on `mac-native` (`4823f6e8`, `33c36514`), D2 and E. **Overlap:** D, E.
+
+**G result (2026-10-12, `5624e54a`):**
+- `L/libc/include/GuestMachineState.hpp`: gregs (DWARF order), rip, rflags, FXSAVE image, fs base; libc exports `LibcHasMachineState/LibcGetMachineState/LibcSetMachineState/LibcMakecontextEntry_nid_no_patch`, the runner sets them with `Aps5SetBridgeMachineState_nid_no_patch`. Get: the innermost bridge call (xmm0-7 from the trampoline block, RFLAGS from `ReconstructCompactedEFLAGS`). Set: a `MachineFrame` exception caught in `Bridge::Invoke`, applied with `SetFlagsFromCompactedEFLAGS`; on the fast path FEXCore does not reload NZCV after the thunk call, so CF/ZF/SF/OF of a resumed context are lost (TechnicalDebt).
+- `makecontext`: rip is 48 bytes of x86 at stub page offset 0x200 that call the function with the six arguments, then `Aps5MakecontextFinish_nid_no_patch` (L/libSceLibcInternal). No library exports `swapcontext`; the fixture builds it from `getcontext`/`setcontext`.
+- `siglongjmp` to another x87 control word resumes the whole state; `sceKernelRaiseException` on the calling thread delivers (G2, another thread, still throws).
+- Tests: fixtures `context`, `context-exit`, `raise`; ctest `guest_user_context`, `guest_user_context_exit`, `guest_raise_exception` run the host argument checks, then these fixtures (`T/run_host_and_fixtures.py`).
 
 ### H. Microbenchmarks
 **Kernels** (`T/bench/*.cpp`):
