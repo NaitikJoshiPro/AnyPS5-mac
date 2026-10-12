@@ -332,6 +332,8 @@ void encodeMsl(Writer& writer, const SharedMsl& msl) {
     writer.Value(reflection.perSample);
     writer.Value(reflection.earlyFragmentTests);
     writer.Value(reflection.usesDiscard);
+    writer.Values(std::span<const std::uint32_t>(reflection.samplerModeUses));
+    writer.Value(reflection.samplerUnconditional);
 }
 
 void decodeMsl(Reader& reader, SharedMsl& msl) {
@@ -368,6 +370,8 @@ void decodeMsl(Reader& reader, SharedMsl& msl) {
     reader.Value(reflection.perSample);
     reader.Value(reflection.earlyFragmentTests);
     reader.Value(reflection.usesDiscard);
+    reader.Values(reflection.samplerModeUses);
+    reader.Value(reflection.samplerUnconditional);
     msl = SharedMsl(std::move(shader));
 }
 

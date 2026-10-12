@@ -529,7 +529,18 @@ std::shared_ptr<const SpecializedModule> buildMslModule(const CompiledShaderArti
         if (!supplied.insert(constant.id).second) throw std::runtime_error("duplicate prepared specialization ID");
         if (std::find(reflection.functionConstants.begin(), reflection.functionConstants.end(), constant.id) != reflection.functionConstants.end()) module->functionConstants.push_back(constant);
     }
-    for (const auto& range : reflection.table.ranges) module->bindings.push_back(RuntimeAbi::BindingNumber(reflection.group, range.binding));
+    // The sampler heap is bound only when a sampler reference survives the supplied constants: an
+    // unconditional one, or one inside the runtime image mode its selector constant picks (default 0).
+    bool samplers = reflection.samplerUnconditional;
+    for (std::size_t index = 0; !samplers && index + 1u < reflection.samplerModeUses.size(); index += 2u) {
+        const auto id = reflection.samplerModeUses[index];
+        const auto found = std::find_if(constants.begin(), constants.end(), [id](const PipelineSpecializationConstant& constant) { return constant.id == id; });
+        samplers = (found != constants.end() ? found->value : 0u) == reflection.samplerModeUses[index + 1u];
+    }
+    for (const auto& range : reflection.table.ranges) {
+        if (range.binding == RuntimeAbi::Binding::Samplers && !samplers) continue;
+        module->bindings.push_back(RuntimeAbi::BindingNumber(reflection.group, range.binding));
+    }
     module->msl = artifact.msl;
     module->pushData = reflection.usesPushData;
     module->specializationId = constants.empty() ? 0u : nextVariantId();

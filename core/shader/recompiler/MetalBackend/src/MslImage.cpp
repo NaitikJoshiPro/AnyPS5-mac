@@ -373,6 +373,13 @@ std::string Sampler(MslEmitterState& state, const Access& access) {
     // LoadSamplerDescriptor: element 2s+1 is the point-filtered twin for integer, converted and
     // depth-bit reads.
     const bool point = access.image.numericClass == IrTextureNumericClass::Sint || access.image.conversionFormat != IrBufferFormat::Invalid || access.image.depthBits;
+    // Reflection::samplerModeUses: the mode case this reference sits in, or an unconditional use.
+    if (state.imageModeCase.second != ~0u) {
+        state.reflection.samplerModeUses.push_back(state.imageModeCase.first);
+        state.reflection.samplerModeUses.push_back(state.imageModeCase.second);
+    } else {
+        state.reflection.samplerUnconditional = true;
+    }
     return HeapElement(state, DescriptorBindingKind::Samplers, state.DescriptorElement(DescriptorBindingKind::Samplers, access.mem.sampler) + (point ? 1u : 0u));
 }
 
@@ -1520,7 +1527,10 @@ void EmitImage(MslEmitterState& state, const IrValue& inst) {
             state.Outdent();
             state.Line("}");
         } else {
+            const auto selectorId = PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords;
+            state.imageModeCase = {selectorId, index};
             EmitMode(state, inst, modes[index], table);
+            state.imageModeCase = {0u, ~0u};
         }
         state.Line("break;");
         state.Outdent();

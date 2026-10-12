@@ -245,6 +245,13 @@ struct Reflection {
     bool perSample = false;
     bool earlyFragmentTests = false;
     bool usesDiscard = false;
+    // Version 3: sampler-heap references and the runtime image modes they sit in. A reference inside
+    // the case `mode` of a direct runtime-mode switch (function constant `id`, the image's mode
+    // selector) is the pair (id, mode); any other reference sets samplerUnconditional. A pipeline
+    // whose supplied constants select no recorded mode does not bind the sampler heap (as the
+    // SPIR-V path's optimizer drops the unused sampler variable).
+    std::vector<std::uint32_t> samplerModeUses;
+    bool samplerUnconditional = false;
 
     bool operator==(const Reflection& other) const = default;
 };

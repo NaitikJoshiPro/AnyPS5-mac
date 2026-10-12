@@ -14,6 +14,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -149,6 +150,9 @@ public:
     // qualifier, e.g. ", flat"), and whether the pixel valid mask (kill) is used.
     std::map<std::uint32_t, std::string> fragmentInputs;
     bool usesValidMask = false;
+    // Images (MslImage.cpp): the direct runtime-mode switch case being emitted, {selector function
+    // constant id, mode index}, for Reflection::samplerModeUses; {0, ~0u} outside one.
+    std::pair<std::uint32_t, std::uint32_t> imageModeCase {0u, ~0u};
     // Descriptor kinds the emitted code references (TableResource): the table holds only these ranges,
     // as the SPIR-V path drops unused descriptor variables (so the binding plan drops them too).
     std::set<DescriptorBindingKind> usedKinds;
