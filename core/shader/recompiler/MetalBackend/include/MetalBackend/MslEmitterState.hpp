@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -15,19 +16,47 @@
 
 namespace ShaderRecompiler {
 
-// Helper code an emitted library may need, pasted before the stage function. Each family owns its
-// chunks (text in its own source file, see MslPrelude.cpp for the registry); a chunk names the
-// chunks it uses so they are emitted first.
+// Helper code an emitted library may need, pasted before the stage function in this order. Each
+// instruction family owns its chunks: the text and dependencies live in the family's source file
+// (MslPreludeEntry functions below); MslPrelude.cpp only dispatches by chunk.
 enum class MslPreludeChunk : std::uint32_t {
+    // Core (MslPrelude.cpp).
     Common,
     FaultRecord,
     LoopGuard,
+    // ALU (MslAluMath.cpp, MslFloat64.cpp).
+    Alu,
+    Float16,
+    Float64,
+    // Wave operations, LDS and atomics (MslWave.cpp, MslMemory.cpp).
+    Wave,
+    LdsLock,
+    Atomics64,
+    // Images (MslImage.cpp).
+    Image,
+    // Buffers, typed formats, BDA (MslRuntimeBuffer.cpp).
     RuntimeBuffer,
+    BufferFormat,
+    Bda,
+    // Stage interfaces (MslStageIo.cpp).
+    StageIo,
     Count
 };
 
-[[nodiscard]] std::string_view MslPreludeText(MslPreludeChunk chunk);
-[[nodiscard]] std::span<const MslPreludeChunk> MslPreludeDependencies(MslPreludeChunk chunk);
+struct MslPreludeEntry {
+    std::string_view text;
+    std::span<const MslPreludeChunk> dependencies;
+};
+
+[[nodiscard]] MslPreludeEntry MslPrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslCorePrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslAluPrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslFloat64Prelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslWavePrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslMemoryPrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslImagePrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslBufferPrelude(MslPreludeChunk chunk);
+[[nodiscard]] MslPreludeEntry MslStagePrelude(MslPreludeChunk chunk);
 
 // Stage-function parameters with Metal attributes ([[thread_position_in_threadgroup]], ...).
 enum class MslBuiltin : std::uint32_t {

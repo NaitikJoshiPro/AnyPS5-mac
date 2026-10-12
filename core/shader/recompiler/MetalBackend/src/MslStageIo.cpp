@@ -1,5 +1,6 @@
 #include "MetalBackend/MslEmitterState.hpp"
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 namespace ShaderRecompiler {
@@ -61,6 +62,10 @@ bool EmitMslStageInstruction(MslEmitterState& state, const IrValue& instruction)
     default:
         return false;
     }
+}
+
+MslPreludeEntry MslStagePrelude(MslPreludeChunk chunk) {
+    throw std::runtime_error("MSL emission failed: prelude chunk " + std::to_string(static_cast<std::uint32_t>(chunk)) + " is not implemented yet");
 }
 
 }

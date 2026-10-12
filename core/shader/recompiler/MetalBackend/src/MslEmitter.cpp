@@ -1,7 +1,7 @@
 #include "MetalBackend/MslEmitterState.hpp"
 #include "BdaAbi.hpp"
-#include <bit>
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -151,14 +151,14 @@ void MslEmitterState::DeclareLocal(std::string_view type, std::string_view name,
 void MslEmitterState::RequirePrelude(MslPreludeChunk chunk) {
     const auto index = static_cast<std::size_t>(chunk);
     if (prelude.test(index)) return;
-    for (const auto dependency : MslPreludeDependencies(chunk)) RequirePrelude(dependency);
+    for (const auto dependency : MslPrelude(chunk).dependencies) RequirePrelude(dependency);
     prelude.set(index);
 }
 
 std::string MslEmitterState::Prelude() const {
     std::string text;
     for (std::size_t index = 0; index < prelude.size(); ++index) {
-        if (prelude.test(index)) text.append(MslPreludeText(static_cast<MslPreludeChunk>(index)));
+        if (prelude.test(index)) text.append(MslPrelude(static_cast<MslPreludeChunk>(index)).text);
     }
     return text;
 }
