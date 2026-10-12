@@ -289,9 +289,10 @@ id<MTLSamplerState> ImageCache::Sampler(std::span<const std::uint32_t> words, bo
     descriptor.lodMinClamp = decoded.minLod;
     descriptor.lodMaxClamp = decoded.maxLod;
     descriptor.lodBias = decoded.lodBias;
-    // MTLSamplerDescriptor.reductionMode is ignored on this GPU (agc_metal_sampler_reduction) and
-    // some combinations fail Metal's descriptor validation: refuse min/max reduction.
-    if (decoded.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) FailD5("min/max sampler reduction is not supported: Metal ignores MTLSamplerDescriptor.reductionMode on this GPU (agc_metal_sampler_reduction)");
+    // Min/max reduction: MTLSamplerDescriptor.reductionMode is ignored on this GPU
+    // (agc_metal_sampler_reduction) and some combinations fail Metal's descriptor validation, so the
+    // sampler filters normally and the shader reduces the footprint it reads through it
+    // (PipelineSpecialization::ReductionBase, MslImage.cpp aps5_reduce_sample).
     if (compare) descriptor.compareFunction = CompareOf(decoded.compareOp);
     if (decoded.unnormalizedCoordinates) {
         descriptor.normalizedCoordinates = NO;
