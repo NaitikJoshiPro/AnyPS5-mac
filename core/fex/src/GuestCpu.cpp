@@ -2,6 +2,7 @@
 
 #include "BareGuest.hpp"
 #include "Bridge.hpp"
+#include "CodeCache.hpp"
 #include "CodePool.hpp"
 #include "GuestProgram.hpp"
 #include "Options.hpp"
@@ -17,9 +18,11 @@
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <csignal>
 #include <cstdio>
 #include <cstddef>
@@ -29,6 +32,7 @@
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -139,13 +143,17 @@ public:
     }
 
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
+        if (modules != nullptr)
+            if (const auto range = modules->ExecutableRange(address)) return *range;
         if (const auto range = GuestCodeRange(address)) return {range->first, range->second - range->first, false};
         return {address & ~std::uint64_t {0x3fff}, 0x4000, false};
     }
 
-    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, std::uint64_t) override {
-        return std::nullopt;
+    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
+        return modules == nullptr ? std::nullopt : modules->Section(address);
     }
+
+    const GuestModules* modules = nullptr;
 
 private:
     Bridge& bridge;
@@ -167,6 +175,8 @@ struct GuestCpu::State {
     BridgeSyscalls syscalls;
     CallbackReturns returns;
     fextl::unique_ptr<FEXCore::Context::Context> context;
+    std::unique_ptr<GuestModules> modules;
+    std::filesystem::path coverage; // APS5_FEX_COVERAGE: written at exit
 };
 
 namespace {
@@ -401,7 +411,58 @@ void InstallFaultHandler() {
         if ((previous->sa_flags & SA_SIGINFO) != 0 && previous->sa_sigaction == OnFault) *previous = {};
 }
 
+// FEXCore's own helper threads (the disk cache writer) are created through the frontend.
+class HostThread final : public FEXCore::Threads::Thread {
+public:
+    HostThread(FEXCore::Threads::ThreadFunc function, void* argument, FEXCore::Threads::Flags flags, const char* name)
+        : start {function, argument, flags.LowPriority, name != nullptr ? name : ""} {
+        if (pthread_create(&thread, nullptr, Entry, &start) != 0) throw std::runtime_error("cannot create a FEXCore thread");
+        running = true;
+    }
+    ~HostThread() override {
+        if (running) pthread_detach(thread);
+    }
+    bool joinable() override { return running; }
+    bool join(void** result) override {
+        if (!running) return false;
+        running = false;
+        return pthread_join(thread, result) == 0;
+    }
+    bool detach() override {
+        if (!running) return false;
+        running = false;
+        return pthread_detach(thread) == 0;
+    }
+    bool IsSelf() override { return running && pthread_equal(thread, pthread_self()); }
+
+private:
+    struct Start {
+        FEXCore::Threads::ThreadFunc function;
+        void* argument;
+        bool lowPriority;
+        std::string name;
+    };
+    static void* Entry(void* data) {
+        const auto* start = static_cast<const Start*>(data);
+        if (!start->name.empty()) pthread_setname_np(start->name.c_str());
+        if (start->lowPriority) pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        return start->function(start->argument);
+    }
+
+    Start start;
+    pthread_t thread {};
+    bool running = false;
+};
+
+fextl::unique_ptr<FEXCore::Threads::Thread> CreateHostThread(FEXCore::Threads::ThreadFunc function, void* argument,
+                                                            FEXCore::Threads::Flags flags, const char* name) {
+    return fextl::make_unique<HostThread>(function, argument, flags, name);
+}
+
+void CleanupAfterFork() {}
+
 void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::string>>& config) {
+    FEXCore::Threads::Thread::SetInternalPointers({CreateHostThread, CleanupAfterFork});
     LogMan::Msg::InstallHandler(LogMessage);
     LogMan::Throw::InstallHandler(LogAssertion);
     CreateCodePool();
@@ -424,20 +485,114 @@ void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::
 
 }
 
-GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
-    PrepareFex({});
+namespace {
 
-    state.reset(new State {BridgeSyscalls(bridge), CallbackReturns(bridge), FEXCore::Context::Context::CreateNewContext(HostFeatures())});
+struct ExitFlush {
+    FEXCore::Context::Context* context;
+    const GuestModules* modules;
+    std::filesystem::path coverage;
+};
+std::optional<ExitFlush> exitFlush;
+
+// The guest ends the process with exit(): queued disk-cache writes must reach the file first.
+void FlushAtExit() {
+    if (!exitFlush) return;
+    exitFlush->context->FlushDiskCache();
+    if (!exitFlush->coverage.empty()) Coverage::Write(exitFlush->coverage, "run", *exitFlush->modules, nullptr);
+}
+
+bool atExitRegistered = false;
+
+}
+
+GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
+    std::vector<std::pair<FEXCore::Config::ConfigOption, std::string>> config;
+    if (const auto cache = CodeCacheDirectory(program.Executable().Path())) {
+        std::filesystem::create_directories(*cache);
+        config.emplace_back(FEXCore::Config::CONFIG_DISKCACHE, "1");
+        // FEX appends the file names to this path as is.
+        config.emplace_back(FEXCore::Config::CONFIG_DISKCACHEPATH, cache->string() + "/");
+    }
+    PrepareFex(config);
+
+    // The disk cache is set up when the context is created, from the configuration above.
+    state.reset(new State {BridgeSyscalls(bridge), CallbackReturns(bridge), FEXCore::Context::Context::CreateNewContext(HostFeatures()),
+                           std::make_unique<GuestModules>(program), {}});
+    state->syscalls.modules = state->modules.get();
+    if (const char* coverage = std::getenv("APS5_FEX_COVERAGE"); coverage != nullptr && *coverage != 0) {
+        state->coverage = coverage;
+        Coverage::Enable();
+    }
+    if (Coverage::Enabled()) state->context->SetCompiledBlockObserver(Coverage::Observe);
     state->context->SetSyscallHandler(&state->syscalls);
     state->context->SetSignalDelegator(&state->returns);
+    state->context->SetThunkHandler(Bridge::Thunks());
     state->context->EnableExitOnHLT();
     if (!state->context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
+    if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
+    exitFlush = ExitFlush {state->context.get(), state->modules.get(), state->coverage};
 }
 
 GuestCpu::~GuestCpu() {
+    if (exitFlush && exitFlush->context == state->context.get()) exitFlush.reset();
+    state->context->FlushDiskCache();
     guestCode = {};
+}
+
+std::size_t GuestCpu::Precompile(unsigned threads, const std::filesystem::path& coverage) {
+    if (!Coverage::Enabled()) throw std::runtime_error("Precompile needs the compiled-block observer (Coverage::Enable before GuestCpu)");
+    std::vector<AotSeeds> seeds;
+    std::vector<std::uint64_t> addresses;
+    for (const auto& module : state->modules->Modules()) {
+        seeds.push_back(FindAotSeeds(module.seedImage));
+        addresses.insert(addresses.end(), seeds.back().addresses.begin(), seeds.back().addresses.end());
+    }
+    const auto compile = [&](const std::vector<std::uint64_t>& batch) {
+        std::atomic<std::size_t> next {0};
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < std::max(1u, threads); ++t) {
+            workers.emplace_back([&] {
+                ApplyThreadQos();
+                GuestThread thread(0, 0, 0);
+                currentThread = thread.Thread();
+                for (std::size_t i = next++; i < batch.size(); i = next++) state->context->CompileRIP(thread.Thread(), batch[i]);
+                currentThread = nullptr;
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    };
+    compile(addresses);
+    // A block ends at a call: the code after it, the return site, starts where the compiled bytes stop. Inside a
+    // function's FDE range, seed the first byte of every gap that follows compiled code, and repeat.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> functions;
+    for (const auto& found : seeds) functions.insert(functions.end(), found.fdeRanges.begin(), found.fdeRanges.end());
+    std::sort(functions.begin(), functions.end());
+    std::vector<std::uint64_t> tried(addresses.begin(), addresses.end());
+    std::sort(tried.begin(), tried.end());
+    constexpr int MaxPasses = 16;
+    for (int pass = 0; pass < MaxPasses && !functions.empty(); ++pass) {
+        const auto compiled = Coverage::CompiledRanges();
+        std::vector<std::uint64_t> batch;
+        for (const auto& [begin, end] : compiled) {
+            const auto function = std::upper_bound(functions.begin(), functions.end(), std::pair {end, ~std::uint64_t {0}});
+            if (function == functions.begin()) continue;
+            const auto& [low, high] = *std::prev(function);
+            if (end <= low || end >= high || std::binary_search(tried.begin(), tried.end(), end)) continue;
+            batch.push_back(end);
+        }
+        if (batch.empty()) break;
+        std::sort(batch.begin(), batch.end());
+        batch.erase(std::unique(batch.begin(), batch.end()), batch.end());
+        compile(batch);
+        tried.insert(tried.end(), batch.begin(), batch.end());
+        std::sort(tried.begin(), tried.end());
+        addresses.insert(addresses.end(), batch.begin(), batch.end());
+    }
+    state->context->FlushDiskCache();
+    if (!coverage.empty()) Coverage::Write(coverage, "precompile", *state->modules, &seeds);
+    return addresses.size();
 }
 
 namespace {

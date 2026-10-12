@@ -50,7 +50,7 @@ ExternalProject_Add(fexcore
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
 add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/BridgeSignatures.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
-target_sources(aps5-fex-runtime PRIVATE src/CodePool.cpp)
+target_sources(aps5-fex-runtime PRIVATE src/AotSeeds.cpp src/CodeCache.cpp src/CodePool.cpp)
 add_dependencies(aps5-fex-runtime fexcore)
 target_compile_features(aps5-fex-runtime PUBLIC cxx_std_20)
 target_include_directories(aps5-fex-runtime PUBLIC
@@ -60,7 +60,8 @@ target_include_directories(aps5-fex-runtime PUBLIC
     ${APS5_FEX_SOURCE_DIR}/FEXHeaderUtils
     ${APS5_FEX_SOURCE_DIR}/External/fmt/include
     ${APS5_FEX_SOURCE_DIR}/External/range-v3/include
-    ${APS5_FEX_SOURCE_DIR}/External/unordered_dense/include)
+    ${APS5_FEX_SOURCE_DIR}/External/unordered_dense/include
+    ${APS5_FEX_SOURCE_DIR}/External/xxhash)
 target_link_libraries(aps5-fex-runtime PUBLIC ${APS5_FEX_LIBRARIES})
 
 add_executable(aps5-fex src/Main.cpp)
@@ -73,6 +74,10 @@ if(BUILD_TESTING)
         ${APS5_FEX_SOURCE_DIR}/External/fmt/include)
     add_dependencies(fex_code_pool_tests fexcore)
     add_test(NAME fex_code_pool COMMAND fex_code_pool_tests)
+    add_test_executable(fex_aot_seeds_tests tests/AotSeeds.cpp src/AotSeeds.cpp)
+    target_compile_features(fex_aot_seeds_tests PRIVATE cxx_std_20)
+    target_include_directories(fex_aot_seeds_tests PRIVATE src)
+    add_test(NAME fex_aot_seeds COMMAND fex_aot_seeds_tests)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME fex_fixtures COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
@@ -87,6 +92,10 @@ if(BUILD_TESTING)
         add_test(NAME fex_code_churn COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --only code-churn)
         set_tests_properties(fex_code_churn PROPERTIES TIMEOUT 300 ENVIRONMENT APS5_FEX_CLEAR_CODE=1)
+        add_test(NAME fex_disk_cache COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_cache.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs)
+        set_tests_properties(fex_disk_cache PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+        add_test(NAME fex_coverage_tool COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/tests/test_fex_coverage.py)
 
         add_test_executable(fex_x87_convert_tests tests/X87Convert.cpp)
         target_compile_features(fex_x87_convert_tests PRIVATE cxx_std_20)

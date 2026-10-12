@@ -2,6 +2,7 @@
 #define CORE_FEX_SRC_GUESTCPU_HPP
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -22,6 +23,10 @@ public:
     std::uint64_t Run(std::uint64_t rip, std::uint64_t rsp, const std::vector<std::uint64_t>& initializers);
 
     [[noreturn]] void Start(Bridge& bridge, std::uint64_t start, std::uint64_t block, std::vector<std::uint64_t> initializers);
+
+    // Compiles the statically found code of every module (AotSeeds) on worker threads into the disk cache, without
+    // running the guest. Writes the coverage report to coverage when it is not empty. Returns the seed count.
+    std::size_t Precompile(unsigned threads, const std::filesystem::path& coverage);
 
 private:
     struct State;
