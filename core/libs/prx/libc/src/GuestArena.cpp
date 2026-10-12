@@ -23,6 +23,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 namespace GuestArena {
 namespace {
@@ -153,6 +157,8 @@ private:
     Arena() {
 #if defined(__linux__)
         SeedLinuxUsedRanges();
+#elif defined(__APPLE__)
+        SeedAppleUsedRanges();
 #elif defined(_WIN32)
         _writeWatched = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
         SYSTEM_INFO system{};
@@ -206,11 +212,54 @@ private:
         _base = ArenaStart;
         _end = ApplicationAreaEnd;
     }
+#elif defined(__APPLE__)
+    // The PS5 layout from 8 GiB is reserved as on Linux, around what the host already mapped there: on
+    // arm64 the dyld shared region spans 6 to 63 GiB, system guard ranges follow up to 448 GiB, and malloc
+    // places its regions between 448 and 512 GiB (macOS 27). Those stay host regions; what the host maps
+    // later lands below 8 GiB or above the arena.
+    void SeedAppleUsedRanges() {
+        for (mach_vm_address_t address = ArenaStart; address < ApplicationAreaEnd;) {
+            mach_vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info{};
+            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t object = MACH_PORT_NULL;
+            if (mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || address >= ApplicationAreaEnd) break;
+            const auto first = std::max<std::uintptr_t>(address, ArenaStart);
+            const auto last = std::min<std::uintptr_t>(address + size, ApplicationAreaEnd);
+            AddUsed(first, last);
+            _hostRegions.emplace_back(first, last);
+            address += size;
+        }
+        AddUsed(SystemReservedStart, SystemReservedEnd);
+        _hostRegions.emplace_back(SystemReservedStart, SystemReservedEnd);
+        ReserveFreeRanges();
+        _base = ArenaStart;
+        _end = ApplicationAreaEnd;
+    }
 
+    void AddUsed(std::uintptr_t first, std::uintptr_t last) {
+        const auto [entry, added] = _used.emplace(first, last);
+        if (!added) entry->second = std::max(entry->second, last);
+    }
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
     static void TryReserve(std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& occupied, std::uintptr_t from, std::uintptr_t to) {
         constexpr std::uintptr_t kChunk = 1ULL << 30;
         for (std::uintptr_t cursor = from; cursor < to; cursor += kChunk) {
             const auto end = std::min(cursor + kChunk, to);
+#ifdef __APPLE__
+            // No MAP_FIXED_NOREPLACE: a fixed mach_vm_map without VM_FLAGS_OVERWRITE refuses a range in use.
+            auto placed = static_cast<mach_vm_address_t>(cursor);
+            const auto result = mach_vm_map(mach_task_self(), &placed, end - cursor, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_DEFAULT);
+            if (result == KERN_SUCCESS) continue;
+            if (result != KERN_NO_SPACE) {
+                char message[160];
+                std::snprintf(message, sizeof(message), "guest arena: cannot reserve 0x%llx+0x%llx: %s",
+                    static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(end - cursor), mach_error_string(result));
+                throw std::runtime_error(message);
+            }
+#else
             void* const wanted = reinterpret_cast<void*>(cursor);
             void* const placed = mmap(wanted, end - cursor, PROT_NONE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
@@ -223,6 +272,7 @@ private:
                     static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(end - cursor));
                 throw std::system_error(failed, std::system_category(), message);
             }
+#endif
             occupied.emplace_back(cursor, end);
         }
     }
