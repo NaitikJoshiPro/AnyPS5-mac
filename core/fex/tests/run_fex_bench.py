@@ -271,15 +271,16 @@ def row(name, entry, guests):
 
 def bridge_costs(kernels, variant):
     """Nanoseconds per guest->native call and per native->guest callback over native code doing the same,
-    and per thread created and joined."""
-    def per_operation(name, binary):
+    by the CPU time of their one thread, and per thread created and joined, by the clock."""
+    def per_operation(name, binary, clock):
         entry = kernels.get(name, {})
         operations = entry.get("extra", {}).get(binary)
-        return entry[binary]["median"] / operations if binary in entry and operations else None
+        return entry[binary][clock] / operations if binary in entry and operations else None
 
     costs = {}
-    for name, key in (("bridge_call", "call_ns"), ("bridge_qsort", "callback_ns"), ("bridge_thread", "thread_ns")):
-        guest, native = per_operation(name, variant), per_operation(name, "native")
+    for name, key, clock in (("bridge_call", "call_ns", "cpu_median"), ("bridge_qsort", "callback_ns", "cpu_median"),
+                             ("bridge_thread", "thread_ns", "median")):
+        guest, native = per_operation(name, variant, clock), per_operation(name, "native", clock)
         if guest is not None and native is not None:
             costs[key] = guest - native if key != "thread_ns" else guest
             costs["native_" + key] = native
