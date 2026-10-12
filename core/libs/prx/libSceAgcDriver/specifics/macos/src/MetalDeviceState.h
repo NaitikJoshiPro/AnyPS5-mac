@@ -155,7 +155,9 @@ struct VulkanDevice::State {
         std::vector<std::byte> bytes;
         // The registered ranges of `bytes` (sorted, disjoint), the base of per-dispatch tables.
         std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
-        std::shared_ptr<const GuestAllocations::Lease> lease;
+        // Weak: in-flight batches hold the lease (recorder Keep); a cached one would pin the registry
+        // and block guest mutations (GuestBufferMemory's pin waiter) while the device is idle.
+        std::weak_ptr<const GuestAllocations::Lease> lease;
         // The writable ranges (a dispatch binding the table may store anywhere in them).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;

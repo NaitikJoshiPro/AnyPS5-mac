@@ -266,12 +266,20 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         if (addressTable.bytes.size() > 0xffffffffu) throw std::runtime_error("Metal device: the BDA page table exceeds 4 GiB");
         addressTable.generation = generation;
         addressTable.wrapperEpoch = wrapperEpoch;
-        addressTable.lease = std::move(acquired);
+        addressTable.lease = acquired;
+        *lease = std::move(acquired);
         addressTable.ranges = std::move(ranges);
         addressTable.writable = std::move(writable);
         addressTable.skipped = skipped;
     }
-    *lease = addressTable.lease;
+    *lease = addressTable.lease.lock();
+    // Nothing in flight held it: the registry is unchanged (same generation), so a new lease pins
+    // the same ranges.
+    if (*lease == nullptr) {
+        auto renewed = std::make_shared<const GuestAllocations::Lease>(GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+        addressTable.lease = renewed;
+        *lease = std::move(renewed);
+    }
     return addressTable.bytes;
 }
 
