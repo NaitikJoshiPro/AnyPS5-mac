@@ -159,6 +159,42 @@ std::string Throws(TCall&& call) {
     return {};
 }
 
+// Overlapping V#s over one unregistered array (one of them past the page the other was wrapped
+// in by an earlier dispatch): every V# binds as an offset into one mapping, so sub-dword stores
+// through either land in the same dword.
+void CheckOverlappingBuffers(AgcDriver::VulkanDevice& device) {
+    alignas(16384) static std::array<std::uint32_t, 8192> memory {};
+    memory.fill(0u);
+    alignas(16384) static std::array<std::uint32_t, 16> output {};
+    output.fill(0xdeadbeefu);
+    // An earlier dispatch wraps the first page alone.
+    const auto first = Kernel("out(0)[0] = 1u;", {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(memory.data(), 64)}}, {1, 1, 1});
+    device.Dispatch(first, 1, 1, 1);
+    const auto kernel = Kernel(R"(
+    if (local == 0u) {
+        out(2)[0] = uint(table.buffers[1].address - table.buffers[0].address);
+        out(2)[1] = uint((table.buffers[1].address - table.buffers[0].address) >> 32);
+    }
+    device atomic_uint* low = reinterpret_cast<device atomic_uint*>(table.buffers[0].address);
+    device atomic_uint* high = reinterpret_cast<device atomic_uint*>(table.buffers[1].address);
+    atomic_fetch_or_explicit(&low[10], 1u << local, memory_order_relaxed);
+    atomic_fetch_or_explicit(&high[2], 0x10000u << local, memory_order_relaxed);)",
+        {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 3, [&] {
+            auto words = Buffer(memory.data(), 64);
+            const auto second = Buffer(reinterpret_cast<const std::byte*>(memory.data()) + 32, 16384 + 64);
+            const auto third = Buffer(output.data(), sizeof(output));
+            words.insert(words.end(), second.begin(), second.end());
+            words.insert(words.end(), third.begin(), third.end());
+            return words;
+        }()}}, {16, 1, 1});
+    device.Dispatch(kernel, 1, 1, 1);
+    device.WaitIdle();
+    const auto delta = static_cast<std::uint64_t>(output[0]) | (static_cast<std::uint64_t>(output[1]) << 32u);
+    Require(delta == 32u, "overlapping V#s: the second V# is not an offset into the first one's mapping (address delta " + Hex(delta) + ")");
+    Require(memory[0] == 1u && memory[10] == 0xffffffffu, "overlapping V#s: the dword stored through both V#s is " + Hex(memory[10]));
+    std::puts("overlapping V#s: one mapping, stores through both land in one dword");
+}
+
 // The BDA page table merge (CPU only): overlapping registered, V# and GDS ranges become sorted,
 // disjoint entries; the first range listed keeps its device address, permissions are ORed.
 void CheckDisjointRanges() {
@@ -325,9 +361,9 @@ void CheckAtomicLocks(AgcDriver::VulkanDevice& device) {
     std::puts("atomic lock table: bound in DriverData, zero-filled, released after use");
 }
 
-// Fault buffer: a published fault record is raised once the device is idle and the buffer is reset;
+// Fault buffer: a published fault record is reported (stderr, as upstream) and the buffer is reset;
 // a written-page record is reported to the write tracker and cleared; DriverData.faultBuffer and the
-// table entry agree; a tripped loop guard names the shader and pc.
+// table entry agree; a tripped loop guard is reported, not raised.
 void CheckFaults(AgcDriver::VulkanDevice& device) {
     namespace Bda = ShaderRecompiler::BdaAbi;
     alignas(16384) static std::array<std::uint32_t, 64> output {};
@@ -357,11 +393,12 @@ void CheckFaults(AgcDriver::VulkanDevice& device) {
     };
     device.Dispatch(record(static_cast<std::uint32_t>(Bda::FaultReason::Unmapped), 0xabc0001000ull), 1, 1, 1);
     const auto fault = Throws([&] { device.WaitIdle(); });
-    Require(fault.find("BDA access failed: address=0xabc0001000") != std::string::npos && fault.find("reason=1") != std::string::npos, "faults: the unmapped fault was raised as '" + fault + "'");
+    // As upstream: the record is reported on stderr by the batch's completion, the wait succeeds.
+    Require(fault.empty(), "faults: the unmapped fault failed the wait: " + fault);
     Require(output[0] == 1u && output[1] == Bda::FaultBufferBytes, "faults: DriverData.faultBuffer or the table entry is wrong");
     device.Dispatch(record(static_cast<std::uint32_t>(Bda::FaultReason::LoopLimit), 0x5eedull), 1, 1, 1);
     const auto guard = Throws([&] { device.WaitIdle(); });
-    Require(guard.find("loop guard") != std::string::npos && guard.find("0x5eed") != std::string::npos, "faults: the loop guard fault was raised as '" + guard + "'");
+    Require(guard.empty(), "faults: the loop guard failed the wait: " + guard);
     // A written-page record over a guest block: reported and cleared, so the next use starts empty.
     GuestBlock block(65536, true);
     auto written = record(0u, 0u);
@@ -371,7 +408,7 @@ void CheckFaults(AgcDriver::VulkanDevice& device) {
     device.Dispatch(record(0u, 0u), 1, 1, 1);
     device.WaitIdle();
     Require(output[2] == 0u, "faults: the fault buffer was not reset after a fault and a written-page record (" + Hex(output[2]) + ")");
-    std::puts("fault buffer: fault and loop-guard records raised, written pages reported, buffer reset");
+    std::puts("fault buffer: fault and loop-guard records reported, written pages reported, buffer reset");
 }
 
 // Device-memory LDS: workgroup w of the grid owns dwords [w*stride, (w+1)*stride), the last one the
@@ -583,6 +620,7 @@ int main(int argc, char** argv) {
             CheckFaults(*device);
             CheckWorkgroupArena(*device);
             CheckAtomicLocks(*device);
+            CheckOverlappingBuffers(*device);
         } else if (mode == "submission") {
             CheckSplit(*device);
             CheckIndirect(*device);

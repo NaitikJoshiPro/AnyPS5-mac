@@ -155,12 +155,24 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
         std::uint64_t offset = 0;
         if (id<MTLBuffer> import = ImportOf(address, bytes, &offset)) return import.gpuAddress + offset;
     }
-    for (const auto& wrapper : wrappers) {
-        if (address >= wrapper.begin && end <= wrapper.end) return wrapper.buffer.gpuAddress + (address - wrapper.begin);
+    // Newest first: a wrapper made over overlapping ones covers all of them and serves their
+    // ranges from then on, so overlapping V#s of a dispatch share one GPU mapping.
+    for (auto wrapper = wrappers.rbegin(); wrapper != wrappers.rend(); ++wrapper) {
+        if (address >= wrapper->begin && end <= wrapper->end) return wrapper->buffer.gpuAddress + (address - wrapper->begin);
     }
-    const auto pageBegin = address & ~(HostPage - 1u);
-    const auto pageEnd = (end + HostPage - 1u) & ~(HostPage - 1u);
+    auto pageBegin = address & ~(HostPage - 1u);
+    auto pageEnd = (end + HostPage - 1u) & ~(HostPage - 1u);
     if (!Unwrappable(pageBegin, pageEnd).empty()) return 0;
+    for (bool grown = true; grown;) {
+        grown = false;
+        for (const auto& wrapper : wrappers) {
+            if (wrapper.begin < pageEnd && pageBegin < wrapper.end && (wrapper.begin < pageBegin || wrapper.end > pageEnd)) {
+                pageBegin = std::min(pageBegin, wrapper.begin);
+                pageEnd = std::max(pageEnd, wrapper.end);
+                grown = true;
+            }
+        }
+    }
     id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:reinterpret_cast<void*>(pageBegin) length:pageEnd - pageBegin options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil];
     if (buffer == nil) return 0;
     [residency addAllocation:buffer];
@@ -191,10 +203,10 @@ std::uint64_t VulkanDevice::State::Wrap(std::uint64_t address, std::uint64_t byt
 
 id<MTLBuffer> VulkanDevice::State::WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const {
     const auto end = address + std::max<std::uint64_t>(bytes, 1u);
-    for (const auto& wrapper : wrappers) {
-        if (address >= wrapper.begin && end <= wrapper.end) {
-            *offset = address - wrapper.begin;
-            return wrapper.buffer;
+    for (auto wrapper = wrappers.rbegin(); wrapper != wrappers.rend(); ++wrapper) {
+        if (address >= wrapper->begin && end <= wrapper->end) {
+            *offset = address - wrapper->begin;
+            return wrapper->buffer;
         }
     }
     return nil;
@@ -288,17 +300,8 @@ void VulkanDevice::State::Sync() {
     if (!recorder->Idle()) Recorder::CountSync(0, __builtin_return_address(0));
     recorder->Sync();
     DropWrappersIfIdle();
-    RaisePendingFault();
 }
 
-void VulkanDevice::State::RaisePendingFault() {
-    std::exception_ptr fault;
-    {
-        std::lock_guard lock(faultMutex);
-        fault = std::exchange(pendingFault, nullptr);
-    }
-    if (fault != nullptr) std::rethrow_exception(fault);
-}
 
 // The BdaAbi fault buffer after a batch with dispatches completed: GPU stores through BDA addresses
 // are reported to the write tracker (written-page record), then a published fault record is raised.
@@ -325,7 +328,9 @@ void VulkanDevice::State::CheckFaults() {
     std::memset(faults.contents, 0, sizeof(report));
     if (report.state != Bda::FaultState::Ready) throw std::runtime_error("Metal device: incomplete GPU fault record (state " + std::to_string(static_cast<std::uint32_t>(report.state)) + ")");
     if (report.reason == Bda::FaultReason::LoopLimit) {
-        throw std::runtime_error("Metal device: GPU loop guard: the loop exit at pc " + Hex(report.instruction) + " of shader " + Hex(report.address) + " ran past " + std::to_string(report.bytes) + " evaluations (APS5_LOOP_GUARD)");
+        // As upstream: the dispatch's result is kept and the guard is reported, not raised.
+        std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
+        return;
     }
     std::string message = "Metal device: GPU fault: BDA access failed: address=" + Hex(report.address) + " instruction=" + Hex(report.instruction) + " bytes=" + std::to_string(report.bytes) + " stage=" + std::to_string(report.stage) + " reason=" + std::to_string(static_cast<std::uint32_t>(report.reason));
     if (report.reason == Bda::FaultReason::Unmapped) message += " (no guest allocation in the BDA page table covers it)";
@@ -688,7 +693,6 @@ void VulkanDevice::ReapRecorded(std::uint64_t serial) {
     Recorder::AnnounceSyncSite(__builtin_return_address(0));
     state->recorder->FinishUpTo(serial);
     state->DropWrappersIfIdle();
-    state->RaisePendingFault();
 }
 
 void VulkanDevice::ReapRecorded() {
@@ -1047,6 +1051,21 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         }
     }
 
+    // Overlapping guest ranges of this dispatch (V#s over one array, GDS) are wrapped as their union
+    // first, so every V# binds as an offset into one mapping (upstream merges overlapping descriptor
+    // regions into one region the same way).
+    {
+        auto merged = reads;
+        std::sort(merged.begin(), merged.end());
+        for (std::size_t index = 0; index < merged.size();) {
+            auto begin = merged[index].first;
+            auto end = merged[index].second;
+            std::size_t count = 1;
+            for (++index; index < merged.size() && merged[index].first < end; ++index, ++count) end = std::max(end, merged[index].second);
+            if (count > 1u) TryWrap(begin, end - begin);
+        }
+    }
+
     VkAccessFlags covered = 0;
     auto& stream = recorder.Stream(&covered);
     std::array<std::byte, Abi::PushDataBytes> push {};
@@ -1195,16 +1214,18 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     if (!reads.empty()) recorder.NotePendingReads(reads, Recorder::ReadKind::DispatchElement);
     if (!writes.empty()) recorder.NotePendingWrites(writes);
     // Faults and written pages of this batch's dispatches (one shared record) when it completes.
+    // Faults and written pages of this batch's dispatches (one shared record) when it completes. As
+    // upstream (BdaResources::CheckFault in a completion): a fault record throws, which the recorder
+    // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait.
     recorder.OnComplete([this] {
+        if (!tearingDown) {
+            CheckFaults();
+            return;
+        }
         try {
             CheckFaults();
         } catch (const std::exception& error) {
-            if (tearingDown) {
-                std::fprintf(stderr, "[metal] %s\n", error.what());
-                return;
-            }
-            std::lock_guard lock(faultMutex);
-            if (pendingFault == nullptr) pendingFault = std::current_exception();
+            std::fprintf(stderr, "[metal] %s\n", error.what());
         }
     });
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", reads.size(), writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
