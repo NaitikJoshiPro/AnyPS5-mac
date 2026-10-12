@@ -850,7 +850,18 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
             const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
-            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
+            // An MSL library keeps every descriptor-table range it declares (its table layout is fixed
+            // at emission), including the image heaps of runtime image modes the specialization does
+            // not select; a SPIR-V module drops those variables. The plan keeps only the heaps the
+            // snapshot's modes use: the other ranges stay zero in the table (only unselected switch
+            // cases could reach them), so they are not part of the selection.
+            auto moduleBindings = module->bindings;
+            if (!module->msl.empty()) {
+                std::erase_if(moduleBindings, [&](std::uint32_t binding) {
+                    return std::none_of(plan->bindings.bindings.begin(), plan->bindings.bindings.end(), [&](const auto& planned) { return planned.descriptor.binding == binding; });
+                });
+            }
+            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, moduleBindings);
             entry->bindings = std::move(selected);
             entry->module = module;
         };
