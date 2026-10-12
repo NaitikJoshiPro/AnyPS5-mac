@@ -57,8 +57,6 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME fex_fixtures COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs)
-        add_test(NAME fex_bridge_tables COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bridge_tables.py
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/Bridge.cpp ${CMAKE_SOURCE_DIR}/core/libs)
         add_test(NAME fex_licence COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mac/check_fex_licence.py
             ${CMAKE_SOURCE_DIR})
         add_test(NAME fex_licence_checker COMMAND ${Python3_EXECUTABLE}
@@ -67,4 +65,60 @@ if(BUILD_TESTING)
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --smoke)
         set_tests_properties(fex_bench_smoke PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     endif()
+endif()
+
+option(APS5_FEX_BRIDGE_SIGNATURES "Compile the bridge signature table derived from the prx library sources into the runner" OFF)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
+    set(APS5_FEX_SIGNATURES_DIR ${CMAKE_CURRENT_BINARY_DIR}/signatures)
+    set(APS5_FEX_SIGNATURES_JSON ${APS5_FEX_SIGNATURES_DIR}/BridgeSignatures.json)
+    set(APS5_FEX_SIGNATURES_TOOL ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_bridge_signatures.py)
+    set(APS5_FEX_PRX_TARGETS libc)
+    file(GLOB APS5_FEX_PRX_DIRECTORIES LIST_DIRECTORIES true ${CMAKE_SOURCE_DIR}/core/libs/prx/*)
+    foreach(prxDirectory IN LISTS APS5_FEX_PRX_DIRECTORIES)
+        get_filename_component(prxName ${prxDirectory} NAME)
+        if(TARGET ${prxName})
+            list(APPEND APS5_FEX_PRX_TARGETS ${prxName})
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES APS5_FEX_PRX_TARGETS)
+    add_custom_command(OUTPUT ${APS5_FEX_SIGNATURES_DIR}/BridgeSignatures.inc ${APS5_FEX_SIGNATURES_JSON}
+        COMMAND ${Python3_EXECUTABLE} ${APS5_FEX_SIGNATURES_TOOL} generate --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json
+            --root ${CMAKE_SOURCE_DIR} --cache ${APS5_FEX_SIGNATURES_DIR}/cache --json ${APS5_FEX_SIGNATURES_JSON}
+            --inc ${APS5_FEX_SIGNATURES_DIR}/BridgeSignatures.inc
+        DEPENDS ${APS5_FEX_SIGNATURES_TOOL} ${CMAKE_BINARY_DIR}/compile_commands.json ${APS5_FEX_PRX_TARGETS}
+        COMMENT "Deriving the bridge signatures from the prx library sources"
+        VERBATIM)
+    add_custom_target(aps5-fex-bridge-signatures DEPENDS ${APS5_FEX_SIGNATURES_DIR}/BridgeSignatures.inc ${APS5_FEX_SIGNATURES_JSON})
+    if(APS5_FEX_BRIDGE_SIGNATURES)
+        set(APS5_FEX_BRIDGE_TARGET aps5-fex)
+        if(TARGET aps5-fex-runtime)
+            set(APS5_FEX_BRIDGE_TARGET aps5-fex-runtime)
+        endif()
+        target_sources(${APS5_FEX_BRIDGE_TARGET} PRIVATE src/BridgeSignatures.cpp)
+        target_compile_definitions(${APS5_FEX_BRIDGE_TARGET} PRIVATE APS5_FEX_BRIDGE_SIGNATURES)
+        target_include_directories(${APS5_FEX_BRIDGE_TARGET} PRIVATE ${APS5_FEX_SIGNATURES_DIR})
+        add_dependencies(${APS5_FEX_BRIDGE_TARGET} aps5-fex-bridge-signatures)
+    endif()
+    if(BUILD_TESTING)
+        add_test_executable(fex_bridge_signatures_tests tests/BridgeSignatures.cpp src/BridgeSignatures.cpp)
+        target_compile_features(fex_bridge_signatures_tests PRIVATE cxx_std_20)
+        target_compile_definitions(fex_bridge_signatures_tests PRIVATE APS5_FEX_BRIDGE_SIGNATURES)
+        target_include_directories(fex_bridge_signatures_tests PRIVATE src ${APS5_FEX_SIGNATURES_DIR})
+        add_dependencies(fex_bridge_signatures_tests aps5-fex-bridge-signatures)
+        add_test(NAME fex_bridge_signatures_table COMMAND fex_bridge_signatures_tests)
+        add_test(NAME fex_bridge_signatures COMMAND ${Python3_EXECUTABLE} ${APS5_FEX_SIGNATURES_TOOL} check
+            --json ${APS5_FEX_SIGNATURES_JSON} --bridge ${CMAKE_CURRENT_SOURCE_DIR}/src/Bridge.cpp)
+        add_test(NAME fex_bridge_signatures_abi COMMAND ${Python3_EXECUTABLE} ${APS5_FEX_SIGNATURES_TOOL} verify
+            --json ${APS5_FEX_SIGNATURES_JSON} --work ${APS5_FEX_SIGNATURES_DIR}/abi)
+        add_test(NAME fex_bridge_signatures_units COMMAND ${Python3_EXECUTABLE} ${APS5_FEX_SIGNATURES_TOOL} verify
+            --json ${APS5_FEX_SIGNATURES_JSON} --work ${APS5_FEX_SIGNATURES_DIR}/units
+            --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json --root ${CMAKE_SOURCE_DIR})
+        set_tests_properties(fex_bridge_signatures_units PROPERTIES TIMEOUT 900 LABELS slow)
+        add_test(NAME fex_bridge_signatures_generator COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gen_bridge_signatures.py)
+        set_tests_properties(fex_bridge_signatures_generator PROPERTIES TIMEOUT 300)
+    endif()
+elseif(APS5_FEX_BRIDGE_SIGNATURES)
+    message(FATAL_ERROR "APS5_FEX_BRIDGE_SIGNATURES needs Python 3 and CMAKE_EXPORT_COMPILE_COMMANDS")
 endif()

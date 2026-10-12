@@ -1,5 +1,6 @@
 #include "Bridge.hpp"
 
+#include "BridgeSignatures.hpp"
 #include "GuestCpu.hpp"
 #include "GuestImage.hpp"
 
@@ -353,6 +354,9 @@ std::uint64_t Bridge::StubFor(void* address, const std::string& name) {
         const bool x87Result = info.dli_sname != nullptr && info.dli_saddr == address &&
             std::find(std::begin(X87Results), std::end(X87Results), info.dli_sname) != std::end(X87Results);
         guest = AddStub(address, name, variadic, fixed, x87Result);
+#if defined(APS5_FEX_BRIDGE_SIGNATURES)
+        if (info.dli_sname != nullptr && info.dli_saddr == address) functions.back().signature = FindBridgeSignature(info.dli_sname);
+#endif
     }
     guestAddresses.emplace(address, guest);
     return guest;

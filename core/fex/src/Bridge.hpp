@@ -20,6 +20,7 @@ struct CPUState;
 namespace Aps5Fex {
 
 class GuestImage;
+struct BridgeSignature;
 
 class Bridge {
 public:
@@ -66,6 +67,7 @@ private:
         Variadic variadic;
         std::uint8_t fixed;
         bool x87Result;
+        const BridgeSignature* signature = nullptr;
     };
 
     static constexpr std::size_t StubBytes = 16;
