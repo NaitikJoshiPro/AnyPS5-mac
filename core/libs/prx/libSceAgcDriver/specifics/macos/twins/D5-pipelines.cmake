@@ -5,4 +5,6 @@
 list(APPEND agcMetalTwins
         "Graphics/src/PipelineCache.cpp=specifics/macos/src/PipelineCache.mm"
         "tests/Recorder.cpp=specifics/macos/tests/D5RecorderModes.mm"
+        "Graphics/src/Sampler.cpp=specifics/macos/src/Sampler.mm"
+        "Graphics/src/PlaceholderImages.cpp=specifics/macos/src/PlaceholderImages.mm"
 )

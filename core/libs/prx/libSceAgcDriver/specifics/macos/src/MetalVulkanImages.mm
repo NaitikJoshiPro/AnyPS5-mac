@@ -261,10 +261,14 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
     descriptor.sampleCount = static_cast<NSUInteger>(info->samples);
     descriptor.storageMode = MTLStorageModePrivate;
     MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u) usage |= MTLTextureUsageShaderWrite;
+    const bool multisample = info->samples > VK_SAMPLE_COUNT_1_BIT;
+    if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u && !multisample) usage |= MTLTextureUsageShaderWrite;
+    // Clears of multisampled and depth images are render passes (CmdClear*): they need the usage.
+    const bool depthFormat = info->format == VK_FORMAT_D32_SFLOAT || info->format == VK_FORMAT_D16_UNORM;
+    if ((info->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0u && (multisample || depthFormat)) usage |= MTLTextureUsageRenderTarget;
     if ((info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0u) usage |= MTLTextureUsageRenderTarget;
     // Texture atomics need the usage on a 32-bit integer image (storage images of R32 formats).
-    if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u) {
+    if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u && !multisample) {
         const auto bytes = PixelFormatOf(info->format).blockBytes;
         if (bytes == 4u || bytes == 8u) usage |= MTLTextureUsageShaderAtomic;
     }
@@ -360,6 +364,98 @@ void GetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkForm
     properties->optimalTilingFeatures = features;
 }
 
+VkResult GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice, VkFormat format, VkImageType, VkImageTiling, VkImageUsageFlags, VkImageCreateFlags, VkImageFormatProperties* properties) {
+    *properties = {};
+    if (Find(format) == nullptr) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    properties->maxExtent = {16384u, 16384u, 2048u};
+    properties->maxMipLevels = 15u;
+    properties->maxArrayLayers = 2048u;
+    properties->sampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    properties->maxResourceSize = VkDeviceSize{1} << 34u;
+    return VK_SUCCESS;
+}
+
+namespace {
+
+MTLSamplerMinMagFilter FilterOf(VkFilter filter) {
+    return filter == VK_FILTER_LINEAR ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+}
+
+MTLSamplerAddressMode AddressOf(VkSamplerAddressMode mode, VkBorderColor border, bool unnormalized) {
+    switch (mode) {
+    case VK_SAMPLER_ADDRESS_MODE_REPEAT: return MTLSamplerAddressModeRepeat;
+    case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT: return MTLSamplerAddressModeMirrorRepeat;
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: return MTLSamplerAddressModeClampToEdge;
+    case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: return MTLSamplerAddressModeMirrorClampToEdge;
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:
+        if (unnormalized) {
+            if (border == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK || border == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK) return MTLSamplerAddressModeClampToZero;
+            FailImages("an unnormalized sampler clamps to an opaque border color, which Metal samplers cannot do");
+        }
+        return MTLSamplerAddressModeClampToBorderColor;
+    default:
+        FailImages("unknown sampler address mode");
+    }
+}
+
+MTLSamplerBorderColor BorderOf(VkBorderColor border) {
+    switch (border) {
+    case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
+    case VK_BORDER_COLOR_INT_OPAQUE_BLACK: return MTLSamplerBorderColorOpaqueBlack;
+    case VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE:
+    case VK_BORDER_COLOR_INT_OPAQUE_WHITE: return MTLSamplerBorderColorOpaqueWhite;
+    default: return MTLSamplerBorderColorTransparentBlack;
+    }
+}
+
+MTLCompareFunction CompareOf(VkCompareOp op) {
+    switch (op) {
+    case VK_COMPARE_OP_NEVER: return MTLCompareFunctionNever;
+    case VK_COMPARE_OP_LESS: return MTLCompareFunctionLess;
+    case VK_COMPARE_OP_EQUAL: return MTLCompareFunctionEqual;
+    case VK_COMPARE_OP_LESS_OR_EQUAL: return MTLCompareFunctionLessEqual;
+    case VK_COMPARE_OP_GREATER: return MTLCompareFunctionGreater;
+    case VK_COMPARE_OP_NOT_EQUAL: return MTLCompareFunctionNotEqual;
+    case VK_COMPARE_OP_GREATER_OR_EQUAL: return MTLCompareFunctionGreaterEqual;
+    default: return MTLCompareFunctionAlways;
+    }
+}
+
+}
+
+VkResult CreateSampler(VkDevice deviceHandle, const VkSamplerCreateInfo* info, const VkAllocationCallbacks*, VkSampler* sampler) {
+    id<MTLDevice> device = DeviceOf(deviceHandle);
+    MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
+    descriptor.supportArgumentBuffers = YES;
+    const bool unnormalized = info->unnormalizedCoordinates == VK_TRUE;
+    descriptor.minFilter = FilterOf(info->minFilter);
+    descriptor.magFilter = FilterOf(info->magFilter);
+    descriptor.mipFilter = unnormalized ? MTLSamplerMipFilterNotMipmapped : info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+    descriptor.sAddressMode = AddressOf(info->addressModeU, info->borderColor, unnormalized);
+    descriptor.tAddressMode = AddressOf(info->addressModeV, info->borderColor, unnormalized);
+    descriptor.rAddressMode = AddressOf(info->addressModeW, info->borderColor, unnormalized);
+    descriptor.borderColor = BorderOf(info->borderColor);
+    descriptor.maxAnisotropy = info->anisotropyEnable == VK_TRUE ? static_cast<NSUInteger>(std::clamp(info->maxAnisotropy, 1.0f, 16.0f)) : 1u;
+    descriptor.lodMinClamp = unnormalized ? 0.0f : info->minLod;
+    descriptor.lodMaxClamp = unnormalized ? 0.0f : info->maxLod;
+    descriptor.lodBias = unnormalized ? 0.0f : info->mipLodBias;
+    descriptor.normalizedCoordinates = unnormalized ? NO : YES;
+    if (info->compareEnable == VK_TRUE) descriptor.compareFunction = CompareOf(info->compareOp);
+    // A VkSamplerReductionModeCreateInfo is not applied: Metal ignores reductionMode on this GPU
+    // (agc_metal_sampler_reduction); the shader reduces (PipelineSpecialization::ReductionBase).
+    id<MTLSamplerState> state = [device newSamplerStateWithDescriptor:descriptor];
+    if (state == nil) {
+        *sampler = VK_NULL_HANDLE;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *sampler = reinterpret_cast<VkSampler>(const_cast<void*>(CFBridgingRetain(state)));
+    return VK_SUCCESS;
+}
+
+void DestroySampler(VkDevice, VkSampler sampler, const VkAllocationCallbacks*) {
+    if (sampler != VK_NULL_HANDLE) CFRelease(reinterpret_cast<CFTypeRef>(sampler));
+}
+
 void CmdPipelineBarrier(VkCommandBuffer commands, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
     Stream(commands).PipelineBarrier(source, destination);
 }
@@ -444,9 +540,17 @@ void CmdBlitImage(VkCommandBuffer commands, VkImage source, VkImageLayout source
     CmdCopyImage(commands, source, sourceLayout, destination, destinationLayout, static_cast<std::uint32_t>(copies.size()), copies.data());
 }
 
+namespace {
+void ClearByRenderPass(VkCommandBuffer commands, id<MTLTexture> texture, const VkImageSubresourceRange* ranges, std::uint32_t rangeCount, const VkClearColorValue* color, const VkClearDepthStencilValue* depth);
+}
+
 void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout, const VkClearColorValue* color, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges) {
     auto& stream = Stream(commands);
     id<MTLTexture> texture = TextureOfImage(image);
+    if ((texture.usage & MTLTextureUsageShaderWrite) == 0u || texture.sampleCount > 1u) {
+        ClearByRenderPass(commands, texture, ranges, rangeCount, color, nullptr);
+        return;
+    }
     id<MTLDevice> device = texture.device;
     const auto pipeline = ClearPipeline(device);
     const bool volume = texture.textureType == MTLTextureType3D;
@@ -481,6 +585,54 @@ void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout, 
             stream.DispatchHelper(pipeline, std::as_bytes(std::span(&params, 1)), MTLSizeMake((width + 7u) / 8u, (height + 7u) / 8u, depth), MTLSizeMake(8, 8, 1));
         }
     }
+}
+
+namespace {
+
+// Clears every (level, layer) of the ranges with a render pass that loads the value.
+void ClearByRenderPass(VkCommandBuffer commands, id<MTLTexture> texture, const VkImageSubresourceRange* ranges, std::uint32_t rangeCount, const VkClearColorValue* color, const VkClearDepthStencilValue* depth) {
+    auto& stream = Stream(commands);
+    for (std::uint32_t index = 0; index < rangeCount; ++index) {
+        const auto& range = ranges[index];
+        const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
+        const bool volume = texture.textureType == MTLTextureType3D;
+        const auto layers = volume ? 1u : (range.layerCount == VK_REMAINING_ARRAY_LAYERS ? texture.arrayLength - range.baseArrayLayer : range.layerCount);
+        for (std::uint32_t level = range.baseMipLevel; level < range.baseMipLevel + levels; ++level) {
+            const auto slices = volume ? std::max<NSUInteger>(texture.depth >> level, 1u) : layers;
+            for (NSUInteger slice = 0; slice < slices; ++slice) {
+                MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
+                if (depth != nullptr) {
+                    pass.depthAttachment.texture = texture;
+                    pass.depthAttachment.level = level;
+                    pass.depthAttachment.slice = volume ? 0u : range.baseArrayLayer + slice;
+                    pass.depthAttachment.loadAction = MTLLoadActionClear;
+                    pass.depthAttachment.storeAction = MTLStoreActionStore;
+                    pass.depthAttachment.clearDepth = depth->depth;
+                } else {
+                    pass.colorAttachments[0].texture = texture;
+                    pass.colorAttachments[0].level = level;
+                    if (volume) pass.colorAttachments[0].depthPlane = slice;
+                    else pass.colorAttachments[0].slice = range.baseArrayLayer + slice;
+                    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    const auto numeric = NumericClass(texture.pixelFormat);
+                    if (numeric == 1u) pass.colorAttachments[0].clearColor = MTLClearColorMake(color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3]);
+                    else if (numeric == 2u) pass.colorAttachments[0].clearColor = MTLClearColorMake(color->int32[0], color->int32[1], color->int32[2], color->int32[3]);
+                    else pass.colorAttachments[0].clearColor = MTLClearColorMake(color->float32[0], color->float32[1], color->float32[2], color->float32[3]);
+                }
+                pass.renderTargetWidth = std::max<NSUInteger>(texture.width >> level, 1u);
+                pass.renderTargetHeight = std::max<NSUInteger>(texture.height >> level, 1u);
+                stream.BeginRender(pass);
+                stream.EndEncoder();
+            }
+        }
+    }
+}
+
+}
+
+void CmdClearDepthStencilImage(VkCommandBuffer commands, VkImage image, VkImageLayout, const VkClearDepthStencilValue* value, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges) {
+    ClearByRenderPass(commands, TextureOfImage(image), ranges, rangeCount, nullptr, value);
 }
 
 void CmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {

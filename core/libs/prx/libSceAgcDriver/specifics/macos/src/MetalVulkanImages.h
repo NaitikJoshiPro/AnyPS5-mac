@@ -29,6 +29,9 @@ inline id<MTLTexture> TextureOfImage(VkImage image) {
 inline id<MTLTexture> TextureOfView(VkImageView view) {
     return (__bridge id<MTLTexture>)reinterpret_cast<void*>(view);
 }
+inline id<MTLSamplerState> SamplerOf(VkSampler sampler) {
+    return (__bridge id<MTLSamplerState>)reinterpret_cast<void*>(sampler);
+}
 // Handles for textures made elsewhere: a retained reference released by DestroyImage/DestroyImageView.
 VkImage RetainImage(id<MTLTexture> texture);
 VkImageView RetainView(id<MTLTexture> texture);
@@ -53,6 +56,10 @@ VkResult BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, 
 VkResult CreateImageView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* allocator, VkImageView* view);
 void DestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* allocator);
 void GetPhysicalDeviceFormatProperties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties* properties);
+VkResult GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physical, VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties* properties);
+// A VkSampler carries a CF-retained id<MTLSamplerState> (argument-buffer capable).
+VkResult CreateSampler(VkDevice device, const VkSamplerCreateInfo* info, const VkAllocationCallbacks* allocator, VkSampler* sampler);
+void DestroySampler(VkDevice device, VkSampler sampler, const VkAllocationCallbacks* allocator);
 
 void CmdPipelineBarrier(VkCommandBuffer commands, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags dependency, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images);
 void CmdCopyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions);
@@ -63,6 +70,8 @@ void CmdBlitImage(VkCommandBuffer commands, VkImage source, VkImageLayout source
 // A compute kernel writes the clear value through a view of the image's format class.
 void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, const VkClearColorValue* color, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges);
 void CmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions);
+// A render pass that loads the clear value (depth images, multisampled images).
+void CmdClearDepthStencilImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges);
 
 }
 
