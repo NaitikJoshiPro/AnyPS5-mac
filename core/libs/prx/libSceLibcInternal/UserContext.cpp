@@ -1,11 +1,15 @@
 #include "prx/libc/include/GuestStacks.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/System/include/UserContext.hpp"
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#if !APS5_GUEST_VA_LIST_IS_HOST
+#include "prx/libc/include/WindowsFormatting.hpp"
+#endif
 
 extern "C" int APS5_VABI setcontext_nid_postfix(const UserUcontext* context);
 
@@ -36,11 +40,11 @@ void APS5_VABI makecontext_nid_postfix(UserUcontext* context, void (APS5_VABI* s
     const auto top = (reinterpret_cast<std::uintptr_t>(context->stackPointer) + context->stackSize) & ~static_cast<std::uintptr_t>(15);
     auto* arguments = reinterpret_cast<std::uint64_t*>(top) - MaximumArguments;
     auto* stack = arguments - 1;
-#ifdef _WIN32
-    __builtin_sysv_va_list list;
-    __builtin_sysv_va_start(list, count);
-    for (int index = 0; index < count; ++index) arguments[index] = __builtin_va_arg(list, std::uint64_t);
-    __builtin_sysv_va_end(list);
+#if !APS5_GUEST_VA_LIST_IS_HOST
+    APS5_VA_BEGIN(count);
+    LibcDetail::FormatArguments list(args);
+    for (int index = 0; index < count; ++index) arguments[index] = list.Next<std::uint64_t>();
+    APS5_VA_END();
 #else
     std::va_list list;
     va_start(list, count);

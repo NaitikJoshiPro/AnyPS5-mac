@@ -11,7 +11,9 @@
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 #include "prx/libc/include/WindowsFormatting.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 
 extern "C" int APS5_VABI iswspace_nid_postfix(std::uint32_t c);
 extern "C" std::size_t APS5_VABI wcrtomb_nid_postfix(char* destination, std::uint16_t value, void* state);
@@ -269,7 +271,6 @@ private:
     }
 
     Outcome Float(const Directive& directive) {
-        static_assert(sizeof(long double) == 16 && std::numeric_limits<long double>::digits == 64);
         if (!directive.length.empty() && directive.length != "l" && directive.length != "L")
             throw std::invalid_argument("swscanf_s: invalid floating length modifier " + directive.length);
         void* target = nullptr;
@@ -281,7 +282,12 @@ private:
         input += field.size();
         if (target != nullptr) {
             if (directive.length == "L") {
+#if defined(__x86_64__)
+                static_assert(sizeof(long double) == 16 && std::numeric_limits<long double>::digits == 64);
                 const long double value = std::strtold(field.c_str(), nullptr);
+#else
+                const X87Extended value = LibcDetail::ParseX87(field.c_str(), nullptr);
+#endif
                 std::memcpy(target, &value, sizeof(value));
             } else if (directive.length == "l") {
                 const double value = std::strtod(field.c_str(), nullptr);
@@ -380,27 +386,13 @@ extern "C" {
 
 int APS5_VABI swscanf_s_nid_postfix(const char16_t* buffer, const char16_t* format, ...) {
     if (buffer == nullptr || format == nullptr) return EOF;
-#ifdef _WIN32
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
-#else
-    std::va_list args;
-    va_start(args, format);
-#endif
+    APS5_VA_BEGIN(format);
     try {
         const int result = WideScanner(buffer, format, args).Run();
-#ifdef _WIN32
-        __builtin_sysv_va_end(args);
-#else
-        va_end(args);
-#endif
+        APS5_VA_END();
         return result;
     } catch (...) {
-#ifdef _WIN32
-        __builtin_sysv_va_end(args);
-#else
-        va_end(args);
-#endif
+        APS5_VA_END();
         throw;
     }
 }
