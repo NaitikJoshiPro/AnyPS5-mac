@@ -1,5 +1,7 @@
 #include "MetalBackend/MslEmitterState.hpp"
 #include "ControlFlow/include/ControlFlow/ControlFlowGraph.hpp"
+#include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -9,6 +11,15 @@
 namespace ShaderRecompiler {
 
 namespace {
+
+// Instructions a host invocation runs once even when it holds two guest lanes.
+bool OncePerInvocation(IrOpcode opcode) {
+    return opcode == IrOpcode::Barrier || opcode == IrOpcode::MeshAllocate || opcode == IrOpcode::Unreachable;
+}
+
+bool DispatchInstruction(MslEmitterState& state, const IrValue& instruction) {
+    return EmitMslControlInstruction(state, instruction) || EmitMslAluInstruction(state, instruction) || EmitMslFloat64Instruction(state, instruction) || EmitMslWaveInstruction(state, instruction) || EmitMslMemoryInstruction(state, instruction) || EmitMslBufferInstruction(state, instruction) || EmitMslImageInstruction(state, instruction) || EmitMslStageInstruction(state, instruction);
+}
 
 // Rebuilds nested MSL control flow from the structurizer's SPIR-V-style annotations
 // (IrProgramMetadata::blockInfo, paired with BlockOrder by position):
@@ -22,6 +33,8 @@ namespace {
 //   on at least one side.
 // Phis are function-scope locals assigned on each incoming edge (parallel copies through
 // temporaries). Every SSA value is hoisted to function scope, so dominance carries over.
+// Branch conditions are wave-uniform: a wave-mask branch (EXEC/VCC zero or non-zero) votes over the
+// guest wave, so both guest lanes of a host invocation (laneCount 2) always take the same path.
 class StructuredEmitter {
 public:
     explicit StructuredEmitter(MslEmitterState& state) : state(state) {
@@ -37,7 +50,10 @@ public:
 
     void Run() {
         const auto& blocks = state.program.BlockOrder();
-        if (blocks.empty()) state.Fail("the program has no blocks");
+        if (blocks.empty()) {
+            Return();
+            return;
+        }
         Region(blocks.front(), nullptr);
     }
 
@@ -53,7 +69,6 @@ private:
     std::unordered_map<std::uint32_t, const IrBlock*> byId;
     std::vector<Loop> loops;
     std::unordered_set<const IrBlock*> emitted;
-    std::uint32_t nextTemporary = 0;
 
     const BlockInfo& Info(const IrBlock* block) const {
         const auto found = info.find(block);
@@ -78,12 +93,60 @@ private:
         return loop != nullptr && (target == loop->merge || target == loop->continueBlock);
     }
 
+    // Wave LDS ordering (see MslWaveLdsScope): a barrier separates an LDS write from the next LDS
+    // access and a read from the next write. A block may be entered right after a write.
+    void WaveLdsBarrier(const IrValue& instruction, bool& written, bool& read) {
+        if (state.waveLdsScope == MslBarrierScope::None) return;
+        if (instruction.Opcode() == IrOpcode::Barrier) {
+            written = false;
+            read = false;
+            return;
+        }
+        const auto access = SharedAccessOf(instruction.Opcode());
+        if (access == SharedAccess::None) return;
+        const bool writes = access != SharedAccess::Read;
+        if (written || (writes && read)) {
+            const auto function = state.waveLdsScope == MslBarrierScope::Threadgroup ? "threadgroup_barrier(" : "simdgroup_barrier(";
+            state.Line(std::string(function) + state.LdsMemoryFlags() + ");");
+            written = false;
+            read = false;
+        }
+        written |= writes;
+        read |= access != SharedAccess::Write;
+    }
+
+    void Instruction(const IrValue& instruction) {
+        if (!state.survey) {
+            if (!DispatchInstruction(state, instruction)) state.Fail(instruction, "has no MSL emitter");
+            return;
+        }
+        // Debug aid: record the failure, keep going (the emission still fails at the end).
+        const auto depth = state.Depth();
+        std::string failure;
+        try {
+            if (!DispatchInstruction(state, instruction)) failure = "opcode=" + std::string(IrOpcodeName(instruction.Opcode())) + " has no MSL emitter";
+        } catch (const std::runtime_error& error) {
+            failure = error.what();
+            const auto reason = failure.find(" opcode=");
+            if (reason != std::string::npos) failure = failure.substr(reason + 1u);
+            state.RestoreDepth(depth);
+        }
+        if (!failure.empty() && std::find(state.surveyFailures.begin(), state.surveyFailures.end(), failure) == state.surveyFailures.end()) state.surveyFailures.push_back(failure);
+    }
+
     void Body(const IrBlock* block, bool repeat) {
         if (!repeat && !emitted.insert(block).second) state.Fail("control flow block " + std::to_string(Info(block).id) + " would be emitted twice");
+        bool ldsWritten = true;
+        bool ldsRead = false;
         for (const auto* instruction : block->Instructions()) {
             if (instruction->IsPhi()) continue;
-            if (EmitMslControlInstruction(state, *instruction) || EmitMslAluInstruction(state, *instruction) || EmitMslFloat64Instruction(state, *instruction) || EmitMslWaveInstruction(state, *instruction) || EmitMslMemoryInstruction(state, *instruction) || EmitMslBufferInstruction(state, *instruction) || EmitMslImageInstruction(state, *instruction) || EmitMslStageInstruction(state, *instruction)) continue;
-            state.Fail(*instruction, "has no MSL emitter");
+            WaveLdsBarrier(*instruction, ldsWritten, ldsRead);
+            for (std::uint32_t half = 0; half < state.laneCount; ++half) {
+                if (half != 0u && (OncePerInvocation(instruction->Opcode()) || state.SharedAcrossHalves(*instruction))) continue;
+                state.half = half;
+                Instruction(*instruction);
+            }
+            state.half = 0u;
         }
     }
 
@@ -101,7 +164,10 @@ private:
                 if (instruction->PhiBlock(index) == from) incoming = instruction->Argument(index);
             }
             if (incoming == nullptr) state.Fail(*instruction, "has no incoming value for block " + std::to_string(Info(from).id));
-            copies.push_back({state.Name(*instruction), MslType(instruction->Type()), state.Value(incoming)});
+            for (std::uint32_t half = 0; half < state.laneCount; ++half) {
+                if (half != 0u && state.SharedAcrossHalves(*instruction)) continue;
+                copies.push_back({state.HalfName(*instruction, half), MslType(instruction->Type()), state.HalfValue(incoming, half)});
+            }
         }
         if (copies.size() == 1u) {
             state.Line(copies.front().phi + " = " + copies.front().value + ";");
@@ -109,7 +175,7 @@ private:
         }
         std::vector<std::string> temporaries;
         for (const auto& copy : copies) {
-            temporaries.push_back("aps5_t" + std::to_string(nextTemporary++));
+            temporaries.push_back(state.Temporary());
             state.Line("const " + copy.type + " " + temporaries.back() + " = " + copy.value + ";");
         }
         for (std::size_t index = 0; index < copies.size(); ++index) state.Line(copies[index].phi + " = " + temporaries[index] + ";");
@@ -117,12 +183,16 @@ private:
 
     std::string Condition(const BlockInfo& blockInfo) {
         if (blockInfo.condition == nullptr) state.Fail("conditional branch of block " + std::to_string(blockInfo.id) + " has no condition");
-        const auto value = state.Value(blockInfo.condition);
-        if (!IsWaveMaskBranch(blockInfo.terminator.condition)) return value;
-        if (state.laneCount != 1u) state.Fail("wave-mask branches of wave64 programs on 32-wide SIMD groups are not implemented in the MSL backend yet");
         const auto kind = blockInfo.terminator.condition;
-        if (kind == BranchCondition::ExecNonZero || kind == BranchCondition::VccNonZero) return "simd_any(" + value + ")";
-        return "!simd_any(!(" + value + "))";
+        const auto* condition = blockInfo.condition;
+        if (kind == BranchCondition::ScalarInstruction || kind == BranchCondition::GotoVariable || kind == BranchCondition::IndirectTarget) return state.HalfValue(condition, 0u);
+        if (state.laneCount == 1u && !IsWaveMaskBranch(kind)) return state.HalfValue(condition, 0u);
+        // A wave-uniform condition is the same in every lane: no vote needed.
+        if (state.laneCount == 2u && (condition->Resolve()->HasImmediate() || state.SharedAcrossHalves(*condition))) return state.HalfValue(condition, 0u);
+        // EXEC/VCC (and, at laneCount 2, every other per-lane condition as the SPIR-V path does):
+        // the zero forms branch when every lane's predicate holds, the others when any lane's does.
+        const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
+        return zero ? state.WaveAll(condition) : state.WaveAny(condition);
     }
 
     void Return() {
@@ -165,9 +235,15 @@ private:
             else state.Fail("continue block " + std::to_string(blockInfo.id) + " branches outside its loop's header and merge");
         };
         switch (term.kind) {
-        case TerminatorKind::Branch:
-            edge(Target(term.trueBlock));
+        case TerminatorKind::Branch: {
+            const auto* target = Target(term.trueBlock);
+            if (target == nullptr) {
+                Return();
+                return;
+            }
+            edge(target);
             return;
+        }
         case TerminatorKind::ConditionalBranch:
             state.Line("if (" + Condition(blockInfo) + ") {");
             state.Indent();
@@ -179,10 +255,18 @@ private:
             state.Outdent();
             state.Line("}");
             return;
-        default:
+        case TerminatorKind::Return:
             Return();
             return;
+        default:
+            Unstructured(blockInfo);
         }
+    }
+
+    [[noreturn]] void Unstructured(const BlockInfo& blockInfo) const {
+        // The front end lowers indirect branches to IndirectTarget conditional chains and refuses
+        // unsupported ones, so neither reaches an emitter.
+        state.Fail("block " + std::to_string(blockInfo.id) + " ends in an indirect or unsupported branch, which the front end lowers before emission");
     }
 
     void EmitLoop(const IrBlock* header) {
@@ -196,6 +280,8 @@ private:
         const auto limit = state.LoopGuardLimit();
         // A bounded loop: the Metal compiler mishandles constant-true loop conditions (Mesa
         // KosmicKrisp workaround list), and the guard keeps a runaway guest loop from hanging the GPU.
+        // The guard counts per entry; every invocation of a SIMD group counts alike (the loop is
+        // wave-uniform), so a tripped guard ends the whole guest wave.
         state.Line("for (" + guard + " = 0u; " + guard + " < " + limit + "; ++" + guard + ") {");
         state.Indent();
         loops.push_back({header, merge, latch});
@@ -313,9 +399,11 @@ private:
                 block = next;
                 continue;
             }
-            default:
+            case TerminatorKind::Return:
                 Return();
                 return false;
+            default:
+                Unstructured(blockInfo);
             }
         }
         return block == stop;
@@ -328,6 +416,54 @@ private:
     }
 };
 
+bool CommunicatesThroughMemory(IrOpcode opcode) {
+    const auto buffer = BufferAccessOf(opcode);
+    const auto address = AddressOpcodeInfoOf(opcode).access;
+    const auto image = ImageOpcodeInfoOf(opcode).access;
+    return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
+}
+
+void EmitBarrier(MslEmitterState& state, const IrValue& instruction) {
+    const auto stage = state.program.Resources().stage;
+    if (stage == IrShaderStage::Vertex) {
+        // One guest wave per primitive group on the SPIR-V path too: an s_barrier between vertex
+        // invocations orders nothing unless they communicate through memory.
+        for (const auto* block : state.program.BlockOrder()) {
+            for (const auto* other : block->Instructions()) {
+                if (CommunicatesThroughMemory(other->Opcode())) state.Fail(instruction, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");
+            }
+        }
+        return;
+    }
+    if (stage == IrShaderStage::TessellationControl) {
+        state.Line("threadgroup_barrier(mem_flags::mem_none);");
+        return;
+    }
+    state.Line("threadgroup_barrier(" + state.LdsMemoryFlags() + ");");
+}
+
+}
+
+MslBarrierScope MslWaveLdsScope(const MslEmitterState& state) {
+    const auto& program = state.program;
+    if (program.Resources().stage != IrShaderStage::Compute || state.workgroup == nullptr) return MslBarrierScope::None;
+    bool writes = false;
+    for (const auto* block : program.BlockOrder()) {
+        for (const auto* instruction : block->Instructions()) {
+            const auto access = SharedAccessOf(instruction->Opcode());
+            writes |= access != SharedAccess::None && access != SharedAccess::Read;
+        }
+    }
+    if (!writes) return MslBarrierScope::None;
+    const auto* workgroup = state.workgroup;
+    const auto threads = std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
+    // As the SPIR-V path: a single-wave workgroup gets threadgroup barriers (a subgroup-scope barrier
+    // did not make LDS writes visible on NVIDIA; APS5_WAVE_LDS_SUBGROUP=1 restores it for comparison),
+    // a guest wave held by one host SIMD group a SIMD-group barrier.
+    static const bool preferSubgroup = std::getenv("APS5_WAVE_LDS_SUBGROUP") != nullptr;
+    if (!preferSubgroup && threads <= program.WaveSize()) return MslBarrierScope::Threadgroup;
+    if (state.laneCount == 2u || (program.WaveSize() == workgroup->hostSubgroupSize && workgroup->hostSubgroupSize <= 32u)) return MslBarrierScope::Simdgroup;
+    return threads <= program.WaveSize() ? MslBarrierScope::Threadgroup : MslBarrierScope::None;
 }
 
 void EmitMslFunctionBody(MslEmitterState& state) {
@@ -337,14 +473,32 @@ void EmitMslFunctionBody(MslEmitterState& state) {
 bool EmitMslControlInstruction(MslEmitterState& state, const IrValue& instruction) {
     switch (instruction.Opcode()) {
     case IrOpcode::Identity:
+    case IrOpcode::Void:
+    case IrOpcode::Reference:
+    case IrOpcode::ReferenceU32:
     case IrOpcode::ControlNop:
     case IrOpcode::Waitcnt:
+    case IrOpcode::Sendmsg:
     case IrOpcode::TtraceData:
     case IrOpcode::InstPrefetch:
     case IrOpcode::GetBufferResource:
     case IrOpcode::GetAddressResource:
     case IrOpcode::GetScratchResource:
     case IrOpcode::GetSrtResource:
+        return true;
+    case IrOpcode::UndefU1:
+    case IrOpcode::UndefU8:
+    case IrOpcode::UndefU16:
+    case IrOpcode::UndefU32:
+    case IrOpcode::UndefU64:
+        // Any value will do; the hoisted local already holds zero.
+        static_cast<void>(state.Name(instruction));
+        return true;
+    case IrOpcode::GetShaderBase:
+        state.Define(instruction, "0ul");
+        return true;
+    case IrOpcode::Barrier:
+        EmitBarrier(state, instruction);
         return true;
     case IrOpcode::Unreachable:
         state.Line("return;");

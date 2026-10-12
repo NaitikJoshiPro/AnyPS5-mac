@@ -4,6 +4,7 @@
 #include "MetalBackend/MslEmitter.hpp"
 #include "IntermediateRepresentation/IrMetadata.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include <array>
 #include <bitset>
 #include <cstdint>
 #include <map>
@@ -13,6 +14,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -68,6 +70,15 @@ enum class MslBuiltin : std::uint32_t {
     Count
 };
 
+// Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
+// host invocations (lanes of a guest wave run in lockstep, host invocations do not): see
+// MslWaveLdsScope in MslFlowEmitter.cpp.
+enum class MslBarrierScope : std::uint32_t {
+    None,
+    Simdgroup,
+    Threadgroup
+};
+
 class MslEmitterState {
 public:
     MslEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo, const CompiledBindingLayout& bindings, const MslTargetOptions& target);
@@ -79,11 +90,21 @@ public:
     const SpirvRequirements requirements;
     MslAbi::Reflection reflection;
 
-    // Guest lanes per host invocation: 2 for a wave64 program on 32-wide SIMD groups (compute), as
-    // SpirvEmitterState::laneCount.
+    // Guest lanes per host invocation: 2 for a wave64 compute program on 32-wide SIMD groups (as
+    // SpirvEmitterState::laneCount). Each host invocation then runs guest lanes `simd_lane` (half 0)
+    // and `simd_lane + 32` (half 1) of guest wave `thread_index_in_threadgroup / 32`: the flow emitter
+    // offers every instruction once per half with `half` set, and Value/Name/Define resolve to that
+    // half's names. Wave-uniform values (WaveUniformValues) without side effects are computed once,
+    // in half 0, and both halves read the same name; such an emitter reaches the other half's
+    // operands through HalfValue/HalfArg (ballots, readfirstlane, ...). Workgroup barriers and
+    // MeshAllocate are emitted once.
     std::uint32_t laneCount = 1u;
+    std::uint32_t half = 0u;
     std::uint32_t hostSubgroupSize = 32u;
     const ShaderWorkgroupInputInfo* workgroup = nullptr;
+    std::unordered_set<const IrValue*> waveUniform;
+    // True when `instruction` is computed once for both halves (always true when laneCount is 1).
+    [[nodiscard]] bool SharedAcrossHalves(const IrValue& instruction) const;
 
     // Function body: statements at the current indentation.
     void Line(std::string_view text);
@@ -95,6 +116,22 @@ public:
     // loop is used after it).
     void DeclareLocal(std::string_view type, std::string_view name, std::string_view initializer);
     std::string locals;
+    // A fresh function-unique identifier for an emitter's temporary (`<prefix><n>`); the caller
+    // declares it (DeclareLocal or a block-scope declaration).
+    [[nodiscard]] std::string Temporary(std::string_view prefix = "aps5_t");
+
+    // Hooks for the instruction families, all emitted by MslEntryPoint.cpp:
+    // - module-scope declarations after the prelude (types, constant tables, function constants);
+    void AddDeclaration(std::string_view text);
+    std::string declarations;
+    // - extra stage-function parameters, each a full declaration with its attribute
+    //   ("threadgroup uint* x [[threadgroup(0)]]"); added once per text;
+    void AddParameter(std::string_view text);
+    std::vector<std::string> parameters;
+    // - statements run at the start of the function, after the locals and before the first block
+    //   (threadgroup variable declarations, the LDS lock reset and its barrier, ...).
+    void AddPrologue(std::string_view line);
+    std::string prologue;
 
     void RequirePrelude(MslPreludeChunk chunk);
     [[nodiscard]] std::string Prelude() const;
@@ -111,11 +148,35 @@ public:
     bool usesPushData = false;
     bool usesDriverData = false;
 
-    // Values: an immediate is a literal, every other value the hoisted local v<id>.
-    [[nodiscard]] std::string Value(const IrValue* value);
+    // Values: an immediate is a literal, every other value the hoisted local v<id> (half 1 of a
+    // value that is not shared across halves: v<id>_h).
+    [[nodiscard]] std::string Value(const IrValue* value) { return HalfValue(value, half); }
+    [[nodiscard]] std::string HalfValue(const IrValue* value, std::uint32_t laneHalf);
     [[nodiscard]] std::string Arg(const IrValue& instruction, std::size_t index) { return Value(instruction.Argument(index)); }
-    std::string Name(const IrValue& instruction);
+    [[nodiscard]] std::string HalfArg(const IrValue& instruction, std::size_t index, std::uint32_t laneHalf) { return HalfValue(instruction.Argument(index), laneHalf); }
+    std::string Name(const IrValue& instruction) { return HalfName(instruction, half); }
+    std::string HalfName(const IrValue& instruction, std::uint32_t laneHalf);
     void Define(const IrValue& instruction, std::string_view expression);
+
+    // Guest lane of the current half within its guest wave (the value of v_mbcnt-style lane ids):
+    // the host SIMD lane, plus 32 in half 1; for a wave64 program kept at one lane per invocation on
+    // a narrower host (graphics stages), the local index modulo the wave size.
+    [[nodiscard]] std::string GuestLane();
+    // Guest LocalInvocationIndex of the current half (the host's for laneCount 1).
+    [[nodiscard]] std::string GuestInvocationIndex();
+    // Guest LocalInvocationId / GlobalInvocationId component of the current half: the Metal builtins
+    // for laneCount 1, rebuilt from GuestInvocationIndex for laneCount 2 (the host threadgroup is then
+    // one-dimensional, see MslEntryPoint.cpp).
+    [[nodiscard]] std::string GuestLocalInvocationId(std::uint32_t component);
+    [[nodiscard]] std::string GuestGlobalInvocationId(std::uint32_t component);
+    // The guest workgroup id component (Metal's threadgroup position plus the split-dispatch base).
+    [[nodiscard]] std::string WorkgroupId(std::uint32_t component);
+    // A 64-lane ballot of a per-lane predicate as a uint2 (lanes 0-31, lanes 32-63): both halves for
+    // laneCount 2, the host SIMD group (high word 0) for a wave32 program.
+    [[nodiscard]] std::string WaveBallot(const IrValue* predicate);
+    // simd_any / simd_all of a per-lane predicate over the whole guest wave.
+    [[nodiscard]] std::string WaveAny(const IrValue* predicate);
+    [[nodiscard]] std::string WaveAll(const IrValue* predicate);
 
     [[nodiscard]] const MemoryInfo& Memory(const IrValue& instruction) const;
     [[noreturn]] void Fail(std::string_view reason) const;
@@ -128,26 +189,55 @@ public:
     std::string MemoryByteOffset(std::uint32_t element);
     // The descriptor table entry `element` of a buffer-kind binding: "aps5_table.<binding>[element]".
     std::string TableBuffer(DescriptorBindingKind kind, std::uint32_t element);
+    // The descriptor table entry `element` of an image heap or the sampler heap (a texture or sampler
+    // expression, "aps5_table.<binding>[element]"); the member type is MslTableMemberType.
+    std::string TableResource(DescriptorBindingKind kind, std::uint32_t element);
     // Index of `resource` within the `kind` binding (as ResourceForDescriptor on the SPIR-V path).
     std::uint32_t DescriptorElement(DescriptorBindingKind kind, std::uint32_t resource) const;
 
     // The loop guard's limit expression (DriverData), see MslFlowEmitter.cpp.
     std::string LoopGuardLimit();
 
+    // LDS: device memory when it does not fit threadgroup memory (RuntimeAbi's workgroup memory
+    // arena, BufferIndex::WorkgroupMemory), else threadgroup memory. The memory flags workgroup
+    // barriers need so the LDS accesses around them are ordered.
+    [[nodiscard]] bool LdsInDeviceMemory() const;
+    [[nodiscard]] std::string LdsMemoryFlags() const;
+    MslBarrierScope waveLdsScope = MslBarrierScope::None;
+
+    // Debug aid (APS5_MSL_SURVEY=1): failures of the instruction families are collected instead of
+    // ending the emission at the first one, and reported together at the end, so one run lists every
+    // missing opcode of a shader. Failures of the core (control flow, entry point) still end it.
+    bool survey = false;
+    std::vector<std::string> surveyFailures;
+    [[nodiscard]] std::uint32_t Depth() const { return depth; }
+    void RestoreDepth(std::uint32_t value) { depth = value; }
+
 private:
     std::uint32_t depth = 1u;
+    std::uint32_t nextTemporary = 0u;
     std::bitset<static_cast<std::size_t>(MslPreludeChunk::Count)> prelude;
-    std::unordered_set<const IrValue*> declared;
+    std::array<std::unordered_set<const IrValue*>, 2> declared;
+    std::set<std::string, std::less<>> parameterSet;
 };
 
 [[nodiscard]] std::string MslType(IrType type);
 [[nodiscard]] std::string MslHex(std::uint64_t value);
 [[nodiscard]] std::string MslTableField(DescriptorBindingKind kind);
+// The MSL type of one descriptor table entry of `kind` (MslAbi.hpp §Descriptor table): Aps5Buffer
+// for buffer kinds, a texture type fixed by the image heap's class, numeric class and dimension, or
+// `sampler`.
+[[nodiscard]] std::string MslTableMemberType(DescriptorBindingKind kind);
 
 // The stage function's signature and module-scope declarations (MslEntryPoint.cpp).
 [[nodiscard]] std::string EmitMslEntryPoint(MslEmitterState& state);
+// The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
+// laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.
+[[nodiscard]] std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInputInfo& workgroup, std::uint32_t laneCount);
 // The stage function's body (MslFlowEmitter.cpp): structured control flow over the IR blocks.
 void EmitMslFunctionBody(MslEmitterState& state);
+// The wave-LDS barrier scope of a program (MslFlowEmitter.cpp, the SPIR-V path's WaveLdsScope).
+[[nodiscard]] MslBarrierScope MslWaveLdsScope(const MslEmitterState& state);
 
 // Per-family instruction emitters: each returns true when it emitted `instruction`. The flow
 // emitter tries them in turn; an opcode no family handles fails the emission with its name.

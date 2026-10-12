@@ -53,6 +53,16 @@ RuntimeAbi::Stage StageGroup(IrShaderStage stage) {
     }
 }
 
+std::string Vote(const std::string& predicate) {
+    return "uint(static_cast<simd_vote::vote_t>(simd_ballot(" + predicate + ")))";
+}
+
+std::string Component(std::string_view vector, std::uint32_t component) {
+    static constexpr const char* Names[] = {".x", ".y", ".z"};
+    if (component > 2u) throw std::runtime_error("MSL emission failed: builtin component " + std::to_string(component) + " is out of range");
+    return std::string(vector) + Names[component];
+}
+
 }
 
 std::string MslHex(std::uint64_t value) {
@@ -125,6 +135,12 @@ MslEmitterState::MslEmitterState(const IrProgram& program, const ShaderStageInpu
     : program(program), inputInfo(inputInfo), bindings(bindings), target(target), requirements(AnalyzeProgramRequirements(program)) {
 }
 
+bool MslEmitterState::SharedAcrossHalves(const IrValue& instruction) const {
+    if (laneCount == 1u) return true;
+    const IrValue* resolved = instruction.Resolve();
+    return resolved->Type() != IrType::Void && !IrOpcodeHasSideEffects(resolved->Opcode()) && waveUniform.contains(resolved);
+}
+
 void MslEmitterState::Line(std::string_view text) {
     body.append(static_cast<std::size_t>(depth) * 4u, ' ');
     body.append(text);
@@ -146,6 +162,25 @@ void MslEmitterState::DeclareLocal(std::string_view type, std::string_view name,
         locals.append(initializer);
     }
     locals.append(";\n");
+}
+
+std::string MslEmitterState::Temporary(std::string_view prefix) {
+    return std::string(prefix) + std::to_string(nextTemporary++);
+}
+
+void MslEmitterState::AddDeclaration(std::string_view text) {
+    declarations.append(text);
+    if (!text.empty() && text.back() != '\n') declarations.push_back('\n');
+}
+
+void MslEmitterState::AddParameter(std::string_view text) {
+    if (parameterSet.emplace(text).second) parameters.emplace_back(text);
+}
+
+void MslEmitterState::AddPrologue(std::string_view line) {
+    prologue.append("    ");
+    prologue.append(line);
+    prologue.push_back('\n');
 }
 
 void MslEmitterState::RequirePrelude(MslPreludeChunk chunk) {
@@ -188,10 +223,10 @@ std::string MslEmitterState::Builtin(MslBuiltin builtin) {
     }
 }
 
-std::string MslEmitterState::Value(const IrValue* value) {
+std::string MslEmitterState::HalfValue(const IrValue* value, std::uint32_t laneHalf) {
     if (value == nullptr) Fail("received a null value");
     const IrValue* resolved = value->Resolve();
-    if (!resolved->HasImmediate()) return Name(*resolved);
+    if (!resolved->HasImmediate()) return HalfName(*resolved, laneHalf);
     switch (resolved->Type()) {
     case IrType::Bool:
         return resolved->ImmediateBool() ? "true" : "false";
@@ -217,10 +252,12 @@ std::string MslEmitterState::Value(const IrValue* value) {
     }
 }
 
-std::string MslEmitterState::Name(const IrValue& instruction) {
+std::string MslEmitterState::HalfName(const IrValue& instruction, std::uint32_t laneHalf) {
+    if (laneHalf >= laneCount) Fail("lane half " + std::to_string(laneHalf) + " does not exist (laneCount " + std::to_string(laneCount) + ")");
     const IrValue* resolved = instruction.Resolve();
-    std::string name = "v" + std::to_string(resolved->Id());
-    if (declared.insert(resolved).second) {
+    const bool second = laneHalf == 1u && !SharedAcrossHalves(*resolved);
+    std::string name = "v" + std::to_string(resolved->Id()) + (second ? "_h" : "");
+    if (declared[second ? 1u : 0u].insert(resolved).second) {
         const auto type = MslType(resolved->Type());
         DeclareLocal(type, name, type + "(0)");
     }
@@ -231,6 +268,62 @@ void MslEmitterState::Define(const IrValue& instruction, std::string_view expres
     Line(Name(instruction) + " = " + std::string(expression) + ";");
 }
 
+std::string MslEmitterState::GuestLane() {
+    if (laneCount == 2u) {
+        const auto lane = Builtin(MslBuiltin::ThreadIndexInSimdgroup);
+        return half == 0u ? lane : "(" + lane + " + 32u)";
+    }
+    if (hostSubgroupSize < program.WaveSize()) return "(" + Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " & " + std::to_string(program.WaveSize() - 1u) + "u)";
+    return Builtin(MslBuiltin::ThreadIndexInSimdgroup);
+}
+
+std::string MslEmitterState::GuestInvocationIndex() {
+    const auto index = Builtin(MslBuiltin::ThreadIndexInThreadgroup);
+    if (laneCount == 1u) return index;
+    // Host invocation h runs guest lanes h % 32 and h % 32 + 32 of guest wave h / 32 (as
+    // EmitLocalInvocationIndex on the SPIR-V path).
+    return "(" + index + " + (" + index + " & ~31u)" + (half == 0u ? std::string() : " + 32u") + ")";
+}
+
+std::string MslEmitterState::GuestLocalInvocationId(std::uint32_t component) {
+    if (component > 2u) Fail("invocation id component " + std::to_string(component) + " is out of range");
+    if (laneCount == 1u) return Component(Builtin(MslBuiltin::ThreadPositionInThreadgroup), component);
+    if (workgroup == nullptr) Fail("invocation ids of a wave64 program need its workgroup size");
+    std::uint32_t divisor = 1u;
+    for (std::uint32_t axis = 0; axis < component; ++axis) divisor *= std::max(workgroup->threadsNum[axis], 1u);
+    const auto size = std::max(workgroup->threadsNum[component], 1u);
+    return "((" + GuestInvocationIndex() + " / " + std::to_string(divisor) + "u) % " + std::to_string(size) + "u)";
+}
+
+std::string MslEmitterState::GuestGlobalInvocationId(std::uint32_t component) {
+    if (component > 2u) Fail("invocation id component " + std::to_string(component) + " is out of range");
+    const auto size = workgroup != nullptr ? std::max(workgroup->threadsNum[component], 1u) : 1u;
+    return "(" + WorkgroupId(component) + " * " + std::to_string(size) + "u + " + GuestLocalInvocationId(component) + ")";
+}
+
+std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
+    usesDriverData = true;
+    return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "])";
+}
+
+std::string MslEmitterState::WaveBallot(const IrValue* predicate) {
+    if (laneCount == 2u) return "uint2(" + Vote(HalfValue(predicate, 0u)) + ", " + Vote(HalfValue(predicate, 1u)) + ")";
+    if (program.WaveSize() > hostSubgroupSize) Fail("a ballot of a wave64 program at one lane per invocation spans two host SIMD groups");
+    return "uint2(" + Vote(Value(predicate)) + ", 0u)";
+}
+
+std::string MslEmitterState::WaveAny(const IrValue* predicate) {
+    if (laneCount == 2u) return "bool(uint(simd_any(" + HalfValue(predicate, 0u) + ")) | uint(simd_any(" + HalfValue(predicate, 1u) + ")))";
+    if (program.WaveSize() > hostSubgroupSize) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
+    return "simd_any(" + Value(predicate) + ")";
+}
+
+std::string MslEmitterState::WaveAll(const IrValue* predicate) {
+    if (laneCount == 2u) return "bool(uint(simd_all(" + HalfValue(predicate, 0u) + ")) & uint(simd_all(" + HalfValue(predicate, 1u) + ")))";
+    if (program.WaveSize() > hostSubgroupSize) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
+    return "simd_all(" + Value(predicate) + ")";
+}
+
 const MemoryInfo& MslEmitterState::Memory(const IrValue& instruction) const {
     const auto index = instruction.Flags<MemoryFlags>().index;
     const auto& memory = program.Resources().memoryInfo;
@@ -239,11 +332,11 @@ const MemoryInfo& MslEmitterState::Memory(const IrValue& instruction) const {
 }
 
 void MslEmitterState::Fail(std::string_view reason) const {
-    throw std::runtime_error("MSL emission failed: hash=0x" + std::to_string(program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage)) + " reason=" + std::string(reason));
+    throw std::runtime_error("MSL emission failed: hash=" + MslHex(program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage)) + " reason=" + std::string(reason));
 }
 
 void MslEmitterState::Fail(const IrValue& instruction, std::string_view reason) const {
-    throw std::runtime_error("MSL emission failed: hash=0x" + std::to_string(program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage)) + " opcode=" + std::string(IrOpcodeName(instruction.Opcode())) + " reason=" + std::string(reason));
+    throw std::runtime_error("MSL emission failed: hash=" + MslHex(program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage)) + " opcode=" + std::string(IrOpcodeName(instruction.Opcode())) + " reason=" + std::string(reason));
 }
 
 std::string MslEmitterState::ShaderDataDword(std::uint32_t dword) {
@@ -264,6 +357,10 @@ std::string MslEmitterState::MemoryByteOffset(std::uint32_t element) {
 
 std::string MslEmitterState::TableBuffer(DescriptorBindingKind kind, std::uint32_t element) {
     if (MslAbi::KindOf(kind) != MslAbi::EntryKind::Buffer) Fail("binding " + MslTableField(kind) + " is not a buffer binding");
+    return TableResource(kind, element);
+}
+
+std::string MslEmitterState::TableResource(DescriptorBindingKind kind, std::uint32_t element) {
     const auto& descriptors = program.Metadata().bindings.descriptors;
     const auto found = std::find_if(descriptors.begin(), descriptors.end(), [&](const IrDescriptorBinding& descriptor) { return descriptor.kind == kind; });
     if (found == descriptors.end()) Fail("descriptor binding " + MslTableField(kind) + " was not allocated");
@@ -287,6 +384,14 @@ std::string MslEmitterState::LoopGuardLimit() {
     return "aps5_driver.loopGuardLimit";
 }
 
+bool MslEmitterState::LdsInDeviceMemory() const {
+    return program.Info().sharedMemoryBytes != 0u;
+}
+
+std::string MslEmitterState::LdsMemoryFlags() const {
+    return LdsInDeviceMemory() ? "mem_flags::mem_device | mem_flags::mem_threadgroup" : "mem_flags::mem_threadgroup";
+}
+
 MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo& inputInfo, const CompiledBindingLayout& bindings, const MslTargetOptions& target) const {
     const auto stage = program.Resources().stage;
     if (!program.Resources().srtPlanComplete || !program.Resources().resourceTrackingComplete || !program.Metadata().shaderInfoComplete || !program.Metadata().bindingLayoutComplete) {
@@ -300,11 +405,19 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     state.hostSubgroupSize = target.subgroupSize;
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
+    if (state.laneCount == 2u) state.waveUniform = WaveUniformValues(program);
+    static const bool survey = std::getenv("APS5_MSL_SURVEY") != nullptr;
+    state.survey = survey;
     if (stage != IrShaderStage::Compute) state.Fail("only compute shaders are implemented in the MSL backend so far");
-    if (state.laneCount != 1u) state.Fail("wave64 programs on 32-wide SIMD groups (laneCount 2) are not implemented in the MSL backend yet");
     if (program.Info().sharedMemoryBytes != 0u) state.Fail("device-memory LDS is not implemented in the MSL backend yet");
+    state.waveLdsScope = MslWaveLdsScope(state);
     EmitMslFunctionBody(state);
     const auto entry = EmitMslEntryPoint(state);
+    if (!state.surveyFailures.empty()) {
+        std::string text = "survey: " + std::to_string(state.surveyFailures.size()) + " instruction family failures:";
+        for (const auto& failure : state.surveyFailures) text += " [" + failure + "]";
+        state.Fail(text);
+    }
     MslShader shader;
     shader.reflection = std::move(state.reflection);
     shader.reflection.usesPushData = state.usesPushData;
