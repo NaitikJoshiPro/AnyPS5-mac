@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "BdaAbi.hpp"
+#include <array>
 #include <span>
 #include <cstdint>
 #include <deque>
@@ -29,6 +30,7 @@ namespace AgcDriver::Graphics::Metal {
 class CommandStream;
 class PipelineCache;
 class ImageCache;
+class ImageBindings;
 }
 
 namespace AgcDriver {
@@ -185,6 +187,35 @@ struct VulkanDevice::State {
     // The bound V# ranges, GDS and snapshots a dispatch adds to the BDA page table.
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressExtras(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream);
     void RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
+
+    // The MslAbi bindings of one shader function (a kernel, or one stage of a draw), built around
+    // taking the open batch's stream: before it PlanBindings (guest ranges), SettleBindings, PlanImages
+    // (image and sampler table entries, which may upload surfaces and sync) and WrapUnions; after it
+    // WriteTable (the descriptor table in the stream's upload memory).
+    struct StageBindings {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        bool addressBased = false;
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> imageEntries;
+    };
+    void PlanBindings(const ShaderRecompiler::RecompileResult& shader, StageBindings& plan);
+    void PlanImages(const ShaderRecompiler::RecompileResult& shader, Graphics::Metal::ImageBindings& images, StageBindings& plan);
+    // Flushes the recorder's queued label and key stores the planned ranges touch (they must precede
+    // the command).
+    void SettleBindings(std::span<const StageBindings* const> plans);
+    // Wraps overlapping guest ranges as their union (one mapping per array), after PlanImages (whose
+    // syncs may drop the wrappers).
+    void WrapUnions(std::span<const StageBindings* const> plans);
+    // Writes the shader's descriptor table into the stream (0: the shader has none). `push` is the
+    // shader's own push constants inside the 256-byte block (the memory-offset bytes of bound V#s
+    // are zeroed there, as the guest-buffer contract says).
+    std::uint64_t WriteTable(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream, StageBindings& plan, std::span<std::byte> push);
+    // The DriverData record of a function of the batch (workgroupBase as given).
+    std::uint64_t WriteDriverData(Graphics::Metal::CommandStream& stream, std::array<std::uint32_t, 3> workgroupBase);
+    // After the command was recorded: pending reads and writes of the planned ranges, and the
+    // fault check of the batch.
+    void NoteBindings(const StageBindings& plan);
+    void CheckFaultsOnComplete();
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).
     void Sync();
     void CheckFaults();

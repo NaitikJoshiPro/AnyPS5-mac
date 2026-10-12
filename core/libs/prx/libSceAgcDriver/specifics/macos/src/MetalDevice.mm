@@ -1000,6 +1000,195 @@ std::vector<Bda::Range> VulkanDevice::State::AddressExtras(const ShaderRecompile
     return extras;
 }
 
+void VulkanDevice::State::PlanBindings(const ShaderRecompiler::RecompileResult& shader, StageBindings& plan) {
+    for (const auto& binding : shader.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            const auto elements = std::min<std::size_t>(binding.count, binding.guestDescriptor.size() / 4u);
+            for (std::uint32_t element = 0; element < elements; ++element) {
+                const auto guest = DecodeBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u));
+                if (guest.base == 0u || guest.bytes == 0u) continue;
+                const auto aligned = guest.base & ~std::uint64_t{3u};
+                const auto end = aligned + ((guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u});
+                plan.reads.push_back({aligned, end});
+                // An element the recompiler did not classify counts as written.
+                if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) plan.writes.push_back({aligned, end});
+            }
+        } else if (binding.role == ShaderRecompiler::DescriptorRole::Gds) {
+            const auto gds = Pm4::GdsAddress();
+            plan.reads.push_back({gds, gds + Pm4::GdsBytes});
+            plan.writes.push_back({gds, gds + Pm4::GdsBytes});
+        } else if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) {
+            plan.addressBased = true;
+        }
+    }
+}
+
+void VulkanDevice::State::PlanImages(const ShaderRecompiler::RecompileResult& shader, Graphics::Metal::ImageBindings& imageBindings, StageBindings& plan) {
+    const auto& reflection = shader.msl.Reflection();
+    // Pairs samplers with images (ANISO_OVERRIDE, FORCE_DEGAMMA) and checks bindless metadata.
+    imageBindings.Prepare(shader);
+    if (reflection.table.bytes != 0u) {
+        for (const auto& binding : shader.bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages && binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
+            const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
+            const auto* range = reflection.table.Find(kind);
+            if (range == nullptr) continue;
+            std::vector<std::uint64_t> entries(std::min(binding.count, range->count), 0u);
+            imageBindings.Write(binding, entries);
+            plan.imageEntries.push_back({range->offset, std::move(entries)});
+        }
+    }
+}
+
+void VulkanDevice::State::SettleBindings(std::span<const StageBindings* const> plans) {
+    auto& recorder = *this->recorder;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    bool addressBased = false;
+    for (const auto* plan : plans) {
+        ranges.insert(ranges.end(), plan->reads.begin(), plan->reads.end());
+        ranges.insert(ranges.end(), plan->writes.begin(), plan->writes.end());
+        addressBased = addressBased || plan->addressBased;
+    }
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; });
+    };
+    if (recorder.HasQueuedKeyStores() && (addressBased || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
+    if (recorder.HasQueuedStores() && (addressBased || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+}
+
+void VulkanDevice::State::WrapUnions(std::span<const StageBindings* const> plans) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto* plan : plans) ranges.insert(ranges.end(), plan->reads.begin(), plan->reads.end());
+    // Overlapping guest ranges (V#s over one array, GDS) are wrapped as their union first, so every
+    // V# binds as an offset into one mapping (upstream merges overlapping descriptor regions into
+    // one region the same way).
+    std::sort(ranges.begin(), ranges.end());
+    for (std::size_t index = 0; index < ranges.size();) {
+        const auto begin = ranges[index].first;
+        auto end = ranges[index].second;
+        std::size_t count = 1;
+        for (++index; index < ranges.size() && ranges[index].first < end; ++index, ++count) end = std::max(end, ranges[index].second);
+        if (count > 1u) TryWrap(begin, end - begin);
+    }
+}
+
+std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream, StageBindings& plan, std::span<std::byte> push) {
+    const auto& reflection = shader.msl.Reflection();
+    if (reflection.table.bytes == 0u) return 0u;
+    auto& recorder = *this->recorder;
+    const auto upload = stream.Allocate(reflection.table.bytes, 16u);
+    std::memset(upload.host, 0, reflection.table.bytes);
+    auto* table = upload.host;
+    for (const auto& binding : shader.bindings) {
+        const auto group = binding.binding / static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+        const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
+        if (group != static_cast<std::uint32_t>(reflection.group)) throw std::runtime_error("Metal device: a binding belongs to another stage group");
+        const auto* range = reflection.table.Find(kind);
+        if (range == nullptr) continue;
+        auto* entries = reinterpret_cast<Abi::BufferEntry*>(table + range->offset);
+        switch (binding.role) {
+        case ShaderRecompiler::DescriptorRole::GuestBuffers:
+            if (binding.guestDescriptor.size() < static_cast<std::size_t>(std::min(binding.count, range->count)) * 4u) throw std::runtime_error("Metal device: a guest buffer binding has fewer than four words per element");
+            for (std::uint32_t element = 0; element < std::min(binding.count, range->count); ++element) {
+                const auto guest = DecodeBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u));
+                if (guest.base == 0u || guest.bytes == 0u) continue;
+                const auto aligned = guest.base & ~std::uint64_t{3u};
+                const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
+                if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: a guest buffer exceeds 4 GiB");
+                entries[element] = {Wrap(aligned, bytes), static_cast<std::uint32_t>(bytes), 0u};
+                const auto position = static_cast<std::size_t>(shader.memoryOffsetDword) * 4u + element;
+                if (position < push.size()) push[position] = std::byte{0};
+            }
+            break;
+        case ShaderRecompiler::DescriptorRole::ShaderData:
+        case ShaderRecompiler::DescriptorRole::FlattenedSrt: {
+            const auto bytes = binding.guestDescriptor.size() * sizeof(std::uint32_t);
+            const auto data = stream.Allocate(std::max<std::size_t>(bytes, 4u), 16u);
+            if (bytes != 0u) std::memcpy(data.host, binding.guestDescriptor.data(), bytes);
+            entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
+            break;
+        }
+        case ShaderRecompiler::DescriptorRole::Gds: {
+            if (binding.count != 1u || !binding.guestDescriptor.empty()) throw std::runtime_error("Metal device: invalid GDS descriptor contract");
+            entries[0] = {Wrap(Pm4::GdsAddress(), Pm4::GdsBytes), static_cast<std::uint32_t>(Pm4::GdsBytes), 0u};
+            break;
+        }
+        case ShaderRecompiler::DescriptorRole::BdaPagetable: {
+            std::shared_ptr<const GuestAllocations::Lease> lease;
+            const auto& registered = AddressTableBytes(&lease);
+            recorder.Keep(std::const_pointer_cast<GuestAllocations::Lease>(lease));
+            plan.writes.insert(plan.writes.end(), addressTable.writable.begin(), addressTable.writable.end());
+            // As upstream's GuestBufferMemory::AddressRanges: the registered ranges plus every
+            // bound V# range (Write when the shader stores to it), GDS, and the captured
+            // snapshots (live in place when wrappable, else their captured bytes read-only).
+            const auto extras = AddressExtras(shader, snapshots, stream);
+            const auto covered = [&](const Bda::Range& extra) {
+                const auto& ranges = addressTable.ranges;
+                const auto found = std::upper_bound(ranges.begin(), ranges.end(), extra.begin, [](std::uint64_t value, const Bda::Range& range) { return value < range.begin; });
+                return found != ranges.begin() && extra.end <= std::prev(found)->end && (std::prev(found)->permissions & extra.permissions) == extra.permissions;
+            };
+            if (std::all_of(extras.begin(), extras.end(), covered)) {
+                const auto data = stream.Write(std::span<const std::byte>(registered), 16u);
+                entries[0] = {data.address, static_cast<std::uint32_t>(registered.size()), 0u};
+            } else {
+                std::vector<Bda::Range> all = addressTable.ranges;
+                all.insert(all.end(), extras.begin(), extras.end());
+                const auto ranges = Metal::DisjointRanges(all);
+                const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
+                const auto bytes = sizeof(header) + ranges.size() * sizeof(Bda::Range);
+                if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: the BDA page table exceeds 4 GiB");
+                const auto data = stream.Allocate(bytes, 16u);
+                std::memcpy(data.host, &header, sizeof(header));
+                if (!ranges.empty()) std::memcpy(data.host + sizeof(header), ranges.data(), ranges.size() * sizeof(Bda::Range));
+                entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
+            }
+            break;
+        }
+        case ShaderRecompiler::DescriptorRole::FaultBuffer:
+            entries[0] = {faults.gpuAddress, static_cast<std::uint32_t>(faults.length), 0u};
+            break;
+        case ShaderRecompiler::DescriptorRole::GuestImages:
+        case ShaderRecompiler::DescriptorRole::GuestSamplers:
+            break;
+        }
+    }
+    for (const auto& [offset, values] : plan.imageEntries) {
+        if (!values.empty()) std::memcpy(table + offset, values.data(), values.size() * sizeof(std::uint64_t));
+    }
+    return upload.address;
+}
+
+std::uint64_t VulkanDevice::State::WriteDriverData(Graphics::Metal::CommandStream& stream, std::array<std::uint32_t, 3> workgroupBase) {
+    Abi::DriverData driver {};
+    driver.workgroupBase = workgroupBase;
+    driver.loopGuardLimit = LoopGuardLimit();
+    driver.faultBuffer = faults.gpuAddress;
+    driver.atomicLocks = atomicLocks.gpuAddress;
+    return stream.Write(std::as_bytes(std::span(&driver, 1)), 16u).address;
+}
+
+void VulkanDevice::State::NoteBindings(const StageBindings& plan) {
+    if (!plan.reads.empty()) recorder->NotePendingReads(plan.reads, Recorder::ReadKind::DispatchElement);
+    if (!plan.writes.empty()) recorder->NotePendingWrites(plan.writes);
+}
+
+void VulkanDevice::State::CheckFaultsOnComplete() {
+    // Faults and written pages of this batch's commands (one shared record) when it completes. As
+    // upstream (BdaResources::CheckFault in a completion): a fault record throws, which the recorder
+    // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait.
+    recorder->OnComplete([this] {
+        if (!tearingDown) {
+            CheckFaults();
+            return;
+        }
+        try {
+            CheckFaults();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[metal] %s\n", error.what());
+        }
+    });
+}
+
 void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirectArguments, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
     const auto& reflection = shader.msl.Reflection();
     const auto stride = WorkgroupStride(shader);
@@ -1023,75 +1212,22 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         throw std::runtime_error("Metal device: the workgroup of " + std::to_string(threads[0] * threads[1] * threads[2]) + " threads exceeds the pipeline's maximum threadgroup size " + std::to_string(pipeline.maxTotalThreadsPerThreadgroup));
     }
 
-    // Guest ranges first (queued label and key stores into them must precede the dispatch).
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
-    bool addressBased = false;
-    for (const auto& binding : shader.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
-            const auto elements = std::min<std::size_t>(binding.count, binding.guestDescriptor.size() / 4u);
-            for (std::uint32_t element = 0; element < elements; ++element) {
-                const auto guest = DecodeBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u));
-                if (guest.base == 0u || guest.bytes == 0u) continue;
-                const auto aligned = guest.base & ~std::uint64_t{3u};
-                const auto end = aligned + ((guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u});
-                reads.push_back({aligned, end});
-                // An element the recompiler did not classify counts as written.
-                if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) writes.push_back({aligned, end});
-            }
-        } else if (binding.role == ShaderRecompiler::DescriptorRole::Gds) {
-            const auto gds = Pm4::GdsAddress();
-            reads.push_back({gds, gds + Pm4::GdsBytes});
-            writes.push_back({gds, gds + Pm4::GdsBytes});
-        } else if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) {
-            addressBased = true;
-        }
-    }
-    if (indirectArguments != 0u) reads.push_back({indirectArguments, indirectArguments + 12u});
-    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
-        const auto overlaps = [&](const auto& ranges) { return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; }); };
-        return overlaps(reads) || overlaps(writes);
-    };
-    if (recorder.HasQueuedKeyStores() && (addressBased || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
-    if (recorder.HasQueuedStores() && (addressBased || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
-
-    // Images and samplers (D4/D5, MetalImages.h) before the open batch is taken: uploading a
-    // surface reads guest memory on the CPU, and the settle hook may sync (submit) the batch.
+    // Guest ranges and image/sampler entries first (queued label and key stores into the ranges
+    // must precede the dispatch; uploading a surface reads guest memory on the CPU, and the settle
+    // hook may sync the batch), before the open batch is taken.
     Graphics::Metal::ImageBindings imageBindings(*images, [this](std::uint64_t address, std::uint64_t bytes) {
         if (this->recorder->PendingWriteOverlaps(address, bytes) || this->recorder->PendingLabelIn(address, bytes)) {
             Recorder::CountSync(4);
             this->recorder->SyncThrough(address, bytes);
         }
     });
-    // Pairs samplers with images (ANISO_OVERRIDE, FORCE_DEGAMMA) and checks bindless metadata.
-    imageBindings.Prepare(shader);
-    std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> imageEntries;
-    if (reflection.table.bytes != 0u) {
-        for (const auto& binding : shader.bindings) {
-            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages && binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
-            const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
-            const auto* range = reflection.table.Find(kind);
-            if (range == nullptr) continue;
-            std::vector<std::uint64_t> entries(std::min(binding.count, range->count), 0u);
-            imageBindings.Write(binding, entries);
-            imageEntries.push_back({range->offset, std::move(entries)});
-        }
-    }
-
-    // Overlapping guest ranges of this dispatch (V#s over one array, GDS) are wrapped as their union
-    // first, so every V# binds as an offset into one mapping (upstream merges overlapping descriptor
-    // regions into one region the same way).
-    {
-        auto merged = reads;
-        std::sort(merged.begin(), merged.end());
-        for (std::size_t index = 0; index < merged.size();) {
-            auto begin = merged[index].first;
-            auto end = merged[index].second;
-            std::size_t count = 1;
-            for (++index; index < merged.size() && merged[index].first < end; ++index, ++count) end = std::max(end, merged[index].second);
-            if (count > 1u) TryWrap(begin, end - begin);
-        }
-    }
+    StageBindings plan;
+    PlanBindings(shader, plan);
+    if (indirectArguments != 0u) plan.reads.push_back({indirectArguments, indirectArguments + 12u});
+    const StageBindings* plans[] = {&plan};
+    SettleBindings(plans);
+    PlanImages(shader, imageBindings, plan);
+    WrapUnions(plans);
 
     VkAccessFlags covered = 0;
     auto& stream = recorder.Stream(&covered);
@@ -1100,100 +1236,13 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         if (shader.pushConstants.size() > push.size()) throw std::runtime_error("Metal device: push constants exceed the push data block");
         std::memcpy(push.data(), shader.pushConstants.data(), shader.pushConstants.size());
     }
-    std::uint64_t tableAddress = 0;
-    if (reflection.table.bytes != 0u) {
-        const auto upload = stream.Allocate(reflection.table.bytes, 16u);
-        tableAddress = upload.address;
-        std::memset(upload.host, 0, reflection.table.bytes);
-        auto* table = upload.host;
-        for (const auto& binding : shader.bindings) {
-            const auto group = binding.binding / static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
-            const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
-            if (group != static_cast<std::uint32_t>(reflection.group)) throw std::runtime_error("Metal device: a binding belongs to another stage group");
-            const auto* range = reflection.table.Find(kind);
-            if (range == nullptr) continue;
-            auto* entries = reinterpret_cast<Abi::BufferEntry*>(table + range->offset);
-            switch (binding.role) {
-            case ShaderRecompiler::DescriptorRole::GuestBuffers:
-                if (binding.guestDescriptor.size() < static_cast<std::size_t>(std::min(binding.count, range->count)) * 4u) throw std::runtime_error("Metal device: a guest buffer binding has fewer than four words per element");
-                for (std::uint32_t element = 0; element < std::min(binding.count, range->count); ++element) {
-                    const auto guest = DecodeBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u));
-                    if (guest.base == 0u || guest.bytes == 0u) continue;
-                    const auto aligned = guest.base & ~std::uint64_t{3u};
-                    const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
-                    if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: a guest buffer exceeds 4 GiB");
-                    entries[element] = {Wrap(aligned, bytes), static_cast<std::uint32_t>(bytes), 0u};
-                    const auto position = static_cast<std::size_t>(shader.memoryOffsetDword) * 4u + element;
-                    if (position < shader.pushConstants.size()) push[position] = std::byte{0};
-                }
-                break;
-            case ShaderRecompiler::DescriptorRole::ShaderData:
-            case ShaderRecompiler::DescriptorRole::FlattenedSrt: {
-                const auto bytes = binding.guestDescriptor.size() * sizeof(std::uint32_t);
-                const auto data = stream.Allocate(std::max<std::size_t>(bytes, 4u), 16u);
-                if (bytes != 0u) std::memcpy(data.host, binding.guestDescriptor.data(), bytes);
-                entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
-                break;
-            }
-            case ShaderRecompiler::DescriptorRole::Gds: {
-                if (binding.count != 1u || !binding.guestDescriptor.empty()) throw std::runtime_error("Metal device: invalid GDS descriptor contract");
-                entries[0] = {Wrap(Pm4::GdsAddress(), Pm4::GdsBytes), static_cast<std::uint32_t>(Pm4::GdsBytes), 0u};
-                break;
-            }
-            case ShaderRecompiler::DescriptorRole::BdaPagetable: {
-                std::shared_ptr<const GuestAllocations::Lease> lease;
-                const auto& registered = AddressTableBytes(&lease);
-                recorder.Keep(std::const_pointer_cast<GuestAllocations::Lease>(lease));
-                writes.insert(writes.end(), addressTable.writable.begin(), addressTable.writable.end());
-                // As upstream's GuestBufferMemory::AddressRanges: the registered ranges plus every
-                // bound V# range (Write when the shader stores to it), GDS, and the captured
-                // snapshots (live in place when wrappable, else their captured bytes read-only).
-                const auto extras = AddressExtras(shader, snapshots, stream);
-                const auto covered = [&](const Bda::Range& extra) {
-                    const auto& ranges = addressTable.ranges;
-                    const auto found = std::upper_bound(ranges.begin(), ranges.end(), extra.begin, [](std::uint64_t value, const Bda::Range& range) { return value < range.begin; });
-                    return found != ranges.begin() && extra.end <= std::prev(found)->end && (std::prev(found)->permissions & extra.permissions) == extra.permissions;
-                };
-                if (std::all_of(extras.begin(), extras.end(), covered)) {
-                    const auto data = stream.Write(std::span<const std::byte>(registered), 16u);
-                    entries[0] = {data.address, static_cast<std::uint32_t>(registered.size()), 0u};
-                } else {
-                    std::vector<Bda::Range> all = addressTable.ranges;
-                    all.insert(all.end(), extras.begin(), extras.end());
-                    const auto ranges = Metal::DisjointRanges(all);
-                    const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
-                    const auto bytes = sizeof(header) + ranges.size() * sizeof(Bda::Range);
-                    if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: the BDA page table exceeds 4 GiB");
-                    const auto data = stream.Allocate(bytes, 16u);
-                    std::memcpy(data.host, &header, sizeof(header));
-                    if (!ranges.empty()) std::memcpy(data.host + sizeof(header), ranges.data(), ranges.size() * sizeof(Bda::Range));
-                    entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
-                }
-                break;
-            }
-            case ShaderRecompiler::DescriptorRole::FaultBuffer:
-                entries[0] = {faults.gpuAddress, static_cast<std::uint32_t>(faults.length), 0u};
-                break;
-            case ShaderRecompiler::DescriptorRole::GuestImages:
-            case ShaderRecompiler::DescriptorRole::GuestSamplers:
-                break;
-            }
-        }
-        for (const auto& [offset, values] : imageEntries) {
-            if (!values.empty()) std::memcpy(table + offset, values.data(), values.size() * sizeof(std::uint64_t));
-        }
-    }
+    const std::uint64_t tableAddress = WriteTable(shader, snapshots, stream, plan, std::span<std::byte>(push).first(shader.pushConstants.size()));
     const auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
     const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     std::vector<std::uint64_t> driverAddresses;
     std::vector<MTLSize> chunkGroups;
     const auto addChunk = [&](std::uint32_t xBase, std::uint32_t yBase, std::uint32_t zBase, MTLSize groups) {
-        Abi::DriverData driver {};
-        driver.workgroupBase = {xBase, yBase, zBase};
-        driver.loopGuardLimit = LoopGuardLimit();
-        driver.faultBuffer = faults.gpuAddress;
-        driver.atomicLocks = atomicLocks.gpuAddress;
-        driverAddresses.push_back(stream.Write(std::as_bytes(std::span(&driver, 1)), 16u).address);
+        driverAddresses.push_back(WriteDriverData(stream, {xBase, yBase, zBase}));
         chunkGroups.push_back(groups);
     };
     if (split) {
@@ -1237,25 +1286,13 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     Recorder::CountBarriers(Recorder::CommandClass::DispatchTrailing);
     recorder.MarkCovered(DispatchedAccess);
     if (!imageBindings.Empty()) imageBindings.Commit(recorder);
-    if (indirectArguments != 0u) recorder.NotePendingRead(indirectArguments, 12u, Recorder::ReadKind::Indirect);
-    if (!reads.empty()) recorder.NotePendingReads(reads, Recorder::ReadKind::DispatchElement);
-    if (!writes.empty()) recorder.NotePendingWrites(writes);
-    // Faults and written pages of this batch's dispatches (one shared record) when it completes.
-    // Faults and written pages of this batch's dispatches (one shared record) when it completes. As
-    // upstream (BdaResources::CheckFault in a completion): a fault record throws, which the recorder
-    // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait.
-    recorder.OnComplete([this] {
-        if (!tearingDown) {
-            CheckFaults();
-            return;
-        }
-        try {
-            CheckFaults();
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[metal] %s\n", error.what());
-        }
-    });
-    if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", reads.size(), writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
+    if (indirectArguments != 0u) {
+        recorder.NotePendingRead(indirectArguments, 12u, Recorder::ReadKind::Indirect);
+        plan.reads.pop_back();
+    }
+    NoteBindings(plan);
+    CheckFaultsOnComplete();
+    if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", plan.reads.size(), plan.writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
 }
 
 void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
