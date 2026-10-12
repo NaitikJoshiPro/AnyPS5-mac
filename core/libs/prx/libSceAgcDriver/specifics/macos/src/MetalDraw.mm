@@ -176,6 +176,21 @@ MTLPixelFormat DepthFormat(const Graphics::DepthTarget& target) {
     }
 }
 
+// The MSL type a fragment function writes to a color attachment of `format` (B6/D6 interface:
+// APS5_COLOR<n>_TYPE): uint4/int4 for integer formats, float4 otherwise.
+const char* ColorOutputType(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatR16Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGB10A2Uint:
+        return "uint4";
+    case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatR16Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint:
+    case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA32Sint:
+        return "int4";
+    default:
+        return "float4";
+    }
+}
+
 bool HasStencil(MTLPixelFormat format) {
     return format == MTLPixelFormatDepth32Float_Stencil8 || format == MTLPixelFormatStencil8;
 }
@@ -538,6 +553,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         auto function = Graphics::Metal::PipelineFunction::From(*fragmentResult);
         function.macros.push_back({Abi::VertexOutputsMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations)) + "u"});
         function.macros.push_back({Abi::VertexOutputsHighMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations >> 32u)) + "u"});
+        for (const auto& target : graphics.colors) {
+            const auto format = Graphics::Metal::PixelFormatOf(target.format).format;
+            if (target.exportIndex < 8u && format != MTLPixelFormatInvalid) function.macros.push_back({"APS5_COLOR" + std::to_string(target.exportIndex) + "_TYPE", ColorOutputType(format)});
+        }
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
