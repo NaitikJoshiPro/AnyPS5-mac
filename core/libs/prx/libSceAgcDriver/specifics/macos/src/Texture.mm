@@ -1437,7 +1437,7 @@ VkImageMemoryBarrier proxyBarrier(VkImage image, VkAccessFlags source, VkAccessF
 
 void StorageTexture::RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const {
     Require(proxyView != VK_NULL_HANDLE, "the storage image has no attachment proxy");
-    const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
+    const auto barrier = Metal::Vk::CmdPipelineBarrier;
     const VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     const auto discard = proxyBarrier(proxyImage, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 1, &discard);
@@ -1448,7 +1448,7 @@ void StorageTexture::RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImage
 
 void StorageTexture::RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const {
     Require(proxyView != VK_NULL_HANDLE, "the storage image has no attachment proxy");
-    const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
+    const auto barrier = Metal::Vk::CmdPipelineBarrier;
     const auto detach = proxyBarrier(proxyImage, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, attachmentLayout, VK_IMAGE_LAYOUT_GENERAL);
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &detach);
     blitWhole(context, commands, proxyImage, image, descriptor.width, descriptor.height);
@@ -2693,12 +2693,12 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         for (const auto& [begin, end, slab] : seeds) {
             // The piece's own slab (a seeded unit is one the piece covers partly).
             const VkBufferCopy seed{begin - import.base, SlabOffset(import, *slab, begin), end - begin};
-            context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, import.buffer, slab->buffer, 1, &seed);
+            Metal::Vk::CmdCopyBuffer(commands, import.buffer, slab->buffer, 1, &seed);
             NoteShadowSeed(begin, end);
         }
         // The padding's current bytes, under the retile that follows (the import-ready barrier
         // orders the scratch writes).
-        for (const auto& [source, copies] : padding.copies) context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+        for (const auto& [source, copies] : padding.copies) Metal::Vk::CmdCopyBuffer(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
     }
     const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
     if (direct) {
@@ -2737,7 +2737,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         // part) precede the copies into the slabs and the import.
         const VkMemoryBarrier scratchDone{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         Metal::Vk::CmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &scratchDone, 0, nullptr, 0, nullptr);
-        const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+        const auto copyBuffer = Metal::Vk::CmdCopyBuffer;
         for (const auto& pieces : slabPieces) copyBuffer(commands, tiledScratch->Handle(), pieces.slab->buffer, static_cast<std::uint32_t>(pieces.copies.size()), pieces.copies.data());
         if (!importCopies.empty()) copyBuffer(commands, tiledScratch->Handle(), import.buffer, static_cast<std::uint32_t>(importCopies.size()), importCopies.data());
     }
