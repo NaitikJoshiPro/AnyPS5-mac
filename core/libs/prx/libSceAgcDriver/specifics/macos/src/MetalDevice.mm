@@ -690,6 +690,17 @@ void TraceGds(const char* where) {
 void VulkanDevice::WaitIdle() {
     state->Sync();
     TraceGds("after WaitIdle");
+    if (std::getenv("APS5_TRACE_GDS") != nullptr) {
+        const auto gds = Pm4::GdsAddress();
+        std::uint64_t offset = 0;
+        id<MTLBuffer> import = state->ImportOf(gds, Pm4::GdsBytes, &offset);
+        id<MTLBuffer> wrapper = state->WrapperOf(gds, Pm4::GdsBytes, &offset);
+        for (id<MTLBuffer> buffer : {import, wrapper}) {
+            if (buffer == nil) continue;
+            const auto* contents = static_cast<const std::uint8_t*>(buffer.contents);
+            std::fprintf(stderr, "[gds] %s contents=%p guest=0x%llx gpu=0x%llx dword4=%u\n", buffer == import ? "import" : "wrapper", contents, static_cast<unsigned long long>(gds), static_cast<unsigned long long>(buffer.gpuAddress), *reinterpret_cast<const std::uint32_t*>(contents + offset + 0x10u));
+        }
+    }
 }
 
 void VulkanDevice::PrepareForReplacement() {
