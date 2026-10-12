@@ -564,6 +564,18 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.importsStampPages = false;
     state.dmaBufImportsStampPages = false;
     if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
+#elif defined(__APPLE__)
+    // Metal: imports are always compared, never watched, and not probed. The macOS write watch
+    // write-protects pages (mprotect); GPU stores through a no-copy buffer do not go through it,
+    // and a probe would have the GPU store into write-protected pages on purpose (DECISIONS D19).
+    // Unwatching an import also lifts that protection from pages the GPU may write.
+    static_cast<void>(importWatchRequest);
+    state.watchDevice = context.device;
+    state.unwatchImports = true;
+    state.unwatchDmaBufImports = true;
+    state.importsStampPages = false;
+    state.dmaBufImportsStampPages = false;
+    if (std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Metal host imports are compared, not watched\n");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;
