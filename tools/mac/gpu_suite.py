@@ -13,7 +13,7 @@ tools/mac/buildlock.py <build>, which is also the machine-wide GPU mutex; the te
 holds the lock for at most --batch-seconds of worst-case test time (sum of the tests' timeouts), so other agents can
 build between batches.
 
-Output directory (--out, default .mac-work/logs/gpu-suite/<time>-<selectors>):
+Output directory (--out, default .mac-work/logs/gpu-suite/<time>-<selectors> of the main checkout):
     junit.xml     every testcase of every batch in one ctest-style JUnit file (tools/check_skips.py reads it)
     summary.txt   per-group counts, failures with their first error line, skips with their reason and allowlist
                   verdict, the MSL emission histogram (opcode or reason) and the most common first errors
@@ -50,6 +50,17 @@ ERROR_LINE = re.compile(r"error|fail|exception|what\(\)|terminate|abort|assert|m
                         r"cannot|could not|invalid|timeout|timed out|signal|segmentation|bus error|nan", re.IGNORECASE)
 NOISE = re.compile(r"^\s*$|^\[gpu\] skip reports|^RecompileRequest:|^[A-Za-z0-9+/=]{120,}$")
 VOLATILE = re.compile(r"0x[0-9a-fA-F]+|\b\d{3,}\b|hash=\S+")
+
+
+def default_logs():
+    """.mac-work/logs/gpu-suite of the main checkout (a worktree shares it through the common git directory)."""
+    try:
+        common = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        root = Path(common).parent
+    except (OSError, subprocess.CalledProcessError):
+        root = REPO
+    return root / ".mac-work" / "logs" / "gpu-suite"
 
 
 def utc_stamp():
@@ -270,11 +281,11 @@ def main():
                                      epilog=__doc__.split("\n\n", 2)[2])
     parser.add_argument("selectors", nargs="+", metavar="SELECTOR")
     parser.add_argument("--build", default="build-metal", help="build directory, relative to the repository root (default: build-metal)")
-    parser.add_argument("--out", type=Path, help="output directory (default: .mac-work/logs/gpu-suite/<time>-<selectors>)")
+    parser.add_argument("--out", type=Path, help="output directory (default: .mac-work/logs/gpu-suite/<time>-<selectors> of the main checkout)")
     parser.add_argument("--timeout", type=int, default=30, help="per-test timeout in seconds for tests without a TIMEOUT property (default: 30)")
     parser.add_argument("--batch-seconds", type=float, default=240.0, help="worst-case test seconds per lock hold (default: 240)")
     parser.add_argument("--validation", action="store_true", help="run with MTL_SHADER_VALIDATION=1 (reported to stderr) and MTL_DEBUG_LAYER=1")
-    parser.add_argument("--dump-requests", type=Path, metavar="DIR", help="export APS5_DUMP_REQUESTS=DIR: every recompile request is written there (MSL corpus)")
+    parser.add_argument("--dump-requests", type=Path, metavar="DIR", help="export APS5_DUMP_REQUESTS=DIR (relative to the repository root): every recompile request is written there, the corpus of agc_metal_msl_corpus (build-metal/msl-corpus)")
     parser.add_argument("--build-first", action="store_true", help="build the selected tests' executables (ninja -k 0, under the lock) before running")
     parser.add_argument("--allowlist", type=Path, default=check_skips.MACOS_ALLOWLIST, help="skip allowlist (default: tools/mac/m2_skip_allowlist.txt)")
     parser.add_argument("--dry-run", action="store_true", help="print the selection and the batches and run nothing")
@@ -312,7 +323,7 @@ def main():
         return 1
 
     stamp = utc_stamp()
-    out = args.out or REPO / ".mac-work" / "logs" / "gpu-suite" / f"{stamp}-{'_'.join(re.sub(r'[^A-Za-z0-9_.-]', '', selector) for selector in args.selectors)[:60]}"
+    out = args.out or default_logs() / f"{stamp}-{'_'.join(re.sub(r'[^A-Za-z0-9_.-]', '', selector) for selector in args.selectors)[:60]}"
     out = out if out.is_absolute() else Path.cwd() / out
     (out / "batches").mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
@@ -320,7 +331,7 @@ def main():
     if args.validation:
         extra.update({"MTL_SHADER_VALIDATION": "1", "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1", "MTL_DEBUG_LAYER": "1"})
     if args.dump_requests:
-        dump = args.dump_requests if args.dump_requests.is_absolute() else Path.cwd() / args.dump_requests
+        dump = args.dump_requests if args.dump_requests.is_absolute() else REPO / args.dump_requests
         dump.mkdir(parents=True, exist_ok=True)
         extra["APS5_DUMP_REQUESTS"] = str(dump)
     environment.update(extra)
