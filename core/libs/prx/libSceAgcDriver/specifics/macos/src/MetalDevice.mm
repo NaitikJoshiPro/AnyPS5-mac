@@ -614,6 +614,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.recorder = state->recorder.get();
             state->recorder->Activate();
             Graphics::PrepareImportWatch(context);
+            // The image cache's Graphics twins (Texture/ShaderResources, D4/D5) take the complete Context.
+            state->images->Attach(state->context);
         }
     } catch (...) {
         // A half-built device releases what it attached (residency sets on the queue) before unwinding.
