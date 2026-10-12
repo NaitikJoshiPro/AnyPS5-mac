@@ -411,6 +411,9 @@ void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::
     FEXCore::Config::Load();
     FEXCore::Config::ReloadMetaLayer();
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+    // A locked access that crosses 16 bytes is emulated in the SIGBUS handler with two CASes, which tear under
+    // contention unless such accesses share a lock (x86 makes them atomic). Only that slow path takes the lock.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1");
     for (const auto& [option, value] : config)
         FEXCore::Config::Set(option, value);
     LoadOptions();
