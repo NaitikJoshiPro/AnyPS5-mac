@@ -1,13 +1,16 @@
 // Compile-only check of MetalBackend output (no GPU work is submitted): every program below is
 // recompiled for the Metal device's target, its MSL is compiled with newLibraryWithSource and a
 // compute pipeline is built with the result's function constants. Also checks that the checker
-// itself rejects invalid MSL and that the reflection matches the MslAbi table layout.
+// itself rejects invalid MSL, that the reflection matches the MslAbi table layout and the lane
+// mapping (wave64 programs run two guest lanes per host invocation), and that every descriptor
+// table member type compiles with the layout MslAbi gives it.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
+#include "MetalBackend/MslEmitterState.hpp"
 #include <array>
 #include <cstdio>
 #include <iostream>
@@ -34,15 +37,35 @@ alignas(256) constexpr std::array<std::uint32_t, 17> Vop1ControlCode{
     0xd5800000, 0x00000000, 0xd59b0000, 0x00000000, 0xd5c10000, 0x00000000, 0xe0702000, 0x80010401, 0xbf810000,
 };
 
+// tests/execution/BranchPastEndpgm.cpp: scalar branches into blocks after s_endpgm, and a loop whose
+// body sits after the test that jumps back to it (selector in s8).
+alignas(256) constexpr std::array<std::uint32_t, 20> TailBlockCode{
+    0x34020082, 0xe0302000, 0x80000401, 0xbf8c3f70, 0xbf068008, 0xbf840008, 0x4a080881, 0xe0702000, 0x80010401, 0xbf810000,
+    0x4a080882, 0xe0702000, 0x80010401, 0xbf810000, 0xbf068108, 0xbf85fffa, 0x4a080883, 0xe0702000, 0x80010401, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 18> LoopBodyCode{
+    0x34020082, 0xe0302000, 0x80000401, 0xbf8c3f70, 0xbe890380, 0xbf068008, 0xbf840006, 0x4a0808c0, 0xe0702000,
+    0x80010401, 0xbf810000, 0x4a080881, 0x80098109, 0xbf0a0809, 0xbf85fffc, 0xe0702000, 0x80010401, 0xbf810000,
+};
+
 struct Program {
     const char* name;
     std::span<const std::uint32_t> code;
     std::uint32_t threads;
     std::uint32_t buffers;
+    std::uint32_t waveSize;
+    std::uint32_t userDataCount;
 };
 
-constexpr std::array<Program, 1> Programs{{
-    {"vop1_control", Vop1ControlCode, 64u, 2u},
+constexpr std::array<Program, 7> Programs{{
+    {"vop1_control", Vop1ControlCode, 64u, 2u, 32u, 8u},
+    {"vop1_control_wave64", Vop1ControlCode, 64u, 2u, 64u, 8u},
+    {"vop1_control_wave64_partial", Vop1ControlCode, 96u, 2u, 64u, 8u},
+    {"tail_blocks", TailBlockCode, 64u, 2u, 32u, 9u},
+    {"tail_blocks_wave64", TailBlockCode, 64u, 2u, 64u, 9u},
+    {"loop_body", LoopBodyCode, 64u, 2u, 32u, 9u},
+    {"loop_body_wave64", LoopBodyCode, 128u, 2u, 64u, 9u},
 }};
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t count) {
@@ -51,7 +74,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t co
 }
 
 ShaderRecompiler::RecompileResult Recompile(const AgcDriver::VulkanDevice& device, const Program& program, std::span<std::uint32_t> backing) {
-    std::vector<std::uint32_t> userData(program.buffers * 4u, 0u);
+    std::vector<std::uint32_t> userData(program.userDataCount, 0u);
     for (std::uint32_t buffer = 0; buffer < program.buffers; ++buffer) {
         const auto descriptor = BufferDescriptor(backing.data(), static_cast<std::uint32_t>(backing.size()));
         std::copy(descriptor.begin(), descriptor.end(), userData.begin() + buffer * 4u);
@@ -60,12 +83,25 @@ ShaderRecompiler::RecompileResult Recompile(const AgcDriver::VulkanDevice& devic
     const ShaderRecompiler::ShaderComputeStageInfo compute{{program.threads, 1, 1}, 0, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
         {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(program.code.data()), program.code, 0, {}},
-        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        {program.waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
         device.Target(),
         {0, 0, 0, 128}
     };
     request.useCache = false;
     return ShaderRecompiler::Recompile(request);
+}
+
+id<MTLLibrary> CompileLibrary(id<MTLDevice> device, const std::string& name, const std::string& source) {
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion4_0;
+    options.mathMode = MTLMathModeSafe;
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:options error:&error];
+    if (library == nil) {
+        std::cerr << source << '\n';
+        throw std::runtime_error(name + ": MSL does not compile: " + Describe(error));
+    }
+    return library;
 }
 
 void CompileCheck(id<MTLDevice> device, const Program& program, const ShaderRecompiler::RecompileResult& result) {
@@ -74,29 +110,49 @@ void CompileCheck(id<MTLDevice> device, const Program& program, const ShaderReco
     const auto& reflection = result.msl.Reflection();
     Require(reflection.abiVersion == ShaderRecompiler::MslAbi::Version, std::string(program.name) + ": unexpected MslAbi version");
     Require(reflection.stage == ShaderRecompiler::MslAbi::Stage::Kernel, std::string(program.name) + ": a compute program must reflect a kernel");
-    Require(reflection.threadsPerThreadgroup[0] * reflection.threadsPerThreadgroup[1] * reflection.threadsPerThreadgroup[2] == program.threads, std::string(program.name) + ": threadgroup size does not match the workgroup");
+    // A wave64 program runs two guest lanes per host invocation: 32 host invocations per guest wave,
+    // in a one-dimensional threadgroup.
+    const std::array<std::uint32_t, 3> threads = program.waveSize == 64u ? std::array<std::uint32_t, 3>{(program.threads + 63u) / 64u * 32u, 1u, 1u} : std::array<std::uint32_t, 3>{program.threads, 1u, 1u};
+    Require(reflection.threadsPerThreadgroup == threads, std::string(program.name) + ": threadgroup size does not match the workgroup and its lane mapping");
     const auto* buffers = reflection.table.Find(ShaderRecompiler::RuntimeAbi::Binding::Buffers);
     Require(buffers != nullptr && buffers->count == program.buffers && buffers->offset == 0u, std::string(program.name) + ": the descriptor table lacks the guest buffers");
     Require(reflection.table.bytes == program.buffers * sizeof(ShaderRecompiler::MslAbi::BufferEntry), std::string(program.name) + ": unexpected descriptor table size");
-    MTLCompileOptions* options = [MTLCompileOptions new];
-    options.languageVersion = MTLLanguageVersion4_0;
-    options.mathMode = MTLMathModeSafe;
-    NSError* error = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:result.msl.Source().c_str()] options:options error:&error];
-    if (library == nil) {
-        std::cerr << result.msl.Source() << '\n';
-        throw std::runtime_error(std::string(program.name) + ": MSL does not compile: " + Describe(error));
-    }
+    id<MTLLibrary> library = CompileLibrary(device, program.name, result.msl.Source());
     MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
     for (const auto& constant : result.specialization) {
         const std::uint32_t value = constant.value;
         [constants setConstantValue:&value type:MTLDataTypeUInt atIndex:constant.id];
     }
+    NSError* error = nil;
     id<MTLFunction> function = [library newFunctionWithName:@(ShaderRecompiler::MslAbi::EntryPoint) constantValues:constants error:&error];
     Require(function != nil, std::string(program.name) + ": the library has no specializable entry point: " + Describe(error));
     id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
     Require(pipeline != nil, std::string(program.name) + ": compute pipeline creation failed: " + Describe(error));
-    Require(pipeline.maxTotalThreadsPerThreadgroup >= program.threads, std::string(program.name) + ": the pipeline cannot run the workgroup");
+    Require(pipeline.maxTotalThreadsPerThreadgroup >= threads[0] * threads[1] * threads[2], std::string(program.name) + ": the pipeline cannot run the workgroup");
+}
+
+// Every RuntimeAbi binding kind in one table (two entries each): the member types MetalBackend
+// declares must compile, and the static assertions MslTableDeclaration adds check that Metal lays
+// the struct out as MslAbi::LayoutTable does. Each texture is touched so its type is instantiated.
+void TableTypesCheck(id<MTLDevice> device) {
+    using ShaderRecompiler::RuntimeAbi::Binding;
+    std::vector<ShaderRecompiler::MslAbi::TableBinding> bindings;
+    for (std::uint32_t kind = 0; kind < static_cast<std::uint32_t>(Binding::Count); ++kind) bindings.push_back({static_cast<Binding>(kind), 2u});
+    const auto layout = ShaderRecompiler::MslAbi::LayoutTable(bindings);
+    std::string source = "#include <metal_stdlib>\nusing namespace metal;\n\n" + std::string(ShaderRecompiler::MslCorePrelude(ShaderRecompiler::MslPreludeChunk::Common).text) + ShaderRecompiler::MslTableDeclaration(layout);
+    source += "kernel void aps5_main(device const Aps5Table& aps5_table [[buffer(0)]], device uint* out [[buffer(1)]]) {\n    uint width = 0u;\n";
+    for (const auto& range : layout.ranges) {
+        if (range.kind != ShaderRecompiler::MslAbi::EntryKind::Texture) continue;
+        const auto field = "aps5_table." + ShaderRecompiler::MslTableField(range.binding) + "[1]";
+        source += "    width += is_null_texture(" + field + ") ? 0u : " + field + ".get_width();\n";
+    }
+    source += "    out[0] = width + aps5_table.buffers[1].bytes;\n}\n";
+    id<MTLLibrary> library = CompileLibrary(device, "descriptor table types", source);
+    NSError* error = nil;
+    id<MTLFunction> function = [library newFunctionWithName:@(ShaderRecompiler::MslAbi::EntryPoint)];
+    Require(function != nil, "descriptor table types: the library has no entry point");
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    Require(pipeline != nil, "descriptor table types: compute pipeline creation failed: " + Describe(error));
 }
 
 }
@@ -113,11 +169,13 @@ int main() {
             Require(device.Target().backend == ShaderRecompiler::ShaderBackend::Msl, "the Metal device target does not select the MSL backend");
             NSError* error = nil;
             Require([metal newLibraryWithSource:@"kernel void aps5_main(device uint* x [[buffer(0)]]) { x[0] = undefined_name; }" options:nil error:&error] == nil && error != nil, "the checker accepted invalid MSL");
-            std::vector<std::uint32_t> backing(256u, 0u);
+            std::vector<std::uint32_t> backing(512u, 0u);
             for (const auto& program : Programs) {
                 CompileCheck(metal, program, Recompile(device, program, backing));
                 std::printf("%s: MSL compiled\n", program.name);
             }
+            TableTypesCheck(metal);
+            std::puts("descriptor table types: MSL compiled");
         }
         std::puts("msl compile check passed");
         return 0;

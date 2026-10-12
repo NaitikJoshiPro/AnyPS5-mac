@@ -1,6 +1,6 @@
 # Work package B1 (MetalBackend core): Metal-only tests. Included by Metal.cmake when BUILD_TESTING is on.
 add_test_executable(agc_metal_msl_compile_tests ${agcMetalDir}/tests/MslCompileCheck.mm)
-target_include_directories(agc_metal_msl_compile_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+target_include_directories(agc_metal_msl_compile_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES> ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
 target_link_libraries(agc_metal_msl_compile_tests PRIVATE libSceAgcDriver SDL2-static libc "-framework Metal" "-framework Foundation")
 set_source_files_properties(${agcMetalDir}/tests/MslCompileCheck.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 set_target_properties(agc_metal_msl_compile_tests PROPERTIES CXX_EXTENSIONS OFF OBJCXX_STANDARD 20)
