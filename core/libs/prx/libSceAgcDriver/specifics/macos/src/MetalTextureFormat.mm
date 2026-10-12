@@ -1,6 +1,10 @@
 // Work package D4: guest texture formats as Metal pixel formats (the Metal twin of the table in
 // Graphics/src/TextureFormat.cpp, whose CPU helpers the rest of the driver keeps using).
 #include "MetalImages.h"
+#include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+
+#include <cstdlib>
+#include <cstring>
 
 #include <stdexcept>
 #include <string>
@@ -90,7 +94,21 @@ constexpr Entry Formats[] = {
 
 }
 
+std::uint32_t SrgbDecodeFormats() {
+    // Metal samples R8 and RG8 sRGB natively, but its decode differs from the hardware-measured
+    // table in the low codes; APS5_SRGB_SHADER_DECODE=1 moves the decode into the shader (the
+    // device reports these bits in Target().srgbDecodeFormats and the views use the UNORM format).
+    const char* forced = std::getenv("APS5_SRGB_SHADER_DECODE");
+    if (forced == nullptr || std::strcmp(forced, "1") != 0) return 0u;
+    using ShaderRecompiler::IrBufferFormat;
+    return ShaderRecompiler::SrgbDecodeBit(IrBufferFormat::Format8Srgb) | ShaderRecompiler::SrgbDecodeBit(IrBufferFormat::Format8_8Srgb);
+}
+
 TextureFormatInfo GuestTextureFormat(std::uint32_t guestFormat) {
+    const auto decode = SrgbDecodeFormats();
+    if (decode != 0u && (decode & ShaderRecompiler::SrgbDecodeBit(static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat))) != 0u) {
+        guestFormat = static_cast<std::uint32_t>(ShaderRecompiler::SrgbUnormFormat(static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat)));
+    }
     // Formats 30, 34 and 43 (11_11_10 and 10_11_11 variants) are read as R32 uint and unpacked in the
     // shader (ImageResource::conversionFormat), as on the Vulkan path.
     const auto remapped = guestFormat == 30u || guestFormat == 34u || guestFormat == 43u ? 20u : guestFormat;

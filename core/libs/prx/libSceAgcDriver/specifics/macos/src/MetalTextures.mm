@@ -281,7 +281,8 @@ id<MTLSamplerState> ImageCache::Sampler(std::span<const std::uint32_t> words, bo
             return found->second;
         }
     }
-    const auto decoded = DecodeSamplerResource(words, unnormalized, false, integerBorder);
+    // FORCE_DEGAMMA pairs only with sRGB textures (ImageBindings::Prepare checks), whose views decode.
+    const auto decoded = DecodeSamplerResource(words, unnormalized, true, integerBorder);
     if (decoded.unnormalizedCoordinates && compare) FailD5("a sampler with unnormalized coordinates enables depth comparison, which is not implemented");
     MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
     descriptor.supportArgumentBuffers = YES;
@@ -406,7 +407,7 @@ std::shared_ptr<GuestSurface> ImageBindings::surface(std::span<const std::uint32
     return result;
 }
 
-std::uint64_t ImageBindings::view(GuestSurface& surface, std::uint32_t heapNumber, bool firstLayer, std::uint32_t mip) {
+std::uint64_t ImageBindings::view(GuestSurface& surface, std::uint32_t heapNumber, bool firstLayer, std::uint32_t mip, bool baseLevelOnly) {
     const auto heap = HeapOf(heapNumber);
     const auto& resource = surface.resource;
     const auto type = HeapTextureType(heap.dimension);
@@ -417,7 +418,7 @@ std::uint64_t ImageBindings::view(GuestSurface& surface, std::uint32_t heapNumbe
     const bool arrayView = type == MTLTextureType2DArray;
     if ((type == MTLTextureType3D) != (textureType == MTLTextureType3D)) Fail("a " + std::string(type == MTLTextureType3D ? "3D" : "2D") + " image heap binds a guest texture of dimension " + std::to_string(static_cast<int>(resource.dimension)));
     const auto lastLevel = std::min(resource.lastLevel, resource.mipCount - 1u);
-    const NSRange levels = storage ? NSMakeRange(mip, 1) : NSMakeRange(resource.baseLevel, lastLevel >= resource.baseLevel ? lastLevel - resource.baseLevel + 1u : 1u);
+    const NSRange levels = storage ? NSMakeRange(mip, 1) : NSMakeRange(resource.baseLevel, baseLevelOnly || lastLevel < resource.baseLevel ? 1u : lastLevel - resource.baseLevel + 1u);
     NSRange slices = NSMakeRange(0, 1);
     if (textureType == MTLTextureType2DArray) {
         const auto layers = surface.geometry.imageLayers;
@@ -465,13 +466,47 @@ std::uint64_t ImageBindings::view(GuestSurface& surface, std::uint32_t heapNumbe
     return ResourceId(view);
 }
 
+void ImageBindings::Prepare(std::span<const ShaderRecompiler::DescriptorBinding> bindings) {
+    const ShaderRecompiler::DescriptorBinding* samplerBinding = nullptr;
+    for (const auto& binding : bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) samplerBinding = &binding;
+    }
+    if (samplerBinding == nullptr) return;
+    const auto count = samplerBinding->guestDescriptor.size() / 4u;
+    samplerWords.resize(count);
+    std::vector<bool> single(count, false);
+    std::vector<bool> mipmapped(count, false);
+    for (std::size_t element = 0; element < count; ++element) std::copy_n(samplerBinding->guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element * 4u), 4, samplerWords[element].begin());
+    for (const auto& binding : bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::SampledImage) continue;
+        const auto elementWords = binding.guestDescriptor.size() / std::max<std::size_t>(binding.count, 1u);
+        for (std::size_t element = 0; element < binding.count && element < binding.imageSamplers.size(); ++element) {
+            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * elementWords, 8u);
+            if (AllZero(words)) continue;
+            const auto mask = binding.imageSamplers[element];
+            const bool singleLevel = DescriptorSingleLevel(words);
+            const auto format = DecodeTextureResource(words).format;
+            for (std::uint32_t sampler = 0; sampler < 32u && sampler < count; ++sampler) {
+                if (((mask >> sampler) & 1u) == 0u) continue;
+                (singleLevel ? single : mipmapped)[sampler] = true;
+                const bool forcesDegamma = ((samplerWords[sampler][0] >> 20u) & 1u) != 0u;
+                if (forcesDegamma && !IsSrgbTextureFormat(format)) FailD5("a texture of guest format " + std::to_string(format) + ", which is not sRGB, is sampled through a sampler that forces sRGB decoding, which is not implemented");
+            }
+        }
+    }
+    for (std::size_t element = 0; element < count; ++element) {
+        if (const auto variant = SingleLevelSamplerWords(std::span<const std::uint32_t, 4>(samplerWords[element]), single[element], mipmapped[element])) samplerWords[element] = *variant;
+    }
+}
+
 void ImageBindings::Write(const ShaderRecompiler::DescriptorBinding& binding, std::span<std::uint64_t> entries) {
     if (committed) FailD5("image bindings written after Commit");
     const auto heap = binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
     if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) {
         if (binding.guestDescriptor.size() < entries.size() * 4u) FailD5("a guest sampler binding has fewer than four words per element");
         for (std::size_t element = 0; element < entries.size(); ++element) {
-            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u);
+            auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u);
+            if (element < samplerWords.size()) words = samplerWords[element];
             const bool compare = element < binding.samplerDepthCompare.size() && binding.samplerDepthCompare[element];
             const bool unnormalized = element < binding.samplerUnnormalized.size() && binding.samplerUnnormalized[element];
             const bool integerBorder = element < binding.samplerIntegerBorder.size() && binding.samplerIntegerBorder[element];
@@ -506,8 +541,25 @@ void ImageBindings::Write(const ShaderRecompiler::DescriptorBinding& binding, st
         }
         const auto mip = storage ? std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u) : 0u;
         const bool elementAtomic = atomic || (element < binding.imageAtomic.size() && binding.imageAtomic[element]);
+        bool baseLevelOnly = false;
+        if (!storage && element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
+            // Unnormalized sampling (ShaderResources::resolveImageBinding): a single-layer 1D or 2D
+            // view without a minimum LOD clamp that is single-level at mip 0, or read only by
+            // image_sample_lz (then viewed at its base level alone).
+            const auto lastLevel = std::min(resource.lastLevel, resource.mipCount - 1u);
+            const auto levelCount = lastLevel >= resource.baseLevel ? lastLevel - resource.baseLevel + 1u : 1u;
+            const auto layerCount = firstLayer || resource.dimension == TextureDimension::k1D || resource.dimension == TextureDimension::k2D ? 1u : DescribeSurface(resource).imageLayers - resource.baseArray;
+            const bool exactAtBase = element < binding.imageUnnormalizedBaseLevel.size() && binding.imageUnnormalizedBaseLevel[element];
+            const bool singleLevel = levelCount == 1u && resource.baseLevel == 0u;
+            const bool planar = resource.dimension == TextureDimension::k1D || resource.dimension == TextureDimension::k2D || firstLayer;
+            const bool supported = layerCount == 1u && EffectiveMinLod(resource) == 0.0f && (singleLevel || exactAtBase);
+            if (!supported || !planar) {
+                throw std::runtime_error("AGC graphics: guest texture sampled with unnormalized coordinates is not a single-layer 1D or 2D view without a minimum LOD clamp, and is neither a single-level view at mip 0 nor read only by image_sample_lz through an S# without minimum LOD or bias, which is not implemented (base level " + std::to_string(resource.baseLevel) + ", levels " + std::to_string(levelCount) + ", layers " + std::to_string(layerCount) + ")");
+            }
+            baseLevelOnly = levelCount > 1u;
+        }
         auto target = surface(words, storage, elementAtomic && storage, mip);
-        entries[element] = view(*target, heap, firstLayer, mip);
+        entries[element] = view(*target, heap, firstLayer, mip, baseLevelOnly);
         if (storage && (element >= binding.imageWritten.size() || binding.imageWritten[element] || elementAtomic)) {
             // Write back this level when the batch completes (MetalImages.h).
             auto& written = writtenLevels[target.get()];

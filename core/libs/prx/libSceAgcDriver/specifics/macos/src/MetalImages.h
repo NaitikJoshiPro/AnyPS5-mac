@@ -60,6 +60,10 @@ TextureFormatInfo GuestTextureFormat(std::uint32_t guestFormat);
 // 1 uint, 2 sint): the integer twin of a normalized format of the same size (R8Unorm → R8Uint),
 // `format` itself when it already matches or has no twin.
 MTLPixelFormat HeapViewFormat(MTLPixelFormat format, std::uint32_t numeric);
+// RecompileRequest target bits (ShaderRecompiler::SrgbDecodeBit) of the sRGB formats the shader
+// decodes itself: R8 and RG8 sRGB under APS5_SRGB_SHADER_DECODE=1, else none. GuestTextureFormat
+// then gives their UNORM format.
+std::uint32_t SrgbDecodeFormats();
 // Depth format for comparison sampling of an R32 float or R16 unorm texture.
 MTLPixelFormat DepthFormatFor(MTLPixelFormat format);
 
@@ -113,6 +117,11 @@ public:
     ImageBindings(const ImageBindings&) = delete;
     ImageBindings& operator=(const ImageBindings&) = delete;
 
+    // Optional, before the first Write: scans all of the dispatch's bindings for what the samplers
+    // depend on (the images paired with each sampler): ANISO_OVERRIDE samplers of single-level
+    // images lose their anisotropy, FORCE_DEGAMMA samplers require sRGB images (as
+    // ShaderResources::applyAnisoOverride / RequireDegammaFormat).
+    void Prepare(std::span<const ShaderRecompiler::DescriptorBinding> bindings);
     // `entries`: the binding's first min(binding.count, range.count) table entries.
     void Write(const ShaderRecompiler::DescriptorBinding& binding, std::span<std::uint64_t> entries);
     // After the dispatch is recorded into the recorder's open batch: keeps the textures alive with
@@ -124,7 +133,7 @@ public:
 
 private:
     std::shared_ptr<GuestSurface> surface(std::span<const std::uint32_t> words, bool storage, bool atomic, std::uint32_t mip);
-    std::uint64_t view(GuestSurface& surface, std::uint32_t heap, bool firstLayer, std::uint32_t mip);
+    std::uint64_t view(GuestSurface& surface, std::uint32_t heap, bool firstLayer, std::uint32_t mip, bool baseLevelOnly = false);
 
     ImageCache& cache;
     std::function<void(std::uint64_t, std::uint64_t)> settle;
@@ -132,6 +141,8 @@ private:
     std::vector<id<MTLSamplerState>> samplers;
     // Storage surfaces and the levels the dispatch may write (written back at completion).
     std::map<GuestSurface*, std::set<std::uint32_t>> writtenLevels;
+    // Prepare's adjusted sampler words per sampler element (empty: not prepared).
+    std::vector<std::array<std::uint32_t, 4>> samplerWords;
     bool committed = false;
 };
 
