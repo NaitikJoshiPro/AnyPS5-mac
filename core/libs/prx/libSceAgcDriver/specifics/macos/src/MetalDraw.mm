@@ -26,6 +26,7 @@
 #include "MetalDepthSurfaces.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "MslAbi.hpp"
+#include "PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -555,8 +556,11 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         function.macros.push_back({Abi::VertexOutputsHighMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations >> 32u)) + "u"});
         for (const auto& target : graphics.colors) {
             const auto format = Graphics::Metal::PixelFormatOf(target.format).format;
-            if (target.exportIndex < 8u && format != MTLPixelFormatInvalid) function.macros.push_back({"APS5_COLOR" + std::to_string(target.exportIndex) + "_TYPE", ColorOutputType(format)});
+            if (target.exportIndex < 8u && format != MTLPixelFormatInvalid) function.macros.push_back({std::string(Abi::ColorTypeMacroPrefix) + std::to_string(target.exportIndex) + "_TYPE", ColorOutputType(format)});
         }
+        // Dual-source blending: the fragment function writes color(0) index(1) too.
+        const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
+        if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
