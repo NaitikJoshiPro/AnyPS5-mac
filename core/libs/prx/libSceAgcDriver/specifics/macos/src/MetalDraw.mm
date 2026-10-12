@@ -646,16 +646,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // for indexed fans.
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
-    if (graphics.rectList) {
-        // Rect lists (B6/D6 interface): 6 host vertices per rect drawn as an identity index list
-        // with baseVertex = the guest first vertex, so [[vertex_id]] - [[base_vertex]] counts the
-        // host vertices and the expansion reads guest vertex base + rect * 3 + k.
-        std::uint32_t most = 0;
-        for (const auto& call : calls) most = std::max(most, call.count / 3u * 6u);
-        fanIndices.resize(most);
-        for (std::uint32_t index = 0; index < most; ++index) fanIndices[index] = index;
-        for (const auto& call : calls) fanCalls.push_back({call.count / 3u * 6u, call.instances, 0u, static_cast<std::int32_t>(call.first), call.firstInstance});
-    } else if (primitive.fan) {
+    if (primitive.fan) {
         std::vector<std::byte> guest;
         if (draw.indexed) {
             state.SettleRange(indexBegin, indexBytes);
@@ -886,7 +877,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     std::uint64_t indexAddress = 0;
     std::uint64_t indexLength = 0;
     MTLIndexType indexType = draw.indexSize == 2u ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
-    const bool expanded = primitive.fan || graphics.rectList;
+    const bool expanded = primitive.fan;
     const auto& drawCalls = expanded ? fanCalls : calls;
     const bool indexedDraw = draw.indexed || expanded;
     if (expanded) {
@@ -916,7 +907,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             [encoder setDepthBias:pass.biasConstant slopeScale:pass.biasSlope clamp:graphics.depthBias ? graphics.depthBiasClamp : 0.0f];
             for (const auto& call : drawCalls) {
                 if (call.count == 0u || call.instances == 0u) continue;
-                if (indexedDraw) {
+                if (graphics.rectList) {
+                    // Rect lists (B6/D6 interface): 6 host vertices per rect from vertex 0, the
+                    // guest first vertex in the vertex stage's DriverData.workgroupBase[0].
+                    const auto rects = call.count / 3u;
+                    if (rects == 0u) continue;
+                    [cache.vertexArguments setAddress:state.WriteDriverData(stream, {call.first, 0u, 0u}) atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:static_cast<NSUInteger>(rects) * 6u instanceCount:call.instances baseInstance:call.firstInstance];
+                } else if (indexedDraw) {
                     const auto size = indexType == MTLIndexTypeUInt16 ? 2u : 4u;
                     [encoder drawIndexedPrimitives:primitive.type indexCount:call.count indexType:indexType indexBuffer:indexAddress + static_cast<std::uint64_t>(call.first) * size indexBufferLength:indexLength - static_cast<std::uint64_t>(call.first) * size instanceCount:call.instances baseVertex:call.vertexOffset baseInstance:call.firstInstance];
                 } else {
