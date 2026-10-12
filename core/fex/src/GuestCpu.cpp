@@ -78,8 +78,7 @@ bool HasFeature(const char* name) {
 
 FEXCore::HostFeatures HostFeatures() {
     FEXCore::HostFeatures features {};
-    features.DCacheLineSize = 64;
-    features.ICacheLineSize = 64;
+    features.DCacheLineLog2 = 4; // 64-byte lines: DCacheSize() is 4 << DCacheLineLog2
     features.SupportsAES = HasFeature("FEAT_AES");
     features.SupportsCRC = HasFeature("FEAT_CRC32");
     features.SupportsSHA = HasFeature("FEAT_SHA1") && HasFeature("FEAT_SHA256");
@@ -135,12 +134,16 @@ bool IsGuestCode(std::uint64_t address) {
 
 class BridgeSyscalls final : public FEXCore::HLE::SyscallHandler {
 public:
-    explicit BridgeSyscalls(Bridge& bridge) : bridge(bridge) {
-        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
-    }
+    explicit BridgeSyscalls(Bridge& bridge) : bridge(bridge) {}
 
-    std::uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments* arguments) override {
-        return bridge.Call(frame->State, arguments->Argument[0], arguments->Argument[1]);
+    // FEX-2610 ends the block at `syscall` and runs this from the dispatcher: the guest registers are in
+    // frame->State, and execution continues at State.rip, which Bridge::Call advances past the instruction
+    // or redirects to a resumed guest frame.
+    void HandleSyscall(FEXCore::Core::CpuStateFrame* frame) override {
+        auto& state = frame->State;
+        const std::uint64_t result =
+            bridge.Call(state, state.gregs[FEXCore::X86State::REG_RAX], state.gregs[FEXCore::X86State::REG_RDI]);
+        state.gregs[FEXCore::X86State::REG_RAX] = result;
     }
 
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
@@ -213,8 +216,10 @@ public:
         const std::uint64_t fs = guestCode.tls == nullptr ? 0 : reinterpret_cast<std::uint64_t>(CreateThreadPointer(*guestCode.tls, &tls));
         {
             std::lock_guard lock(threadsMutex);
-            thread = guestCode.context->CreateThread(rip, rsp);
+            thread = guestCode.context->CreateThread();
         }
+        thread->CurrentFrame->State.rip = rip;
+        thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = rsp;
         callRet = mmap(nullptr, ThreadState::CALLRET_STACK_SIZE + 2 * Page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (callRet == MAP_FAILED) throw std::runtime_error("cannot allocate the call-return stack");
         thread->CallRetStackBase = static_cast<std::uint8_t*>(callRet) + Page;
@@ -466,15 +471,13 @@ namespace {
 class BareSyscalls final : public FEXCore::HLE::SyscallHandler {
 public:
     BareSyscalls(FEXCore::Context::Context& context, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& executable)
-        : context(context), executable(executable) {
-        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
-    }
+        : context(context), executable(executable) {}
 
-    std::uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments* arguments) override {
+    void HandleSyscall(FEXCore::Core::CpuStateFrame* frame) override {
         frame->State.rip += 2;
-        if (count++ == 0) first = arguments->Argument[0];
+        if (count++ == 0) first = frame->State.gregs[FEXCore::X86State::REG_RAX];
         constexpr std::uint64_t LinuxNoSyscall = 38;
-        return -LinuxNoSyscall;
+        frame->State.gregs[FEXCore::X86State::REG_RAX] = -LinuxNoSyscall;
     }
 
     void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState*, std::uint64_t start, std::uint64_t length) override {

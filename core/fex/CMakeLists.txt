@@ -36,6 +36,9 @@ ExternalProject_Add(fexcore
         -DENABLE_ASSERTIONS=OFF
         -DENABLE_CCACHE=OFF
         -DENABLE_LTO=OFF
+        # GDBJIT.cpp includes GDB's GPL-3.0 <gdb/jit-reader.h> when this is on; FEX turns it on by default
+        # whenever the header is installed. tools/mac/check_fex_licence.py checks this line.
+        -DENABLE_GDB_SYMBOLS=OFF
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target FEXCore FEXCore_Base JemallocLibs xxhash --parallel ${APS5_FEX_JOBS}
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
