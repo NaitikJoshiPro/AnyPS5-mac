@@ -19,6 +19,7 @@ if(BUILD_TESTING)
     target_link_libraries(guest_amm_placement_tests PRIVATE libSceAmpr libkernel libc)
     configure_windows_unwind(guest_amm_placement_tests)
     add_test(NAME guest_amm_placement COMMAND guest_amm_placement_tests)
+    set_tests_properties(guest_amm_placement PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(guest_amm_placement PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAmpr>")

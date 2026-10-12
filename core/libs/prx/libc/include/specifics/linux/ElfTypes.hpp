@@ -20,6 +20,8 @@ struct dl_phdr_info {
     const char* dlpi_name;
     const Elf64_Phdr* dlpi_phdr;
     std::uint16_t dlpi_phnum;
+    unsigned long long dlpi_adds;
+    unsigned long long dlpi_subs;
 };
 
 static constexpr std::uint32_t PT_LOAD = 1;

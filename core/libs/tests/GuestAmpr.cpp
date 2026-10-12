@@ -1231,10 +1231,12 @@ int main() {
     TestResolveFailures();
     TestMalformedCommandSizes();
     TestGatherScatter();
-    TestAmmRangesAboveHintedMaps();
-    TestAmm();
-    TestAmmRemapAndProtect();
-    TestAmmPrt();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+        TestAmmRangesAboveHintedMaps();
+        TestAmm();
+        TestAmmRemapAndProtect();
+        TestAmmPrt();
+    }
     TestKernelWriteCommands();
     return 0;
 }

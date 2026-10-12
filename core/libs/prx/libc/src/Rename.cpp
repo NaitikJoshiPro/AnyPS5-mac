@@ -33,7 +33,10 @@ static int RenamePath_nid_no_patch(const std::filesystem::path& source, const st
     bool sameFile = false;
     if (destinationExists) {
         error.clear();
-        sameFile = fs::equivalent(source, destination, error);
+        const bool destinationResolves = fs::exists(fs::status(destination, error));
+        if (error && error != std::errc::no_such_file_or_directory) return FilesystemError(error);
+        error.clear();
+        if (destinationResolves) sameFile = fs::equivalent(source, destination, error);
         if (error == std::errc::no_such_file_or_directory) error.clear();
         if (error) return FilesystemError(error);
         if (!sameFile && sourceIsDirectory && !destinationIsDirectory) return GuestEnotdir;

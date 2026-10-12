@@ -5,6 +5,10 @@
 
 #include <cerrno>
 #include <string>
+#ifdef __APPLE__
+#include <climits>
+#include <fcntl.h>
+#endif
 
 #ifdef _WIN32
 
@@ -160,9 +164,15 @@ namespace File {
 std::optional<std::filesystem::path> DirectoryDescriptorPath(int fd) {
     if (fd < 0) return std::nullopt;
     std::error_code error;
+#ifdef __APPLE__
+    char buffer[PATH_MAX];
+    if (::fcntl(fd, F_GETPATH, buffer) != 0) return std::nullopt;
+    const std::filesystem::path target(buffer);
+#else
     const auto link = std::filesystem::path("/proc/self/fd") / std::to_string(fd);
     const auto target = std::filesystem::read_symlink(link, error);
     if (error) return std::nullopt;
+#endif
     if (!std::filesystem::is_directory(target, error)) return std::nullopt;
     return target;
 }

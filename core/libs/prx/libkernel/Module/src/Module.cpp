@@ -22,6 +22,45 @@
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #endif
 
+#ifdef __APPLE__
+namespace {
+void FillEhFrame(const dl_phdr_info& image, ModuleInfoForUnwind* info) {
+  const auto* header = reinterpret_cast<const std::uint8_t*>(info->eh_frame_hdr_addr);
+  if (header[0] != 1) return;
+  const auto encoding = header[1];
+  const auto application = encoding & 0x70;
+  if ((encoding & 0x80) != 0 || (application != 0x00 && application != 0x10)) return;
+  const auto* at = header + 4;
+  std::uint64_t frames = 0;
+  switch (encoding & 0x0f) {
+  case 0x03: { std::uint32_t v; std::memcpy(&v, at, 4); frames = v; break; }
+  case 0x0b: { std::int32_t v; std::memcpy(&v, at, 4); frames = static_cast<std::uint64_t>(static_cast<std::int64_t>(v)); break; }
+  case 0x04: case 0x0c: std::memcpy(&frames, at, 8); break;
+  default: return;
+  }
+  if (application == 0x10) frames += reinterpret_cast<std::uint64_t>(at);
+  std::uint64_t limit = 0;
+  for (std::uint16_t index = 0; index < image.dlpi_phnum; ++index) {
+    const auto& load = image.dlpi_phdr[index];
+    const std::uint64_t start = image.dlpi_addr + load.p_vaddr;
+    if (load.p_type == PT_LOAD && frames >= start && frames - start < load.p_memsz) limit = start + load.p_memsz;
+  }
+  if (limit == 0) return;
+  auto record = frames;
+  for (;;) {
+    if (limit - record < 4) return;
+    std::uint32_t length = 0;
+    std::memcpy(&length, reinterpret_cast<const void*>(record), 4);
+    if (length == 0) break;
+    if (length == 0xffffffffu || length > limit - record - 4) return;
+    record += 4 + length;
+  }
+  info->eh_frame_addr = frames;
+  info->eh_frame_size = record - frames;
+}
+}
+#endif
+
 #ifdef _WIN32
 namespace {
 void FillGuestUnwindInfo(const std::uint8_t* base, ModuleInfoForUnwind* info) {
@@ -146,6 +185,7 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
     info->eh_frame_hdr_addr = frames != nullptr ? image->dlpi_addr + frames->p_vaddr : 0;
     info->eh_frame_addr = 0;
     info->eh_frame_size = 0;
+    if (info->eh_frame_hdr_addr != 0) FillEhFrame(*image, info);
     info->seg0_addr = image->dlpi_addr + first->p_vaddr;
     info->seg0_size = first->p_memsz;
     search.found = true;

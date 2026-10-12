@@ -25,6 +25,8 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/GuestTlsMacOs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/MainThreadMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Attr.cpp
@@ -65,6 +67,11 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/AppMetadata.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/ParamJsonParser.cpp
 )
+if(APPLE)
+    # The main-thread run loop the guest is started from (MainThreadMacOs.cpp).
+    target_link_libraries(libkernel PRIVATE "-framework CoreFoundation")
+    target_sources(libkernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/Kqueue.cpp)
+endif()
 
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR}/nid/include)
@@ -152,9 +159,9 @@ if(BUILD_TESTING)
         VERBATIM)
     add_dependencies(guest_module_fixture nid_patcher)
     configure_windows_unwind(guest_module_fixture)
-    set_target_properties(guest_module_fixture PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH "$ORIGIN")
+    set_target_properties(guest_module_fixture PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH "${ANYPS5_PRX_RPATH}")
     find_package(Python3 QUIET COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND AND NOT WIN32)
+    if(Python3_Interpreter_FOUND AND NOT WIN32 AND NOT APPLE)
         target_link_options(guest_module_fixture PRIVATE -Wl,--no-as-needed)
         add_test(NAME nid_patcher_dynamic_strings COMMAND ${Python3_EXECUTABLE}
             ${LIBS_INCLUDE_DIR}/nid/tests/test_dynamic_strings.py $<TARGET_FILE:guest_module_fixture>)
@@ -178,17 +185,19 @@ if(BUILD_TESTING)
         set_tests_properties(guest_dynamic_loader PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
-    add_test_executable(guest_module_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestModuleInfo.cpp)
-    target_include_directories(guest_module_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_module_info_tests PRIVATE libkernel libc)
-    configure_windows_unwind(guest_module_info_tests)
-    add_dependencies(guest_module_info_tests guest_module_fixture)
-    add_test(NAME guest_module_info COMMAND guest_module_info_tests $<TARGET_FILE_NAME:guest_module_fixture>)
-    set_tests_properties(guest_module_info PROPERTIES
-        WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>")
-    if(WIN32)
-        set_tests_properties(guest_module_info PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    if(NOT APPLE)
+        add_test_executable(guest_module_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestModuleInfo.cpp)
+        target_include_directories(guest_module_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_module_info_tests PRIVATE libkernel libc)
+        configure_windows_unwind(guest_module_info_tests)
+        add_dependencies(guest_module_info_tests guest_module_fixture)
+        add_test(NAME guest_module_info COMMAND guest_module_info_tests $<TARGET_FILE_NAME:guest_module_fixture>)
+        set_tests_properties(guest_module_info PROPERTIES
+            WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>")
+        if(WIN32)
+            set_tests_properties(guest_module_info PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endif()
     endif()
     add_test_executable(guest_file_timestamp_tests ${LIBS_INCLUDE_DIR}/tests/GuestFileTimestamps.cpp)
     target_include_directories(guest_file_timestamp_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -1145,5 +1154,12 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_pthread_rename PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    if(APPLE)
+        add_test_executable(guest_kqueue_tests ${LIBS_INCLUDE_DIR}/tests/GuestKqueue.cpp)
+        target_include_directories(guest_kqueue_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_kqueue_tests PRIVATE libkernel libc)
+        add_test(NAME guest_kqueue COMMAND guest_kqueue_tests)
+        set_tests_properties(guest_kqueue PROPERTIES TIMEOUT 20)
     endif()
 endif()

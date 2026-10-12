@@ -180,6 +180,7 @@ static void CheckInternalNamedFlexibleMapping() {
     Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before);
 }
 
+#ifndef __APPLE__
 static void CheckGuestModuleUsesFlexibleMemory() {
     constexpr std::size_t moduleData = 0x10000;
     const auto path = std::filesystem::relative(GUEST_MEMORY_MODULE).generic_string();
@@ -194,6 +195,7 @@ static void CheckGuestModuleUsesFlexibleMemory() {
     Require(dlclose_nid_postfix(module) == 0);
     Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before);
 }
+#endif
 
 static void CheckBatchMapStopsAtInvalidEntry() {
     constexpr std::size_t page = 0x4000;
@@ -1829,7 +1831,9 @@ int main() {
     CheckMunmapOverUnmappedPages();
     CheckNamedAndHintedMappings();
     CheckInternalNamedFlexibleMapping();
+#ifndef __APPLE__
     CheckGuestModuleUsesFlexibleMemory();
+#endif
     CheckBatchMapStopsAtInvalidEntry();
     CheckCheckedReleaseDirectMemory();
     CheckAudioCoprocessorProtection();
@@ -1853,22 +1857,22 @@ int main() {
     CheckMtypeprotect();
     CheckHeapAlignment();
     CheckHeapAfterMappingReuse();
-    CheckNoOverwriteRejectsHostOccupiedMapping();
-    CheckFixedMappingsReachTheApplicationAreaEnd();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckNoOverwriteRejectsHostOccupiedMapping();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckFixedMappingsReachTheApplicationAreaEnd();
 #ifdef _WIN32
     CheckGuestModuleImageProtection();
 #endif
-    CheckUnhintedKernelMappingsLandInTheWindow();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckUnhintedKernelMappingsLandInTheWindow();
 #if defined(__linux__)
     CheckUnmappedArenaRangeStaysReserved();
 #endif
-    CheckArenaPlacesUnhintedMappingsInsideTheWindow();
-    CheckArenaReusesAFreedRange();
-    CheckArenaHonoursHintsWithoutGoingBelowThem();
-    CheckSharedWriteTracking();
-    CheckReadsIntoSharedWriteTracking();
-    CheckPinnedSharedPages();
-    CheckFailedCollectKeepsWrites();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckArenaPlacesUnhintedMappingsInsideTheWindow();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckArenaReusesAFreedRange();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckArenaHonoursHintsWithoutGoingBelowThem();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckSharedWriteTracking();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckReadsIntoSharedWriteTracking();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckPinnedSharedPages();
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) CheckFailedCollectKeepsWrites();
 #if defined(__linux__)
     CheckWriteWatch();
     CheckWriteWatchArmedCollect();

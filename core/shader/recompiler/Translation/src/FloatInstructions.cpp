@@ -359,6 +359,8 @@ bool TranslationContext::vLdexpF16(const RdnaInstruction& inst) {
         const IrU1 tiny(ir.ULessThan(ir.BitwiseAnd(ir.BitCastU32(product.Value()), ir.Constant(0x7fffffffu)), ir.Constant(0x38800000u)));
         result = IrU32(ir.Select(tiny.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x8000u)), result.Value()));
     }
+    // ldexp keeps the sign; Metal returned +0.0 for -0.0 scaled up, so the sign comes from the input.
+    result = IrU32(ir.BitwiseOr(result.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x8000u))));
     const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(source.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
     write16Bits(inst.destination, clampF16Bits(inst.destination, IrU32(ir.Select(nan.Value(), quietNan16(source).Value(), result.Value()))));
     return true;

@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cwchar>
 #include <cstdio>
+#include <cerrno>
+#include <cinttypes>
 #include <limits>
 #include <string>
 
@@ -43,6 +45,21 @@ auto ParseAsciiPrefix(const char16_t* text, char16_t** end, TParse parse) {
     const auto value = parse(prefix.c_str(), &parsedEnd);
     if (end != nullptr) *end = const_cast<char16_t*>(text) + (parsedEnd - prefix.c_str());
     return value;
+}
+
+// Darwin's strto* set EINVAL when no digits are converted; the guest's leave errno untouched then.
+template <class Convert>
+auto ConvertInteger(const char* str, char** endptr, int base, Convert convert) {
+#ifdef __APPLE__
+    const int saved = errno;
+    char* end = nullptr;
+    const auto value = convert(str, &end, base);
+    if (errno == EINVAL && end == str && (base == 0 || (base >= 2 && base <= 36))) errno = saved;
+    if (endptr != nullptr) *endptr = end;
+    return value;
+#else
+    return convert(str, endptr, base);
+#endif
 }
 
 }
@@ -146,22 +163,32 @@ bool StopAtPrefixLetter_nid_no_patch(const char* str, char** endptr, int base) {
 
 std::int64_t APS5_VABI strtol_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoll(str, endptr, base);
+    return ConvertInteger(str, endptr, base, std::strtoll);
 }
 
 std::uint64_t APS5_VABI strtoul_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoull(str, endptr, base);
+    return ConvertInteger(str, endptr, base, std::strtoull);
 }
 
 long long APS5_VABI strtoll_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoll(str, endptr, base);
+    return ConvertInteger(str, endptr, base, std::strtoll);
 }
 
 unsigned long long APS5_VABI strtoull_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoull(str, endptr, base);
+    return ConvertInteger(str, endptr, base, std::strtoull);
+}
+
+std::intmax_t APS5_VABI strtoimax_nid_postfix(const char* str, char** endptr, int base) {
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    return ConvertInteger(str, endptr, base, std::strtoimax);
+}
+
+std::uintmax_t APS5_VABI strtoumax_nid_postfix(const char* str, char** endptr, int base) {
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    return ConvertInteger(str, endptr, base, std::strtoumax);
 }
 
 double APS5_VABI strtod_nid_postfix(const char* str, char** endptr) {
@@ -466,19 +493,19 @@ long double APS5_VABI wcstold_nid_postfix(const char16_t* str, char16_t** endptr
 }
 
 long long APS5_VABI wcstol_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : ConvertInteger(text, end, base, std::strtoll); });
 }
 
 long long APS5_VABI wcstoll_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : ConvertInteger(text, end, base, std::strtoll); });
 }
 
 unsigned long long APS5_VABI wcstoul_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : ConvertInteger(text, end, base, std::strtoull); });
 }
 
 unsigned long long APS5_VABI wcstoull_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : ConvertInteger(text, end, base, std::strtoull); });
 }
 
 std::uint64_t APS5_VABI _WStoul_nid_postfix(const char16_t* str, char16_t** endptr, int base) {

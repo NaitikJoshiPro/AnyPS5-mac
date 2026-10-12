@@ -12,6 +12,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
 #else
 #include <dlfcn.h>
 #include <sched.h>
@@ -42,7 +46,7 @@ void LogOnce(const char* role, const std::string& text) {
     std::fprintf(stderr, "[thread-priority] %s: %s\n", role, text.c_str());
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 
 struct DBusConnection;
 struct DBusMessage;
@@ -266,6 +270,18 @@ void Raise(const char* role) {
         throw std::runtime_error(std::string("APS5_THREAD_PRIORITY=high: ") + role + " nice " + std::to_string(nice) + " refused: " + failure);
     }
     LogOnce(role, "nice " + std::to_string(nice) + " via rtkit");
+}
+
+#elif defined(__APPLE__)
+
+void Raise(const char* role) {
+    const bool realtime = RequestedMode() == ThreadPriorityMode::Realtime;
+    thread_precedence_policy_data_t precedence{realtime ? 63 : 47};
+    const auto result = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_PRECEDENCE_POLICY, reinterpret_cast<thread_policy_t>(&precedence), THREAD_PRECEDENCE_POLICY_COUNT);
+    if (result != KERN_SUCCESS) {
+        throw std::runtime_error(std::string("APS5_THREAD_PRIORITY: ") + role + " thread_policy_set failed (kern_return " + std::to_string(result) + ")");
+    }
+    LogOnce(role, "precedence " + std::to_string(precedence.importance));
 }
 
 #else

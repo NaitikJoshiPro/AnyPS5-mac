@@ -250,6 +250,10 @@ void importedFreshTests(const Context& context) {
 }
 
 void importWatchTests() {
+#ifdef __APPLE__
+    std::cout << "host memory imports do not exist under MoltenVK: import watch not tested\n";
+    return;
+#endif
 #ifndef _WIN32
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
         std::cout << "write watch unavailable: import watch not tested\n";

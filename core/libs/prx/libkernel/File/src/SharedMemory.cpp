@@ -31,6 +31,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cstdio>
+#ifdef __APPLE__
+#include <filesystem>
+#endif
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
@@ -107,7 +110,7 @@ int GuestError(int error) {
     }
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 int NamedGuestError(int error) {
     switch (error) {
     case ENOENT:
@@ -208,6 +211,13 @@ int CreateAnonymousFile() {
     }
     errno = EEXIST;
     return -1;
+#elif defined(__APPLE__)
+    auto path = (std::filesystem::temp_directory_path() / "anyps5-shm-XXXXXX").string();
+    const int descriptor = mkstemp(path.data());
+    if (descriptor < 0) return -1;
+    unlink(path.c_str());
+    fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    return descriptor;
 #else
     const int descriptor = memfd_create("anyps5 shm_open", MFD_CLOEXEC);
     return descriptor;
@@ -455,7 +465,7 @@ extern "C" int APS5_VABI shm_open_nid_postfix(const char* path, int flags, int m
     if (accessMode != SCE_KERNEL_O_RDONLY && accessMode != SCE_KERNEL_O_RDWR) return Fail(GuestInvalid);
     if ((flags & ~AcceptedFlags) != 0) return Fail(GuestInvalid);
     if (path != anonymousObject) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         NotImplemented_nid_no_patch("shm_open of a named object");
 #else
         return OpenNamedFile(path, flags, mode);
@@ -470,7 +480,7 @@ extern "C" int APS5_VABI shm_open_nid_postfix(const char* path, int flags, int m
 }
 
 extern "C" int APS5_VABI shm_unlink_nid_postfix(const char* path) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     (void)path;
     NotImplemented_nid_no_patch("shm_unlink of a named object");
 #else

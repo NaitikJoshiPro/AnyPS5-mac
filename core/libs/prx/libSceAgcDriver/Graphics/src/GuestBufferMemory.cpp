@@ -10,11 +10,14 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <fcntl.h>
+#ifdef __linux__
 #include <linux/udmabuf.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -116,7 +119,7 @@ namespace {
 struct RetiredImport;
 
 struct AddressSpaceCache {
-    std::atomic<std::shared_ptr<const GuestBufferMemory::AddressSpace>> current;
+    AtomicSharedPtr<const GuestBufferMemory::AddressSpace> current;
     std::atomic<std::uint64_t> serials{0};
     // Set by the waiter's drop, cleared by the next publish: the rebuild's reason.
     std::atomic<bool> droppedByWaiter{false};
@@ -265,7 +268,7 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     return bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, &import, pointer.memoryTypeBits, allocated, failure);
 }
 
-#ifndef _WIN32
+#ifdef __linux__
 int udmabufDevice() {
     static const int device = [] {
         const int result = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
@@ -307,7 +310,7 @@ const char* createDmaBufImport(const Context& context, HostImport& entry, int fi
 }
 #endif
 
-#ifndef _WIN32
+#ifdef __linux__
 constexpr std::uint64_t ImportChunkBytes = std::uint64_t{64} << 20u;
 
 struct ImportChunk {
@@ -454,7 +457,7 @@ const char* createChunkedDmaBufImport(const Context& context, HostImport& entry,
 
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
     const char* step = createHostPointerImport(context, entry, failure);
-#ifndef _WIN32
+#ifdef __linux__
     int file = -1;
     std::uint64_t offset = 0;
     if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), &file, &offset)) {
@@ -1872,6 +1875,10 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context) {
 #ifdef _WIN32
     static_cast<void>(context);
     probe.failure = "the Linux write watch";
+    return probe;
+#elif !defined(__linux__)
+    static_cast<void>(context);
+    probe.failure = "dma-buf import support";
     return probe;
 #else
     if (!context.dmaBufImport) {

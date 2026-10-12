@@ -16,6 +16,13 @@
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#ifndef _WIN32
+#ifdef RUSAGE_THREAD
+#define THREAD_USAGE RUSAGE_THREAD
+#else
+#define THREAD_USAGE RUSAGE_SELF
+#endif
+#endif
 
 extern "C" {
 int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
@@ -65,7 +72,7 @@ void benchmark(bool labels = false, bool backing = true) {
         for (unsigned pass = 0; pass < 10; ++pass) {
 #ifndef _WIN32
             rusage before{}, after{};
-            getrusage(RUSAGE_THREAD, &before);
+            getrusage(THREAD_USAGE, &before);
 #endif
             const auto start = std::chrono::steady_clock::now();
             for (unsigned i = 0; i < 256; ++i) {
@@ -78,7 +85,7 @@ void benchmark(bool labels = false, bool backing = true) {
             }
             const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 256;
 #ifndef _WIN32
-            getrusage(RUSAGE_THREAD, &after);
+            getrusage(THREAD_USAGE, &after);
             if (pass != 0) faults += after.ru_minflt - before.ru_minflt;
 #endif
             if (pass != 0) times.push_back(us);
@@ -177,7 +184,7 @@ template<class TAction> void fails(TAction&& fn) {
     require(failed, "invalid write was accepted");
 }
 
-#ifndef _WIN32
+#ifdef __linux__
 std::size_t directMappings() {
     std::ifstream maps("/proc/self/maps");
     require(maps.is_open(), "cannot inspect mapping lifetimes");
@@ -205,7 +212,7 @@ void run() {
         bytes[part + 456] = std::byte{91};
         CollectWritesUncached(mapping.Address(), mapping.size);
         require(!UnchangedSince(mapping.Address(), mapping.size, after), "subsequent guest write was lost");
-#ifndef _WIN32
+#ifdef __linux__
         std::size_t dirty = 0;
         const auto collect = [&] {
             return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(mapping.Address(), mapping.size,
@@ -238,7 +245,7 @@ void run() {
         require(std::memcmp(mapping.data, across.data(), across.size()) == 0, "write across backing boundaries differs");
         require(std::memcmp(replacement.data, across.data() + part, part) == 0, "physical alias did not see the write");
         require(std::all_of(static_cast<std::byte*>(originalAlias), static_cast<std::byte*>(originalAlias) + part, [](auto x) { return x == std::byte{29}; }), "replaced virtual range wrote the old backing");
-#ifndef _WIN32
+#ifdef __linux__
         require(sceKernelMunmap(middle, part) == 0, "partial unmap failed");
         const auto saved = bytes[0];
         across[0] = std::byte{99};
@@ -273,14 +280,15 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-fallback") benchmark(false, false);
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-labels-fallback") benchmark(true, false);
         else {
-#ifndef _WIN32
+#ifdef __linux__
             const auto before = directMappings();
 #endif
             run();
             smallStores();
-#ifndef _WIN32
+#ifdef __linux__
             require(directMappings() == before, "physical backing write views leaked");
 #endif
+
             std::cout << "Shared backing write tests passed\n";
         }
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

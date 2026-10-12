@@ -315,6 +315,7 @@ int APS5_VABI EqueueDeleteEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, in
 }
 
 
+#ifndef __APPLE__
 int APS5_VABI kqueue_nid_postfix() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -324,6 +325,7 @@ int APS5_VABI kevent_nid_postfix() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
+#endif
 
 int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name) {
     if (eq == nullptr || name == nullptr) {

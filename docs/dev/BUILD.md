@@ -14,7 +14,7 @@ Python must be found during CMake configuration for Python tests to be registere
 
 This mode builds the conversion tool and its tests on Linux, Windows and macOS, including Apple Silicon. macOS uses AppleClang from the Xcode command-line tools; Windows uses the MinGW-w64 toolchain below. The executable is `build-relinker/core/relinker/relinker` (`relinker.exe` on Windows with Ninja).
 
-The output remains x86-64 Linux ELF or Windows PE. Converted games need system libraries built for the target OS and a compatible x86-64 host. This mode does not build those libraries or provide macOS game execution. Tests inspect both output formats; execution checks run only on their compatible hosts.
+The output is x86-64 Linux ELF, Windows PE or, with `--macos`, Mach-O. Converted games need system libraries built for the target OS by the [full build](#full-build) and an x86-64 host, which on Apple silicon is Rosetta. Tests inspect every output format; execution checks run only on their compatible hosts.
 
 Use a separate build directory for the full build.
 
@@ -26,10 +26,11 @@ git submodule update --init --recursive
 
 ## Requirements
 
-- x86-64, Git, CMake 3.22.1 or newer, Ninja, C++20.
+- x86-64, Git, CMake 3.22.1 or newer, Ninja, C++20. On Apple silicon the build is x86-64 and runs under Rosetta.
 - Linux: GCC, G++, binutils. SDL's X11 backend requires X11 and Xext development headers (`libx11-dev` and `libxext-dev` on Debian/Ubuntu). Audio output needs SDL's PipeWire, PulseAudio or ALSA backend, built from their development files (`libpipewire-0.3-dev`, `libpulse-dev` and `libasound2-dev` on Debian/Ubuntu; `pipewire-devel`, `pulseaudio-libs-devel` and `alsa-lib-devel` on Fedora). SDL loads them at run time. Without any of them SDL keeps only its silent dummy and disk drivers, so configuration fails.
 - Fedora: if CMake reports `Could NOT find Threads`, install `glibc-static` and `libstdc++-static` with `sudo dnf install glibc-static libstdc++-static`, then rerun configuration. The project enables static executable linking, and FFmpeg's thread check needs these libraries.
 - Windows: only MinGW-w64 GCC 15.2.0 (WinLibs `x86_64-ucrt-posix-seh`, release `15.2.0posix-14.0.0-ucrt-r7`) is currently supported. Add its `mingw64/bin` directory to `PATH` before configuring.
+- macOS: AppleClang from the Xcode command-line tools, and Rosetta on Apple silicon (`softwareupdate --install-rosetta`). The full build selects x86-64 itself, so configure without `CMAKE_OSX_ARCHITECTURES`. The GPU tests and converted titles need the Vulkan loader and MoltenVK as x86-64 or universal binaries, such as those of the LunarG Vulkan SDK: set `DYLD_LIBRARY_PATH=<sdk>/macOS/lib` and `VK_DRIVER_FILES` to the SDK's `MoltenVK_icd.json`. Homebrew's `vulkan-loader` and `molten-vk` on Apple silicon are arm64 only and cannot be loaded. Without a loader the GPU tests are skipped. Run the GPU tests one at a time with a timeout (`ctest -j1 --timeout 30`) and leave out `agc_driver_lds_atomics64` and the flip and display tests, which open windows: a wedged GPU can stop WindowServer and restart the Mac.
 - Windows antivirus software can quarantine the executables that the relinker tests create in the temp directory, which fails `optional_plt`, `empty_tls`, `windows_address_space` and `windows_icon`. Set `TEMP` and `TMP` to a directory the scanner excludes before running `ctest`.
 - FFmpeg binaries are downloaded during configuration unless `FFMPEG_PREBUILT_DIR` is set. With the WinLibs CMake, the download fails with status 60 (`SSL peer certificate or SSH remote key was not OK`) unless `SSL_CERT_FILE` names a CA bundle, for example `C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt` from Git for Windows, as in CI.
 
@@ -39,6 +40,12 @@ git submodule update --init --recursive
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
 cmake --build build --parallel
 cmake --build build --target libs --parallel
+```
+
+On macOS, configure with AppleClang instead:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ```
 
 `libs` is a custom target: every library under [core/libs/prx](../../core/libs/prx) is built with

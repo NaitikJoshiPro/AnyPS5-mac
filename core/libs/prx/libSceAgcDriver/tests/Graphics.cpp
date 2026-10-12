@@ -2653,11 +2653,19 @@ void descriptorPoolResetFailureTest() {
     const VkDescriptorPoolSize size{binding.descriptorType, binding.descriptorCount};
     const auto allocation = cache.Allocate(layout, std::span(&size, 1));
     mock.descriptorResetResult = VK_ERROR_DEVICE_LOST;
+#ifdef __APPLE__
+    const auto previous = std::set_terminate([] {
+        std::_Exit(mock.descriptorResetResult == VK_SUCCESS ? 0 : 1);
+    });
+    cache.Free(allocation);
+    std::set_terminate(previous);
+#else
     const auto previous = _ZSt13set_terminatePFvvE_nid_postfix([] {
         std::_Exit(mock.descriptorResetResult == VK_SUCCESS ? 0 : 1);
     });
     cache.Free(allocation);
     _ZSt13set_terminatePFvvE_nid_postfix(previous);
+#endif
 }
 
 void pushConstantTests() {

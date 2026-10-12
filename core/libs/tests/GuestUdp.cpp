@@ -52,6 +52,12 @@ int main() {
     Require(getsockname_nid_postfix(receiver, destination.data(), &size) == 0 && size == 16);
     Require(destination[2] || destination[3]);
     Require(connect_nid_postfix(sender, destination.data(), destination.size()) == 0);
+#ifdef __APPLE__
+    const int addressed = socket_nid_postfix(2, 2, 17);
+    Require(addressed >= 0);
+#else
+    const int addressed = sender;
+#endif
     char vectorHead[] = "atomic ";
     char vectorTail[] = "datagram";
     Iovec vectorOutput[]{{vectorHead, sizeof(vectorHead) - 1}, {vectorTail, sizeof(vectorTail)}};
@@ -93,7 +99,10 @@ int main() {
     Require(recvfrom_nid_postfix(receiver, buffer, sizeof(buffer), 0, nullptr, nullptr) == -1);
     Require(*__error_nid_postfix() == 35);
     const char message[] = "guest UDP loopback";
-    Require(sendto_nid_postfix(sender, message, sizeof(message), 0x20000, destination.data(), destination.size()) == sizeof(message));
+#ifdef __APPLE__
+    Require(sendto_nid_postfix(sender, message, sizeof(message), 0x20000, destination.data(), destination.size()) == -1 && *__error_nid_postfix() == 56);
+#endif
+    Require(sendto_nid_postfix(addressed, message, sizeof(message), 0x20000, destination.data(), destination.size()) == sizeof(message));
     int queued = 0;
     for (int i = 0; i < 100 && queued == 0; ++i) {
         Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == 0);
@@ -114,7 +123,7 @@ int main() {
     char tail[] = "gather";
     Iovec parts[2]{{head, 8}, {tail, 6}};
     Msghdr outgoing{destination.data(), static_cast<std::uint32_t>(destination.size()), parts, 2, nullptr, 0, 0};
-    Require(sendmsg_nid_postfix(sender, &outgoing, 0) == 14);
+    Require(sendmsg_nid_postfix(addressed, &outgoing, 0) == 14);
     const auto wait = [&] {
         queued = 0;
         for (int i = 0; i < 100 && queued == 0; ++i) {
@@ -132,7 +141,7 @@ int main() {
     Require(recvmsg_nid_postfix(receiver, &incoming, 0) == 14);
     Require(std::memcmp(first, "scat", 4) == 0 && std::memcmp(second, "ter gather", 10) == 0);
     Require(incoming.flags == 0 && incoming.controlLength == 0 && incoming.nameLength == 16 && source[1] == 2 && source[4] == 127);
-    Require(sendmsg_nid_postfix(sender, &outgoing, 0) == 14);
+    Require(sendmsg_nid_postfix(addressed, &outgoing, 0) == 14);
     wait();
     char shortBuffer[5]{};
     Iovec single{shortBuffer, sizeof(shortBuffer)};
@@ -141,13 +150,16 @@ int main() {
     Require(std::memcmp(shortBuffer, "scatt", 5) == 0 && truncated.flags == 0x10);
     Require(recvmsg_nid_postfix(receiver, &truncated, 0) == -1 && *__error_nid_postfix() == 35);
     Msghdr oversized{nullptr, 0, parts, 1025, nullptr, 0, 0};
-    Require(sendmsg_nid_postfix(sender, &oversized, 0) == -1 && *__error_nid_postfix() == 40);
+    Require(sendmsg_nid_postfix(addressed, &oversized, 0) == -1 && *__error_nid_postfix() == 40);
     Require(recvmsg_nid_postfix(receiver, nullptr, 0) == -1 && *__error_nid_postfix() == 14);
     Require(close_nid_postfix(receiver) == 0);
     Require(close_nid_postfix(receiver) == -1 && *__error_nid_postfix() == 9);
     Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == -1);
     Require(_ioctl_nid_postfix(receiver, 0x4004667f, &queued) == -1 && *__error_nid_postfix() == 9);
     Require(close_nid_postfix(sender) == 0);
+#ifdef __APPLE__
+    Require(close_nid_postfix(addressed) == 0);
+#endif
     unsigned char parsed[16]{};
     Require(inet_pton_nid_postfix(2, "127.0.0.1", parsed) == 1);
     Require(parsed[0] == 127 && parsed[1] == 0 && parsed[2] == 0 && parsed[3] == 1);

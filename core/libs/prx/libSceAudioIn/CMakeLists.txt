@@ -1,7 +1,13 @@
 add_library(libSceAudioIn SHARED EXCLUDE_FROM_ALL Export.cpp)
 target_include_directories(libSceAudioIn PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
-target_link_libraries(libSceAudioIn PRIVATE SDL2-static)
-target_link_options(libSceAudioIn PRIVATE LINKER:--exclude-libs,ALL)
+# On macOS every library uses one SDL, the driver's, as libSceVideoOut does: a second static copy would
+# register SDL's Objective-C classes twice, and the runtime would pick one of them at random.
+if(APPLE)
+    target_link_libraries(libSceAudioIn PRIVATE libSceAgcDriver)
+else()
+    target_link_libraries(libSceAudioIn PRIVATE SDL2-static)
+    target_link_options(libSceAudioIn PRIVATE LINKER:--exclude-libs,ALL)
+endif()
 configure_windows_unwind(libSceAudioIn)
 
 if(BUILD_TESTING)

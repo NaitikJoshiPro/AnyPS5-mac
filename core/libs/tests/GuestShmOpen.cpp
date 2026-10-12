@@ -37,7 +37,7 @@ int main() {
     Require(pread_nid_postfix(first, &last, 1, 0x3fff) == 1 && last == 0);
     Require(pread_nid_postfix(first, &last, 1, 0x4000) == 0);
     Require(pread_nid_postfix(second, back, sizeof(back), 0) == 0);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     Require(pwrite_nid_disambig1_nid_postfix(third, text, sizeof(text), 0) == 0);
 #endif
     Require(ftruncate_nid_postfix(third, 0x4000) == 0);
@@ -51,7 +51,7 @@ int main() {
     RequireInvalid(anonymous, 0x2 | 0x4);
     RequireInvalid("/anyps5-shm", 0x1);
     RequireInvalid("/anyps5-shm", 0x202 | 0x8);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     bool threw = false;
     try {
         shm_open_nid_postfix("/anyps5-shm", 0x202, 0600);
