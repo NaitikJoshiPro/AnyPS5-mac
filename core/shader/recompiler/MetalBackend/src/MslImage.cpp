@@ -173,6 +173,43 @@ static inline float4 aps5_ec_sample(T t, float2 coord, uint layer, int2 offset, 
     for (uint channel = 0u; channel < 4u; ++channel) value[channel] = swizzle[channel] == 0u ? 0.0f : (swizzle[channel] == 1u ? 1.0f : result);
     return value;
 }
+// Min/max sampler reduction (Metal ignores MTLSamplerDescriptor.reductionMode): the 2x2 bilinear
+// footprint of the selected level read through the sampler at texel centres (exact for every
+// filter and address mode), reduced per component. `packed`/`filters` are the
+// PipelineSpecialization::ReductionBase words; linear mip filtering with a reduction is refused by
+// the sampler decoder.
+static inline float4 aps5_rs_fetch(texture2d<float> t, sampler s, float2 c, uint slice, uint l) {
+    return t.sample(s, c, level(float(l)));
+}
+
+static inline float4 aps5_rs_fetch(texture2d_array<float> t, sampler s, float2 c, uint slice, uint l) {
+    return t.sample(s, c, slice, level(float(l)));
+}
+
+template <typename T>
+static float4 aps5_reduce_sample(T t, sampler s, float2 coord, uint slice, float lod, int2 offset, uint packed, uint filters) {
+    const uint reduction = packed & 3u;
+    const uint mip = (packed >> 2u) & 3u;
+    float lambda = 0.0f;
+    if (mip != 0u) {
+        const float bias = float(int(((filters & 0x3fffu) ^ 0x2000u) - 0x2000u)) / 256.0f;
+        lambda = clamp(lod + bias, float((packed >> 4u) & 0xfffu) / 256.0f, float((packed >> 16u) & 0xfffu) / 256.0f);
+    }
+    const uint levels = max(t.get_num_mip_levels(), 1u);
+    const uint level = mip == 0u ? 0u : min(uint(max(ceil(lambda + 0.5f) - 1.0f, 0.0f)), levels - 1u);
+    const uint filter = lambda > 0.0f ? (filters >> 18u) & 3u : (filters >> 16u) & 3u;
+    if (filter == 0u) return aps5_rs_fetch(t, s, coord + float2(offset) / float2(float(t.get_width(level)), float(t.get_height(level))), slice, level);
+    const float w = float(t.get_width(level));
+    const float h = float(t.get_height(level));
+    const float x0 = floor(coord.x * w - 0.5f) + float(offset.x);
+    const float y0 = floor(coord.y * h - 0.5f) + float(offset.y);
+    float4 result = aps5_rs_fetch(t, s, float2((x0 + 0.5f) / w, (y0 + 0.5f) / h), slice, level);
+    for (uint corner = 1u; corner < 4u; ++corner) {
+        const float4 texel = aps5_rs_fetch(t, s, float2((x0 + float(corner & 1u) + 0.5f) / w, (y0 + float(corner >> 1u) + 0.5f) / h), slice, level);
+        result = reduction == 1u ? min(result, texel) : max(result, texel);
+    }
+    return result;
+}
 )MSL";
 
 struct Access {
@@ -1208,7 +1245,17 @@ void EmitSample(MslEmitterState& state, const Access& access, const ImageSampleL
         const auto offsetF = spatial == 3u ? "float3(" + offset + ")" : "float2(" + offset + ")";
         return "(" + coord.coord + " + " + (spatial == 1u ? "float2(float(" + offset + ".x), 0.0f)" : offsetF) + ")";
     };
-    if (!foldOffset) {
+    const bool reducible = !dref && access.image.numericClass == IrTextureNumericClass::Float && explicitLod && !HasFlag(mem, RdnaImageSampleFlagDerivative) && spatial == 2u && (image.dimension == RdnaImageDimension::Dim1D || image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim2DArray);
+    if (reducible && !foldOffset) {
+        // A min/max reduction sampler (PipelineSpecialization::ReductionBase, supplied only for those).
+        const auto first = PipelineSpecialization::ReductionBase + mem.sampler * PipelineSpecialization::ReductionWords;
+        const auto packed = state.FunctionConstant(first, 0u);
+        const auto filters = state.FunctionConstant(first + 1u, 0u);
+        auto lod = HasFlag(mem, RdnaImageSampleFlagLod) ? AddressF32(state, access, layout.lod) : std::string("0.0f");
+        if (!clamp.empty()) lod = "max(" + lod + ", " + clamp + ")";
+        const auto offset2 = offset.empty() ? std::string("int2(0)") : "int2(" + offset + ".xy)";
+        state.Line("const " + type + " " + sample + " = (" + packed + " & 3u) != 0u ? aps5_reduce_sample(" + texture + ", " + sampler + ", " + coord.coord + ", " + (coord.slice.empty() ? std::string("0u") : coord.slice) + ", " + lod + ", " + offset2 + ", " + packed + ", " + filters + ") : " + call(coord.coord, offset) + ";");
+    } else if (!foldOffset) {
         state.Line("const " + type + " " + sample + " = " + call(coord.coord, offset) + ";");
     } else {
         const auto selector = state.FunctionConstant(PipelineSpecialization::FoldOffsetBase + mem.sampler, 0u);
