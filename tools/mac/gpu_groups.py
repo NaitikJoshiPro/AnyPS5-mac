@@ -26,6 +26,8 @@ Groups:
 
 HOLD lists the tests tools/mac/gpu_suite.sh never runs, whatever the map says: the 64-bit LDS atomics
 test (it can hang the GPU, MISSION §5) and everything that flips, presents or opens a window (all of libSceVideoOut).
+tools/mac/gpu_quarantine.txt adds tests that took the machine down (kernel panic, GPU hang) until they are cleared;
+a missing or malformed quarantine file stops gpu_suite.sh from running anything (fail closed).
 """
 import argparse
 import os
@@ -40,6 +42,8 @@ GROUPS = ("G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7")
 # Never run by gpu_suite.sh (CLAUDE.md GPU safety): a wedged GPU can take WindowServer down.
 HOLD = re.compile(r"^agc_driver_lds_atomics64$|(^|_)(flip|visual|present|presentation|swapchain)(_|$)|^(guest_)?video_out_|^pad_sdl$|^guest_buffer_reuse$")
 HOLD_DIRECTORIES = ("core/libs/prx/libSceVideoOut",)
+# Tests quarantined after they took the machine down: `<test> | <reason> | <TechnicalDebt anchor>` per line.
+QUARANTINE = Path(__file__).resolve().parent / "gpu_quarantine.txt"
 
 # Tests that drive Vulkan internals directly (raw Vulkan or MockVulkan); Metal twins replace them (M2_DESIGN.md §8).
 VULKAN_INTERNAL = frozenset("""
@@ -207,8 +211,34 @@ def write_map(groups, path=MAP):
     Path(path).write_text("\n".join(lines) + "\n")
 
 
+def load_quarantine(path=QUARANTINE):
+    """{test: reason} of the quarantine file; raises (OSError, ValueError) when it is missing or malformed, so a
+    caller that runs GPU tests fails closed instead of running a quarantined test."""
+    quarantined = {}
+    for number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) != 3 or not all(fields) or not re.fullmatch(r"[A-Za-z0-9_.+-]+", fields[0]):
+            raise ValueError(f"{path}:{number}: expected '<test> | <reason> | <TechnicalDebt anchor>', got {line!r}")
+        quarantined[fields[0]] = f"{fields[1]} ({fields[2]})"
+    return quarantined
+
+
+_quarantine_cache = None
+
+
+def quarantine_reason(name):
+    """Why `name` is quarantined, or None. Raises like load_quarantine when the file cannot be read."""
+    global _quarantine_cache
+    if _quarantine_cache is None:
+        _quarantine_cache = load_quarantine()
+    return _quarantine_cache.get(name)
+
+
 def held(name):
-    return bool(HOLD.search(name))
+    return bool(HOLD.search(name)) or quarantine_reason(name) is not None
 
 
 def main():

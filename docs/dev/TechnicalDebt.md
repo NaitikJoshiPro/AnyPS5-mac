@@ -733,6 +733,10 @@ Interim behaviour of the Metal device ([MetalDevice.mm](../../core/libs/prx/libS
 - Upload ring: linear and reset when idle; a command that finds less than 1 MiB left waits for idle first, larger single uploads get a buffer of their own
 - `ReplayComputePipeline` (Vulkan pipeline captures) and `DispatchRecipe` throw; `DispatchRecipes()` and `PrepareDispatch` keep the driver on the ordinary dispatch path
 
+### Metal GPU quarantine (macOS)
+
+- <a id="metal-gpu-quarantine"></a>Quarantined GPU tests: [tools/mac/gpu_quarantine.txt](../../tools/mac/gpu_quarantine.txt) lists tests that took the Mac down; `tools/mac/gpu_suite.sh` refuses to run them and runs nothing when the list is missing or malformed. `agc_driver_f16_denormal_flush` is there since a kernel panic on 2026-10-12 20:20 IST (macOS 27.0.1, M3: `Kernel data abort` in `com.apple.iokit.IOGPUFamily`, `far 0x10`, panicked task pid 20052 already terminating: 1 thread with `TH_SFLAG_ABORT`, 98 KB resident). The library it ran against was a half-edited D1/B5 build (MetalDevice.mm recorder integration compiled mid-edit, MslRuntimeBuffer.cpp emitting MSL that does not compile), so its kernels never reached the GPU; the panic was in process teardown. It leaves the list after a supervised single run on a consistent, committed build with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, preceded by the canary tests (`.mac-work/feedback/gpu-safety-proposal.md`)
+
 ### Metal skips (macOS)
 
 Apple GPU and Metal limits behind the skips that [m2_skip_allowlist.txt](../../tools/mac/m2_skip_allowlist.txt) accepts on macOS (`tools/check_skips.py --job macos`, decision D-M2-8 in [M2_DESIGN.md](../mac/M2_DESIGN.md)). Each allowlist line names one of these anchors; a skip without one fails the check. f64 and 64-bit atomics are emulated, never allowlisted. Facts from the Metal Feature Set Tables and probes on an M3 (Apple9).

@@ -121,7 +121,22 @@ class GroupTests(unittest.TestCase):
         self.assertEqual(mapped.get("agc_driver_lds_atomics64"), "G6")
         for name, group in mapped.items():
             if group in ("G1", "G2", "G3", "G4"):
-                self.assertFalse(gpu_groups.held(name), name)
+                self.assertFalse(bool(gpu_groups.HOLD.search(name)), name)
+
+    def test_quarantine_file(self):
+        committed = gpu_groups.load_quarantine()
+        self.assertIn("kernel panic", committed["agc_driver_f16_denormal_flush"])
+        self.assertTrue(gpu_groups.held("agc_driver_f16_denormal_flush"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quarantine.txt"
+            path.write_text("# comment\nagc_x | it panicked | anchor-x\n\n")
+            self.assertEqual(gpu_groups.load_quarantine(path), {"agc_x": "it panicked (anchor-x)"})
+            for bad in ("agc_x | no anchor\n", "agc_x | | anchor\n", "agc x | reason | anchor\n"):
+                path.write_text(bad)
+                with self.assertRaises(ValueError, msg=bad):
+                    gpu_groups.load_quarantine(path)
+            with self.assertRaises(OSError):
+                gpu_groups.load_quarantine(Path(directory) / "missing.txt")
 
 
 class SuiteHelperTests(unittest.TestCase):
@@ -216,6 +231,18 @@ class SuiteRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         outcomes = {entry["test"]: entry["outcome"] for entry in json.loads(files["summary.json"])["results"]}
         self.assertEqual(outcomes, {"agc_driver_missing": "failed", "agc_driver_ok": "passed"})
+
+    def test_never_runs_quarantined_tests(self):
+        plan = {"agc_driver_ok": ["run", "", ""], "agc_driver_f16_denormal_flush": ["run", "", "must never run"]}
+        tests = {"agc_driver_ok": (None, "tests/execution/A.cpp"), "agc_driver_f16_denormal_flush": (None, "tests/execution/F16DenormalFlush.cpp")}
+        result, files, log = self.run_suite(plan, "re:^agc_driver_", tests=tests)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("f16_denormal", log)
+        self.assertIn("refusing to run quarantined test agc_driver_f16_denormal_flush: kernel panic", result.stdout)
+        self.assertIn("quarantined agc_driver_f16_denormal_flush", files["summary.txt"])
+        result, _, log = self.run_suite(plan, "agc_driver_f16_denormal_flush", tests=tests)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(log, "")
 
     def test_selecting_only_held_tests_runs_nothing(self):
         result, _, log = self.run_suite({"agc_driver_lds_atomics64": ["run", "", ""]}, "agc_driver_lds_atomics64")

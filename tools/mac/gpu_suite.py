@@ -9,7 +9,9 @@ matched with re.search) or an exact test name. Selections are unions.
 
 GPU safety (CLAUDE.md, MISSION §5): every ctest invocation runs -j1 with a per-test timeout inside
 tools/mac/buildlock.py <build>, which is also the machine-wide GPU mutex; the tests gpu_groups.HOLD matches
-(agc_driver_lds_atomics64, flip, present, window and video-out tests) are never run, whatever is selected; a batch
+(agc_driver_lds_atomics64, flip, present, window and video-out tests) and the quarantined ones (tools/mac/
+gpu_quarantine.txt: tests that panicked or hung the machine; without a readable quarantine file nothing runs) are
+never run, whatever is selected; a batch
 holds the lock for at most --batch-seconds of worst-case test time (sum of the tests' timeouts), so other agents can
 build between batches.
 
@@ -245,6 +247,7 @@ def summarize(results, groups, held, selectors, meta, allow_errors, allow_warnin
     lines.append("")
     if held:
         lines.append("held back (never run by gpu_suite): " + " ".join(sorted(held)))
+        lines += [f"  quarantined {name}: {gpu_groups.quarantine_reason(name)}" for name in sorted(held) if gpu_groups.quarantine_reason(name)]
         lines.append("")
     broken = [result for result in results if result["outcome"] in ("failed", "timeout", "not-built")]
     if broken:
@@ -307,8 +310,16 @@ def main():
         chosen = select(sorted(registered), groups, args.selectors)
     except (ValueError, re.error) as error:
         parser.error(str(error))
-    held = [name for name in chosen if gpu_groups.held(name)]
-    runnable = [name for name in chosen if not gpu_groups.held(name)]
+    try:
+        quarantine = gpu_groups.load_quarantine()
+    except (OSError, ValueError) as error:
+        print(f"refusing to run GPU tests: the quarantine list cannot be read ({error})", file=sys.stderr)
+        return 2
+    for name in chosen:
+        if name in quarantine:
+            print(f"refusing to run quarantined test {name}: {quarantine[name]}")
+    held = [name for name in chosen if gpu_groups.held(name) or name in quarantine]
+    runnable = [name for name in chosen if name not in held]
     timeouts = {name: registered[name]["properties"].get("TIMEOUT") for name in runnable}
     planned = list(batches(runnable, timeouts, args.timeout, args.batch_seconds))
     if args.dry_run:
