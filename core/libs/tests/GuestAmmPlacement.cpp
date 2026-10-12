@@ -18,12 +18,6 @@ int main() {
         std::uintptr_t arenaBase = 0;
         std::size_t arenaBytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-#ifdef __APPLE__
-        if (arenaBase == 0) {
-            std::puts("skipped, the guest arena is Linux and Windows only");
-            return 77;
-        }
-#endif
         Require(arenaBase != 0 && arenaBytes != 0, "the guest arena is unavailable");
         const std::uint64_t arenaEnd = arenaBase + arenaBytes;
         constexpr std::uint64_t occupied = 4ull << 20;
