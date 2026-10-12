@@ -1,6 +1,7 @@
 add_library(libSceLibcInternal SHARED EXCLUDE_FROM_ALL Export.cpp FileTime.cpp UserContext.cpp)
 target_include_directories(libSceLibcInternal PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(libSceLibcInternal PRIVATE ${CMAKE_DL_LIBS})
+target_sources(libSceLibcInternal PRIVATE Directory.cpp)
 configure_windows_unwind(libSceLibcInternal)
 target_sources(libSceLibcInternal PRIVATE FilesystemStatistics.cpp PathStatistics.cpp)
 
@@ -28,6 +29,15 @@ if(BUILD_TESTING)
     set_tests_properties(guest_fstatvfs PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_fstatvfs PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibcInternal>")
+    endif()
+    add_test_executable(guest_fdopendir_tests ${LIBS_INCLUDE_DIR}/tests/GuestFdopendir.cpp)
+    target_include_directories(guest_fdopendir_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_fdopendir_tests PRIVATE libSceLibcInternal libkernel libc)
+    configure_windows_unwind(guest_fdopendir_tests)
+    add_test(NAME guest_fdopendir COMMAND guest_fdopendir_tests)
+    if(WIN32)
+        set_tests_properties(guest_fdopendir PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibcInternal>")
     endif()
     add_test_executable(guest_utime_forwarding_tests ${LIBS_INCLUDE_DIR}/tests/GuestUtimeForwarding.cpp FileTime.cpp)
