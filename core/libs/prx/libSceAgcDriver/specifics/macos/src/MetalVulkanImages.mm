@@ -357,6 +357,35 @@ void DestroyImageView(VkDevice, VkImageView view, const VkAllocationCallbacks*) 
     if (view != VK_NULL_HANDLE) CFRelease(reinterpret_cast<CFTypeRef>(view));
 }
 
+VkResult CreateBuffer(VkDevice deviceHandle, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* buffer) {
+    id<MTLDevice> device = DeviceOf(deviceHandle);
+    id<MTLBuffer> made = [device newBufferWithLength:std::max<VkDeviceSize>(info->size, 4u) options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
+    if (made == nil) {
+        *buffer = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    if (auto* cache = ImageCache::For(device)) cache->TrackBuffer(made);
+    *buffer = reinterpret_cast<VkBuffer>(const_cast<void*>(CFBridgingRetain(made)));
+    return VK_SUCCESS;
+}
+
+void DestroyBuffer(VkDevice deviceHandle, VkBuffer buffer, const VkAllocationCallbacks*) {
+    if (buffer == VK_NULL_HANDLE) return;
+    id<MTLBuffer> released = CFBridgingRelease(reinterpret_cast<CFTypeRef>(buffer));
+    if (auto* cache = ImageCache::For(DeviceOf(deviceHandle))) cache->UntrackBuffer(released);
+}
+
+void GetBufferMemoryRequirements(VkDevice, VkBuffer buffer, VkMemoryRequirements* requirements) {
+    id<MTLBuffer> metal = BufferOf(buffer);
+    requirements->size = metal != nil ? metal.allocatedSize : 0u;
+    requirements->alignment = 256u;
+    requirements->memoryTypeBits = ~0u;
+}
+
+VkResult BindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
+    return VK_SUCCESS;
+}
+
 void GetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkFormatProperties* properties) {
     // Apple GPUs (Apple7+): every ordinary color format is sampled and filtered; shader writes and
     // reads (read_write, tier 2) work for the non-packed, non-sRGB, non-compressed ones; render

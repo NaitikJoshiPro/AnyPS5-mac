@@ -191,6 +191,9 @@ public:
     // A texture the twins made: resident until Untrack (DestroyImage, after the batches using it).
     void Track(id<MTLTexture> texture);
     void Untrack(id<MTLTexture> texture);
+    // Buffers the twins make (unit shadow slabs, MetalVulkanImages CreateBuffer), likewise.
+    void TrackBuffer(id<MTLBuffer> buffer);
+    void UntrackBuffer(id<MTLBuffer> buffer);
     // Residency of textures in flight: added before the batch is submitted, removed when it completes.
     void MakeResident(std::span<const id<MTLTexture>> textures);
     void Release(std::span<const id<MTLTexture>> textures);

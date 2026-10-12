@@ -10,4 +10,5 @@ list(APPEND agcMetalTwins
         "Graphics/src/TextureDetiler.cpp=specifics/macos/src/TextureDetiler.mm"
         "Graphics/src/TextureDetilerDescriptors.cpp=specifics/macos/src/TextureDetiler.mm"
         "Graphics/src/Texture.cpp=specifics/macos/src/Texture.mm"
+        "Graphics/src/UnitShadow.cpp=specifics/macos/src/UnitShadow.mm"
 )

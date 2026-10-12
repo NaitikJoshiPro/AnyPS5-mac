@@ -238,6 +238,28 @@ void ImageCache::Track(id<MTLTexture> texture) {
     MakeResident(one);
 }
 
+void ImageCache::TrackBuffer(id<MTLBuffer> buffer) {
+    std::lock_guard lock(mutex);
+    if (tornDown || buffer == nil) return;
+    auto& count = residentCounts[(__bridge void*)buffer];
+    if (count++ == 0u) {
+        [residency addAllocation:buffer];
+        [residency commit];
+    }
+}
+
+void ImageCache::UntrackBuffer(id<MTLBuffer> buffer) {
+    std::lock_guard lock(mutex);
+    if (tornDown || buffer == nil) return;
+    const auto found = residentCounts.find((__bridge void*)buffer);
+    if (found == residentCounts.end()) return;
+    if (--found->second == 0u) {
+        [residency removeAllocation:buffer];
+        residentCounts.erase(found);
+        [residency commit];
+    }
+}
+
 void ImageCache::Untrack(id<MTLTexture> texture) {
     const std::array<id<MTLTexture>, 1> one{texture};
     Release(one);

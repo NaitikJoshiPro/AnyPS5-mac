@@ -55,6 +55,12 @@ void FreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallba
 VkResult BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize offset);
 VkResult CreateImageView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* allocator, VkImageView* view);
 void DestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* allocator);
+// A VkBuffer made here carries a CF-retained private id<MTLBuffer> (unit shadow slabs), resident
+// through the image cache until DestroyBuffer; BufferOf() reads it like D2's buffers.
+VkResult CreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer);
+void DestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator);
+void GetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements* requirements);
+VkResult BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset);
 void GetPhysicalDeviceFormatProperties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties* properties);
 VkResult GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physical, VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties* properties);
 // A VkSampler carries a CF-retained id<MTLSamplerState> (argument-buffer capable).
