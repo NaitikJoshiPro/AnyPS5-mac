@@ -1,5 +1,6 @@
 """Tests for tools/mac/gpu_groups.py and tools/mac/gpu_suite.py; a fake ctest stands in for the GPU tests."""
 from pathlib import Path
+import hashlib
 import json
 import os
 import stat
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -31,14 +33,52 @@ for name, (status, message, output) in sorted(plan.items()):
     cases.append(f'<testcase name="{name}" classname="{name}" time="0.5" status="{status}">{inner}<system-out>{output}</system-out></testcase>')
 with open(junit, "w") as stream:
     stream.write('<?xml version="1.0" encoding="UTF-8"?><testsuite name="(empty)" tests="%d">%s</testsuite>' % (len(cases), "".join(cases)))
+if os.environ.get("FAKE_CTEST_TOUCH"):
+    with open(os.environ["FAKE_CTEST_TOUCH"], "a") as touched:
+        touched.write("rebuilt\n")
 sys.exit(8 if any(plan[name][0] == "fail" for name in plan if pattern.search(name)) else 0)
 '''
 
+FAKE_NINJA = r'''#!/usr/bin/env python3
+import os, sys
+with open(os.environ["FAKE_NINJA_LOG"], "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+print("[0/1] Re-checking globbed directories...")
+print(os.environ.get("FAKE_NINJA_OUTPUT", "ninja: no work to do."))
+'''
 
-def write_build(root, tests):
+FAKE_SYSCTL = r'''#!/bin/sh
+echo "{ ${FAKE_LOAD:-0.50} 0.40 0.30 }"
+'''
+
+FAKE_PS = r'''#!/bin/sh
+printf '%s\n' /sbin/launchd /usr/bin/python3 ${FAKE_PROCESSES}
+'''
+
+CANARY = "agc_canary_ok"
+
+
+def source_repository(root):
+    """A committed git tree standing in for the source tree that configured the build."""
+    source = root / "source"
+    (source / "core").mkdir(parents=True)
+    (source / "core" / "a.cpp").write_text("int a;\n")
+    (source / "docs").mkdir()
+    (source / "docs" / "notes.md").write_text("notes\n")
+    for command in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]):
+        subprocess.run(["git", "-C", str(source), *command], check=True, capture_output=True)
+    return source
+
+
+def write_build(root, tests, source=None):
     """A configured-looking build directory: CTestTestfile.cmake with gpu-labelled tests and a build.ninja link line each."""
     build = root / "build"
     (build / "sub").mkdir(parents=True)
+    if source is not None:
+        (build / "CMakeCache.txt").write_text(f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n")
+        prx = build / gpu_suite.PRX
+        prx.parent.mkdir(parents=True)
+        prx.write_bytes(b"prx")
     (build / "CTestTestfile.cmake").write_text('subdirs("sub")\n')
     lines, ninja = [], []
     for name, (timeout, source) in tests.items():
@@ -48,6 +88,8 @@ def write_build(root, tests):
         lines.append(f'set_tests_properties("{name}" PROPERTIES {properties} _BACKTRACE_TRIPLES "x;1;add_test")')
         ninja.append(f"build tests/{name}_tests: CXX_EXECUTABLE_LINKER__{name}_tests_Release core/x/CMakeFiles/{name}_tests.dir/{source}.o | dep")
     (build / "sub" / "CTestTestfile.cmake").write_text("\n".join(lines) + "\n")
+    if source is not None:
+        ninja.append(f"build {gpu_suite.PRX}: CXX_SHARED_LIBRARY_LINKER__libSceAgcDriver_Release dep")
     (build / "build.ninja").write_text("\n".join(ninja) + "\n")
     return build
 
@@ -174,24 +216,41 @@ class SuiteHelperTests(unittest.TestCase):
 
 
 class SuiteRunTests(unittest.TestCase):
-    def run_suite(self, plan, *arguments, tests=None):
+    def run_suite(self, plan, *arguments, tests=None, canaries=(CANARY,), env=None, prepare=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tests = tests or {name: (None, "tests/execution/X.cpp") for name in plan}
-            build = write_build(root, tests)
+            plan = dict(plan)
+            for canary in canaries:
+                plan.setdefault(canary, ["run", "", "canary"])
+            tests = dict(tests or {name: (None, "tests/execution/X.cpp") for name in plan})
+            for canary in canaries:
+                tests.setdefault(canary, (None, "tests/execution/Canary.cpp"))
+            source = source_repository(root)
+            build = write_build(root, tests, source)
             bin_directory = root / "bin"
             bin_directory.mkdir()
-            ctest = bin_directory / "ctest"
-            ctest.write_text(FAKE_CTEST)
-            ctest.chmod(ctest.stat().st_mode | stat.S_IEXEC)
+            for name, text in (("ctest", FAKE_CTEST), ("ninja", FAKE_NINJA), ("sysctl", FAKE_SYSCTL), ("ps", FAKE_PS)):
+                tool = bin_directory / name
+                tool.write_text(text)
+                tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
             (root / "plan.json").write_text(json.dumps(plan))
+            (root / "canaries.txt").write_text("# canaries\n" + "".join(f"{name}\n" for name in canaries))
             environment = dict(os.environ, PATH=f"{bin_directory}{os.pathsep}{os.environ.get('PATH', '')}",
-                               FAKE_CTEST_PLAN=str(root / "plan.json"), FAKE_CTEST_LOG=str(root / "ctest.log"))
+                               FAKE_CTEST_PLAN=str(root / "plan.json"), FAKE_CTEST_LOG=str(root / "ctest.log"),
+                               FAKE_NINJA_LOG=str(root / "ninja.log"))
+            environment.pop("FAKE_PROCESSES", None)
+            environment.update({key: value.format(build=build, root=root) for key, value in (env or {}).items()})
+            if prepare:
+                prepare(root, source, build)
             out = root / "out"
-            result = subprocess.run([sys.executable, "-I", str(HERE / "gpu_suite.py"), *arguments, "--build", str(build), "--out", str(out)],
+            started = time.monotonic()
+            result = subprocess.run([sys.executable, "-I", str(HERE / "gpu_suite.py"), *arguments, "--build", str(build), "--out", str(out),
+                                     "--canaries", str(root / "canaries.txt"), "--busy-wait", "0"],
                                     capture_output=True, text=True, env=environment)
+            result.seconds = time.monotonic() - started
             files = {name: (out / name).read_text() for name in ("summary.txt", "summary.json", "junit.xml") if (out / name).exists()}
             log = (root / "ctest.log").read_text() if (root / "ctest.log").exists() else ""
+            result.ninja = (root / "ninja.log").read_text() if (root / "ninja.log").exists() else ""
             return result, files, log
 
     def test_counts_failures_skips_and_never_runs_held_tests(self):
@@ -215,7 +274,8 @@ class SuiteRunTests(unittest.TestCase):
         self.assertTrue(any("agc_driver_skip skipped and is not in the allowlist" in error for error in summary["skip_errors"]))
         self.assertIn("opcode=FPMul32", files["summary.txt"])
         self.assertIn("<testcase", files["junit.xml"])
-        self.assertEqual(log.count("--output-junit"), 2)
+        self.assertEqual(log.count("--output-junit"), 4)  # the canary, then one ctest process per test
+        self.assertTrue(log.splitlines()[0].endswith("^agc_canary_ok$") or "agc_canary_ok" in log.splitlines()[0])
 
     def test_dry_run_runs_nothing(self):
         result, files, log = self.run_suite({"agc_driver_ok": ["run", "", ""]}, "agc_driver_ok", "--dry-run")
@@ -249,6 +309,128 @@ class SuiteRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("held back", result.stdout)
         self.assertEqual(log, "")
+
+
+class GuardTests(unittest.TestCase):
+    """DECISIONS D19: gpu_suite refuses inconsistent binaries, a loaded machine and failing canaries."""
+    run_suite = SuiteRunTests.run_suite
+    PLAN = {"agc_driver_ok": ["run", "", ""]}
+
+    def assertRefused(self, result, log, text):
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn(text, result.stdout + result.stderr)
+        self.assertEqual(log, "", "no test may run after a refusal")
+
+    def test_refuses_uncommitted_changes_under_core(self):
+        def edit(root, source, build):
+            (source / "core" / "a.cpp").write_text("int b;\n")
+        result, files, log = self.run_suite(self.PLAN, "agc_driver_ok", prepare=edit)
+        self.assertRefused(result, log, "uncommitted changes")
+        self.assertIn("core/a.cpp", json.loads(files["summary.json"])["meta"]["guards"]["dirty"])
+
+    def test_refuses_untracked_files_under_specifics(self):
+        def add(root, source, build):
+            (source / "specifics").mkdir()
+            (source / "specifics" / "new.mm").write_text("x\n")
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", prepare=add)
+        self.assertRefused(result, log, "specifics/new.mm")
+
+    def test_changes_outside_core_and_specifics_are_allowed(self):
+        def edit(root, source, build):
+            (source / "docs" / "notes.md").write_text("more\n")
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", prepare=edit)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("agc_driver_ok", log)
+
+    def test_refuses_stale_binaries(self):
+        env = {"FAKE_NINJA_OUTPUT": "[1/2] Linking CXX shared library core/libs/libs/unpatched/libSceAgcDriver.prx"}
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", env=env)
+        self.assertRefused(result, log, "build step(s) pending")
+
+    def test_stale_check_names_tests_canaries_and_the_prx(self):
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = result.ninja.split()
+        for target in ("tests/agc_driver_ok_tests", "tests/agc_canary_ok_tests", gpu_suite.PRX):
+            self.assertIn(target, targets)
+        self.assertIn("-n", targets)
+
+    def test_refuses_under_load(self):
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", env={"FAKE_LOAD": "7.25"})
+        self.assertRefused(result, log, "load average 7.25 > 6")
+
+    def test_refuses_while_a_compiler_runs(self):
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", env={"FAKE_PROCESSES": "/usr/bin/clang++ /opt/x/bin/swift-frontend"})
+        self.assertRefused(result, log, "compiler/linker running: clang++ swift-frontend")
+
+    def test_refuses_without_a_canary_list(self):
+        def remove(root, source, build):
+            (root / "canaries.txt").unlink()
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", prepare=remove)
+        self.assertRefused(result, log, "canary list")
+
+    def test_a_failing_canary_stops_the_run(self):
+        plan = {"agc_canary_ok": ["fail", "Failed", "error: canary broke"], "agc_driver_ok": ["run", "", ""]}
+        result, files, log = self.run_suite(plan, "agc_driver_ok")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("canary agc_canary_ok failed", result.stderr)
+        self.assertNotIn("agc_driver_ok", log)
+        summary = json.loads(files["summary.json"])
+        self.assertEqual(summary["meta"]["not_run"], ["agc_driver_ok"])
+        self.assertEqual(summary["meta"]["canaries"], {"agc_canary_ok": "failed"})
+
+    def test_canaries_run_first_once_and_tests_are_paused(self):
+        plan = {"agc_driver_a": ["run", "", ""], "agc_driver_b": ["run", "", ""]}
+        result, files, log = self.run_suite(plan, "re:^agc_", "--validation")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = [line.split("-R ")[1].split()[0] for line in log.splitlines()]
+        self.assertEqual(runs, ["^agc_canary_ok$", "^agc_driver_a$", "^agc_driver_b$"])
+        self.assertGreaterEqual(result.seconds, 2 * gpu_suite.PAUSE_SECONDS)
+        meta = json.loads(files["summary.json"])["meta"]
+        self.assertEqual(meta["environment"]["MTL_SHADER_VALIDATION"], "1")
+        self.assertEqual(meta["environment"]["MTL_DEBUG_LAYER"], "1")
+        self.assertEqual(meta["prx"]["sha256"], hashlib.sha256(b"prx").hexdigest())
+        self.assertRegex(meta["git"]["head"], r"^[0-9a-f]{7,}$")
+        self.assertIn("sha256 " + hashlib.sha256(b"prx").hexdigest(), files["summary.txt"])
+
+    def test_timeout_is_capped(self):
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", "--timeout", "60")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+        tests = {"agc_driver_ok": ("900", "tests/execution/X.cpp")}
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", tests=tests)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--timeout 30 -R ^agc_driver_ok$", log)
+        self.assertEqual(gpu_suite.effective_timeout("900", 30), 30)
+        self.assertEqual(gpu_suite.effective_timeout("10", 30), 10)
+        self.assertEqual(gpu_suite.effective_timeout(None, 20), 20)
+
+    def test_pause_below_two_seconds_is_rejected(self):
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", "--pause", "0.5")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+
+    def test_a_binary_rebuilt_during_the_run_fails_it(self):
+        result, files, _ = self.run_suite(self.PLAN, "agc_driver_ok", env={"FAKE_CTEST_TOUCH": "{build}/" + gpu_suite.PRX})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("changed while the suite ran", files["summary.txt"])
+
+    def test_the_process_group_is_killed_at_the_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bin").mkdir()
+            ctest = root / "bin" / "ctest"
+            ctest.write_text("#!/bin/sh\nsleep 60 &\necho $! > \"$FAKE_CHILD\"\nwait\n")
+            ctest.chmod(ctest.stat().st_mode | stat.S_IEXEC)
+            environment = dict(os.environ, PATH=f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}", FAKE_CHILD=str(root / "child"))
+            started = time.monotonic()
+            code, seconds, killed = gpu_suite.run_test(root, "x", 1, root / "x.xml", root / "x.log", environment)
+            self.assertTrue(killed)
+            self.assertLess(time.monotonic() - started, 20)
+            child = int((root / "child").read_text())
+            time.sleep(0.2)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
 
 
 if __name__ == "__main__":
