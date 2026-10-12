@@ -135,7 +135,10 @@ Shared SharedOf(MslEmitterState& state, const IrValue& instruction) {
         return shared;
     }
     if (memory.kind != ResourceKind::Gds) state.Fail(instruction, "must access LDS or GDS");
-    const auto element = state.DescriptorElement(DescriptorBindingKind::Gds, memory.resource);
+    // One GDS buffer per program (the SPIR-V path's single gdsVariable), whatever resource id the
+    // front end gave the access.
+    static_cast<void>(memory.resource);
+    const std::uint32_t element = 0u;
     const auto name = "aps5_gds" + std::to_string(element);
     if (state.prologue.find(" " + name + " ") == std::string::npos) {
         const auto table = state.TableBuffer(DescriptorBindingKind::Gds, element);
