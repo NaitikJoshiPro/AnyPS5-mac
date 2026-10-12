@@ -3,6 +3,7 @@ an arm64 program and as x86-64 guest programs, the way run_fex_fixtures.py build
 three guest targets: sse2 (-march=x86-64), sse4 (-march=x86-64-v2) and avx2 (-march=znver2, the PS5).
 
     python3 run_fex_bench.py <relinker> <aps5-fex> <patched prx directory> [--smoke] [options]
+    python3 run_fex_bench.py --compare <result.json>...
 
 --smoke runs every kernel at a tiny size natively and as the avx2 guest and checks each result
 against the native one (the ctest fex_bench_smoke). Otherwise each kernel runs in its own process:
@@ -194,7 +195,8 @@ def benchmark(arguments, native, guests):
     binaries.update({variant: ([str(arguments.runner), "eboot.elf"], eboot.parent, guest_environment) for variant, eboot in guests.items()})
     report = {"date": datetime.datetime.now().isoformat(timespec="seconds"), "machine": machine(), "load_start": os.getloadavg(),
               "permille": arguments.permille, "repetitions": arguments.reps, "processes": arguments.processes,
-              "qos": arguments.qos, "fex_config": arguments.config or "", "variants": {v: VARIANTS[v] for v in guests},
+              "qos": arguments.qos, "fex_config": arguments.config or "", "label": arguments.label,
+              "variants": {v: VARIANTS[v] for v in guests},
               "kernels": {}}
     print(f"load average {' '.join(f'{value:.2f}' for value in report['load_start'])}; {len(names)} kernels, "
           f"{arguments.processes} process(es) of {arguments.reps} repetitions each", flush=True)
@@ -298,11 +300,31 @@ def table(report, guests):
     return "\n".join(lines)
 
 
+def compare(paths):
+    """The speed of every kernel in several result files, side by side."""
+    reports = [(report.get("label", path.stem), report) for path in paths for report in [json.loads(path.read_text())]]
+    columns = [(label, report, variant) for label, report in reports for variant in report["variants"]]
+    names = list(dict.fromkeys(name for _, report in reports for name in report["kernels"]))
+    lines = ["| kernel | " + " | ".join(f"{label} {variant}" for label, _, variant in columns) + " |", "|---|" + "---|" * len(columns)]
+    for name in names:
+        cells = []
+        for _, report, variant in columns:
+            value = speed(report["kernels"][name], variant) if name in report["kernels"] else None
+            cells.append(f"{value:.2f}" if value else "-")
+        lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    for group in GROUPS:
+        values = [report["speed"][variant].get(group) for _, report, variant in columns]
+        lines.append(f"| geomean {group} | " + " | ".join(f"{value:.2f}" if value else "-" for value in values) + " |")
+    print("\n".join(lines))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("relinker", type=pathlib.Path)
-    parser.add_argument("runner", type=pathlib.Path)
-    parser.add_argument("libraries", type=pathlib.Path)
+    parser.add_argument("relinker", type=pathlib.Path, nargs="?")
+    parser.add_argument("runner", type=pathlib.Path, nargs="?")
+    parser.add_argument("libraries", type=pathlib.Path, nargs="?")
+    parser.add_argument("--compare", type=pathlib.Path, nargs="+", metavar="JSON", help="print the speeds of earlier runs side by side")
     parser.add_argument("--smoke", action="store_true", help="check every kernel at a tiny size against the native results")
     parser.add_argument("--variants", help="guest targets, from " + ", ".join(VARIANTS) + " (default: all; avx2 with --smoke)")
     parser.add_argument("--kernels", default="", help="comma-separated regular expressions of kernel names")
@@ -315,6 +337,10 @@ def main():
     parser.add_argument("--timeout", type=int, default=300, help="seconds per process")
     parser.add_argument("--keep", type=pathlib.Path, help="build in this new directory and keep it")
     arguments = parser.parse_args()
+    if arguments.compare:
+        return compare(arguments.compare)
+    if arguments.libraries is None:
+        parser.error("the relinker, aps5-fex and the patched prx directory are required")
     arguments.runner = arguments.runner.resolve()
     variants = [v for v in arguments.variants.split(",") if v] if arguments.variants else SMOKE_VARIANTS if arguments.smoke else list(VARIANTS)
     if unknown := [v for v in variants if v not in VARIANTS]:
