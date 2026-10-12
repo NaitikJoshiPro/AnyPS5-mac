@@ -13,6 +13,7 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
+#include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Utils/LogManager.h>
 
@@ -20,6 +21,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <mach/mach.h>
@@ -359,6 +361,24 @@ namespace Aps5Fex {
 namespace {
 
 struct sigaction previousBus {}, previousSegv {};
+FEXCore::ArchHelpers::Arm64::UnalignedHandlerType unalignedHandler = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier;
+
+// The M3 raises SIGBUS (BUS_ADRALN) when an ordered access (LDAPR/LDAPUR/STLR/STLUR) or an atomic crosses a
+// 16-byte boundary. FEX emulates the access or backpatches it to a plain access plus barrier; the backpatch writes
+// through the code pool's writable alias (FEX Arm64.cpp).
+bool HandleUnaligned(int signal, siginfo_t* info, __darwin_mcontext64* machine) {
+    if (signal != SIGBUS || info->si_code != BUS_ADRALN || currentThread == nullptr) return false;
+    const std::uint64_t pc = arm_thread_state64_get_pc(machine->__ss);
+    if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) return false;
+    // __x[0..28], __fp, __lr, __sp and __pc are contiguous: FEX indexes the GPRs as x0..x31.
+    static_assert(offsetof(__darwin_arm_thread_state64, __x) + 29 * 8 == offsetof(__darwin_arm_thread_state64, __fp));
+    static_assert(offsetof(__darwin_arm_thread_state64, __fp) + 8 == offsetof(__darwin_arm_thread_state64, __lr));
+    static_assert(offsetof(__darwin_arm_thread_state64, __lr) + 8 == offsetof(__darwin_arm_thread_state64, __sp));
+    const auto result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(currentThread, unalignedHandler, pc, machine->__ss.__x);
+    if (!result) return false;
+    arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(pc + *result));
+    return true;
+}
 
 void OnFault(int signal, siginfo_t* info, void* context) {
     auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
@@ -368,6 +388,7 @@ void OnFault(int signal, siginfo_t* info, void* context) {
         arm_thread_state64_set_pc_fptr(machine->__ss, &Aps5GuestCallEntry);
         return;
     }
+    if (HandleUnaligned(signal, info, machine)) return;
     const struct sigaction& previous = signal == SIGBUS ? previousBus : previousSegv;
     if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
         previous.sa_sigaction(signal, info, context);
@@ -404,6 +425,9 @@ void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::
     for (const auto& [option, value] : config)
         FEXCore::Config::Set(option, value);
     LoadOptions();
+    FEX_CONFIG_OPT(halfBarrierTso, HALFBARRIERTSOENABLED);
+    unalignedHandler = halfBarrierTso() ? FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier
+                                        : FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic;
 }
 
 }
