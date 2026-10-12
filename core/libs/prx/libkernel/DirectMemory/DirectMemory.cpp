@@ -1012,6 +1012,19 @@ static bool IsGuestModuleImage(const void* base) {
 }
 #endif
 
+static std::uintptr_t HostPageBytes() {
+#ifdef _WIN32
+    static const auto bytes = [] {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        return static_cast<std::uintptr_t>(info.dwPageSize);
+    }();
+#else
+    static const auto bytes = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+#endif
+    return bytes;
+}
+
 int DoMprotect(const void* addr, size_t len, int prot) {
     Trace("protect %p+0x%zx prot=0x%x", addr, len, prot);
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
@@ -1029,7 +1042,8 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     std::uintptr_t stackStart = 0;
     std::uintptr_t stackEnd = 0;
     if ((prot & GuestProtGpuReadWrite) == 0 && GuestThreadStack(address, &stackStart, &stackEnd) && address >= stackStart && address + len <= stackEnd) {
-        constexpr std::uintptr_t hostPageMask = 0xfff;
+        // Whole host pages: 16 KiB on Apple silicon, where a 4 KiB boundary is not one mprotect accepts.
+        const auto hostPageMask = HostPageBytes() - 1;
         const auto inside = std::max(first, (stackStart + hostPageMask) & ~hostPageMask);
         const auto insideEnd = std::min(end, stackEnd & ~hostPageMask);
         if (inside >= insideEnd) return 0;
