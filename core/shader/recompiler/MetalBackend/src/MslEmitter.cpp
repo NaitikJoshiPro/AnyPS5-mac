@@ -381,7 +381,10 @@ std::uint32_t MslEmitterState::DescriptorElement(DescriptorBindingKind kind, std
 
 std::string MslEmitterState::LoopGuardLimit() {
     usesDriverData = true;
-    return "aps5_driver.loopGuardLimit";
+    // MslAbi::DriverData: 0 means no guard.
+    if (!loopGuardDeclared) AddPrologue("const uint aps5_loop_limit = aps5_driver.loopGuardLimit != 0u ? aps5_driver.loopGuardLimit : 0xffffffffu;");
+    loopGuardDeclared = true;
+    return "aps5_loop_limit";
 }
 
 bool MslEmitterState::LdsInDeviceMemory() const {

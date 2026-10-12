@@ -61,6 +61,22 @@ std::string MslTableMemberType(DescriptorBindingKind kind) {
     return std::string(TextureShapes[dimension]) + "<" + Scalars[index / HeapDimensions] + (multisampled ? ", access::read>" : ", access::read_write>");
 }
 
+std::string MslTableDeclaration(const MslAbi::TableLayout& layout) {
+    std::string text = "struct Aps5Table {\n";
+    for (const auto& range : layout.ranges) {
+        const auto type = MslTableMemberType(range.binding);
+        if (range.kind == MslAbi::EntryKind::Buffer) text += "    " + type + " " + MslTableField(range.binding) + "[" + std::to_string(range.count) + "];\n";
+        else text += "    array<" + type + ", " + std::to_string(range.count) + "> " + MslTableField(range.binding) + ";\n";
+    }
+    text += "};\n";
+    // The driver writes the table by MslAbi's layout: a mismatch must not compile.
+    text += "static_assert(sizeof(Aps5Table) == " + std::to_string(layout.bytes) + ", \"MslAbi descriptor table size\");\n";
+    for (const auto& range : layout.ranges) {
+        text += "static_assert(__builtin_offsetof(Aps5Table, " + MslTableField(range.binding) + ") == " + std::to_string(range.offset) + ", \"MslAbi descriptor table offset\");\n";
+    }
+    return text + "\n";
+}
+
 std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInputInfo& workgroup, std::uint32_t laneCount) {
     const std::array<std::uint32_t, 3> guest {std::max(workgroup.threadsNum[0], 1u), std::max(workgroup.threadsNum[1], 1u), std::max(workgroup.threadsNum[2], 1u)};
     if (laneCount == 1u) return guest;
@@ -90,13 +106,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     std::vector<std::string> parameters;
     if (state.reflection.table.bytes != 0u) {
         state.RequirePrelude(MslPreludeChunk::Common);
-        text += "struct Aps5Table {\n";
-        for (const auto& range : state.reflection.table.ranges) {
-            const auto type = MslTableMemberType(range.binding);
-            if (range.kind == MslAbi::EntryKind::Buffer) text += "    " + type + " " + MslTableField(range.binding) + "[" + std::to_string(range.count) + "];\n";
-            else text += "    array<" + type + ", " + std::to_string(range.count) + "> " + MslTableField(range.binding) + ";\n";
-        }
-        text += "};\n\n";
+        text += MslTableDeclaration(state.reflection.table);
         parameters.push_back("device const Aps5Table& aps5_table [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DescriptorTable)) + ")]]");
     }
     if (state.usesPushData) parameters.push_back("constant uint* aps5_push [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::PushData)) + ")]]");

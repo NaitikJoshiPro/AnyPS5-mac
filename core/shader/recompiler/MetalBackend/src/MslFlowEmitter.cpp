@@ -346,6 +346,14 @@ private:
                     Return();
                     return false;
                 }
+                if (trueBlock == falseBlock) {
+                    // Both edges lead to the same block (a branch to the next instruction): the
+                    // structurizer gives it no merge, and the condition does not matter.
+                    if (Exit(block, trueBlock, stop)) return trueBlock == stop;
+                    PhiCopies(block, trueBlock);
+                    block = trueBlock;
+                    continue;
+                }
                 const auto condition = Condition(blockInfo);
                 const auto* merge = term.loopHeader ? nullptr : Target(term.mergeBlock);
                 if (merge != nullptr) {

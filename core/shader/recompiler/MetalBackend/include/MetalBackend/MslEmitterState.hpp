@@ -216,6 +216,7 @@ public:
 private:
     std::uint32_t depth = 1u;
     std::uint32_t nextTemporary = 0u;
+    bool loopGuardDeclared = false;
     std::bitset<static_cast<std::size_t>(MslPreludeChunk::Count)> prelude;
     std::array<std::unordered_set<const IrValue*>, 2> declared;
     std::set<std::string, std::less<>> parameterSet;
@@ -228,6 +229,9 @@ private:
 // for buffer kinds, a texture type fixed by the image heap's class, numeric class and dimension, or
 // `sampler`.
 [[nodiscard]] std::string MslTableMemberType(DescriptorBindingKind kind);
+// `struct Aps5Table` for a descriptor table layout (needs the Common prelude chunk), with static
+// assertions that the Metal compiler lays it out as MslAbi::LayoutTable does.
+[[nodiscard]] std::string MslTableDeclaration(const MslAbi::TableLayout& layout);
 
 // The stage function's signature and module-scope declarations (MslEntryPoint.cpp).
 [[nodiscard]] std::string EmitMslEntryPoint(MslEmitterState& state);
