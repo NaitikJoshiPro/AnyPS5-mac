@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -160,6 +161,11 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
     [residency commit];
     wrappers.push_back({pageBegin, pageEnd, buffer});
     return buffer.gpuAddress + (address - pageBegin);
+}
+
+std::uint64_t VulkanDevice::State::TryWrapRegistered(std::uint64_t address, std::uint64_t bytes) {
+    if (!Graphics::RegisteredReadableCovers(address, bytes)) return 0;
+    return TryWrap(address, bytes);
 }
 
 // The GPU address of guest (host) memory [address, address + bytes): the 16 KiB pages around it
@@ -465,6 +471,7 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         arguments = nil;
         workgroupArena = nil;
         faults = nil;
+        atomicLocks = nil;
         residency = nil;
         // 5. The buffer pool (its residency set leaves the queue in its destructor) and the queue.
         context.bufferPool.reset();
@@ -496,7 +503,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             NSError* error = nil;
             state->compiler = [state->device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler: " + Describe(error));
-            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
+            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
             // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
@@ -516,6 +523,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             if (state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the fault buffer");
             std::memset(state->faults.contents, 0, state->faults.length);
             [state->residency addAllocation:state->faults];
+            state->atomicLocks = [state->device newBufferWithLength:Abi::AtomicLockTableBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            if (state->atomicLocks == nil) throw std::runtime_error("Metal device: cannot allocate the 64-bit atomic lock table");
+            // Every lock word starts released; only the GPU touches the table after this.
+            std::memset(state->atomicLocks.contents, 0, state->atomicLocks.length);
+            [state->residency addAllocation:state->atomicLocks];
             [state->residency commit];
             [state->queue addResidencySet:state->residency];
             MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
@@ -668,7 +680,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     }
     if (recorder.Idle()) return 1;
     @autoreleasepool {
-        if (state->TryWrap(address, bytes.size()) == 0u) return 3;
+        if (state->TryWrapRegistered(address, bytes.size()) == 0u) return 3;
         std::uint64_t offset = 0;
         id<MTLBuffer> wrapper = state->WrapperOf(address, bytes.size(), &offset);
         recorder.RecordStore(Graphics::Metal::BufferHandle(wrapper), offset, bytes, address);
@@ -721,7 +733,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         state->DropWrappersIfIdle();
     }
     @autoreleasepool {
-        if (state->TryWrap(address, bytes) == 0u) return false;
+        if (state->TryWrapRegistered(address, bytes) == 0u) return false;
         static const bool alwaysSync = std::getenv("APS5_FILL_SYNC") != nullptr;
         if (recorder.PendingWriteOverlaps(address, bytes) && (alwaysSync || (Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes)))) {
             Recorder::CountSync(4);
@@ -802,7 +814,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         return outcome;
     }
     @autoreleasepool {
-        if (state->TryWrap(destination, bytes) == 0u || state->TryWrap(source, bytes) == 0u) return outcome;
+        if (state->TryWrapRegistered(destination, bytes) == 0u || state->TryWrapRegistered(source, bytes) == 0u) return outcome;
         const bool waitSource = recorder.PendingWriteOverlaps(source, bytes) && completionStoreOverlaps(source);
         const bool waitDestination = recorder.PendingWriteOverlaps(destination, bytes) && completionStoreOverlaps(destination);
         if (waitSource || waitDestination) {
@@ -1020,6 +1032,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         driver.workgroupBase = {xBase, yBase, zBase};
         driver.loopGuardLimit = LoopGuardLimit();
         driver.faultBuffer = faults.gpuAddress;
+        driver.atomicLocks = atomicLocks.gpuAddress;
         driverAddresses.push_back(stream.Write(std::as_bytes(std::span(&driver, 1)), 16u).address);
         chunkGroups.push_back(groups);
     };

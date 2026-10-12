@@ -91,6 +91,8 @@ struct VulkanDevice::State {
     // The BdaAbi fault buffer: fault record + written-page record, shared by every dispatch, checked
     // and reset when a batch with a dispatch completes (CheckFaults).
     id<MTLBuffer> faults = nil;
+    // MslAbi v2: the 64-bit atomic lock table (AtomicLockTableBytes, zero-filled, GPU-only after setup).
+    id<MTLBuffer> atomicLocks = nil;
     // Device-memory LDS arena (MslAbi::BufferIndex::WorkgroupMemory), grown in 1 MiB granules
     // while idle; its lock dwords start at zero.
     id<MTLBuffer> workgroupArena = nil;
@@ -143,6 +145,9 @@ struct VulkanDevice::State {
     std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
     // Wrap without throwing: 0 when the range cannot be wrapped (unmapped, executable, unreadable).
     std::uint64_t TryWrap(std::uint64_t address, std::uint64_t bytes);
+    // TryWrap limited to registered guest allocations (upstream HostImportFor): labels, fills and
+    // copies into other memory take the PM4 core's drain-and-CPU path.
+    std::uint64_t TryWrapRegistered(std::uint64_t address, std::uint64_t bytes);
     // The wrapper holding [address, address + bytes) and the offset of `address` in it (after Wrap).
     id<MTLBuffer> WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const;
     // Drops the wrappers (and the cached BDA table) once the recorder is idle.

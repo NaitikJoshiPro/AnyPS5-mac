@@ -113,7 +113,7 @@ ShaderRecompiler::RecompileResult Kernel(const std::string& body, std::vector<Ta
     std::string source = R"(#include <metal_stdlib>
 using namespace metal;
 struct Buffer { ulong address; uint bytes; uint flags; };
-struct DriverData { uint workgroupBase[3]; uint loopGuardLimit; ulong faultBuffer; uint reserved[2]; };
+struct DriverData { uint workgroupBase[3]; uint loopGuardLimit; ulong faultBuffer; ulong atomicLocks; };
 )" + table + R"(#define out(n) reinterpret_cast<device uint*>(table.buffers[n].address)
 kernel void aps5_main(device const Table& table [[buffer(0)]], constant uint* push [[buffer(1)]], device uint* lds [[buffer(2)]], constant DriverData& driver [[buffer(3)]],
                       uint3 group [[threadgroup_position_in_grid]], uint3 groups [[threadgroups_per_grid]], uint local [[thread_index_in_threadgroup]]) {
@@ -231,6 +231,40 @@ void CheckAddressTable(AgcDriver::VulkanDevice& device) {
     Require(output[5] == (Bda::Read | Bda::Write), "bda table: the writable block has permissions " + std::to_string(output[5]));
     Require(output[6] == 0x5678u && output[7] == Bda::Read, "bda table: the read-only block read " + Hex(output[6]) + " with permissions " + std::to_string(output[7]));
     std::printf("bda page table: %u ranges, translated load and store, read-only permissions\n", output[1]);
+}
+
+// MslAbi v2: DriverData.atomicLocks is the device's zero-filled AtomicLockTableBytes table, the
+// same for every dispatch; a kernel can take and release a lock word in it.
+void CheckAtomicLocks(AgcDriver::VulkanDevice& device) {
+    alignas(16384) static std::array<std::uint32_t, 64> output {};
+    output.fill(0xdeadbeefu);
+    const auto kernel = Kernel(R"(
+    device atomic_uint* locks = reinterpret_cast<device atomic_uint*>(driver.atomicLocks);
+    if (local == 0u) {
+        out(0)[group.x * 4u] = uint(driver.atomicLocks);
+        out(0)[group.x * 4u + 1u] = uint(driver.atomicLocks >> 32);
+        uint nonzero = 0u;
+        for (uint index = 0u; index < )" + std::to_string(Abi::AtomicLockTableBytes / 4u) + R"(u; ++index) nonzero += atomic_load_explicit(&locks[index], memory_order_relaxed) != 0u ? 1u : 0u;
+        out(0)[group.x * 4u + 2u] = nonzero;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (local == 0u && group.x == 0u) {
+        uint expected = 0u;
+        const bool taken = atomic_compare_exchange_weak_explicit(&locks[7], &expected, 1u, memory_order_relaxed, memory_order_relaxed);
+        atomic_store_explicit(&locks[7], 0u, memory_order_relaxed);
+        out(0)[3] = taken ? 1u : 0u;
+    })",
+        {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(output.data(), sizeof(output))}}, {32, 1, 1});
+    device.Dispatch(kernel, 1, 1, 1);
+    device.WaitIdle();
+    device.Dispatch(kernel, 2, 1, 1);
+    device.WaitIdle();
+    const auto address = static_cast<std::uint64_t>(output[0]) | (static_cast<std::uint64_t>(output[1]) << 32u);
+    const auto second = static_cast<std::uint64_t>(output[4]) | (static_cast<std::uint64_t>(output[5]) << 32u);
+    Require(address != 0u && address == second, "atomic locks: DriverData.atomicLocks is " + Hex(address) + " / " + Hex(second));
+    Require(output[2] == 0u && output[6] == 0u, "atomic locks: the lock table is not all released (" + std::to_string(output[2]) + " busy words)");
+    Require(output[3] == 1u, "atomic locks: a free lock word could not be taken");
+    std::puts("atomic lock table: bound in DriverData, zero-filled, released after use");
 }
 
 // Fault buffer: a published fault record is raised once the device is idle and the buffer is reset;
@@ -368,9 +402,12 @@ void CheckIndirect(AgcDriver::VulkanDevice& device) {
 
 // Labels, fills, copies and completion actions are ordered after the work committed before them.
 void CheckSubmission(AgcDriver::VulkanDevice& device) {
-    alignas(16384) static std::array<std::uint32_t, 1024> memory {};
-    memory.fill(0u);
-    const auto writeAll = Kernel("for (uint index = 0u; index < 1024u; ++index) out(0)[index] = 0x11111111u;", {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(memory.data(), sizeof(memory))}}, {1, 1, 1});
+    // Labels, fills and copies go to the GPU only in registered guest allocations (upstream's host
+    // imports); other memory (a static page here) is left to the PM4 core's drain-and-CPU path.
+    alignas(16384) static std::array<std::uint32_t, 1024> unregistered {};
+    GuestBlock block(16384, true);
+    const std::span<std::uint32_t, 1024> memory(block.Words(), 1024);
+    const auto writeAll = Kernel("for (uint index = 0u; index < 1024u; ++index) out(0)[index] = 0x11111111u;", {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(memory.data(), 4096u)}}, {1, 1, 1});
     const std::array<std::uint32_t, 2> label {0xbbbb0001u, 0xbbbb0002u};
     const auto labelAddress = reinterpret_cast<std::uintptr_t>(&memory[8]);
     device.WaitIdle();
@@ -378,6 +415,11 @@ void CheckSubmission(AgcDriver::VulkanDevice& device) {
     Require(device.WriteLabelOnGpu(labelAddress + 2u, std::as_bytes(std::span(label)), 1, 0) == 4, "labels: a misaligned label was accepted");
     device.Dispatch(writeAll, 1, 1, 1);
     Require(device.WriteLabelOnGpu(labelAddress, std::as_bytes(std::span(label)), 2, 0, false) == 0, "labels: a label behind recorded work was not stored on the GPU");
+    const auto staticAddress = reinterpret_cast<std::uintptr_t>(unregistered.data());
+    Require(device.WriteLabelOnGpu(staticAddress, std::as_bytes(std::span(label)), 3, 0, false) == 3, "labels: a label into unregistered memory was not left to the drain path");
+    const std::array<std::uint32_t, 4> zeros {};
+    Require(!device.FillBuffer(staticAddress, 64, zeros), "fills: a fill into unregistered memory was not refused");
+    Require(device.CopyBuffer(staticAddress, reinterpret_cast<std::uintptr_t>(&memory[64]), 64, 0, 1u << 20u, 0, 0, 0, [](std::span<const std::byte>, std::uint64_t) {}).path == 2, "copies: a copy into unregistered memory was not refused");
     const std::array<std::uint32_t, 4> pattern {0x01020304u, 0xa0b0c0d0u, 0x55aa55aau, 0x00ff00ffu};
     Require(device.FillBuffer(reinterpret_cast<std::uintptr_t>(&memory[64]), 256, pattern), "fills: the pattern fill was refused");
     const std::array<std::uint32_t, 4> uniform {0x05050505u, 0x05050505u, 0x05050505u, 0x05050505u};
@@ -481,6 +523,7 @@ int main(int argc, char** argv) {
             CheckAddressTable(*device);
             CheckFaults(*device);
             CheckWorkgroupArena(*device);
+            CheckAtomicLocks(*device);
         } else if (mode == "submission") {
             CheckSplit(*device);
             CheckIndirect(*device);
