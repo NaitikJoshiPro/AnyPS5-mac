@@ -145,6 +145,9 @@ public:
     std::string Builtin(MslBuiltin builtin);
     std::bitset<static_cast<std::size_t>(MslBuiltin::Count)> builtins;
     bool usesTable = false;
+    // Descriptor kinds the emitted code references (TableResource): the table holds only these ranges,
+    // as the SPIR-V path drops unused descriptor variables (so the binding plan drops them too).
+    std::set<DescriptorBindingKind> usedKinds;
     bool usesPushData = false;
     bool usesDriverData = false;
 

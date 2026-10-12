@@ -366,6 +366,7 @@ std::string MslEmitterState::TableResource(DescriptorBindingKind kind, std::uint
     if (found == descriptors.end()) Fail("descriptor binding " + MslTableField(kind) + " was not allocated");
     if (element >= std::max<std::size_t>(found->resources.size(), 1u)) Fail("descriptor element " + std::to_string(element) + " of " + MslTableField(kind) + " is out of range");
     usesTable = true;
+    usedKinds.insert(kind);
     return "aps5_table." + MslTableField(kind) + "[" + std::to_string(element) + "]";
 }
 

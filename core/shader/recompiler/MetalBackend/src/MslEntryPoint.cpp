@@ -89,6 +89,7 @@ std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInput
 std::string EmitMslEntryPoint(MslEmitterState& state) {
     std::vector<MslAbi::TableBinding> tableBindings;
     for (const auto& descriptor : state.program.Metadata().bindings.descriptors) {
+        if (!state.usedKinds.contains(descriptor.kind)) continue;
         tableBindings.push_back({descriptor.kind, std::max<std::uint32_t>(static_cast<std::uint32_t>(descriptor.resources.size()), 1u)});
     }
     state.reflection.table = MslAbi::LayoutTable(tableBindings);
