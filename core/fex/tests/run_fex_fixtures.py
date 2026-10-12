@@ -127,6 +127,10 @@ COMPILED = {
     "tls-modules": (lambda d: compiled_modules(d, [("tls_owner.cpp", "libowner.prx", []), ("tls_user.cpp", "libuser.prx", ["libowner.prx"])],
                     "tls_modules_main.cpp", {"libc.prx": ["exit", "__tls_get_addr"],
                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 47),
+    "image-protect": (lambda d: compiled_executable(d, [str(HERE / "image_protect.cpp")], {"libc.prx": ["exit"],
+                      "libkernel.prx": ["sceKernelMprotect", "sceKernelQueryMemoryProtection"]}), 43),
+    "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
+                   "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }
 
 

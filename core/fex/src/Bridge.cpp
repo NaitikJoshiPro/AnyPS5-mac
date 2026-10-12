@@ -220,6 +220,9 @@ Bridge::Bridge(std::filesystem::path libraries) : directory(std::move(libraries)
     void* memory = mmap(nullptr, StubSize(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (memory == MAP_FAILED) throw std::runtime_error("cannot allocate the import stubs");
     stubs = static_cast<std::uint8_t*>(memory);
+    // Stubs are added while guest threads run (StubFor): Call reads entries without the lock, so the
+    // table never moves.
+    functions.reserve(StubCapacity);
     static_assert(TrampolineOffset + TrampolineCall.size() + TrampolineReturn.size() <= X87TrampolineOffset);
     static_assert(X87TrampolineOffset + TrampolineCall.size() + X87TrampolineReturn.size() <= FirstStubOffset);
     std::memset(stubs, 0xcc, FirstStubOffset);
@@ -296,6 +299,7 @@ std::uint64_t Bridge::TlsGetAddrStub() {
 }
 
 std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic variadic, std::uint8_t fixed, bool x87Result) {
+    std::lock_guard lock(stubMutex);
     if (FirstStubOffset + (functions.size() + 1) * StubBytes > StubSize()) throw std::runtime_error("too many imported functions");
     const auto number = static_cast<std::uint32_t>(FirstStub + functions.size());
     std::uint8_t* stub = stubs + FirstStubOffset + functions.size() * StubBytes;
@@ -307,40 +311,53 @@ std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic v
     std::memset(stub, 0xcc, StubBytes);
     std::memcpy(stub, code, sizeof(code));
     functions.push_back({address, name, variadic, fixed, x87Result});
+    stubCount.store(functions.size(), std::memory_order_release);
     return reinterpret_cast<std::uint64_t>(stub);
+}
+
+std::uint64_t Bridge::StubFor(void* address, const std::string& name) {
+    Dl_info info;
+    if (address == nullptr || dladdr(address, &info) == 0) return 0;
+    const auto* image = static_cast<const mach_header_64*>(info.dli_fbase);
+    // Only the PS5 libraries: a symbol the system libraries define (dlsym searches a library's
+    // dependencies too) has macOS semantics, which the guest never gets.
+    if (std::find(images.begin(), images.end(), image) == images.end() &&
+        (info.dli_fname == nullptr || !std::string_view(info.dli_fname).ends_with(".prx")))
+        return 0;
+    std::lock_guard lock(stubMutex);
+    if (const auto found = guestAddresses.find(address); found != guestAddresses.end()) return found->second;
+    unsigned long textSize = 0;
+    const auto* text = getsectiondata(image, "__TEXT", "__text", &textSize);
+    const auto* byte = static_cast<const std::uint8_t*>(address);
+    const bool function = text != nullptr && byte >= text && byte < text + textSize;
+    std::uint64_t guest = reinterpret_cast<std::uint64_t>(address);
+    if (function) {
+        Variadic variadic = Variadic::None;
+        std::uint8_t fixed = 0;
+        for (const auto& entry : VariadicExports) {
+            if (info.dli_sname != nullptr && entry.name == info.dli_sname && info.dli_saddr == address) {
+                variadic = static_cast<Variadic>(entry.kind);
+                fixed = entry.fixed;
+            }
+        }
+        if (variadic == Variadic::GuestList && setBridgeVaList == nullptr) {
+            for (void* library : handles)
+                if (auto* setter = dlsym(library, "Aps5SetBridgeVaList_nid_no_patch")) setBridgeVaList = reinterpret_cast<void (*)(void*)>(setter);
+            if (setBridgeVaList == nullptr) throw std::runtime_error("libc has no Aps5SetBridgeVaList_nid_no_patch");
+        }
+        const bool x87Result = info.dli_sname != nullptr && info.dli_saddr == address &&
+            std::find(std::begin(X87Results), std::end(X87Results), info.dli_sname) != std::end(X87Results);
+        guest = AddStub(address, name, variadic, fixed, x87Result);
+    }
+    guestAddresses.emplace(address, guest);
+    return guest;
 }
 
 std::uint64_t Bridge::Resolve(const std::string& name, bool weak) {
     if (const auto found = resolved.find(name); found != resolved.end()) return found->second;
     for (void* handle : handles) {
-        void* address = dlsym(handle, name.c_str());
-        Dl_info info;
-        if (address == nullptr || dladdr(address, &info) == 0) continue;
-        const auto* image = static_cast<const mach_header_64*>(info.dli_fbase);
-        if (std::find(images.begin(), images.end(), image) == images.end()) continue;
-        unsigned long textSize = 0;
-        const auto* text = getsectiondata(image, "__TEXT", "__text", &textSize);
-        const auto* byte = static_cast<const std::uint8_t*>(address);
-        const bool function = text != nullptr && byte >= text && byte < text + textSize;
-        std::uint64_t guest = reinterpret_cast<std::uint64_t>(address);
-        if (function) {
-            Variadic variadic = Variadic::None;
-            std::uint8_t fixed = 0;
-            for (const auto& entry : VariadicExports) {
-                if (info.dli_sname != nullptr && entry.name == info.dli_sname && info.dli_saddr == address) {
-                    variadic = static_cast<Variadic>(entry.kind);
-                    fixed = entry.fixed;
-                }
-            }
-            if (variadic == Variadic::GuestList && setBridgeVaList == nullptr) {
-                for (void* library : handles)
-                    if (auto* setter = dlsym(library, "Aps5SetBridgeVaList_nid_no_patch")) setBridgeVaList = reinterpret_cast<void (*)(void*)>(setter);
-                if (setBridgeVaList == nullptr) throw std::runtime_error("libc has no Aps5SetBridgeVaList_nid_no_patch");
-            }
-            const bool x87Result = info.dli_sname != nullptr && info.dli_saddr == address &&
-                std::find(std::begin(X87Results), std::end(X87Results), info.dli_sname) != std::end(X87Results);
-            guest = AddStub(address, name, variadic, fixed, x87Result);
-        }
+        const std::uint64_t guest = StubFor(dlsym(handle, name.c_str()), name);
+        if (guest == 0) continue;
         resolved.emplace(name, guest);
         return guest;
     }
@@ -354,7 +371,7 @@ std::uint64_t Bridge::Resolve(const std::string& name, bool weak) {
 std::uint64_t Bridge::Call(FEXCore::Core::CPUState& state, std::uint64_t number, std::uint64_t block) {
     const std::uint64_t rip = state.rip;
     state.rip = rip + 2;
-    if (number < FirstStub || number - FirstStub >= functions.size()) {
+    if (number < FirstStub || number - FirstStub >= stubCount.load(std::memory_order_acquire)) {
         std::fprintf(stderr, "[aps5-fex] guest syscall %llu at %#llx is not supported\n", static_cast<unsigned long long>(number),
                      static_cast<unsigned long long>(rip));
         return static_cast<std::uint64_t>(-ENOSYS);

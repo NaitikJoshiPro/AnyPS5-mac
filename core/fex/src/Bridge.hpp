@@ -1,10 +1,12 @@
 #ifndef CORE_FEX_SRC_BRIDGE_HPP
 #define CORE_FEX_SRC_BRIDGE_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -37,6 +39,10 @@ public:
 
     std::uint64_t Resolve(const std::string& name, bool weak);
     const std::vector<std::string>& Missing() const { return missing; }
+
+    // What guest code gets for a native export: the x86 stub of a function (one per function), the
+    // address itself for data, 0 when no PS5 library (*.prx) holds the address. Thread-safe.
+    std::uint64_t StubFor(void* address, const std::string& name);
 
     std::uint64_t CallbackReturn() const { return StubBase(); }
 
@@ -80,6 +86,9 @@ private:
     std::vector<std::string> missing;
     std::deque<std::string> imageNames;
     std::uint64_t tlsGetAddrStub = 0;
+    std::unordered_map<const void*, std::uint64_t> guestAddresses;
+    std::recursive_mutex stubMutex;
+    std::atomic<std::size_t> stubCount {0};
     std::uint8_t* stubs = nullptr;
     void (*setBridgeVaList)(void*) = nullptr;
     bool trace = false;

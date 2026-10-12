@@ -17,6 +17,7 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include "prx/libc/include/specifics/macos/GuestImages.hpp"
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #else
@@ -57,8 +58,10 @@ std::map<const void*, std::uintptr_t> imageIds;
 void* Symbol(Module& module, const char* name) {
 #if defined(__APPLE__) && defined(__aarch64__)
     if (module.guest) return guestSymbol(module.native, name);
-#endif
-#ifdef _WIN32
+    // A native library's functions are arm64 code: the guest gets the bridge's x86 stubs for them.
+    void* native = ::dlsym(module.native, name);
+    return native != nullptr ? LibcGuestCallable_nid_no_patch(native, name) : nullptr;
+#elif defined(_WIN32)
     return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module.native), name));
 #else
     return ::dlsym(module.native, name);
@@ -97,7 +100,12 @@ bool FromGuestModule(void* address) {
 
 void* DefaultScopeSymbol(const char* symbolName) {
     auto* result = ::dlsym(RTLD_DEFAULT, symbolName);
-    return FromGuestModule(result) ? result : nullptr;
+    if (!FromGuestModule(result)) return nullptr;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return LibcGuestCallable_nid_no_patch(result, symbolName);
+#else
+    return result;
+#endif
 }
 #endif
 

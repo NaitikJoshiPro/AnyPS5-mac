@@ -242,7 +242,14 @@ int LinuxProtFromSce(int prot) {
     int result = PROT_NONE;
     if (prot & 0x113) result |= PROT_READ;
     if (prot & 0x222) result |= PROT_READ | PROT_WRITE;
+#if defined(__APPLE__) && defined(__aarch64__)
+    // Guest code is x86-64, which the translator reads and the CPU never runs. An executable host page
+    // would let a native call into guest code run x86 bytes as arm64 instead of faulting into the runner,
+    // and macOS refuses pages that are writable and executable outside MAP_JIT.
+    if (prot & 4) result |= PROT_READ;
+#else
     if (prot & 4) result |= PROT_READ | PROT_EXEC;
+#endif
     return result;
 }
 

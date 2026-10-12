@@ -16,7 +16,7 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
-#include "prx/libc/include/specifics/linux/ElfTypes.hpp"
+#include "prx/libc/include/specifics/macos/GuestImages.hpp"
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <unistd.h>
@@ -235,13 +235,64 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     state.registeredImages.erase(found);
 }
 #else
+namespace {
+struct ImagePage {
+    bool readable = false;
+    bool writable = false;
+};
+
+// Registers runs of image pages with equal access as guest image memory, which is never releasable.
+void registerImagePages(void* mutation, const std::map<std::uint64_t, ImagePage>& pages, std::uint64_t pageSize) {
+    auto& state = registry();
+    auto replacement = state.ranges;
+    for (auto page = pages.begin(); page != pages.end();) {
+        auto last = page;
+        while (std::next(last) != pages.end() && std::next(last)->first == last->first + pageSize && std::next(last)->second.readable == page->second.readable && std::next(last)->second.writable == page->second.writable) ++last;
+        const auto address = page->first;
+        const auto bytes = static_cast<std::size_t>(last->first + pageSize - address);
+        const auto next = replacement.lower_bound(address);
+        require(next == replacement.end() || address + bytes <= next->first, "guest image overlaps a registered allocation");
+        if (next != replacement.begin()) {
+            const auto& previous = *std::prev(next)->second;
+            require(previous.address + previous.bytes <= address, "guest image overlaps a registered allocation");
+        }
+        replacement.emplace(address, std::make_shared<const Range>(Range{address, bytes, page->second.readable, page->second.writable, address, bytes, false}));
+        recordChange(mutation, reinterpret_cast<const void*>(address), bytes);
+        page = std::next(last);
+    }
+    state.ranges.swap(replacement);
+}
+}
+
+#ifdef __APPLE__
+void RegisterRunnerImage(const dl_phdr_info& image) {
+    constexpr std::uint32_t PF_R = 4;
+    const auto pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+    std::map<std::uint64_t, ImagePage> pages;
+    for (std::uint16_t index = 0; index < image.dlpi_phnum; ++index) {
+        const auto& header = image.dlpi_phdr[index];
+        if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
+        const auto start = (image.dlpi_addr + header.p_vaddr) & ~(pageSize - 1);
+        const auto end = (image.dlpi_addr + header.p_vaddr + header.p_memsz + pageSize - 1) & ~(pageSize - 1);
+        for (auto page = start; page < end; page += pageSize) {
+            auto& entry = pages[page];
+            entry.readable = entry.readable || (header.p_flags & (PF_R | PF_W)) != 0;
+            entry.writable = entry.writable || (header.p_flags & PF_W) != 0;
+        }
+    }
+    require(!pages.empty(), "a guest image has no loadable segments");
+    struct Scope {
+        void* mutation = GuestAllocationsBegin_nid_postfix();
+        ~Scope() { GuestAllocationsEnd_nid_postfix(mutation); }
+    } scope;
+    registerImagePages(scope.mutation, pages, pageSize);
+}
+#endif
+
 void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     auto& state = registry();
     if (state.mainImageRegistered) return;
-    struct Page {
-        bool readable = false;
-        bool writable = false;
-    };
+    using Page = ImagePage;
     std::map<std::uint64_t, Page> pages;
     const auto pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
     std::pair<std::map<std::uint64_t, Page>*, std::uint64_t> collection{&pages, pageSize};
@@ -300,22 +351,7 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     }, &collection);
 #endif
     require(!pages.empty(), "main guest image has no loadable segments");
-    auto replacement = state.ranges;
-    for (auto page = pages.begin(); page != pages.end();) {
-        auto last = page;
-        while (std::next(last) != pages.end() && std::next(last)->first == last->first + pageSize && std::next(last)->second.readable == page->second.readable && std::next(last)->second.writable == page->second.writable) ++last;
-        const auto address = page->first;
-        const auto bytes = static_cast<std::size_t>(last->first + pageSize - address);
-        const auto next = replacement.lower_bound(address);
-        require(next == replacement.end() || address + bytes <= next->first, "guest image overlaps a registered allocation");
-        if (next != replacement.begin()) {
-            const auto& previous = *std::prev(next)->second;
-            require(previous.address + previous.bytes <= address, "guest image overlaps a registered allocation");
-        }
-        replacement.emplace(address, std::make_shared<const Range>(Range{address, bytes, page->second.readable, page->second.writable, address, bytes, false}));
-        page = std::next(last);
-    }
-    state.ranges.swap(replacement);
+    registerImagePages(nullptr, pages, pageSize);
     state.mainImageRegistered = true;
 }
 #endif

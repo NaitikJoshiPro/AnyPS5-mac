@@ -1,6 +1,6 @@
 #ifdef __APPLE__
 
-#include "prx/libc/include/specifics/linux/ElfTypes.hpp"
+#include "prx/libc/include/specifics/macos/GuestImages.hpp"
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
@@ -36,11 +36,30 @@ __attribute__((constructor)) void TrackImages() {
 
 }
 
+// The arm64 runner maps the executable and the guest modules itself. They join dl_iterate_phdr, and the
+// guest memory registry right away, whether or not it has registered the dyld images yet, so the guest can
+// query and protect their pages.
 extern "C" void Aps5RegisterGuestImage_nid_no_patch(const dl_phdr_info* image) {
+    GuestAllocations::RegisterRunnerImage(*image);
     std::lock_guard lock(registeredMutex);
     registered.push_back({image->dlpi_addr, image->dlpi_name, image->dlpi_phdr, image->dlpi_phnum});
     imagesAdded.fetch_add(1, std::memory_order_relaxed);
 }
+
+#ifdef __aarch64__
+namespace {
+std::atomic<void* (*)(const void*, const char*)> bridgeCallable {nullptr};
+}
+
+extern "C" void Aps5SetBridgeCallable_nid_no_patch(void* (*callable)(const void* address, const char* name)) {
+    bridgeCallable.store(callable, std::memory_order_release);
+}
+
+extern "C" void* LibcGuestCallable_nid_no_patch(const void* address, const char* name) {
+    const auto callable = bridgeCallable.load(std::memory_order_acquire);
+    return callable != nullptr && address != nullptr ? callable(address, name) : const_cast<void*>(address);
+}
+#endif
 
 extern "C" int dl_iterate_phdr(int (*callback)(dl_phdr_info*, std::size_t, void*), void* data) {
     std::vector<dl_phdr_info> images;

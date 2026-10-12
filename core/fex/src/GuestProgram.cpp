@@ -19,6 +19,12 @@ std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment) {
 }
 
 const GuestProgram* loadedProgram = nullptr;
+Bridge* loadedBridge = nullptr;
+
+// libc and libkernel hand the guest native code through this (dlsym, get_terminate): the x86 stub.
+void* GuestCallable(const void* address, const char* name) {
+    return reinterpret_cast<void*>(loadedBridge->StubFor(const_cast<void*>(address), name != nullptr ? name : ""));
+}
 
 void* OpenGuestModule(const char* path) {
     std::error_code error;
@@ -70,6 +76,10 @@ GuestProgram::GuestProgram(const std::filesystem::path& executable, Bridge& brid
         });
     }
     bridge.Connect();
+    auto* setCallable = bridge.HostSymbol("Aps5SetBridgeCallable_nid_no_patch");
+    if (setCallable == nullptr) throw std::runtime_error("libc has no Aps5SetBridgeCallable_nid_no_patch");
+    loadedBridge = &bridge;
+    reinterpret_cast<void (*)(void* (*)(const void*, const char*))>(setCallable)(GuestCallable);
     if (auto* setLoader = bridge.HostSymbol("Aps5SetGuestLoader_nid_no_patch")) {
         loadedProgram = this;
         reinterpret_cast<void (*)(void* (*)(const char*), void* (*)(void*, const char*))>(setLoader)(OpenGuestModule, GuestModuleSymbol);
