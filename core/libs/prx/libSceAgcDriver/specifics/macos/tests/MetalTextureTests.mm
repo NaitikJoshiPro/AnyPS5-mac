@@ -210,6 +210,9 @@ int Reduction() {
         "struct Table { texture2d<float> image; array<sampler, 3> samplers; };\n"
         "kernel void probe(constant Table& table [[buffer(0)]], device float* out [[buffer(1)]], uint index [[thread_position_in_grid]]) {\n"
         "    out[index] = table.image.sample(table.samplers[index], float2(0.5, 0.5), level(0.0)).x;\n"
+        "}\n"
+        "kernel void direct(texture2d<float> image [[texture(0)]], sampler s0 [[sampler(0)]], sampler s1 [[sampler(1)]], sampler s2 [[sampler(2)]], device float* out [[buffer(1)]], uint index [[thread_position_in_grid]]) {\n"
+        "    out[4 + index] = image.sample(index == 0 ? s0 : (index == 1 ? s1 : s2), float2(0.5, 0.5), level(0.0)).x;\n"
         "}\n";
     id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&error];
     if (library == nil) return (std::fprintf(stderr, "FAIL: %s\n", error.localizedDescription.UTF8String), 1);
@@ -233,7 +236,8 @@ int Reduction() {
     auto* ids = static_cast<std::uint64_t*>(table.contents);
     ids[0] = texture.gpuResourceID._impl;
     for (int index = 0; index < 3; ++index) ids[1 + index] = samplers[index].gpuResourceID._impl;
-    id<MTLBuffer> output = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> output = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+    id<MTLComputePipelineState> direct = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"direct"] error:&error];
     id<MTLCommandQueue> queue = [device newCommandQueue];
     id<MTLCommandBuffer> commands = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
@@ -242,11 +246,15 @@ int Reduction() {
     [encoder setBuffer:output offset:0 atIndex:1];
     [encoder useResource:texture usage:MTLResourceUsageRead];
     [encoder dispatchThreads:MTLSizeMake(3, 1, 1) threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
+    [encoder setComputePipelineState:direct];
+    [encoder setTexture:texture atIndex:0];
+    for (int index = 0; index < 3; ++index) [encoder setSamplerState:samplers[index] atIndex:index];
+    [encoder dispatchThreads:MTLSizeMake(3, 1, 1) threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
     [encoder endEncoding];
     [commands commit];
     [commands waitUntilCompleted];
     const auto* values = static_cast<const float*>(output.contents);
-    std::printf("average %f, min %f, max %f\n", values[0], values[1], values[2]);
+    std::printf("argument buffer: average %f, min %f, max %f; direct: average %f, min %f, max %f\n", values[0], values[1], values[2], values[4], values[5], values[6]);
     Check(values[0] == 15.0f, "weighted average reduction");
     Check(values[1] == 10.0f, "minimum reduction (argument-buffer sampler)");
     Check(values[2] == 20.0f, "maximum reduction (argument-buffer sampler)");
