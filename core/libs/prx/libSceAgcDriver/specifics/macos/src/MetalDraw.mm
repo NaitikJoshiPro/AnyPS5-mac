@@ -30,7 +30,9 @@ bool VulkanDevice::ConservativeRasterization() const {
 }
 
 VkShaderStageFlags VulkanDevice::SubgroupStages() const {
-    return VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // SIMD-group functions in vertex functions are undocumented: D1's startup self-test decides.
+    const bool vertex = state->queue != nil && Metal::Profile(state->device).vertexSimdGroups;
+    return VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | (vertex ? VK_SHADER_STAGE_VERTEX_BIT : 0u);
 }
 
 bool VulkanDevice::ProvokingVertexLast() const {
