@@ -11,6 +11,8 @@
 
 #include "MetalDeviceState.h"
 #include "MetalCommandStream.h"
+#include "MetalPipelineCache.h"
+#include "MetalImages.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -31,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -136,10 +139,6 @@ std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
 }
 
 // The MSL version MetalBackend emits (MslAbi::LanguageMajor/LanguageMinor).
-MTLLanguageVersion ShaderLanguage() {
-    static_assert(Abi::LanguageMajor == 4u, "the Metal device compiles MSL 4.x");
-    return Abi::LanguageMinor >= 1u ? MTLLanguageVersion4_1 : MTLLanguageVersion4_0;
-}
 
 std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
     return shader.msl.Reflection().workgroupMemoryStrideDwords;
@@ -164,9 +163,14 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
     return buffer.gpuAddress + (address - pageBegin);
 }
 
-std::uint64_t VulkanDevice::State::TryWrapRegistered(std::uint64_t address, std::uint64_t bytes) {
-    if (!Graphics::RegisteredReadableCovers(address, bytes)) return 0;
-    return TryWrap(address, bytes);
+// The host import (GuestBufferMemory.mm, D3) holding guest memory [address, address + bytes): a
+// no-copy buffer over a registered guest allocation run, nil when it has none (unregistered or
+// unwrappable memory). Labels, fills and copies record on the GPU only into imports, as upstream.
+id<MTLBuffer> VulkanDevice::State::ImportOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const {
+    const auto* import = Graphics::HostImportFor(context, address, bytes);
+    if (import == nullptr) return nil;
+    *offset = address - import->base;
+    return Graphics::Metal::BufferOf(import->buffer);
 }
 
 // The GPU address of guest (host) memory [address, address + bytes): the 16 KiB pages around it
@@ -198,60 +202,6 @@ void VulkanDevice::State::DropWrappersIfIdle() {
     ++wrapperEpoch;
     // The cached BDA table points into the dropped wrappers and its lease pins the registry.
     addressTable = {};
-}
-
-id<MTLLibrary> VulkanDevice::State::Library(const ShaderRecompiler::MslShader& shader) {
-    std::lock_guard lock(pipelinesMutex);
-    if (const auto found = libraries.find(shader.source); found != libraries.end()) return found->second;
-    MTLCompileOptions* options = [MTLCompileOptions new];
-    options.languageVersion = ShaderLanguage();
-    options.mathMode = MTLMathModeSafe;
-    options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
-    MTL4LibraryDescriptor* descriptor = [MTL4LibraryDescriptor new];
-    descriptor.source = [NSString stringWithUTF8String:shader.source.c_str()];
-    descriptor.options = options;
-    NSError* error = nil;
-    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:descriptor error:&error];
-    if (library == nil) {
-        std::fprintf(stderr, "[metal] MSL compile failed:\n%s\n", shader.source.c_str());
-        throw std::runtime_error("Metal device: MSL compile failed: " + Describe(error));
-    }
-    libraries.emplace(shader.source, library);
-    return library;
-}
-
-id<MTLComputePipelineState> VulkanDevice::State::ComputePipeline(const ShaderRecompiler::RecompileResult& shader) {
-    const auto& msl = shader.msl.Shader();
-    std::string key = msl.source;
-    for (const auto& constant : shader.specialization) key += "|" + std::to_string(constant.id) + "=" + std::to_string(constant.value);
-    {
-        std::lock_guard lock(pipelinesMutex);
-        if (const auto found = computePipelines.find(key); found != computePipelines.end()) return found->second;
-    }
-    id<MTLLibrary> library = Library(msl);
-    MTL4LibraryFunctionDescriptor* function = [MTL4LibraryFunctionDescriptor new];
-    function.name = @(Abi::EntryPoint);
-    function.library = library;
-    MTL4FunctionDescriptor* entry = function;
-    if (!shader.specialization.empty()) {
-        MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
-        for (const auto& constant : shader.specialization) {
-            const std::uint32_t value = constant.value;
-            [values setConstantValue:&value type:MTLDataTypeUInt atIndex:constant.id];
-        }
-        MTL4SpecializedFunctionDescriptor* specialized = [MTL4SpecializedFunctionDescriptor new];
-        specialized.functionDescriptor = function;
-        specialized.constantValues = values;
-        entry = specialized;
-    }
-    MTL4ComputePipelineDescriptor* descriptor = [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = entry;
-    NSError* error = nil;
-    id<MTLComputePipelineState> pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
-    if (pipeline == nil) throw std::runtime_error("Metal device: compute pipeline creation failed: " + Describe(error));
-    std::lock_guard lock(pipelinesMutex);
-    computePipelines.emplace(std::move(key), pipeline);
-    return pipeline;
 }
 
 id<MTLBuffer> VulkanDevice::State::WorkgroupArena(std::uint64_t groups, std::uint32_t strideDwords) {
@@ -311,6 +261,7 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         addressTable.generation = generation;
         addressTable.wrapperEpoch = wrapperEpoch;
         addressTable.lease = std::move(acquired);
+        addressTable.ranges = std::move(ranges);
         addressTable.writable = std::move(writable);
         addressTable.skipped = skipped;
     }
@@ -425,6 +376,43 @@ void UnregisterLiveDevice(const void* state) {
     std::erase_if(live.states, [&](const LiveDevices::Entry& entry) { return entry.state == state; });
 }
 
+std::vector<Bda::Range> Metal::DisjointRanges(std::span<const Bda::Range> ranges) {
+    struct Edge {
+        std::uint64_t address;
+        bool opens;
+        std::size_t index;
+    };
+    std::vector<Edge> edges;
+    edges.reserve(ranges.size() * 2u);
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        if (ranges[index].end <= ranges[index].begin) continue;
+        edges.push_back({ranges[index].begin, true, index});
+        edges.push_back({ranges[index].end, false, index});
+    }
+    std::sort(edges.begin(), edges.end(), [](const Edge& left, const Edge& right) { return left.address < right.address; });
+    std::vector<Bda::Range> result;
+    std::set<std::size_t> active;
+    for (std::size_t edge = 0; edge < edges.size();) {
+        const auto address = edges[edge].address;
+        for (; edge < edges.size() && edges[edge].address == address; ++edge) {
+            if (edges[edge].opens) active.insert(edges[edge].index);
+            else active.erase(edges[edge].index);
+        }
+        if (active.empty() || edge == edges.size()) continue;
+        const auto next = edges[edge].address;
+        const auto& owner = ranges[*active.begin()];
+        std::uint32_t permissions = 0;
+        for (const auto index : active) permissions |= ranges[index].permissions;
+        const auto device = owner.deviceAddress + (address - owner.begin);
+        if (!result.empty() && result.back().end == address && result.back().permissions == permissions && result.back().deviceAddress + (address - result.back().begin) == device) {
+            result.back().end = next;
+        } else {
+            result.push_back({address, next, device, permissions, 0u});
+        }
+    }
+    return result;
+}
+
 Metal::TeardownReport Metal::LastTeardown() {
     std::lock_guard lock(TeardownReportMutex());
     return TeardownReportValue();
@@ -458,6 +446,16 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         //    residency set (and its command stream's) from the queue.
         recorder.reset();
         context.recorder = nullptr;
+        // 2b. The host imports (no-copy buffers over guest allocations) and their residency set on
+        //     the queue (GuestBufferMemory.mm), once nothing recorded can use them.
+        if (context.device != VK_NULL_HANDLE) {
+            try {
+                Graphics::ClearImageMirrors(context.device);
+                Graphics::ClearHostImports(context.device);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[metal] teardown: host imports: %s\n", error.what());
+            }
+        }
         // 3. The guest-memory wrappers (no-copy buffers over guest and static __DATA pages) and
         //    the cached BDA table holding their addresses.
         report.wrappersDropped = std::max(heldWrappers, wrappers.size());
@@ -474,11 +472,12 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
             [residency commit];
             report.residencyRemoved = true;
         }
-        {
-            std::lock_guard lock(pipelinesMutex);
-            computePipelines.clear();
-            libraries.clear();
-        }
+        // The image cache's residency set leaves the queue (D4/D5, MetalImages.h).
+        if (images != nullptr) images->Teardown();
+        images.reset();
+        // The pipeline cache after the recorder: joins its background workers, saves the archive.
+        pipelines.reset();
+        compiler = nil;
         arguments = nil;
         workgroupArena = nil;
         faults = nil;
@@ -512,8 +511,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             if (state->device == nil) throw std::runtime_error("Metal device: no Metal device");
             if (![state->device supportsFamily:MTLGPUFamilyMetal4] || ![state->device supportsFamily:MTLGPUFamilyApple7]) throw std::runtime_error("Metal device: the GPU lacks the Metal 4 / Apple7 feature set this driver needs");
             NSError* error = nil;
-            state->compiler = [state->device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
-            if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler: " + Describe(error));
+            state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
+            state->compiler = state->pipelines->Compiler();
+            if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
             for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
@@ -543,6 +543,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             [state->queue addResidencySet:state->residency];
             MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
             table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
+            state->images = std::make_unique<Graphics::Metal::ImageCache>(state->device, state->queue);
             state->arguments = [state->device newArgumentTableWithDescriptor:table error:&error];
             if (state->arguments == nil) throw std::runtime_error("Metal device: argument table setup failed: " + Describe(error));
 
@@ -551,6 +552,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.device = Graphics::Metal::DeviceHandle(state->device);
             context.queue = Graphics::Metal::QueueHandle(state->queue);
             context.bufferDeviceAddress = true;
+            // Host imports (D3): no-copy buffers over whole 16 KiB pages of guest allocations.
+            context.hostImportAlignment = HostPage;
             const auto bufferLength = static_cast<std::uint64_t>(state->device.maxBufferLength);
             context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
             context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
@@ -570,6 +573,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->recorder = std::make_unique<Graphics::Recorder>(context, true);
             context.recorder = state->recorder.get();
             state->recorder->Activate();
+            Graphics::PrepareImportWatch(context);
         }
     } catch (...) {
         // A half-built device releases what it attached (residency sets on the queue) before unwinding.
@@ -630,8 +634,9 @@ void VulkanDevice::PrepareForReplacement() {
     WaitIdle();
 }
 
-bool VulkanDevice::ImportGuestMemory(const GuestAllocations::Mapped&, std::uint64_t, bool) {
-    return true;
+bool VulkanDevice::ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
+    if (state->recorder == nullptr) return true;
+    return Graphics::ImportMappedRanges(state->context, ranges, generation, adoptDevice);
 }
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
@@ -692,9 +697,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     }
     if (recorder.Idle()) return 1;
     @autoreleasepool {
-        if (state->TryWrapRegistered(address, bytes.size()) == 0u) return 3;
         std::uint64_t offset = 0;
-        id<MTLBuffer> wrapper = state->WrapperOf(address, bytes.size(), &offset);
+        id<MTLBuffer> wrapper = state->ImportOf(address, bytes.size(), &offset);
+        if (wrapper == nil) return 3;
         recorder.RecordStore(Graphics::Metal::BufferHandle(wrapper), offset, bytes, address);
     }
     recorder.NoteLabel(address, bytes, stamp, queue);
@@ -745,7 +750,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         state->DropWrappersIfIdle();
     }
     @autoreleasepool {
-        if (state->TryWrapRegistered(address, bytes) == 0u) return false;
+        std::uint64_t offset = 0;
+        if (state->ImportOf(address, bytes, &offset) == nil) return false;
         static const bool alwaysSync = std::getenv("APS5_FILL_SYNC") != nullptr;
         if (recorder.PendingWriteOverlaps(address, bytes) && (alwaysSync || (Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes)))) {
             Recorder::CountSync(4);
@@ -753,8 +759,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         }
         recorder.FlushKeyStoresOverlapping(address, bytes);
         recorder.FlushStoresOverlapping(address, bytes);
-        std::uint64_t offset = 0;
-        id<MTLBuffer> wrapper = state->WrapperOf(address, bytes, &offset);
+        id<MTLBuffer> wrapper = state->ImportOf(address, bytes, &offset);
+        if (wrapper == nil) throw std::runtime_error("Metal device: the fill's host import vanished while it waited");
         VkAccessFlags covered = 0;
         auto& stream = recorder.Stream(&covered);
         if ((covered & VK_ACCESS_TRANSFER_WRITE_BIT) != 0u && Recorder::MergeBarriers()) {
@@ -826,7 +832,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         return outcome;
     }
     @autoreleasepool {
-        if (state->TryWrapRegistered(destination, bytes) == 0u || state->TryWrapRegistered(source, bytes) == 0u) return outcome;
+        std::uint64_t probeOffset = 0;
+        if (state->ImportOf(destination, bytes, &probeOffset) == nil || state->ImportOf(source, bytes, &probeOffset) == nil) return outcome;
         const bool waitSource = recorder.PendingWriteOverlaps(source, bytes) && completionStoreOverlaps(source);
         const bool waitDestination = recorder.PendingWriteOverlaps(destination, bytes) && completionStoreOverlaps(destination);
         if (waitSource || waitDestination) {
@@ -848,8 +855,9 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         recorder.FlushStoresOverlapping(destination, bytes);
         std::uint64_t destinationOffset = 0;
         std::uint64_t sourceOffset = 0;
-        id<MTLBuffer> destinationBuffer = state->WrapperOf(destination, bytes, &destinationOffset);
-        id<MTLBuffer> sourceBuffer = state->WrapperOf(source, bytes, &sourceOffset);
+        id<MTLBuffer> destinationBuffer = state->ImportOf(destination, bytes, &destinationOffset);
+        id<MTLBuffer> sourceBuffer = state->ImportOf(source, bytes, &sourceOffset);
+        if (destinationBuffer == nil || sourceBuffer == nil) throw std::runtime_error("Metal device: the copy's host imports vanished while it waited");
         VkAccessFlags covered = 0;
         auto& stream = recorder.Stream(&covered);
         constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -881,7 +889,9 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
     return {};
 }
 
-std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult&, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t) {
+std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t) {
+    // The pipeline starts building on the cache's workers; Dispatch waits for it.
+    if (state->pipelines != nullptr && state->recorder != nullptr && !shader.msl.empty() && shader.msl.Reflection().stage == Abi::Stage::Kernel) state->pipelines->PrepareCompute(shader);
     return nullptr;
 }
 
@@ -915,7 +925,39 @@ void VulkanDevice::State::RequireDispatchable(const ShaderRecompiler::RecompileR
 // Barriers as upstream: a leading one (unless the last command's trailing barrier covered shader
 // access) and a trailing one; the written V# ranges, GDS and every writable range of a bound BDA
 // table are noted as pending writes, the bound V# ranges as in-place reads.
-void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirectArguments) {
+std::vector<Bda::Range> VulkanDevice::State::AddressExtras(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream) {
+    std::vector<Bda::Range> extras;
+    for (const auto& binding : shader.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            const auto elements = std::min<std::size_t>(binding.count, binding.guestDescriptor.size() / 4u);
+            for (std::uint32_t element = 0; element < elements; ++element) {
+                const auto guest = DecodeBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u));
+                if (guest.base == 0u || guest.bytes == 0u) continue;
+                const auto aligned = guest.base & ~std::uint64_t{3u};
+                const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                extras.push_back({aligned, aligned + bytes, Wrap(aligned, bytes), Bda::Read | (written ? Bda::Write : 0u), 0u});
+            }
+        } else if (binding.role == ShaderRecompiler::DescriptorRole::Gds) {
+            const auto gds = Pm4::GdsAddress();
+            extras.push_back({gds, gds + Pm4::GdsBytes, Wrap(gds, Pm4::GdsBytes), Bda::Read | Bda::Write, 0u});
+        }
+    }
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.bytes.empty()) continue;
+        const auto end = snapshot.address + snapshot.bytes.size();
+        if (const auto gpu = TryWrap(snapshot.address, snapshot.bytes.size()); gpu != 0u) {
+            extras.push_back({snapshot.address, end, gpu, Bda::Read, 0u});
+        } else {
+            // Unwrappable (executable) pages: the GPU reads the bytes captured for this dispatch.
+            const auto copy = stream.Write(snapshot.bytes, 16u);
+            extras.push_back({snapshot.address, end, copy.address, Bda::Read, 0u});
+        }
+    }
+    return extras;
+}
+
+void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirectArguments, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
     const auto& reflection = shader.msl.Reflection();
     const auto stride = WorkgroupStride(shader);
     const bool split = indirectArguments == 0u && (x > GroupLimit || y > GroupLimit || z > GroupLimit);
@@ -932,7 +974,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     // the CPU first, so the grid is direct here); growing it waits for idle, before the open batch
     // is taken below.
     id<MTLBuffer> arena = stride != 0u ? WorkgroupArena(static_cast<std::uint64_t>(x) * y * z, stride) : nil;
-    id<MTLComputePipelineState> pipeline = ComputePipeline(shader);
+    id<MTLComputePipelineState> pipeline = pipelines->Compute(shader);
     const auto& threads = reflection.threadsPerThreadgroup;
     if (static_cast<NSUInteger>(threads[0]) * threads[1] * threads[2] > pipeline.maxTotalThreadsPerThreadgroup) {
         throw std::runtime_error("Metal device: the workgroup of " + std::to_string(threads[0] * threads[1] * threads[2]) + " threads exceeds the pipeline's maximum threadgroup size " + std::to_string(pipeline.maxTotalThreadsPerThreadgroup));
@@ -969,6 +1011,27 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     };
     if (recorder.HasQueuedKeyStores() && (addressBased || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (addressBased || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+
+    // Images and samplers (D4/D5, MetalImages.h) before the open batch is taken: uploading a
+    // surface reads guest memory on the CPU, and the settle hook may sync (submit) the batch.
+    Graphics::Metal::ImageBindings imageBindings(*images, [this](std::uint64_t address, std::uint64_t bytes) {
+        if (this->recorder->PendingWriteOverlaps(address, bytes) || this->recorder->PendingLabelIn(address, bytes)) {
+            Recorder::CountSync(4);
+            this->recorder->SyncThrough(address, bytes);
+        }
+    });
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> imageEntries;
+    if (reflection.table.bytes != 0u) {
+        for (const auto& binding : shader.bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages && binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
+            const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
+            const auto* range = reflection.table.Find(kind);
+            if (range == nullptr) continue;
+            std::vector<std::uint64_t> entries(std::min(binding.count, range->count), 0u);
+            imageBindings.Write(binding, entries);
+            imageEntries.push_back({range->offset, std::move(entries)});
+        }
+    }
 
     VkAccessFlags covered = 0;
     auto& stream = recorder.Stream(&covered);
@@ -1019,11 +1082,33 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
             }
             case ShaderRecompiler::DescriptorRole::BdaPagetable: {
                 std::shared_ptr<const GuestAllocations::Lease> lease;
-                const auto& bytes = AddressTableBytes(&lease);
-                const auto data = stream.Write(std::span<const std::byte>(bytes), 16u);
-                entries[0] = {data.address, static_cast<std::uint32_t>(bytes.size()), 0u};
+                const auto& registered = AddressTableBytes(&lease);
                 recorder.Keep(std::const_pointer_cast<GuestAllocations::Lease>(lease));
                 writes.insert(writes.end(), addressTable.writable.begin(), addressTable.writable.end());
+                // As upstream's GuestBufferMemory::AddressRanges: the registered ranges plus every
+                // bound V# range (Write when the shader stores to it), GDS, and the captured
+                // snapshots (live in place when wrappable, else their captured bytes read-only).
+                const auto extras = AddressExtras(shader, snapshots, stream);
+                const auto covered = [&](const Bda::Range& extra) {
+                    const auto& ranges = addressTable.ranges;
+                    const auto found = std::upper_bound(ranges.begin(), ranges.end(), extra.begin, [](std::uint64_t value, const Bda::Range& range) { return value < range.begin; });
+                    return found != ranges.begin() && extra.end <= std::prev(found)->end && (std::prev(found)->permissions & extra.permissions) == extra.permissions;
+                };
+                if (std::all_of(extras.begin(), extras.end(), covered)) {
+                    const auto data = stream.Write(std::span<const std::byte>(registered), 16u);
+                    entries[0] = {data.address, static_cast<std::uint32_t>(registered.size()), 0u};
+                } else {
+                    std::vector<Bda::Range> all = addressTable.ranges;
+                    all.insert(all.end(), extras.begin(), extras.end());
+                    const auto ranges = Metal::DisjointRanges(all);
+                    const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
+                    const auto bytes = sizeof(header) + ranges.size() * sizeof(Bda::Range);
+                    if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: the BDA page table exceeds 4 GiB");
+                    const auto data = stream.Allocate(bytes, 16u);
+                    std::memcpy(data.host, &header, sizeof(header));
+                    if (!ranges.empty()) std::memcpy(data.host + sizeof(header), ranges.data(), ranges.size() * sizeof(Bda::Range));
+                    entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
+                }
                 break;
             }
             case ShaderRecompiler::DescriptorRole::FaultBuffer:
@@ -1031,8 +1116,11 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
                 break;
             case ShaderRecompiler::DescriptorRole::GuestImages:
             case ShaderRecompiler::DescriptorRole::GuestSamplers:
-                Unimplemented("image and sampler descriptors in compute dispatches", "work packages D4/D5");
+                break;
             }
+        }
+        for (const auto& [offset, values] : imageEntries) {
+            if (!values.empty()) std::memcpy(table + offset, values.data(), values.size() * sizeof(std::uint64_t));
         }
     }
     const auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
@@ -1088,6 +1176,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     stream.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, AnyStage);
     Recorder::CountBarriers(Recorder::CommandClass::DispatchTrailing);
     recorder.MarkCovered(DispatchedAccess);
+    if (!imageBindings.Empty()) imageBindings.Commit(recorder);
     if (indirectArguments != 0u) recorder.NotePendingRead(indirectArguments, 12u, Recorder::ReadKind::Indirect);
     if (!reads.empty()) recorder.NotePendingReads(reads, Recorder::ReadKind::DispatchElement);
     if (!writes.empty()) recorder.NotePendingWrites(writes);
@@ -1107,12 +1196,12 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", reads.size(), writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
 }
 
-void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
+void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
     state->RequireDispatchable(shader);
     if (x == 0u || y == 0u || z == 0u) return;
     @autoreleasepool {
-        state->RecordCompute(shader, x, y, z, 0u);
+        state->RecordCompute(shader, x, y, z, 0u, snapshots);
     }
 }
 
@@ -1122,7 +1211,7 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
 // flush hook waits for the batch that writes them) and dispatched directly: 8 the shader uses the
 // device-memory LDS arena, sized from the counts; 2 a label is pending over the counts; 3 they
 // cannot be wrapped (unmapped, executable or misaligned memory).
-VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
+VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
     state->RequireDispatchable(shader);
     IndirectOutcome outcome {0, 0.0};
@@ -1142,14 +1231,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
             outcome.cpuReason = 3;
         }
         if (outcome.cpuReason == 0) {
-            state->RecordCompute(shader, 1u, 1u, 1u, arguments);
+            state->RecordCompute(shader, 1u, 1u, 1u, arguments, snapshots);
             return outcome;
         }
         const auto start = std::chrono::steady_clock::now();
         std::array<std::uint32_t, 3> groups {};
         GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4u);
         outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        if (groups[0] != 0u && groups[1] != 0u && groups[2] != 0u) state->RecordCompute(shader, groups[0], groups[1], groups[2], 0u);
+        if (groups[0] != 0u && groups[1] != 0u && groups[2] != 0u) state->RecordCompute(shader, groups[0], groups[1], groups[2], 0u, snapshots);
     }
     return outcome;
 }

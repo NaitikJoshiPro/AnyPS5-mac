@@ -159,6 +159,54 @@ std::string Throws(TCall&& call) {
     return {};
 }
 
+// The BDA page table merge (CPU only): overlapping registered, V# and GDS ranges become sorted,
+// disjoint entries; the first range listed keeps its device address, permissions are ORed.
+void CheckDisjointRanges() {
+    namespace Bda = ShaderRecompiler::BdaAbi;
+    using Range = Bda::Range;
+    const auto same = [](const std::vector<Range>& got, const std::vector<Range>& want) {
+        if (got.size() != want.size()) return false;
+        for (std::size_t index = 0; index < got.size(); ++index) {
+            if (got[index].begin != want[index].begin || got[index].end != want[index].end || got[index].deviceAddress != want[index].deviceAddress || got[index].permissions != want[index].permissions) return false;
+        }
+        return true;
+    };
+    constexpr auto R = Bda::Read;
+    constexpr auto RW = Bda::Read | Bda::Write;
+    // Disjoint input, unsorted: sorted, unchanged; an empty range is dropped.
+    const std::vector<Range> disjoint {{0x3000, 0x4000, 0x93000, R, 0}, {0x1000, 0x2000, 0x71000, RW, 0}, {0x5000, 0x5000, 0x1, R, 0}};
+    Require(same(AgcDriver::Metal::DisjointRanges(disjoint), {{0x1000, 0x2000, 0x71000, RW, 0}, {0x3000, 0x4000, 0x93000, R, 0}}), "bda ranges: disjoint input changed");
+    // A written V# inside a read-only registered range: split in three, W only in the middle,
+    // device addresses of the registered (first) range throughout.
+    const std::vector<Range> inside {{0x1000, 0x5000, 0xa1000, R, 0}, {0x2000, 0x3000, 0xf2000, RW, 0}};
+    Require(same(AgcDriver::Metal::DisjointRanges(inside), {{0x1000, 0x2000, 0xa1000, R, 0}, {0x2000, 0x3000, 0xa2000, RW, 0}, {0x3000, 0x5000, 0xa3000, R, 0}}), "bda ranges: a range inside another is wrong");
+    // A V# contained in a writable range with the same permissions disappears into it.
+    const std::vector<Range> absorbed {{0x1000, 0x5000, 0xa1000, RW, 0}, {0x2000, 0x3000, 0xf2000, R, 0}};
+    Require(same(AgcDriver::Metal::DisjointRanges(absorbed), {{0x1000, 0x5000, 0xa1000, RW, 0}}), "bda ranges: a contained range was not absorbed");
+    // Partial overlap of two unrelated wrappers: the overlap keeps the first one's mapping, the
+    // tail continues with the second's.
+    const std::vector<Range> partial {{0x1000, 0x3000, 0xa1000, R, 0}, {0x2000, 0x4000, 0xb2000, R, 0}};
+    Require(same(AgcDriver::Metal::DisjointRanges(partial), {{0x1000, 0x3000, 0xa1000, R, 0}, {0x3000, 0x4000, 0xb3000, R, 0}}), "bda ranges: a partial overlap is wrong");
+    // Many random ranges: output sorted, disjoint, and every input address resolves to an output
+    // range with at least its permissions.
+    std::uint64_t seed = 12345;
+    const auto next = [&] { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33u; };
+    std::vector<Range> random;
+    for (int index = 0; index < 200; ++index) {
+        const auto begin = (next() % 4096u) * 4u;
+        random.push_back({begin, begin + 4u + (next() % 256u) * 4u, 0x100000u * (index + 1u), (next() & 1u) != 0u ? RW : R, 0});
+    }
+    const auto merged = AgcDriver::Metal::DisjointRanges(random);
+    for (std::size_t index = 1; index < merged.size(); ++index) Require(merged[index - 1u].end <= merged[index].begin, "bda ranges: the random output overlaps or is unsorted");
+    for (const auto& range : random) {
+        for (auto address = range.begin; address < range.end; address += 4u) {
+            const auto found = std::upper_bound(merged.begin(), merged.end(), address, [](std::uint64_t value, const Range& entry) { return value < entry.begin; });
+            Require(found != merged.begin() && address < std::prev(found)->end && (std::prev(found)->permissions & range.permissions) == range.permissions, "bda ranges: a random input address is not covered");
+        }
+    }
+    std::printf("bda range merge: contained, partial and %zu random ranges -> %zu disjoint entries\n", random.size(), merged.size());
+}
+
 // GDS: the binding is the 64 KiB global data share in guest memory (Pm4::GdsAddress()), so PM4
 // DMA packets and shaders see the same words.
 void CheckGds(AgcDriver::VulkanDevice& device) {
@@ -219,14 +267,24 @@ void CheckAddressTable(AgcDriver::VulkanDevice& device) {
             found |= 2u;
         }
     }
+    // The bound V# (a static, unregistered array) is in the table too, writable (upstream's
+    // AddressRanges): store through its translation.
+    const ulong bound = ulong(push[4]) | (ulong(push[5]) << 32);
+    for (uint index = 0u; index < header[1]; ++index) {
+        if (bound >= ranges[index].begin && bound < ranges[index].end) {
+            reinterpret_cast<device uint*>(ranges[index].gpu + (bound - ranges[index].begin))[9] = 0x77u + ranges[index].permissions;
+            found |= 8u;
+        }
+    }
     out(0)[8] = found;)",
-        {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(output.data(), sizeof(output))}, {RuntimeAbi::Binding::BdaPagetable, DescriptorRole::BdaPagetable, 1, {}}}, {1, 1, 1}, 0, {Low(guest), High(guest), Low(guestRo), High(guestRo)});
+        {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(output.data(), sizeof(output))}, {RuntimeAbi::Binding::BdaPagetable, DescriptorRole::BdaPagetable, 1, {}}}, {1, 1, 1}, 0, {Low(guest), High(guest), Low(guestRo), High(guestRo), Low(reinterpret_cast<std::uintptr_t>(output.data())), High(reinterpret_cast<std::uintptr_t>(output.data()))});
     device.Dispatch(kernel, 1, 1, 1);
     device.WaitIdle();
     namespace Bda = ShaderRecompiler::BdaAbi;
     Require(output[0] == Bda::Version && output[2] == sizeof(Bda::Range), "bda table: bad header (version " + std::to_string(output[0]) + ", entry bytes " + std::to_string(output[2]) + ")");
     Require(output[3] == sizeof(Bda::Header) + output[1] * sizeof(Bda::Range), "bda table: the binding's size disagrees with the header's count");
-    Require(output[8] == 3u, "bda table: the guest blocks were not found or the ranges are unsorted (flags " + std::to_string(output[8]) + ")");
+    Require(output[8] == 11u, "bda table: the guest blocks or the bound V# were not found or the ranges are unsorted (flags " + std::to_string(output[8]) + ")");
+    Require(output[9] == 0x77u + (Bda::Read | Bda::Write), "bda table: the store through the bound V#'s translation read " + Hex(output[9]));
     Require(output[4] == 0x1234u && writable.Words()[101] == 0x1235u, "bda table: the translated load/store of the writable block failed");
     Require(output[5] == (Bda::Read | Bda::Write), "bda table: the writable block has permissions " + std::to_string(output[5]));
     Require(output[6] == 0x5678u && output[7] == Bda::Read, "bda table: the read-only block read " + Hex(output[6]) + " with permissions " + std::to_string(output[7]));
@@ -519,6 +577,7 @@ int main(int argc, char** argv) {
     }
     try {
         if (mode == "bindings") {
+            CheckDisjointRanges();
             CheckGds(*device);
             CheckAddressTable(*device);
             CheckFaults(*device);

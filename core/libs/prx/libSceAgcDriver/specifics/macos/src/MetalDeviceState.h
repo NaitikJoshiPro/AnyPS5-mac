@@ -11,6 +11,8 @@
 
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "BdaAbi.hpp"
+#include <span>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -22,6 +24,12 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+namespace AgcDriver::Graphics::Metal {
+class CommandStream;
+class PipelineCache;
+class ImageCache;
+}
 
 namespace AgcDriver {
 
@@ -77,6 +85,13 @@ struct TeardownReport {
     bool atExit = false;
 };
 TeardownReport LastTeardown();
+
+// The BDA page table's ranges made disjoint and sorted by begin, as aps5_bda_find's binary search
+// needs: every address covered by any input range is covered by exactly one output range, whose
+// device address is that of the first input range (in input order) covering it and whose
+// permissions are the OR of every input range covering it; adjacent pieces of one input range
+// with equal permissions are joined. Empty input ranges are dropped.
+std::vector<ShaderRecompiler::BdaAbi::Range> DisjointRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges);
 
 }
 
@@ -138,28 +153,29 @@ struct VulkanDevice::State {
         std::uint64_t generation = ~std::uint64_t{0};
         std::uint64_t wrapperEpoch = ~std::uint64_t{0};
         std::vector<std::byte> bytes;
+        // The registered ranges of `bytes` (sorted, disjoint), the base of per-dispatch tables.
+        std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
         std::shared_ptr<const GuestAllocations::Lease> lease;
         // The writable ranges (a dispatch binding the table may store anywhere in them).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
     } addressTable;
 
-    std::mutex pipelinesMutex;
-    std::unordered_map<std::string, id<MTLLibrary>> libraries;
-    std::unordered_map<std::string, id<MTLComputePipelineState>> computePipelines;
+    // D5's shader library and pipeline cache (MTL4Compiler + MTL4Archive, background builds); it
+    // owns `compiler`. Destroyed in Teardown after the recorder is idle (joins its workers, saves).
+    std::unique_ptr<Graphics::Metal::PipelineCache> pipelines;
+    // D4/D5's image cache: textures and samplers of dispatch bindings, its residency set on the queue.
+    std::unique_ptr<Graphics::Metal::ImageCache> images;
 
     std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
     // Wrap without throwing: 0 when the range cannot be wrapped (unmapped, executable, unreadable).
     std::uint64_t TryWrap(std::uint64_t address, std::uint64_t bytes);
-    // TryWrap limited to registered guest allocations (upstream HostImportFor): labels, fills and
-    // copies into other memory take the PM4 core's drain-and-CPU path.
-    std::uint64_t TryWrapRegistered(std::uint64_t address, std::uint64_t bytes);
+    // The host import holding [address, address + bytes) (D3, GuestBufferMemory.mm), nil if none.
+    id<MTLBuffer> ImportOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const;
     // The wrapper holding [address, address + bytes) and the offset of `address` in it (after Wrap).
     id<MTLBuffer> WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const;
     // Drops the wrappers (and the cached BDA table) once the recorder is idle.
     void DropWrappersIfIdle();
-    id<MTLLibrary> Library(const ShaderRecompiler::MslShader& shader);
-    id<MTLComputePipelineState> ComputePipeline(const ShaderRecompiler::RecompileResult& shader);
     // The device-memory LDS arena for `groups` workgroups of `strideDwords` each.
     id<MTLBuffer> WorkgroupArena(std::uint64_t groups, std::uint32_t strideDwords);
     // The BDA page table bytes for a dispatch; `lease` receives the registry lease its wrappers
@@ -169,7 +185,9 @@ struct VulkanDevice::State {
     // one grid (split over the group limit) or, with `indirect` (a guest address), of a dispatch
     // whose counts the GPU reads.
     void RequireDispatchable(const ShaderRecompiler::RecompileResult& shader) const;
-    void RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect);
+    // The bound V# ranges, GDS and snapshots a dispatch adds to the BDA page table.
+    std::vector<ShaderRecompiler::BdaAbi::Range> AddressExtras(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream);
+    void RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).
     void Sync();
     void CheckFaults();
