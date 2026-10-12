@@ -10,6 +10,9 @@ namespace ShaderRecompiler {
 
 namespace {
 
+// Threads per SIMD group on every Apple GPU (MTLComputePipelineState.threadExecutionWidth).
+constexpr std::uint32_t AppleSimdWidth = 32u;
+
 const ShaderWorkgroupInputInfo* WorkgroupInput(const IrProgram& program, const ShaderStageInputInfo& inputInfo) {
     switch (program.Resources().stage) {
     case IrShaderStage::Compute:
@@ -419,7 +422,12 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     MslEmitterState state(program, inputInfo, bindings, target);
     state.reflection.stage = ReflectedStage(stage);
     state.reflection.group = StageGroup(stage);
-    state.hostSubgroupSize = target.subgroupSize;
+    // Apple SIMD groups are 32 wide whatever width the target claims. A target may claim 64 so the
+    // front end lays a wave64 program out at one lane per invocation (agc_driver_pixel_wave_reduction's
+    // wide layout, APS5_SINGLE_LANE): the emitter still maps it to the 32-lane hardware, so graphics
+    // stages take the half-wave view and compute wave ops across two SIMD groups throw, instead of
+    // shuffling lanes 32-63 that do not exist (undefined in MSL; they read 0 on the M3).
+    state.hostSubgroupSize = std::min(target.subgroupSize, AppleSimdWidth);
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
     // Wave-uniform values: computed once for both lane halves at laneCount 2; at any lane count the

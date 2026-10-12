@@ -487,9 +487,23 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
     RequireHostWave(state, instruction);
     if (MslGraphicsHalfWave(state)) {
         const IrValue* selector = instruction.Argument(1u)->Resolve();
-        const auto lane = selector->HasImmediate() ? selector->ImmediateU32() & 63u : 64u;
-        if (lane < 64u && (lane & 31u) == 31u) {
-            if (const auto scan = MatchHalfWaveScan(instruction.Argument(0u), state.program.Resources().stage, true)) {
+        const auto stage = state.program.Resources().stage;
+        if (!selector->HasImmediate()) {
+            // A lane chosen at run time (waterfall loops: s_ff1 of an EXEC copy). The half-wave
+            // view's EXEC masks and ballots hold only this SIMD group's lanes (low word), so lanes
+            // picked from them are below 32; a lane past 31 reads 0, as a shuffle past the host
+            // subgroup on the SPIR-V path (TechnicalDebt metal-b6-half-wave).
+            const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & 63u", "aps5_rl");
+            const auto value = Shuffle(state, instruction, 0u, "(" + lane + " & 31u)");
+            state.Define(instruction, "(" + lane + " < 32u ? " + value + " : " + MslType(instruction.Type()) + "(0))");
+            return;
+        }
+        const auto lane = selector->ImmediateU32() & 63u;
+        if ((lane & 31u) == 31u) {
+            // As EmitHalfWaveReduction: the scan laid out for the wave first, then for 32-lane hosts.
+            auto scan = MatchHalfWaveScan(instruction.Argument(0u), stage, false);
+            if (!scan) scan = MatchHalfWaveScan(instruction.Argument(0u), stage, true);
+            if (scan) {
                 if (lane >= 32u) {
                     state.Define(instruction, MslHex(scan->reduction->identity) + "u");
                     return;
@@ -501,6 +515,10 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
                     return;
                 }
             }
+        }
+        if (lane >= 32u && UpperLaneWalk{stage}.ZeroValue(instruction.Argument(0u))) {
+            state.Define(instruction, "0u");
+            return;
         }
         if (lane >= 32u) state.Fail(instruction, "v_readlane_b32 of a lane outside the 32-lane host SIMD group that runs this wave64 graphics program (work package B6)");
     }
