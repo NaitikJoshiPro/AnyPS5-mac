@@ -304,6 +304,13 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     ResumeThread(native);
     return true;
 }
+#elif defined(__APPLE__) && defined(__aarch64__)
+// The handler receives the interrupted guest's x86-64 registers. On arm64 they live in the translator (the FEXCore
+// runner), not in the host thread context a host signal would capture, so delivery needs the runner.
+bool RaiseOn(Pthread) {
+    throw std::runtime_error("sceKernelRaiseException needs the arm64 guest runner to deliver the exception: the guest's x86-64 "
+        "registers live in the translator, not in the host signal context");
+}
 #else
 constexpr int HostSignal = SIGUSR1;
 constexpr std::size_t FxsaveRegisterBytes = 416;

@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_HOST_APPLE AND NOT ANYPS5_RELINKER_ONLY)
-    set(CMAKE_OSX_ARCHITECTURES x86_64 CACHE STRING "Architectures built on macOS")
+    set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "Architecture built on macOS: arm64 (native), or x86_64 (runs under Rosetta)")
     set(CMAKE_APPLE_SILICON_PROCESSOR ${CMAKE_OSX_ARCHITECTURES} CACHE STRING "Host processor CMake reports on Apple silicon")
+    # tools/mac/check_no_x86.py reads compile_commands.json to show that no x86 code is left on the arm64 build path.
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Write compile_commands.json")
 endif()
 project(Relinker CXX)
 
@@ -10,6 +12,16 @@ set(ANYPS5_TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 function(add_test_executable target)
     add_executable(${target} ${ARGN})
     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+endfunction()
+
+# Labels every test the calling directory registers; call it with cmake_language(DEFER CALL ...). The directory's own
+# LABELS property is not enough: CTest gives it only to tests that run in that build directory, not to tests with
+# another WORKING_DIRECTORY.
+function(label_directory_tests label)
+    get_property(tests DIRECTORY PROPERTY TESTS)
+    if(tests)
+        set_property(TEST ${tests} APPEND PROPERTY LABELS ${label})
+    endif()
 endfunction()
 
 option(BUILD_TESTING "Build and register relinker tests" OFF)
@@ -99,6 +111,11 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_nid_names.py)
         add_test(NAME release_package COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_package_release.py)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            add_test(NAME check_no_x86_tool COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_check_no_x86.py)
+            set_tests_properties(check_no_x86_tool PROPERTIES TIMEOUT 120 ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
+        endif()
     endif()
 endif()
 
@@ -178,4 +195,11 @@ add_subdirectory(core/relinker)
 
 if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" AND EXISTS ${CMAKE_SOURCE_DIR}/3rdparty/FEX/CMakeLists.txt)
     add_subdirectory(core/fex)
+endif()
+
+if(BUILD_TESTING AND Python3_Interpreter_FOUND AND APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" AND CMAKE_EXPORT_COMPILE_COMMANDS)
+    # Preprocesses every repository translation unit of this build with its own flags and fails on x86 inline
+    # assembly or intrinsics; it takes minutes and uses every core, so it runs alone.
+    add_test(NAME no_x86_build_path COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/check_no_x86.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(no_x86_build_path PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE LABELS slow)
 endif()

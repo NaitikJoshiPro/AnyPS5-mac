@@ -7,7 +7,15 @@ DEVICE_LIMITATION = re.compile(r"skipped,.*(subgroup|the device (has no|reports|
 
 NO_DISPLAY = re.compile(r"skipped,.*no display", re.IGNORECASE)
 
+# What ctest itself writes into <skipped message=...>; the test's own "skipped, <reason>" line says more.
+CTEST_MESSAGE = re.compile(r"skipped, (?:SKIP_RETURN_CODE=\d+|SKIP_REGULAR_EXPRESSION_MATCHED|Disabled)$")
+
 WINDOWS_PREFIX = "agc"
+
+
+def reason(output):
+    lines = [line.strip() for line in output.splitlines() if line.startswith("skipped")]
+    return next((line for line in lines if not CTEST_MESSAGE.match(line)), lines[0] if lines else "")
 
 
 def skips(path):
@@ -35,8 +43,7 @@ if __name__ == "__main__":
         parser.error(str(error))
     if args.list:
         for name, output in found:
-            reason = next((line.strip() for line in output.splitlines() if line.startswith("skipped")), "")
-            print(f"{name}: {reason}")
+            print(f"{name}: {reason(output)}")
         raise SystemExit
     if args.job == "windows":
         unexpected = [name for name, output in found if not name.startswith(WINDOWS_PREFIX) and not NO_DISPLAY.search(output)]

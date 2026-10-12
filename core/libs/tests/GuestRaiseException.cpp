@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -54,6 +55,7 @@ static constexpr std::uint64_t PatchedXmm8 = 0x7e7e5678dcba0002ULL;
 
 static void Require(bool value) { if (!value) std::abort(); }
 
+#if defined(__x86_64__)
 static std::atomic<int> calls{0};
 static std::atomic<std::thread::id> handlerThread;
 static std::atomic<std::uint64_t> handlerRsp{0};
@@ -661,3 +663,30 @@ int main() {
     NestedWaitKeepsOuterWake();
     Require(sceKernelRemoveExceptionHandler(GuestSigUsr1) == 0);
 }
+#else
+static void APS5_VABI Handler(int, void*) {}
+
+int main() {
+    Require(sceKernelRaiseException(scePthreadSelf(), 11) == SCE_KERNEL_ERROR_EINVAL);
+    bool rejected = false;
+    try {
+        sceKernelRaiseException(scePthreadSelf(), GuestSigUsr1);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected);
+    Require(sceKernelInstallExceptionHandler(GuestSigUsr1, reinterpret_cast<void*>(&Handler)) == 0);
+    Require(sceKernelInstallExceptionHandler(GuestSigUsr1, reinterpret_cast<void*>(&Handler)) != 0);
+    // The handler gets the interrupted guest's x86-64 registers, which on arm64 live in the guest runner.
+    bool needsRunner = false;
+    try {
+        sceKernelRaiseException(scePthreadSelf(), GuestSigUsr1);
+    } catch (const std::runtime_error& error) {
+        needsRunner = std::strstr(error.what(), "needs the arm64 guest runner") != nullptr;
+    }
+    Require(needsRunner);
+    Require(sceKernelRemoveExceptionHandler(GuestSigUsr1) == 0);
+    std::puts("skipped, sceKernelRaiseException needs the arm64 guest runner to deliver an exception: the guest's x86-64 registers live in the translator");
+    return 77;
+}
+#endif

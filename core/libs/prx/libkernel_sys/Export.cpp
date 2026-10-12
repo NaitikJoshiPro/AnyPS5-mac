@@ -19,6 +19,10 @@
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libc/include/CreationMask.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
+#if !APS5_GUEST_VA_LIST_IS_HOST
+#include "prx/libc/include/WindowsFormatting.hpp"
+#endif
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -188,11 +192,10 @@ int APS5_VABI open_nid_postfix(const char* path, int flags, int mode);
 int APS5_VABI openat_nid_postfix(int fd, const char* path, int flags, ...) {
     int mode = 0;
     if (flags & SCE_KERNEL_O_CREAT) {
-#ifdef _WIN32
-        __builtin_sysv_va_list arguments;
-        __builtin_sysv_va_start(arguments, flags);
-        mode = __builtin_va_arg(arguments, int);
-        __builtin_sysv_va_end(arguments);
+#if !APS5_GUEST_VA_LIST_IS_HOST
+        APS5_VA_BEGIN(flags);
+        mode = LibcDetail::FormatArguments(args).Next<int>();
+        APS5_VA_END();
 #else
         std::va_list arguments;
         va_start(arguments, flags);

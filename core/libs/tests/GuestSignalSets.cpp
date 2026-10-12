@@ -24,6 +24,7 @@ int APS5_VABI _sigprocmask_nid_postfix(int, const GuestSignalSet*, GuestSignalSe
 int APS5_VABI JumpKeepingCalleeSaved(std::uint64_t* buffer);
 }
 
+#if defined(__x86_64__)
 #define TEST_ASM_FUNCTION(name) APS5_ASM_FUNCTION(name)
 #if defined(_WIN32) || defined(__APPLE__)
 #define TEST_ASM_CALL(name) "    call " APS5_ASM_SYMBOL(name) "\n"
@@ -89,6 +90,7 @@ asm(".text\n"
     "    popq %rbp\n"
     "    popq %rbx\n"
     "    ret\n");
+#endif
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -96,6 +98,7 @@ static bool Equals(const GuestSignalSet& set, std::uint32_t w0, std::uint32_t w1
     return set.bits[0] == w0 && set.bits[1] == w1 && set.bits[2] == w2 && set.bits[3] == w3;
 }
 
+#if defined(__x86_64__)
 static std::uint32_t BlockedMask() {
     GuestSignalSet current{};
     Require(_sigprocmask_nid_postfix(1, nullptr, &current) == 0);
@@ -163,10 +166,15 @@ static void CheckSigsetjmp() {
     Require(BlockedMask() == 0x6u);
     SetBlockedMask(0);
 }
+#endif
 
 int main() {
+#if defined(__x86_64__)
     CheckSigsetjmp();
     CheckSiglongjmp();
+#endif
+    // On arm64 sigsetjmp and siglongjmp reach the guest's registers through the guest runner's bridge hooks, which a
+    // host caller does not have, so only the set operations are checked there.
     static constexpr int Untouched = 5;
     GuestSignalSet set{{0x12345678u, 0x9abcdef0u, 0xffffffffu, 1u}};
     *__error_nid_postfix() = Untouched;

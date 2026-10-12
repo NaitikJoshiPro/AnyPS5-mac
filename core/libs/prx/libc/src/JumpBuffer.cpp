@@ -99,6 +99,20 @@ extern "C" void APS5_VABI longjmp_nid_postfix(void* buffer, int value) {
     registers[Rip] = saved.rip;
     LibcRestoreRegisters(registers);
 }
+
+// The same hooks for the other libraries (libkernel's sigsetjmp and siglongjmp): a patched library exports only NIDs
+// and _nid_no_patch names, so they cannot import the hooks under their own names.
+extern "C" void LibcCaptureRegisters_nid_no_patch(std::uintptr_t* registers) {
+    LibcCaptureRegisters(registers);
+}
+
+extern "C" [[noreturn]] void LibcRestoreRegisters_nid_no_patch(const std::uintptr_t* registers) {
+    LibcRestoreRegisters(registers);
+}
+
+extern "C" void LibcGuestControl_nid_no_patch(std::uint32_t* mxcsr, std::uint16_t* fcw) {
+    LibcGuestControl(mxcsr, fcw);
+}
 #else
 extern "C" int APS5_VABI setjmp_nid_postfix(void* buffer) {
     (void)buffer;

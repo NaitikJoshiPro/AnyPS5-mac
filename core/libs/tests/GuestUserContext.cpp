@@ -8,12 +8,16 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#if defined(__x86_64__)
 #include <xmmintrin.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
 using ContextEntry = void (APS5_VABI*)();
+
+#if defined(__x86_64__)
 
 extern "C" {
 [[gnu::returns_twice]] int APS5_VABI getcontext_nid_postfix(UserUcontext* context);
@@ -471,3 +475,113 @@ int main(int argc, char** argv) {
     }).join();
     return 0;
 }
+#else
+// On arm64 the guest's x86-64 registers live in the guest runner, so a host caller can check only what needs no
+// registers: the argument checks, and the context makecontext prepares from the guest's variable arguments.
+extern "C" {
+int APS5_VABI getcontext_nid_postfix(UserUcontext* context);
+int APS5_VABI setcontext_nid_postfix(const UserUcontext* context);
+void APS5_VABI makecontext_nid_postfix(UserUcontext* context, ContextEntry entry, int count, ...);
+using ContextFunction = void (APS5_VABI*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+[[noreturn]] void APS5_VABI Aps5MakecontextStart_nid_no_patch(UserUcontext* context, ContextFunction function, const std::uint64_t* arguments);
+int* APS5_VABI __error_nid_postfix();
+}
+
+namespace {
+
+constexpr int GuestEinval = 22;
+constexpr std::size_t StackBytes = 256 * 1024;
+
+struct alignas(16) Stack {
+    unsigned char bytes[StackBytes];
+};
+
+Stack g_contextStack;
+
+void APS5_VABI Entry() {}
+
+void Require(bool value, const char* what) {
+    if (!value) {
+        std::fprintf(stderr, "User context check failed: %s\n", what);
+        std::abort();
+    }
+}
+
+template<class Call> bool NeedsRunner(Call call) {
+    try {
+        call();
+    } catch (const std::runtime_error& error) {
+        return std::strstr(error.what(), "needs the arm64 guest runner") != nullptr;
+    }
+    return false;
+}
+
+void CheckErrors() {
+    *__error_nid_postfix() = 0;
+    Require(getcontext_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == GuestEinval, "getcontext rejects a null context");
+    *__error_nid_postfix() = 0;
+    Require(setcontext_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == GuestEinval, "setcontext rejects a null context");
+    UserUcontext context{};
+    *__error_nid_postfix() = 0;
+    Require(setcontext_nid_postfix(&context) == -1 && *__error_nid_postfix() == GuestEinval, "setcontext rejects a wrong mc_len");
+    context.mcontext.len = sizeof(UserMcontext);
+    context.mcontext.flags = 0x8;
+    *__error_nid_postfix() = 0;
+    Require(setcontext_nid_postfix(&context) == -1 && *__error_nid_postfix() == GuestEinval, "setcontext rejects unknown mc_flags");
+    context.mcontext.flags = 0;
+    UserUcontext invalid = context;
+    invalid.stackPointer = g_contextStack.bytes;
+    invalid.stackSize = StackBytes;
+    makecontext_nid_postfix(&invalid, &Entry, 7);
+    Require(invalid.mcontext.len == 0, "makecontext invalidates a context with more than six arguments");
+    invalid = context;
+    invalid.stackPointer = g_contextStack.bytes;
+    invalid.stackSize = 2047;
+    makecontext_nid_postfix(&invalid, &Entry, 0);
+    Require(invalid.mcontext.len == 0, "makecontext invalidates a context with a stack below MINSIGSTKSZ");
+    invalid = context;
+    invalid.stackPointer = nullptr;
+    invalid.stackSize = StackBytes;
+    makecontext_nid_postfix(&invalid, &Entry, 0);
+    Require(invalid.mcontext.len == 0, "makecontext invalidates a context without a stack");
+    invalid = context;
+    invalid.stackPointer = g_contextStack.bytes;
+    invalid.stackSize = StackBytes;
+    invalid.mcontext.len = 0;
+    invalid.mcontext.rip = 0x1234;
+    makecontext_nid_postfix(&invalid, &Entry, 0);
+    Require(invalid.mcontext.len == 0 && invalid.mcontext.rip == 0x1234, "makecontext leaves a context without a valid mc_len untouched");
+    makecontext_nid_postfix(nullptr, &Entry, 0);
+}
+
+void CheckMakecontext() {
+    UserUcontext context{};
+    context.mcontext.len = sizeof(UserMcontext);
+    context.stackPointer = g_contextStack.bytes;
+    context.stackSize = StackBytes;
+    makecontext_nid_postfix(&context, &Entry, 3, 0x8000000000000001ull, 0x8000000000000002ull, 0x8000000000000003ull);
+    const auto& machine = context.mcontext;
+    Require(machine.len == sizeof(UserMcontext), "makecontext keeps the context valid");
+    const auto top = reinterpret_cast<std::uint64_t>(g_contextStack.bytes + StackBytes) & ~std::uint64_t{15};
+    Require(machine.rdx == top - 6 * 8, "makecontext stores the arguments at the top of the stack");
+    const auto* arguments = reinterpret_cast<const std::uint64_t*>(machine.rdx);
+    for (unsigned index = 0; index < 3; ++index) Require(arguments[index] == 0x8000000000000001ull + index, "makecontext reads the guest's variable arguments");
+    for (unsigned index = 3; index < 6; ++index) Require(arguments[index] == 0, "makecontext clears the arguments it was not given");
+    Require(machine.rsp == machine.rdx - 8 && machine.rbx == machine.rsp && arguments[-1] == 0, "the made context starts below a null return address");
+    Require(machine.rdi == reinterpret_cast<std::uint64_t>(&context) && machine.rsi == reinterpret_cast<std::uint64_t>(&Entry), "the made context passes the context and its function");
+    Require(machine.rip == reinterpret_cast<std::uint64_t>(&Aps5MakecontextStart_nid_no_patch), "the made context starts in the makecontext trampoline");
+}
+
+}
+
+int main() {
+    CheckErrors();
+    CheckMakecontext();
+    UserUcontext context{};
+    context.mcontext.len = sizeof(UserMcontext);
+    Require(NeedsRunner([&] { getcontext_nid_postfix(&context); }), "getcontext reports that it needs the guest runner");
+    Require(NeedsRunner([&] { setcontext_nid_postfix(&context); }), "setcontext reports that it needs the guest runner");
+    std::puts("skipped, getcontext and setcontext need the arm64 guest runner: the guest's x86-64 registers live in the translator");
+    return 77;
+}
+#endif

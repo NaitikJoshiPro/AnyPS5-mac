@@ -11,6 +11,7 @@
 
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 
 namespace {
 
@@ -227,9 +228,13 @@ int APS5_VABI __fpclassifyf_nid_postfix(float x) {
     return Normal;
 }
 int APS5_VABI __signbitf_nid_postfix(float x) { return std::signbit(x) ? 1 : 0; }
-int APS5_VABI __signbitl_nid_postfix(long double x) {
+int APS5_VABI __signbitl_nid_postfix(GuestLongDouble x) {
+#if defined(__x86_64__)
     static_assert(sizeof(long double) == 16, "guest long double requires x87 extended precision storage");
     return std::signbit(x) ? 1 : 0;
+#else
+    return (x.signExponent & 0x8000u) != 0 ? 1 : 0;
+#endif
 }
 
 static std::mutex g_randLock;

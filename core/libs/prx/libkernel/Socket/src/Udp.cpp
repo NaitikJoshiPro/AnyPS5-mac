@@ -20,6 +20,10 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
+#if !APS5_GUEST_VA_LIST_IS_HOST
+#include "prx/libc/include/WindowsFormatting.hpp"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -455,11 +459,10 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
     std::lock_guard lock(socket->modeMutex);
     if (command == 3) return 2 | (socket->nonblocking ? 4 : 0); // F_GETFL, O_RDWR
     if (command != 4) return Fail(22);
-#ifdef _WIN32
-    __builtin_sysv_va_list arguments;
-    __builtin_sysv_va_start(arguments, command);
-    const int flags = __builtin_va_arg(arguments, int);
-    __builtin_sysv_va_end(arguments);
+#if !APS5_GUEST_VA_LIST_IS_HOST
+    APS5_VA_BEGIN(command);
+    const int flags = LibcDetail::FormatArguments(args).Next<int>();
+    APS5_VA_END();
 #else
     std::va_list arguments;
     va_start(arguments, command);

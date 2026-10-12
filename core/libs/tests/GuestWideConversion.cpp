@@ -1,3 +1,4 @@
+#include "prx/libc/include/X87Extended.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cerrno>
 #include <cstddef>
@@ -137,8 +138,8 @@ static void CheckScan() {
     double real = 0;
     Require(swscanf_s_nid_postfix(u"1.5e3", u"%lf", &real) == 1 && real == 1500.0, "%lf");
     Require(swscanf_s_nid_postfix(u"1e+x", u"%lf", &real) == 0, "%lf incomplete exponent is a matching failure");
-    long double extended = 0;
-    Require(swscanf_s_nid_postfix(u"2.25", u"%Lf", &extended) == 1 && extended == 2.25L, "%Lf");
+    GuestLongDouble extended{};
+    Require(swscanf_s_nid_postfix(u"2.25", u"%Lf", &extended) == 1 && extended == GuestLongDoubleFromDouble(2.25), "%Lf");
     float single = 0;
     Require(swscanf_s_nid_postfix(u"-inf", u"%f", &single) == 1 && single == -std::numeric_limits<float>::infinity(), "%f infinity");
 

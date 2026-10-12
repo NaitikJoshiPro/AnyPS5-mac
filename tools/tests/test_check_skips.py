@@ -91,6 +91,15 @@ class SkipReportTests(unittest.TestCase):
         found = self.skipped('<testsuite><testcase name="gpu"><skipped/><system-out>skipped, the device reports too few descriptors</system-out></testcase></testsuite>')
         self.assertRegex(found[0][1], check_skips.DEVICE_LIMITATION)
 
+    def test_listed_reason_is_the_test_output_rather_than_the_ctest_message(self):
+        found = self.skipped('<testsuite><testcase name="arena"><skipped message="SKIP_RETURN_CODE=77"/>'
+                             '<system-out>setting up\nskipped, the guest arena is Linux and Windows only\n</system-out></testcase></testsuite>')
+        self.assertEqual(check_skips.reason(found[0][1]), "skipped, the guest arena is Linux and Windows only")
+
+    def test_listed_reason_falls_back_to_the_ctest_message(self):
+        found = self.skipped('<testsuite><testcase name="quiet"><skipped message="SKIP_RETURN_CODE=77"/></testcase></testsuite>')
+        self.assertEqual(check_skips.reason(found[0][1]), "skipped, SKIP_RETURN_CODE=77")
+
     def test_message_and_element_text_are_both_retained(self):
         found = self.skipped('<testsuite><testcase name="gpu"><skipped message="unsupported">the device has no required extension</skipped></testcase></testsuite>')
         self.assertRegex(found[0][1], check_skips.DEVICE_LIMITATION)

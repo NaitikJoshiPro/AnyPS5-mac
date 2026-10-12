@@ -19,3 +19,22 @@ Append-only. Read the tail on every start or resume. Each entry: date, milestone
 - M3 title candidate: DOOM Shareware homebrew `lowbit/ps5-doom` v1.1.1 (`PPSA99666.zip`, sha256 `4d8e5b78…711b5f` verified against the release's `.sha256`). Licence: GPL-2.0 (id's linuxdoom source, repo `LICENSE`), shareware `doom1.wad` freely distributable; bundled `sce_module/libc.prx` is GPL-3.0 (test data only, not linked into our code). Extracted to `.mac-work/titles/dl-ps5-doom-v1.1.1/extracted/`. `eboot.bin` and `libc.prx` are fSELF (`4f 15 3d 1d`): the relinker rejects SELF containers, so an unwrap step is needed (upstream #2599).
 - Disk: ~0.5 GB.
 - **Next:** full arm64 build (`build-arm64`, running), fix build breaks, non-GPU ctest; decide FEX licence from the audit.
+
+## 2026-10-12: recon done, three streams launched
+- Recon workflow (6 agents) reports in `.mac-work/research/` (summaries in `research/summaries/`): FEX licence audit (clean), runner architecture + gaps, M0 inventory (11 arm64 compile blockers, `check_no_x86.py`), M2 scope, Metal/Apple9 limits (probed on this M3), translator performance (TSO cost measured). Decisions D6–D12 recorded; MISSION §4/§5/§6.1/§3.2 corrected.
+- Full arm64 build first attempt (`build-arm64`): configure OK (287 s), 1232/3011 steps, 10 failed objects (main-only x86 code), as predicted by the inventory.
+- Removed `build-relinker` (superseded; to be re-verified at M0 end). Added `tools/mac/buildlock.py` (serialises ninja/ctest in a shared build dir).
+- User answer on titles: no titles from the user; use freely distributed homebrew only ("make do with whatever you have"). Commercial dumps stay off-limits (CLAUDE.md legal rule).
+- Running agents: (A) M0 completion in main worktree/`build-arm64`; (B) M1 prep in worktree `.mac-work/wt/m1prep` (branch `mac-native-m1prep`, no builds): FEX pin + licence test, code-cache verdict, `tools/unself.py`, DOOM unwrap + relink, `docs/mac/M1_DESIGN.md`; (C) M2 architect in worktree `.mac-work/wt/metal` (branch `mac-native-metal`, `build-metal`): `docs/mac/M2_DESIGN.md`, MslAbi, MetalBackend + MetalDevice skeletons, one compute test end to end; (D) search for more licensed PS5 homebrew (3D draws wanted).
+- **Next:** on A's completion verify M0 exit criteria myself and close M0; then merge B's branch and start M1 implementation (work packages from M1_DESIGN.md); on C's completion fan out M2 work packages.
+
+## 2026-10-12: network outage, agents resumed
+- A DNS/API outage killed all four agents and their sub-agents mid-task. State at the time: (A) M0: 16 files fixed but uncommitted in the main worktree, plus `tools/mac/check_no_x86.py` and its test; (B) M1 prep: 3 commits on `mac-native-m1prep` (`986586b8` FEX branch tracking removed, `cf215cc4` FEX licence guard test, `e47605dc` `tools/unself.py`); was relinking DOOM; (C) M2 architect: worktree and `build-metal` configured, `MslAbi.hpp` uncommitted, plus temporary copies of A's WIP fixes (to be dropped when A's commits land); (D) homebrew search: ccleste excluded (unlicensed assets), checking ProsperoPuzzles and Homebrew UI Lab.
+- All four resumed with context intact (SendMessage); each told to resume or re-launch its own sub-agents.
+
+## 2026-10-12: Xcode and sudo setup (user-authorised)
+- The user supplied their sudo password to end password prompts. It is not stored anywhere (repo, logs, memory, agent prompts); it was used once for:
+  - `DevToolsSecurity -enable` (debugger attach no longer raises the "Developer Tools Access" dialog);
+  - Xcode 27.0 (27A266a) at `/Applications/Xcode.app`: licence accepted, `-runFirstLaunch` OK. `xcode-select` still points at the Command Line Tools on purpose (switching mid-build would swap compilers under live build dirs); use `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun <tool>` for Xcode tools. The Metal toolchain (`metal`, `metallib`) is a separate component: `xcodebuild -downloadComponent MetalToolchain` running;
+  - `/etc/sudoers.d/anyps5-powermetrics` (0440 root:wheel, `visudo -c` OK): `naitikjoshi ALL=(root) NOPASSWD: /usr/bin/powermetrics` only. Verified: `sudo -n /usr/bin/powermetrics --samplers cpu_power -i 200 -n 1` → CPU 1167 mW, combined 1244 mW (idle-ish).
+- **Cleanup at project end:** delete `/etc/sudoers.d/anyps5-powermetrics`, optionally `DevToolsSecurity -disable`; the user will rotate the password.
