@@ -1,12 +1,12 @@
 // The buffer primitives on Metal (work package D2): twin of Graphics/src/Resources.cpp. Buffer and
 // DeviceBuffer hold pool allocations (MTLBuffers, resident on the device's queue); CommandBatch is a
 // one-shot MTL4 command buffer with its own event; CopyBuffer and RecordMemoryBarrier record into a
-// Metal::CommandStream.
+// Metal::CommandStream. The active recorder is reached through Metal::ActiveRecorder(), not its
+// symbols, so targets without the recorder link.
 
 #include "MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -152,7 +152,7 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
     metal = std::move(objects);
     try {
         // Work recorded so far goes first in queue order, so this batch sees its results.
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+        if (const auto recorder = Metal::ActiveRecorder(); recorder.submitOpen != nullptr) recorder.submitOpen();
     } catch (...) {
         release();
         throw;
@@ -221,7 +221,7 @@ void CommandBatch::Wait() {
         if (!metal->failure->empty()) Metal::Fail("a one-shot command batch failed on the GPU: " + *metal->failure);
     }
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
-    if (auto* recorder = Recorder::Active()) recorder->Reap();
+    if (const auto recorder = Metal::ActiveRecorder(); recorder.reap != nullptr) recorder.reap();
 }
 
 }

@@ -201,6 +201,18 @@ private:
     std::uint64_t commands = 0;
 };
 
+// What a one-shot CommandBatch needs from the active recorder: submit its open batch first (queue
+// order) and retire its finished batches after a wait. Recorder::Activate registers them, so the
+// buffer primitives link in targets that compile Resources.cpp without Recorder.cpp
+// (agc_driver_bda_device_tests); with no recorder registered they do nothing, as with no active
+// recorder.
+struct ActiveRecorderCalls {
+    void (*submitOpen)() = nullptr;
+    void (*reap)() = nullptr;
+};
+void SetActiveRecorderCalls(const ActiveRecorderCalls& calls);
+ActiveRecorderCalls ActiveRecorder();
+
 // The driver's helper kernels (MSL in RecorderKernels.h), compiled once per device and kept for
 // the process: FillPattern, MeshArguments, SampleCounter, SampleDumps.
 enum class HelperKernel { FillPattern, MeshArguments, SampleCounter, SampleDumps, Count };

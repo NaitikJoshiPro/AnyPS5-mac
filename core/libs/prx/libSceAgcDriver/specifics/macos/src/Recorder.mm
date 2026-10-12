@@ -1308,6 +1308,12 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     activeRecorder = this;
+    // macOS: what the one-shot CommandBatch (Resources.mm) calls on the active recorder.
+    Metal::SetActiveRecorderCalls({+[] {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+    }, +[] {
+        if (auto* recorder = Recorder::Active()) recorder->Reap();
+    }});
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;

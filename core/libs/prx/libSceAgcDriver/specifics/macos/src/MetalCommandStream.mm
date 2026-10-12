@@ -5,6 +5,7 @@
 #include "RecorderKernels.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -289,6 +290,22 @@ void CommandStream::Recycle() {
     current = nil;
     currentUsed = 0;
     arena->Give(uploads);
+}
+
+namespace {
+
+std::atomic<void (*)()> activeSubmitOpen{nullptr};
+std::atomic<void (*)()> activeReap{nullptr};
+
+}
+
+void SetActiveRecorderCalls(const ActiveRecorderCalls& calls) {
+    activeSubmitOpen.store(calls.submitOpen, std::memory_order_release);
+    activeReap.store(calls.reap, std::memory_order_release);
+}
+
+ActiveRecorderCalls ActiveRecorder() {
+    return {activeSubmitOpen.load(std::memory_order_acquire), activeReap.load(std::memory_order_acquire)};
 }
 
 id<MTLComputePipelineState> HelperPipeline(id<MTLDevice> device, HelperKernel kernel) {
