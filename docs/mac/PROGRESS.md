@@ -99,3 +99,4 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Open (TechnicalDebt): positional callbacks via fault path, flags lost on fast-path resume, cross-thread raise, long double at double precision, no swapcontext export, FEX JIT temp-buffer guard on 16 KiB pages, STK TPOFF64 relocations.
 - Disk 8.01 GB.
 - **Next:** M2, gated on the user's OK of the GPU safety proposal (GPU frozen since the panic).
+- SuperTuxKart relinks now (`36a74c44d` executable TLS relocations TPOFF64/DTPOFF64/DTPMOD64 → Linux `.rela.dyn`, applied by the runner's variant II layout; static resolution on Windows/macOS outputs; test `executable_tls_relocations`, fixture `tls-exec`; `5dc07a7e6` grow the program header table into unused zero padding). Relinker tests 103/103, fex fixtures 35/35. Not run (needs GPU).
