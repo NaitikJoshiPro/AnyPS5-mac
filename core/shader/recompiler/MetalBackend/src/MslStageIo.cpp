@@ -445,12 +445,15 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         if (scalars > 124u) state.Fail("the vertex function exceeds 124 scalar varyings");
         text += "    float aps5_clip [[clip_distance]] [" + std::to_string(clips) + "];\n};\n\n";
         result.outputType = "Aps5VertexOut";
-        // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w]. Metal's
-        // normalized device y points up, Vulkan's (and the guest's viewport transform) down.
+        // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w]. The y
+        // flip between Vulkan and Metal lives in the driver's viewport (MetalDraw.mm); APS5_FLIP_Y is
+        // a debug aid the driver never defines.
         result.epilogue = "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n"
                           "    aps5_out.aps5_position.z = (aps5_out.aps5_position.z + aps5_out.aps5_position.w) * 0.5f;\n"
                           "#endif\n"
-                          "    aps5_out.aps5_position.y = -aps5_out.aps5_position.y;\n";
+                          "#if defined(APS5_FLIP_Y) && APS5_FLIP_Y\n"
+                          "    aps5_out.aps5_position.y = -aps5_out.aps5_position.y;\n"
+                          "#endif\n";
         return result;
     }
     if (stage != IrShaderStage::Pixel) state.Fail("only vertex and pixel graphics stages are implemented in the MSL backend so far (work package B6)");

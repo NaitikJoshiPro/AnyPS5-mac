@@ -142,6 +142,17 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     // end the guest program and the stage function applies the epilogue (MslGraphicsInterfaceOf).
     const bool fragment = state.reflection.stage == MslAbi::Stage::Fragment;
     if (fragment) parameters.insert(parameters.begin(), "Aps5FragmentIn aps5_in [[stage_in]]");
+    if (!fragment) {
+        // Rect lists (APS5_RECT_LIST) need the host vertex id and the guest first vertex.
+        const std::string vertexId = "uint aps5_vertex_id [[vertex_id]]";
+        if (std::find(parameters.begin(), parameters.end(), vertexId) == parameters.end()) parameters.push_back(vertexId);
+        const std::string driver = "constant Aps5DriverData& aps5_driver [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DriverData)) + ")]]";
+        if (std::find(parameters.begin(), parameters.end(), driver) == parameters.end()) {
+            state.RequirePrelude(MslPreludeChunk::Common);
+            state.reflection.usesDriverData = true;
+            parameters.push_back(driver);
+        }
+    }
     const auto graphics = MslGraphicsInterfaceOf(state);
     text += graphics.declarations;
     std::vector<std::string> helperParameters;
@@ -170,9 +181,50 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     text += ")\n{\n";
     if (!graphics.outputType.empty()) text += "    " + graphics.outputType + " aps5_out = {};\n";
     if (state.usesValidMask) text += "    uint aps5_valid = 1u;\n";
-    text += "    aps5_body(";
-    for (std::size_t index = 0; index < arguments.size(); ++index) text += (index == 0u ? "" : ", ") + arguments[index];
-    text += ");\n" + graphics.epilogue;
+    const auto call = [&](const std::string& vertexId, const std::string& output) {
+        std::string line = "aps5_body(";
+        for (std::size_t index = 0; index < arguments.size(); ++index) {
+            auto argument = arguments[index] == "aps5_vertex_id" ? vertexId : arguments[index] == "aps5_out" ? output : arguments[index];
+            line += (index == 0u ? "" : ", ") + argument;
+        }
+        return line + ");";
+    };
+    if (!fragment) {
+        // APS5_RECT_LIST: 6 host vertices per rect (two triangles); each runs the guest program for
+        // the rect's 3 guest vertices (DriverData.workgroupBase[0] = the guest first vertex) and
+        // emits one corner, the fourth derived as on the SPIR-V path's rect-list TCS: the right-angle
+        // vertex gets weight -1, the others +1; an invalid rect is culled (zero position).
+        text += "#if defined(APS5_RECT_LIST) && APS5_RECT_LIST\n";
+        text += "    const uint aps5_rect = aps5_vertex_id / 6u;\n";
+        text += "    constexpr uint aps5_corners[6] = {0u, 1u, 2u, 2u, 1u, 3u};\n";
+        text += "    const uint aps5_corner = aps5_corners[aps5_vertex_id % 6u];\n";
+        text += "    Aps5VertexOut aps5_v[3] = {};\n";
+        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
+            text += "    " + call("aps5_driver.workgroupBase[0] + aps5_rect * 3u + " + std::to_string(vertex) + "u", "aps5_v[" + std::to_string(vertex) + "]") + "\n";
+        }
+        text += "    bool aps5_edge[3];\n    float aps5_weight[3];\n    uint aps5_edges = 0u;\n";
+        text += "    for (uint i = 0u; i < 3u; ++i) {\n";
+        text += "        const uint next = (i + 1u) % 3u, previous = (i + 2u) % 3u;\n";
+        text += "        const bool xy = aps5_v[i].aps5_position.x == aps5_v[next].aps5_position.x && aps5_v[i].aps5_position.y == aps5_v[previous].aps5_position.y;\n";
+        text += "        const bool yx = aps5_v[i].aps5_position.y == aps5_v[next].aps5_position.y && aps5_v[i].aps5_position.x == aps5_v[previous].aps5_position.x;\n";
+        text += "        aps5_edge[i] = xy || yx;\n        aps5_weight[i] = aps5_edge[i] ? -1.0f : 1.0f;\n        aps5_edges += aps5_edge[i] ? 1u : 0u;\n    }\n";
+        text += "    const uint aps5_first = aps5_edge[1] ? 1u : (aps5_edge[2] ? 2u : 0u);\n";
+        text += "    if (aps5_corner < 3u) {\n        aps5_out = aps5_v[(aps5_first + aps5_corner) % 3u];\n    } else {\n        aps5_out = aps5_v[aps5_first];\n";
+        text += "        aps5_out.aps5_position = aps5_v[0].aps5_position * aps5_weight[0] + aps5_v[1].aps5_position * aps5_weight[1] + aps5_v[2].aps5_position * aps5_weight[2];\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            const auto field = "p" + std::to_string(output.location);
+            text += "        aps5_out." + field + " = aps5_v[0]." + field + " * aps5_weight[0] + aps5_v[1]." + field + " * aps5_weight[1] + aps5_v[2]." + field + " * aps5_weight[2];\n";
+        }
+        text += "    }\n";
+        text += "    const float aps5_w = aps5_v[0].aps5_position.w;\n";
+        text += "    const bool aps5_valid_rect = aps5_edges == 1u && aps5_w > 0.0f && aps5_v[1].aps5_position.w == aps5_w && aps5_v[2].aps5_position.w == aps5_w && all(isfinite(aps5_out.aps5_position));\n";
+        text += "    if (!aps5_valid_rect) aps5_out.aps5_position = float4(0.0f);\n";
+        text += "#else\n    " + call("aps5_vertex_id", "aps5_out") + "\n#endif\n";
+    } else {
+        text += "    " + call("aps5_vertex_id", "aps5_out") + "\n";
+    }
+    text += graphics.epilogue;
     if (!graphics.outputType.empty()) text += "    return aps5_out;\n";
     text += "}\n";
     return text;
