@@ -62,6 +62,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SystemConfiguration.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Login.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SoftwareVersion.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ThermalSensors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Signals.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SigactionAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SignalSets.cpp
@@ -83,7 +84,7 @@ target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR}/nid/include)
 target_link_libraries(libkernel PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(libkernel PRIVATE libc)
 if(WIN32)
-    target_link_libraries(libkernel PRIVATE ws2_32 shell32 advapi32)
+    target_link_libraries(libkernel PRIVATE ws2_32 shell32 advapi32 wbemuuid ole32 oleaut32)
     target_compile_definitions(libkernel PRIVATE _WIN32_WINNT=0x0602)
 endif()
 configure_windows_unwind(libkernel)
@@ -804,6 +805,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_getrusage PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_getrusage PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_thermal_sensors_tests ${LIBS_INCLUDE_DIR}/tests/GuestThermalSensors.cpp)
+    target_include_directories(guest_thermal_sensors_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_thermal_sensors_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_thermal_sensors_tests)
+    add_test(NAME guest_thermal_sensors COMMAND guest_thermal_sensors_tests)
+    set_tests_properties(guest_thermal_sensors PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_thermal_sensors PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_getlogin_tests ${LIBS_INCLUDE_DIR}/tests/GuestGetlogin.cpp)
