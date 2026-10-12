@@ -154,6 +154,8 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslWave.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslMemory.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslRuntimeBuffer.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslBda.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslAddress.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslImage.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslStageIo.cpp
 
