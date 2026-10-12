@@ -8,9 +8,13 @@
 #include <filesystem>
 #include <fstream>
 #include <source_location>
+#include <stdexcept>
 #include <string>
 #ifdef _WIN32
 #include <windows.h>
+#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
+#endif
 #endif
 #ifdef __linux__
 #include <cerrno>
@@ -161,6 +165,33 @@ int main() {
         Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == 0);
         Require((GetFileAttributesW(std::filesystem::path(dangling).wstring().c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
         Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == -1 && Error() == 17);
+        Require(readlink_nid_postfix(symbolic.c_str(), buffer, sizeof(buffer)) == 12 && std::memcmp(buffer, "original.bin", 12) == 0);
+        Require(readlink_nid_postfix(dangling.c_str(), buffer, sizeof(buffer)) == 11 && std::memcmp(buffer, "missing.bin", 11) == 0);
+        const auto nested = (root / "nested").string();
+        Require(symlink_nid_postfix("sub/target.txt", nested.c_str()) == 0);
+        std::memset(buffer, '#', sizeof(buffer));
+        Require(readlink_nid_postfix(nested.c_str(), buffer, sizeof(buffer)) == 14);
+        Require(std::memcmp(buffer, "sub/target.txt", 14) == 0 && buffer[14] == '#');
+        Require(readlink_nid_postfix(nested.c_str(), buffer, 3) == 3 && std::memcmp(buffer, "sub", 3) == 0);
+        Require(readlink_nid_postfix(nested.c_str(), nullptr, 0) == 0);
+        Require(readlink_nid_postfix(nested.c_str(), nullptr, sizeof(buffer)) == -1 && Error() == 14);
+        const auto accented = (root / "accented").string();
+        Require(symlink_nid_postfix("a\xc3\xa7\xc3\xa3o.bin", accented.c_str()) == 0);
+        Require(readlink_nid_postfix(accented.c_str(), buffer, sizeof(buffer)) == 10 && std::memcmp(buffer, "a\xc3\xa7\xc3\xa3o.bin", 10) == 0);
+        Require(std::filesystem::create_directory(root / "sub"));
+        const auto directoryLink = (root / "directory-link").string();
+        Require(symlink_nid_postfix("sub", directoryLink.c_str()) == 0);
+        Require(readlink_nid_postfix(directoryLink.c_str(), buffer, sizeof(buffer)) == 3 && std::memcmp(buffer, "sub", 3) == 0);
+        const auto absolute = std::filesystem::absolute(root / "absolute");
+        Require(CreateSymbolicLinkW(absolute.wstring().c_str(), std::filesystem::absolute(original).wstring().c_str(),
+            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        bool refused = false;
+        try {
+            readlink_nid_postfix((root / "absolute").string().c_str(), buffer, sizeof(buffer));
+        } catch (const std::runtime_error& failure) {
+            refused = std::string(failure.what()) == "readlink of a Windows reparse point other than a relative symbolic link not implemented";
+        }
+        Require(refused);
 #else
         Require(std::filesystem::is_symlink(std::filesystem::symlink_status(symbolic)));
         Require(readlink_nid_postfix(symbolic.c_str(), buffer, sizeof(buffer)) == 12 && std::memcmp(buffer, "original.bin", 12) == 0);
