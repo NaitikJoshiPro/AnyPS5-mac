@@ -6,7 +6,7 @@
 agc_driver_shader_clock | lacks shaderSubgroupClock or shaderDeviceClock | metal-shader-clock
 agc_driver_pixel_barycentric_emulation | lacks geometryShader | metal-geometry-shaders
 agc_driver_draw_cache_reuse | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
-agc_pipeline_library | no usable Vulkan device | metal-graphics-pipeline-libraries
-agc_pipeline_library_off | no usable Vulkan device | metal-graphics-pipeline-libraries
-agc_pipeline_library_fast_only | no usable Vulkan device | metal-graphics-pipeline-libraries
-agc_descriptor_pool_recycling | no usable Vulkan device | metal-vulkan-internal-tests
+agc_pipeline_library | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
+agc_pipeline_library_off | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
+agc_pipeline_library_fast_only | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
+agc_descriptor_pool_recycling | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests
