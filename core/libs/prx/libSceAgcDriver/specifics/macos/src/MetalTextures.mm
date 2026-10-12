@@ -283,7 +283,7 @@ ImageCache::~ImageCache() {
     Teardown();
 }
 
-void ImageCache::Attach(const Context& deviceContext) {
+void ImageCache::Attach(const Context& deviceContext, bool force) {
     if (imageContext != nullptr) return;
     // Bring-up switch while the twins reach the bring-up path's G2 count: the upstream image path
     // (Texture/ShaderResources twins) only with APS5_METAL_UPSTREAM_IMAGES=1.
@@ -291,7 +291,7 @@ void ImageCache::Attach(const Context& deviceContext) {
         const char* value = std::getenv("APS5_METAL_UPSTREAM_IMAGES");
         return value != nullptr && std::strcmp(value, "1") == 0;
     }();
-    if (!upstream) return;
+    if (!upstream && !force) return;
     imageContext = std::make_unique<Context>(deviceContext);
     auto& context = *imageContext;
     detiler = std::make_unique<TextureDetiler>(context);

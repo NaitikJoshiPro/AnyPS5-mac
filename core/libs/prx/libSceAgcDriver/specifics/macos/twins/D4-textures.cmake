@@ -11,4 +11,5 @@ list(APPEND agcMetalTwins
         "Graphics/src/TextureDetilerDescriptors.cpp=specifics/macos/src/TextureDetiler.mm"
         "Graphics/src/Texture.cpp=specifics/macos/src/Texture.mm"
         "Graphics/src/UnitShadow.cpp=specifics/macos/src/UnitShadow.mm"
+        "tests/Recorder.cpp=specifics/macos/tests/D3RecorderModes.mm"
 )

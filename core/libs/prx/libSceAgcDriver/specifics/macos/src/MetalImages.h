@@ -178,10 +178,11 @@ public:
     // A 1x1 (one layer) zero texture of an image heap's type (RuntimeAbi binding 1-56).
     id<MTLTexture> Placeholder(std::uint32_t heap);
 
+    // `force`: attach whatever APS5_METAL_UPSTREAM_IMAGES says (tests of the upstream path).
     // Attaches the device's Context (once it is complete): image bindings then build upstream's
     // ShaderResources over a copy of it that carries the cache's detiler, placeholder images and
     // sampler cache (D4/D5 twins). Teardown clears the texture and resource caches of the device.
-    void Attach(const Context& deviceContext);
+    void Attach(const Context& deviceContext, bool force = false);
     // The Context image builds use (null before Attach).
     const Context* ImageContext() const { return imageContext.get(); }
 
