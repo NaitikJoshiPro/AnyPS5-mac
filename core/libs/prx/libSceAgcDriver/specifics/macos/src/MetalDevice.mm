@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -871,6 +872,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     @autoreleasepool {
         std::uint64_t offset = 0;
         if (state->ImportOf(address, bytes, &offset) == nil) return false;
+        // Pending resident-image results over the range land before the fill overwrites it.
+        Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "fill destination", Graphics::PublishScope::PartialUnits);
         static const bool alwaysSync = std::getenv("APS5_FILL_SYNC") != nullptr;
         if (recorder.PendingWriteOverlaps(address, bytes) && (alwaysSync || (Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes)))) {
             Recorder::CountSync(4);
@@ -922,6 +925,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     auto& recorder = *state->recorder;
     const auto completionStoreOverlaps = [&](std::uint64_t address) { return Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes); };
     bool settledBySignal = false;
+    // Pending resident-image results over either range are stored first (upstream copies between
+    // the storage images instead, CopyOutcome path 3; not ported: TechnicalDebt metal-d6-bring-up-draws).
+    Graphics::StorageTexture::FlushPending(source, bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
+    Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "buffer copy destination", Graphics::PublishScope::PartialUnits);
     const auto refusal = [&]() -> int {
         settledBySignal = false;
         if (bytes > cpuMax) return CopyOutcome::Size;
@@ -1132,6 +1139,12 @@ void VulkanDevice::State::SettleBindings(std::span<const StageBindings* const> p
     };
     if (recorder.HasQueuedKeyStores() && (addressBased || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (addressBased || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // Resident images (render targets, storage images of the upstream image path) whose results are
+    // still on the GPU store them into guest memory before a command reads or writes that memory as
+    // a buffer, as upstream's buffer bindings do.
+    if (!ranges.empty() && Graphics::StorageTexture::AnyPendingOverlaps(ranges)) {
+        for (const auto& [begin, end] : ranges) Graphics::StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "buffer binding");
+    }
 }
 
 void VulkanDevice::State::WrapUnions(std::span<const StageBindings* const> plans) {

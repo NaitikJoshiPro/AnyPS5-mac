@@ -26,6 +26,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace AgcDriver::Graphics {
+class StorageTexture;
+}
+
 namespace AgcDriver::Graphics::Metal {
 class CommandStream;
 class PipelineCache;
@@ -250,7 +254,8 @@ struct VulkanDevice::State {
     Metal::DrawCache& Draws();
     void SettleRange(std::uint64_t address, std::uint64_t bytes);
     // CMASK fast clears expanded into guest memory (MetalDraw.mm).
-    void MaterializeCmask(const Graphics::ColorTarget& color);
+    // `resident`: the target's resident image, refreshed from the patched memory.
+    void MaterializeCmask(const Graphics::ColorTarget& color, Graphics::StorageTexture* resident);
     id<MTLBuffer> BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset);
     void RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots);
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).

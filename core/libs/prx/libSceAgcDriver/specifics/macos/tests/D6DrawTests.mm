@@ -18,6 +18,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <array>
 #include <cstdint>
@@ -164,6 +166,14 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::State& sta
     device.Draw(state, draw, compiled);
 }
 
+// Tiled targets are resident images (upstream image path): their results reach guest memory when a
+// reader flushes them, as the PM4 core's readers do.
+void StoreResults(AgcDriver::VulkanDevice& device, std::uint64_t address, std::size_t bytes) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "test");
+    device.WaitIdle();
+}
+
 void WriteVertices(GuestBlock& block, std::span<const std::array<float, 4>> vertices) {
     std::memcpy(block.Data(), vertices.data(), vertices.size_bytes());
 }
@@ -229,6 +239,7 @@ void CheckTargets(AgcDriver::VulkanDevice& device) {
     tiledState.scissor = {{0, 0}, {Extent, Extent / 2u}};
     Draw(device, tiledState, red, {0u, 3u, 0u, 1u, 0u, false});
     device.WaitIdle();
+    StoreResults(device, tiled.Address(), layout.Bytes());
     layout.Detile(std::span<const std::byte>(tiled.Data(), layout.Bytes()), linearBytes);
     for (std::uint32_t y = 0; y < Extent; ++y) {
         for (std::uint32_t x = 0; x < Extent; ++x) {
@@ -242,6 +253,7 @@ void CheckTargets(AgcDriver::VulkanDevice& device) {
     tiledState.scissor = {{0, static_cast<std::int32_t>(Extent / 2u)}, {Extent, Extent / 2u}};
     Draw(device, tiledState, green, {0u, 3u, 0u, 1u, 0u, false});
     device.WaitIdle();
+    StoreResults(device, tiled.Address(), layout.Bytes());
     layout.Detile(std::span<const std::byte>(tiled.Data(), layout.Bytes()), linearBytes);
     std::array<std::uint16_t, 4> top;
     std::array<std::uint16_t, 4> bottom;

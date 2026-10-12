@@ -25,6 +25,11 @@
 #include "MetalVulkanImages.h"
 #include "MetalDepthSurfaces.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "MslAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -52,6 +57,13 @@ using Graphics::Recorder;
 
 [[noreturn]] void Fail(const std::string& what) {
     throw std::runtime_error("Metal draw (work package D6): " + what);
+}
+
+// Debug aid (as upstream): APS5_NO_RESIDENT_TARGETS=1 keeps tiled targets out of the image cache
+// (the bring-up load/write-back path).
+bool ResidentTargets() {
+    static const bool resident = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    return resident;
 }
 
 bool Trace() {
@@ -290,10 +302,51 @@ struct ColorAttachment {
     MTLPixelFormat format;
     std::uint64_t begin;
     std::uint64_t end;
-    // Linear targets: a texture over the guest memory (made per pass). Tiled: the cache entry.
+    // Linear targets: a texture over the guest memory (made per pass). Tiled: the image cache's
+    // resident image of the surface (upstream image path), else the bring-up cache entry.
     std::shared_ptr<DrawCache::TiledTarget> tiled;
     bool load = false;
+    std::shared_ptr<Graphics::StorageTexture> resident;
 };
+
+// The color buffer as a single-mip 2D surface descriptor (upstream Draw.cpp SurfaceForTarget).
+Graphics::GuestTextureResource SurfaceForTarget(const Graphics::ColorTarget& color) {
+    const bool chain = color.mipCount > 1;
+    Graphics::GuestTextureResource surface {};
+    surface.baseAddress = chain ? color.surfaceAddress : color.address;
+    surface.pipeBankXor = color.pipeBankXor;
+    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
+    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
+    surface.depthOrLastArray = color.depth - 1u;
+    surface.baseArray = 0;
+    surface.mipCount = color.mipCount;
+    surface.baseLevel = 0;
+    surface.lastLevel = color.mipCount - 1;
+    surface.tileMode = Graphics::ColorTextureTileMode(color.tileMode);
+    surface.dimension = color.depth > 1 ? Graphics::TextureDimension::k3D : Graphics::TextureDimension::k2D;
+    const auto guest = Graphics::FindGuestColorTargetFormat(color.format, color.elementBytes);
+    if (!guest) Fail("no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(color.format)));
+    surface.format = *guest;
+    surface.dstSelX = 4;
+    surface.dstSelY = 5;
+    surface.dstSelZ = 6;
+    surface.dstSelW = 7;
+    surface.dccAddress = color.dccAddress;
+    surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
+    surface.dccPipeAligned = color.dccPipeAligned;
+    return surface;
+}
+
+// A slice of a 2D array color target as the whole array (upstream ArraySurfaceForTarget).
+Graphics::GuestTextureResource ArraySurfaceForTarget(const Graphics::ColorTarget& color) {
+    auto surface = SurfaceForTarget(color);
+    surface.baseAddress = color.arrayAddress;
+    surface.width = color.surfaceExtent.width;
+    surface.height = color.surfaceExtent.height;
+    surface.depthOrLastArray = color.arrayLastSlice;
+    surface.dimension = Graphics::TextureDimension::k2DArray;
+    return surface;
+}
 
 std::uint64_t Mix(std::uint64_t hash, std::uint64_t value) {
     hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
@@ -324,7 +377,7 @@ void VulkanDevice::State::SettleRange(std::uint64_t address, std::uint64_t bytes
 // expanded (all 0xff), before a draw or a CB fast-clear eliminate reads the target. Codes other than
 // 0 and 15 are recorded and reported by the next materialization, as upstream reports its GPU
 // pass's codes.
-void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color) {
+void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color, Graphics::StorageTexture* resident) {
     auto& cache = Draws();
     if (const auto codes = std::exchange(cache.cmaskErrors, 0u); codes != 0u) {
         if ((codes & 1u) != 0u) Fail("a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
@@ -353,23 +406,29 @@ void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color) {
     if (!cleared.empty()) {
         if (color.dccAddress != 0u) Fail("CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys");
         if (color.elementBytes == 0u || color.elementBytes > sizeof(color.clearWords)) Fail("the CMASK register clear of a texel over 64 bits is not modeled");
-        // The texels are patched in guest memory: recorded GPU work over the target (and a tiled
-        // target's pending write-back) lands first.
+        // The texels are patched in guest memory (upstream storeCmaskClearTexels): pending
+        // resident-image results and recorded GPU work over the target (and a tiled target's
+        // pending write-back) land first.
+        Graphics::StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
         if (recorder->PendingWriteOverlaps(color.address, color.bytes)) {
             Recorder::CountSync(2);
             recorder->SyncThrough(color.address, color.bytes);
         }
         const Graphics::ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, color.pipeBankXor);
-        auto* texels = reinterpret_cast<std::byte*>(color.address);
+        std::vector<std::byte> texels(surface.Bytes());
+        GuestMemory::Read(color.address, texels, surface.Alignment());
         for (const auto tile : cleared) {
             const auto x0 = (tile % layout.TilesX()) * 8u;
             const auto y0 = (tile / layout.TilesX()) * 8u;
             for (auto y = y0; y < std::min(y0 + 8u, color.extent.height); ++y) {
-                for (auto x = x0; x < std::min(x0 + 8u, color.extent.width); ++x) std::memcpy(texels + surface.Offset(x, y), color.clearWords.data(), color.elementBytes);
+                for (auto x = x0; x < std::min(x0 + 8u, color.extent.width); ++x) std::memcpy(texels.data() + surface.Offset(x, y), color.clearWords.data(), color.elementBytes);
             }
         }
+        GuestMemory::Write(color.address, texels, surface.Alignment());
+        if (resident != nullptr) resident->Refresh();
     }
-    std::memset(reinterpret_cast<void*>(color.cmaskAddress), 0xff, bytes);
+    const std::vector<std::byte> expanded(bytes, std::byte{0xff});
+    GuestMemory::Write(color.cmaskAddress, expanded, Graphics::CmaskLayout::Alignment);
 }
 
 id<MTLBuffer> VulkanDevice::State::BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) {
@@ -477,20 +536,45 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (target.exportIndex >= 8u) Fail("color target location " + std::to_string(target.exportIndex));
         if (target.samples > 1u) Fail("multisampled color targets");
         if (target.dccAddress != 0u) Fail("DCC-compressed color targets");
-        if (target.depth > 1u || target.arrayAddress != 0u || target.mip != 0u || target.mipCount > 1u) Fail("color targets with mips, slices or array layers");
+        // Tiled targets are the image cache's resident images (upstream image path): their writes
+        // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
+        std::shared_ptr<Graphics::StorageTexture> resident;
+        if (target.tileMode != Graphics::ColorTileMode::Linear && state.images->ImageContext() != nullptr && ResidentTargets()) {
+            const auto& imageContext = *state.images->ImageContext();
+            if (Graphics::AttachmentProxyFormat(imageContext, target.format) != VK_FORMAT_UNDEFINED) Fail("color target format " + std::to_string(target.format) + " needs an attachment proxy");
+            if (target.arrayLastSlice != 0u) {
+                if (target.cmaskAddress != 0u) Fail("a slice of a 2D array color target with CMASK");
+                const auto array = ArraySurfaceForTarget(target);
+                if (target.surfaceAddress != target.arrayAddress + target.arraySlice * Graphics::DescribeSurface(array).layerBytes) Fail("the array image's layer pitch differs from the color view's slice offset");
+                resident = Graphics::CachedStorageSurface(imageContext, array);
+            } else {
+                resident = Graphics::CachedStorageSurface(imageContext, SurfaceForTarget(target));
+            }
+            if (resident == nullptr || !resident->Attachable()) Fail("storage format cannot be a color attachment");
+            // CMASK fast clears land in guest memory, which the image then picks up (Refresh).
+            state.MaterializeCmask(target, resident.get());
+        } else if (target.depth > 1u || target.arrayAddress != 0u || target.mip != 0u || target.mipCount > 1u) {
+            Fail("linear color targets with mips, slices or array layers");
+        }
         const auto format = Graphics::Metal::PixelFormatOf(target.format);
         if (format.format == MTLPixelFormatInvalid) Fail("color target format " + std::to_string(target.format) + " has no Metal pixel format");
         if (format.blockBytes != target.elementBytes) Fail("color target format " + std::to_string(target.format) + " is " + std::to_string(format.blockBytes) + " bytes a texel in Metal, " + std::to_string(target.elementBytes) + " in guest memory");
         const Graphics::ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
-        ColorAttachment attachment {&target, format.format, target.address, target.address + layout.Bytes(), nullptr, false};
-        targetPlan.reads.push_back({attachment.begin, attachment.end});
+        ColorAttachment attachment {&target, format.format, target.address, target.address + (resident != nullptr ? target.bytes : layout.Bytes()), nullptr, false, resident};
         const bool written = target.exportIndex < graphics.blends.size() && graphics.blends[target.exportIndex].colorWriteMask != 0u && (colorOutputs & (1u << target.exportIndex)) != 0u;
-        if (written) targetPlan.writes.push_back({attachment.begin, attachment.end});
+        // A resident image's guest memory is not touched by the pass (its results are pending in
+        // the storage registry instead).
+        if (resident == nullptr) {
+            targetPlan.reads.push_back({attachment.begin, attachment.end});
+            if (written) targetPlan.writes.push_back({attachment.begin, attachment.end});
+        }
         colors.push_back(attachment);
     }
 
     // CMASK fast clears land in guest memory before the targets load from it.
-    for (const auto& target : graphics.colors) state.MaterializeCmask(target);
+    for (const auto& attachment : colors) {
+        if (attachment.resident == nullptr) state.MaterializeCmask(*attachment.target, nullptr);
+    }
 
     const StageBindings* plans[] = {&vertexPlan, &fragmentPlan, &targetPlan};
     state.SettleBindings(plans);
@@ -504,6 +588,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     for (auto& attachment : colors) {
         const auto& target = *attachment.target;
         passKey = Mix(Mix(Mix(passKey, target.address), target.format | (static_cast<std::uint64_t>(target.exportIndex) << 32u)), static_cast<std::uint64_t>(target.tileMode) | (static_cast<std::uint64_t>(target.extent.width) << 16u) | (static_cast<std::uint64_t>(target.extent.height) << 40u));
+        if (attachment.resident != nullptr) {
+            passKey = Mix(passKey, reinterpret_cast<std::uint64_t>(attachment.resident.get()) ^ (static_cast<std::uint64_t>(target.mip) << 48u) ^ (static_cast<std::uint64_t>(target.arraySlice | target.depthSlice) << 32u));
+            continue;
+        }
         if (target.tileMode == Graphics::ColorTileMode::Linear) continue;
         for (const auto& entry : cache.tiled) {
             if (entry->address == target.address && entry->extent.width == target.extent.width && entry->extent.height == target.extent.height && entry->format == target.format && entry->tileMode == target.tileMode && entry->elementBytes == target.elementBytes && entry->pipeBankXor == target.pipeBankXor) {
@@ -775,7 +863,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         for (auto& attachment : colors) {
             const auto& target = *attachment.target;
             id<MTLTexture> texture = nil;
-            if (attachment.tiled != nullptr) {
+            if (attachment.resident != nullptr) {
+                texture = Graphics::Metal::TextureOfView(attachment.resident->AttachmentView(target.format, target.mip, target.depthSlice, target.arraySlice));
+                if (texture == nil) Fail("the resident color target has no attachment view");
+            } else if (attachment.tiled != nullptr) {
                 texture = attachment.tiled->texture;
                 if (attachment.load) {
                     const Graphics::ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
@@ -1018,6 +1109,13 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
     recorder.LeaveRenderPassOpen(passKey, Recorder::NoTiming, false, access, std::move(afterPass));
 
+    // Resident targets: the results stay on the GPU until something reads the target's memory.
+    for (const auto& attachment : colors) {
+        if (attachment.resident == nullptr) continue;
+        recorder.Keep(attachment.resident);
+        attachment.resident->MarkDirty();
+    }
+
     // Lifetimes and pending accesses.
     held->objects.push_back(cache.vertexArguments);
     held->objects.push_back(cache.fragmentArguments);
@@ -1114,7 +1212,7 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     if (pass.mode == Graphics::ColorMetadataPass::Mode::Resolve) Fail("CB resolves (multisampled targets)");
     for (const auto& color : pass.targets) {
         if (color.dccAddress != 0u) Fail("CB metadata passes over DCC-compressed targets");
-        state->MaterializeCmask(color);
+        state->MaterializeCmask(color, nullptr);
     }
 }
 
