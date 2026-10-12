@@ -560,7 +560,7 @@ std::string MslDeviceAtomic64(MslEmitterState& state, const IrValue& instruction
     state.Line("if (atomic_compare_exchange_weak_explicit(" + lock + ", &" + expected + ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
     state.Indent();
     state.Line(Fence(lockSpace.flags, "memory_order_acquire", lockSpace.scope));
-    state.Line(result + " = *reinterpret_cast<coherent(device) device const ulong*>(" + words + ");");
+    state.Line(result + " = ulong(atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + words + "), memory_order_relaxed)) | (ulong(atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + words + ") + 1, memory_order_relaxed)) << 32u);");
     const auto updated = state.Temporary("aps5_n64");
     state.Line("const ulong " + updated + " = aps5_atomic64_next(" + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + result + ", ulong(" + std::string(value) + "), ulong(" + std::string(comparator.empty() ? "0ul" : comparator) + "));");
     // Commit the new value with one 64-bit atomic (max when it grows, min when it shrinks: the lock

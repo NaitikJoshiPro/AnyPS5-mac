@@ -118,13 +118,25 @@ struct Aps5BufferMemory {
         aps5_buffer_write(buffer, byteOffset, misalignment, byte, value, bits, glc);
     }
 
-    // A coherent (GLC) dwordx2 at an 8-byte aligned address is one 64-bit load, so it never sees half
-    // of a 64-bit atomic (which commits with one 64-bit atomic_max/min, see the Atomics64 chunk).
+    // A coherent (GLC) dwordx2 at an 8-byte aligned address reads a pair one 64-bit store wrote, never
+    // half of a 64-bit atomic (which commits with one 64-bit atomic_max/min, see the Atomics64 chunk).
     uint2 read2(uint byte, thread bool& stop) const {
         const ulong address = buffer.address + ulong(byteOffset) + ulong(byte);
         const uint index = (byte >> 2u) + (byteOffset >> 2u);
         if (glc && misalignment == 0u && (address & 7ul) == 0ul && index + 1u < (buffer.bytes >> 2u)) {
-            return as_type<uint2>(*reinterpret_cast<coherent(device) device const ulong*>(address));
+            // Atomic loads reach other threadgroups' stores (a plain or coherent(device) load may hit a
+            // stale cache line in a spin loop); re-reading the high dword until it is stable gives a
+            // pair some 64-bit store wrote.
+            device atomic_uint* words = reinterpret_cast<device atomic_uint*>(address);
+            uint high = atomic_load_explicit(words + 1, memory_order_relaxed);
+            uint low = 0u;
+            for (uint attempt = 0u; attempt < 64u; ++attempt) {
+                low = atomic_load_explicit(words, memory_order_relaxed);
+                const uint again = atomic_load_explicit(words + 1, memory_order_relaxed);
+                if (again == high) break;
+                high = again;
+            }
+            return uint2(low, high);
         }
         return uint2(read(byte, 32u, stop), read(byte + 4u, 32u, stop));
     }
