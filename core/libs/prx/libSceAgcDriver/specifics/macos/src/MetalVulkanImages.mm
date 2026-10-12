@@ -273,7 +273,10 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
     if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u && !multisample) usage |= MTLTextureUsageShaderWrite;
     // Clears of multisampled and depth images are render passes (CmdClear*): they need the usage.
     const bool depthFormat = info->format == VK_FORMAT_D32_SFLOAT || info->format == VK_FORMAT_D16_UNORM;
-    if ((info->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0u && (multisample || depthFormat)) usage |= MTLTextureUsageRenderTarget;
+    // Images a clear may target that compute cannot write (no storage usage, multisampled, depth)
+    // are cleared by a render pass: every renderable (non-compressed) image with transfer-destination use.
+    if ((info->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0u && PixelFormatOf(info->format).blockWidth == 1u) usage |= MTLTextureUsageRenderTarget;
+    static_cast<void>(depthFormat);
     if ((info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0u) usage |= MTLTextureUsageRenderTarget;
     // Texture atomics need the usage on a 32-bit integer image (storage images of R32 formats).
     // (Metal allows the usage only on R32Uint, R32Sint and RG32Uint textures.)
