@@ -1,5 +1,6 @@
 #include "GuestCpu.hpp"
 
+#include "BareGuest.hpp"
 #include "Bridge.hpp"
 #include "GuestProgram.hpp"
 #include "Options.hpp"
@@ -209,7 +210,7 @@ public:
             this->stackSize = stackSize;
             rsp = reinterpret_cast<std::uint64_t>(stack) + stackSize - Page;
         }
-        const std::uint64_t fs = reinterpret_cast<std::uint64_t>(CreateThreadPointer(*guestCode.tls, &tls));
+        const std::uint64_t fs = guestCode.tls == nullptr ? 0 : reinterpret_cast<std::uint64_t>(CreateThreadPointer(*guestCode.tls, &tls));
         {
             std::lock_guard lock(threadsMutex);
             thread = guestCode.context->CreateThread(rip, rsp);
@@ -221,7 +222,7 @@ public:
         auto& guest = thread->CurrentFrame->State;
         guest.callret_sp = reinterpret_cast<std::uint64_t>(thread->CallRetStackBase) + ThreadState::CALLRET_DEFAULT_OFFSET;
         guest.callret_sp_base = reinterpret_cast<std::uint64_t>(thread->CallRetStackBase);
-        thread->CurrentFrame->Pointers.ThunkCallbackRet = guestCode.bridge->CallbackReturn();
+        thread->CurrentFrame->Pointers.ThunkCallbackRet = guestCode.bridge == nullptr ? 0 : guestCode.bridge->CallbackReturn();
 
         guest.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt;
         guest.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt;
@@ -383,9 +384,7 @@ void InstallFaultHandler() {
         if ((previous->sa_flags & SA_SIGINFO) != 0 && previous->sa_sigaction == OnFault) *previous = {};
 }
 
-}
-
-GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
+void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::string>>& config) {
     LogMan::Msg::InstallHandler(LogMessage);
     LogMan::Throw::InstallHandler(LogAssertion);
     CreateCodePool();
@@ -395,7 +394,15 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     FEXCore::Config::Load();
     FEXCore::Config::ReloadMetaLayer();
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+    for (const auto& [option, value] : config)
+        FEXCore::Config::Set(option, value);
     LoadOptions();
+}
+
+}
+
+GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
+    PrepareFex({});
 
     state.reset(new State {BridgeSyscalls(bridge), CallbackReturns(bridge), FEXCore::Context::Context::CreateNewContext(HostFeatures())});
     state->context->SetSyscallHandler(&state->syscalls);
@@ -452,6 +459,91 @@ std::uint64_t GuestCpu::Run(std::uint64_t rip, std::uint64_t rsp, const std::vec
     state->context->ExecuteThread(currentThread);
     currentThread = nullptr;
     return main.Thread()->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX];
+}
+
+namespace {
+
+class BareSyscalls final : public FEXCore::HLE::SyscallHandler {
+public:
+    BareSyscalls(FEXCore::Context::Context& context, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& executable)
+        : context(context), executable(executable) {
+        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
+    }
+
+    std::uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments* arguments) override {
+        frame->State.rip += 2;
+        if (count++ == 0) first = arguments->Argument[0];
+        constexpr std::uint64_t LinuxNoSyscall = 38;
+        return -LinuxNoSyscall;
+    }
+
+    void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState*, std::uint64_t start, std::uint64_t length) override {
+        std::lock_guard lock(context.GetCodeInvalidationMutex());
+        context.InvalidateCodeBuffersCodeRange(start, length);
+        if (currentThread != nullptr) context.InvalidateThreadCachedCodeRange(currentThread, start, length);
+    }
+
+    FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
+        for (const auto& [begin, end] : executable)
+            if (address >= begin && address < end) return {begin, end - begin, true};
+        return {address, 0, false};
+    }
+
+    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, std::uint64_t) override {
+        return std::nullopt;
+    }
+
+    std::uint32_t count = 0;
+    std::uint64_t first = 0;
+
+private:
+    FEXCore::Context::Context& context;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> executable;
+};
+
+FEXCore::Context::Context* bareContext = nullptr;
+
+}
+
+FEXCore::HostFeatures RunnerHostFeatures() {
+    return HostFeatures();
+}
+
+void RunBareGuest(const BareGuest& guest, BareGuestResult& result) {
+    PrepareFex(guest.config);
+    auto context = FEXCore::Context::Context::CreateNewContext(HostFeatures());
+    BareSyscalls syscalls(*context, guest.executable);
+    FEXCore::SignalDelegator signals;
+    context->SetSyscallHandler(&syscalls);
+    context->SetSignalDelegator(&signals);
+    context->EnableExitOnHLT();
+    if (!context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
+    guestCode = {{}, nullptr, nullptr, context.get()};
+    bareContext = context.get();
+    InstallFaultHandler();
+    {
+        GuestThread thread(guest.rip, guest.rsp, 0);
+        currentThread = thread.Thread();
+        context->ExecuteThread(currentThread);
+        std::memcpy(&result.state, &currentThread->CurrentFrame->State, sizeof(result.state));
+        __uint128_t low[CPUState::NUM_XMMS];
+        __uint128_t high[CPUState::NUM_XMMS];
+        context->ReconstructXMMRegisters(currentThread, low, high);
+        for (std::size_t index = 0; index < CPUState::NUM_XMMS; ++index) {
+            std::memcpy(&result.state.xmm.avx.data[index][0], &low[index], sizeof(low[index]));
+            std::memcpy(&result.state.xmm.avx.data[index][2], &high[index], sizeof(high[index]));
+        }
+        currentThread = nullptr;
+    }
+    bareContext = nullptr;
+    guestCode = {};
+    result.syscalls = syscalls.count;
+    result.firstSyscall = syscalls.first;
+}
+
+std::uint64_t BareGuestRip(std::uint64_t hostPc) {
+    if (bareContext == nullptr || currentThread == nullptr) return 0;
+    return bareContext->RestoreRIPFromHostPC(currentThread, hostPc);
 }
 
 }
