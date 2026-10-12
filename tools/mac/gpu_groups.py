@@ -8,8 +8,10 @@ The classification reads the build directory only (CTestTestfile.cmake for each 
 build.ninja for each test executable's sources) and the sources themselves; it never runs a test.
 The committed map tools/mac/gpu_groups.txt is what tools/mac/gpu_suite.sh uses, so pass counts per
 group stay comparable between runs; tests the map does not list yet are classified on the fly.
-  --write   rewrite the map from the current build directory
-  --check   exit 1 when the map and the current classification differ (new, removed or moved tests)
+  --write   add the tests the map lacks and drop the ones the build no longer has; the groups of listed tests
+            stay (with --reclassify, every test is classified again)
+  --check   exit 1 when the map lacks a test or lists one the build no longer has; tests whose sources now
+            classify differently are reported without failing
   --list G  print the tests of group G, one per line
 
 Groups:
@@ -58,7 +60,7 @@ DRIVER_LEVEL = re.compile(r"^agc_driver$|^agc_driver_pm4|^agc_driver_wait_shutdo
                           r"|^agc_driver_cmask_fast_clear$|^agc_shared_write|^agc_driver_prepared_|^agc_driver_readonly_resummarize$")
 
 FEATURES = {
-    "device": re.compile(r"OpenVulkanTestDevice|\bVulkanDevice\b|MetalDevice\b"),
+    "device": re.compile(r"OpenVulkanTestDevice|\bVulkanDevice\b|MetalDevice\b|MTLCreateSystemDefaultDevice|id<MTLDevice>"),
     "submit": re.compile(r"AgcDriver::Submit\b|\bSubmit\(&|AgcDriverSubmit|sceAgcDriverSubmit|AgcDriverInit|Execution/include/Driver\.hpp\""),
     "draw": re.compile(r"\.Draw\(|->Draw\(|\bDrawIndexed|\bDrawIndirect|\bDrawMesh"),
     "image": re.compile(r"TextureDescriptor|SamplerDescriptor|StorageTexture|\bimage_(load|store|sample|gather|atomic|get_resinfo|bvh)|FillTexture|ImageResources"),
@@ -213,9 +215,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--build", default="build-metal", help="CMake build directory (default: build-metal)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--write", action="store_true", help="rewrite tools/mac/gpu_groups.txt")
+    mode.add_argument("--write", action="store_true", help="update tools/mac/gpu_groups.txt (new tests added, removed ones dropped)")
     mode.add_argument("--check", action="store_true", help="fail when the map is out of date")
     mode.add_argument("--list", choices=GROUPS, help="print the tests of one group")
+    parser.add_argument("--reclassify", action="store_true", help="with --write: classify every test again")
     args = parser.parse_args()
     build = Path(args.build)
     if not build.is_absolute():
@@ -223,28 +226,32 @@ def main():
     if not (build / "CTestTestfile.cmake").exists():
         parser.error(f"{build} is not a configured build directory")
     current = classify(build)
+    stored = load_map()
     if args.write:
-        write_map(current)
-        print(f"wrote {MAP.relative_to(REPO)}: {len(current)} tests")
+        merged = dict(current) if args.reclassify else {name: stored.get(name, group) for name, group in current.items()}
+        write_map(merged)
+        print(f"wrote {MAP.relative_to(REPO)}: {len(merged)} tests, {len(set(current) - set(stored))} new, {len(set(stored) - set(current))} dropped")
         return 0
     if args.check:
-        stored = load_map()
         changes = [f"new {name} {current[name]}" for name in sorted(set(current) - set(stored))]
         changes += [f"removed {name} {stored[name]}" for name in sorted(set(stored) - set(current))]
-        changes += [f"moved {name} {stored[name]} -> {current[name]}" for name in sorted(set(stored) & set(current)) if stored[name] != current[name]]
         for change in changes:
             print(change)
+        for name in sorted(set(stored) & set(current)):
+            if stored[name] != current[name]:
+                print(f"note: {name} is in {stored[name]}, its sources now classify as {current[name]} (--write --reclassify moves it)")
         if changes:
             print(f"{len(changes)} difference(s): run tools/mac/gpu_groups.py --write and review the diff")
             return 1
         print(f"{MAP.name} is up to date ({len(current)} tests)")
         return 0
+    effective = {name: stored.get(name, group) for name, group in current.items()}
     if args.list:
-        for name in sorted(name for name, group in current.items() if group == args.list):
+        for name in sorted(name for name, group in effective.items() if group == args.list):
             print(name)
         return 0
     for group in GROUPS:
-        names = [name for name, found in current.items() if found == group]
+        names = [name for name, found in effective.items() if found == group]
         print(f"{group} {len(names):4d} tests, {sum(held(name) for name in names)} held back")
     return 0
 
