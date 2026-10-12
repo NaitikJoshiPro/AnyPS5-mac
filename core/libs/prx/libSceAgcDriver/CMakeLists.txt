@@ -1,3 +1,6 @@
+# Every test registered here can reach the GPU: `ctest -LE gpu` leaves them out and `ctest -L gpu` selects them.
+cmake_language(DEFER CALL label_directory_tests gpu)
+
 function(ensure_agc_glslang)
     if(TARGET glslang AND TARGET SPIRV AND TARGET glslang-standalone)
         return()

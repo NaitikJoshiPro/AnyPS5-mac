@@ -14,6 +14,16 @@ function(add_test_executable target)
     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
 endfunction()
 
+# Labels every test the calling directory registers; call it with cmake_language(DEFER CALL ...). The directory's own
+# LABELS property is not enough: CTest gives it only to tests that run in that build directory, not to tests with
+# another WORKING_DIRECTORY.
+function(label_directory_tests label)
+    get_property(tests DIRECTORY PROPERTY TESTS)
+    if(tests)
+        set_property(TEST ${tests} APPEND PROPERTY LABELS ${label})
+    endif()
+endfunction()
+
 option(BUILD_TESTING "Build and register relinker tests" OFF)
 option(ANYPS5_RELINKER_ONLY "Build the relinker without system libraries or third-party dependencies" OFF)
 if(BUILD_TESTING)

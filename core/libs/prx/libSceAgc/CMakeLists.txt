@@ -1,3 +1,6 @@
+# Every test registered here can reach the GPU: `ctest -LE gpu` leaves them out and `ctest -L gpu` selects them.
+cmake_language(DEFER CALL label_directory_tests gpu)
+
 add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Acb/src/Control.cpp
