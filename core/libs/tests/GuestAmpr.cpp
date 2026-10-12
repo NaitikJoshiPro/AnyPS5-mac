@@ -1236,7 +1236,7 @@ int main() {
         TestAmm();
         TestAmmRemapAndProtect();
         TestAmmPrt();
+        TestKernelWriteCommands();
     }
-    TestKernelWriteCommands();
     return 0;
 }

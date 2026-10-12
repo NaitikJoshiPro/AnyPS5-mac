@@ -20,7 +20,7 @@ int main() {
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
 #ifdef __APPLE__
         if (arenaBase == 0) {
-            std::puts("the guest arena is Linux and Windows only: skipped");
+            std::puts("skipped, the guest arena is Linux and Windows only");
             return 77;
         }
 #endif
