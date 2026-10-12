@@ -398,7 +398,9 @@ void GetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkForm
     *properties = {};
     const auto* entry = Find(format);
     if (entry == nullptr) return;
-    VkFormatFeatureFlags features = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    // Min/max filtering is emulated in the shader (PipelineSpecialization::ReductionBase), so every
+    // filterable format offers it.
+    VkFormatFeatureFlags features = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     const bool compressed = entry->blockWidth > 1u;
     const bool depth = entry->metal == MTLPixelFormatDepth32Float || entry->metal == MTLPixelFormatDepth16Unorm;
     const bool srgb = entry->metal == MTLPixelFormatR8Unorm_sRGB || entry->metal == MTLPixelFormatRG8Unorm_sRGB || entry->metal == MTLPixelFormatRGBA8Unorm_sRGB || entry->metal == MTLPixelFormatBGRA8Unorm_sRGB;
