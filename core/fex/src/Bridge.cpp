@@ -6,6 +6,7 @@
 #include "GuestImage.hpp"
 #include "X87Convert.hpp"
 
+#include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Core/Thunks.h>
@@ -106,6 +107,109 @@ struct GuestFrame {
     throw frame;
 }
 
+// libc's GuestMachineState (core/libs/prx/libc/include/GuestMachineState.hpp).
+struct MachineState {
+    std::uint64_t gregs[16];
+    std::uint64_t rip;
+    std::uint64_t rflags;
+    alignas(16) std::uint8_t fxsave[512];
+    std::uint64_t fsBase;
+};
+static_assert(offsetof(MachineState, fxsave) == 144 && offsetof(MachineState, fsBase) == 656 && sizeof(MachineState) == 672);
+
+struct MachineFrame {
+    MachineState state;
+};
+
+constexpr std::size_t FxsaveStatus = 2;
+constexpr std::size_t FxsaveTags = 4;
+constexpr std::size_t FxsaveMxcsr = 24;
+constexpr std::size_t FxsaveMxcsrMask = 28;
+constexpr std::size_t FxsaveX87 = 32;
+constexpr std::size_t FxsaveXmm = 160;
+constexpr std::uint32_t X87ConditionBits[4][2] = {{X87FLAG_C0_LOC, 8}, {X87FLAG_C1_LOC, 9}, {X87FLAG_C2_LOC, 10}, {X87FLAG_C3_LOC, 14}};
+
+FEXCore::Core::InternalThreadState* ThreadOf(FEXCore::Core::CPUState& state) {
+    static_assert(offsetof(FEXCore::Core::CpuStateFrame, State) == 0);
+    return reinterpret_cast<FEXCore::Core::CpuStateFrame*>(&state)->Thread;
+}
+
+// The guest's state at the innermost guest call, as the guest sees it after the call returns.
+void GetMachineState(MachineState* machine) {
+    std::uintptr_t registers[17];
+    CaptureGuestFrame(registers);
+    auto& state = *currentCall->state;
+    std::memset(machine, 0, sizeof(*machine));
+    std::memcpy(machine->gregs, registers, sizeof(machine->gregs));
+    machine->rip = registers[16];
+    auto* thread = ThreadOf(state);
+    machine->rflags = thread != nullptr ? thread->CTX->ReconstructCompactedEFLAGS(thread, false, nullptr, 0) : 0x202;
+    std::uint8_t* image = machine->fxsave;
+    std::memcpy(image, &state.FCW, sizeof(state.FCW));
+    const unsigned top = state.flags[X87FLAG_TOP_LOC] & 7u;
+    std::uint16_t status = static_cast<std::uint16_t>(top << 11);
+    for (const auto& [flag, bit] : X87ConditionBits) status |= static_cast<std::uint16_t>((state.flags[flag] & 1u) << bit);
+    std::memcpy(image + FxsaveStatus, &status, sizeof(status));
+    image[FxsaveTags] = state.AbridgedFTW;
+    std::memcpy(image + FxsaveMxcsr, &state.mxcsr, sizeof(state.mxcsr));
+    const std::uint32_t mask = 0xffbf;
+    std::memcpy(image + FxsaveMxcsrMask, &mask, sizeof(mask));
+    for (unsigned index = 0; index < 8; ++index) std::memcpy(image + FxsaveX87 + 16 * index, state.mm[(top + index) & 7u], 10);
+    // xmm0-7 as the guest passed them to the call (the import trampoline saved them), xmm8-15 untouched.
+    std::memcpy(image + FxsaveXmm, reinterpret_cast<const void*>(currentCall->block + BlockVectors), 8 * 16);
+    std::memcpy(image + FxsaveXmm + 8 * 16, state.xmm.sse.data[8], 8 * 16);
+    machine->fsBase = state.fs_cached;
+}
+
+[[noreturn]] void SetMachineState(const MachineState* machine) {
+    if (currentCall == nullptr) {
+        std::fprintf(stderr, "[aps5-fex] a library resumed the guest outside a guest call\n");
+        std::abort();
+    }
+    throw MachineFrame {*machine};
+}
+
+void ApplyMachineState(FEXCore::Core::CPUState& state, const MachineState& machine) {
+    for (std::size_t i = 0; i < 16; ++i) state.gregs[DwarfRegisters[i]] = machine.gregs[i];
+    state.rip = machine.rip;
+    const std::uint8_t* image = machine.fxsave;
+    std::memcpy(&state.FCW, image, sizeof(state.FCW));
+    std::uint16_t status = 0;
+    std::memcpy(&status, image + FxsaveStatus, sizeof(status));
+    const unsigned top = (status >> 11) & 7u;
+    state.flags[X87FLAG_TOP_LOC] = static_cast<std::uint8_t>(top);
+    for (const auto& [flag, bit] : X87ConditionBits) state.flags[flag] = static_cast<std::uint8_t>((status >> bit) & 1u);
+    state.AbridgedFTW = image[FxsaveTags];
+    std::memcpy(&state.mxcsr, image + FxsaveMxcsr, sizeof(state.mxcsr));
+    for (unsigned index = 0; index < 8; ++index) {
+        std::memset(state.mm[(top + index) & 7u], 0, sizeof(state.mm[0]));
+        std::memcpy(state.mm[(top + index) & 7u], image + FxsaveX87 + 16 * index, 10);
+    }
+    std::memcpy(state.xmm.sse.data, image + FxsaveXmm, 16 * 16);
+    if (machine.fsBase != 0) state.fs_cached = machine.fsBase;
+    if (auto* thread = ThreadOf(state)) thread->CTX->SetFlagsFromCompactedEFLAGS(thread, static_cast<std::uint32_t>(machine.rflags));
+}
+
+// makecontext's guest entry (rdi = the context, rsi = its function, rdx = six arguments; rsp = the context's
+// stack, a null return address on top): call the function, then Aps5MakecontextFinish_nid_no_patch(context).
+constexpr std::uint8_t MakecontextEntryCode[] = {
+    0x48, 0x89, 0xfb,       // mov rbx, rdi
+    0x48, 0x89, 0xf0,       // mov rax, rsi
+    0x49, 0x89, 0xd2,       // mov r10, rdx
+    0x49, 0x8b, 0x3a,       // mov rdi, [r10]
+    0x49, 0x8b, 0x72, 0x08, // mov rsi, [r10 + 8]
+    0x49, 0x8b, 0x52, 0x10, // mov rdx, [r10 + 16]
+    0x49, 0x8b, 0x4a, 0x18, // mov rcx, [r10 + 24]
+    0x4d, 0x8b, 0x42, 0x20, // mov r8, [r10 + 32]
+    0x4d, 0x8b, 0x4a, 0x28, // mov r9, [r10 + 40]
+    0x48, 0x83, 0xec, 0x08, // sub rsp, 8
+    0xff, 0xd0,             // call rax
+    0x48, 0x89, 0xdf,       // mov rdi, rbx
+    0xe8, 0, 0, 0, 0,       // call Aps5MakecontextFinish (rel32 patched)
+    0x0f, 0x0b,             // ud2
+};
+constexpr std::size_t MakecontextFinishCall = 41;
+static_assert(MakecontextEntryCode[MakecontextFinishCall] == 0xe8);
 
 std::vector<std::uint64_t> tlsOffsets;
 
@@ -372,6 +476,20 @@ void Bridge::Connect() {
                                         std::uint64_t);
         reinterpret_cast<SetFiberBridge>(setFiber)(CaptureGuestFrame, ResumeGuestFrame, GuestControl,
                                                    AddStub(reinterpret_cast<void*>(&FiberEntryReturned), "fiber entry return"));
+    }
+    if (void* setMachine = HostSymbol("Aps5SetBridgeMachineState_nid_no_patch")) {
+        std::uint64_t entry = 0;
+        if (void* finish = HostSymbol("Aps5MakecontextFinish_nid_no_patch")) {
+            const std::uint64_t finishStub = AddStub(finish, "Aps5MakecontextFinish");
+            std::uint8_t* code = stubs + MakecontextOffset;
+            std::memcpy(code, MakecontextEntryCode, sizeof(MakecontextEntryCode));
+            const auto relative = static_cast<std::int32_t>(static_cast<std::int64_t>(finishStub) -
+                                                            reinterpret_cast<std::int64_t>(code + MakecontextFinishCall + 5));
+            std::memcpy(code + MakecontextFinishCall + 1, &relative, sizeof(relative));
+            entry = reinterpret_cast<std::uint64_t>(code);
+        }
+        using SetMachine = void (*)(void (*)(MachineState*), void (*)(const MachineState*), std::uint64_t);
+        reinterpret_cast<SetMachine>(setMachine)(GetMachineState, SetMachineState, entry);
     }
 }
 
@@ -737,6 +855,12 @@ bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, st
         if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
         for (std::size_t i = 0; i < 16; ++i) state.gregs[DwarfRegisters[i]] = frame.registers[i];
         state.rip = frame.registers[16];
+        if (const std::uint64_t guest = GuestBehindThunk(state.rip)) state.rip = guest;
+        return true;
+    } catch (const MachineFrame& frame) {
+        currentCall = call.outer;
+        if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
+        ApplyMachineState(state, frame.state);
         if (const std::uint64_t guest = GuestBehindThunk(state.rip)) state.rip = guest;
         return true;
     } catch (const std::exception& error) {

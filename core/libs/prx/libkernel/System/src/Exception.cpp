@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestMachineState.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <array>
@@ -306,10 +307,70 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
 }
 #elif defined(__APPLE__) && defined(__aarch64__)
 // The handler receives the interrupted guest's x86-64 registers. On arm64 they live in the translator (the FEXCore
-// runner), not in the host thread context a host signal would capture, so delivery needs the runner.
-bool RaiseOn(Pthread) {
-    throw std::runtime_error("sceKernelRaiseException needs the arm64 guest runner to deliver the exception: the guest's x86-64 "
-        "registers live in the translator, not in the host signal context");
+// runner), not in the host thread context a host signal would capture. A thread raising on itself is interrupted at
+// its call to sceKernelRaiseException: the runner's machine state hooks give that state (after the call, returning
+// 0), and a context the handler changed resumes the guest. Raising on another thread would have to stop it inside
+// the translator (M1 package G2).
+constexpr std::uint64_t UserCodeSelector = 0x43;
+constexpr std::uint64_t UserStackSelector = 0x3b;
+
+void FromMachine(const GuestMachineState& state, GuestMcontext& m) {
+    using namespace GuestMachine;
+    m.rdi = state.gregs[Rdi];
+    m.rsi = state.gregs[Rsi];
+    m.rdx = state.gregs[Rdx];
+    m.rcx = state.gregs[Rcx];
+    m.r8 = state.gregs[R8];
+    m.r9 = state.gregs[R9];
+    m.rax = state.gregs[Rax];
+    m.rbx = state.gregs[Rbx];
+    m.rbp = state.gregs[Rbp];
+    m.r10 = state.gregs[R10];
+    m.r11 = state.gregs[R11];
+    m.r12 = state.gregs[R12];
+    m.r13 = state.gregs[R13];
+    m.r14 = state.gregs[R14];
+    m.r15 = state.gregs[R15];
+    m.rip = state.rip;
+    m.rsp = state.gregs[Rsp];
+    m.rflags = state.rflags;
+    m.cs = UserCodeSelector;
+    m.ss = UserStackSelector;
+    m.trapno = 0;
+    m.len = sizeof(GuestMcontext);
+    m.fpformat = 0x10002;
+    m.ownedfp = 0x20001;
+    m.fsbase = state.fsBase;
+    static_assert(sizeof(m.fpstate) >= sizeof(state.fxsave));
+    std::memcpy(m.fpstate, state.fxsave, sizeof(state.fxsave));
+}
+
+void ToMachine(const GuestMcontext& m, GuestMachineState& state) {
+    using namespace GuestMachine;
+    const std::uint64_t values[16] = {m.rax, m.rdx, m.rcx, m.rbx, m.rsi, m.rdi, m.rbp, m.rsp, m.r8, m.r9, m.r10, m.r11, m.r12, m.r13, m.r14, m.r15};
+    std::memcpy(state.gregs, values, sizeof(values));
+    state.rip = m.rip;
+    state.rflags = m.rflags;
+    std::memcpy(state.fxsave, m.fpstate, sizeof(state.fxsave));
+}
+
+bool RaiseOn(Pthread thread) {
+    if (!LibcHasMachineState_nid_no_patch())
+        throw std::runtime_error("sceKernelRaiseException needs the arm64 guest runner to deliver the exception: the guest's x86-64 "
+            "registers live in the translator, not in the host signal context");
+    if (thread != scePthreadSelf())
+        throw std::runtime_error("sceKernelRaiseException on another thread is not supported on arm64 yet: the target's x86-64 "
+            "registers live in the translator, which would have to stop it first");
+    GuestMachineState state{};
+    LibcGetMachineState_nid_no_patch(&state);
+    state.gregs[GuestMachine::Rax] = 0;
+    GuestUcontext ucontext{};
+    FromMachine(state, ucontext.mcontext);
+    const GuestMcontext before = ucontext.mcontext;
+    CallHandler(Handler(RaisedSignal), RaisedSignal, ucontext);
+    if (std::memcmp(&before, &ucontext.mcontext, sizeof(before)) == 0) return true;
+    ToMachine(ucontext.mcontext, state);
+    LibcSetMachineState_nid_no_patch(&state);
 }
 #else
 constexpr int HostSignal = SIGUSR1;

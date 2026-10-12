@@ -96,7 +96,8 @@ private:
     static constexpr std::size_t StubCapacity = 0x10000;
     static constexpr std::size_t TrampolineOffset = 0x10;
     static constexpr std::size_t X87TrampolineOffset = 0x100;
-    static constexpr std::size_t FirstStubOffset = 0x200;
+    static constexpr std::size_t MakecontextOffset = 0x200;
+    static constexpr std::size_t FirstStubOffset = 0x280;
     static constexpr std::uint32_t FirstStub = 0x41500000;
 
     std::uint64_t AddStub(void* address, const std::string& name, Variadic variadic = Variadic::None, std::uint8_t fixed = 0,

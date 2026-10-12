@@ -123,6 +123,12 @@ COMPILED = {
                         "exp2l", "expl", "frexpl", "ldexpl", "log10l", "logl", "powl", "sinhl", "sinl", "tanhl", "tanl", "truncl",
                         "strtold", "wcstold", "__signbitl"]}), 43),
     "abi-callbacks": (lambda d: with_abi_library(d, "abi_callbacks.cpp", {"libc.prx": ["exit"]}), 43),
+    "context": (lambda d: compiled_executable(d, [str(HERE / "context.cpp")], {"libc.prx": ["exit"], "libkernel.prx": ["getcontext",
+                "setcontext", "sigsetjmp", "siglongjmp"], "libSceLibcInternal.prx": ["makecontext"]}), 43),
+    "context-exit": (lambda d: compiled_executable(d, [str(HERE / "context.cpp")], {"libc.prx": ["exit"], "libkernel.prx": ["getcontext",
+                     "setcontext", "sigsetjmp", "siglongjmp"], "libSceLibcInternal.prx": ["makecontext"]}, ["-DCONTEXT_EXIT"]), 0),
+    "raise": (lambda d: compiled_executable(d, [str(HERE / "raise.cpp")], {"libc.prx": ["exit"], "libkernel.prx": [
+              "sceKernelInstallExceptionHandler", "sceKernelRemoveExceptionHandler", "sceKernelRaiseException", "scePthreadSelf"]}), 43),
     "abi-variadic": (lambda d: compiled_executable(d, [str(HERE / "abi_variadic.cpp")], {"libc.prx": ["exit", "snprintf", "swprintf"]}), 43),
     "exception": (lambda d: compiled_executable(d, ["exception.cpp"], None), 43),
     "c-cleanup": (lambda d: compiled_executable(d, ["c_cleanup.c", "c_cleanup_main.cpp"], None), 47),
