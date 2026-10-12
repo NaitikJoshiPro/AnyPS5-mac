@@ -13,7 +13,10 @@ entries hold digests. The PT_SCE_VERSION data has no entry and is appended after
 The output is the ELF header and program headers, then each stored segment at its p_offset. A SELF
 does not store section headers, so e_shoff, e_shnum and e_shstrndx are cleared. Non-loadable
 PT_NOTE and PT_SCE_COMMENT ranges without stored data are left zero-filled and reported. Encrypted
-or compressed segments (retail SELFs, which need a console to decrypt) are refused.
+or compressed segments (retail SELFs, which need a console to decrypt) are refused. An executable
+PT_LOAD whose stored bytes are almost all zero is reported: SDK placeholder modules (the libc.prx
+shipped by ps5-payload-dev homebrew) keep their export table but have their code stripped, so every
+export points at one stub that returns 0.
 
 In directory mode the tree is copied, every file starting with a SELF magic is unwrapped and every
 other file is copied unchanged. Symbolic links are refused."""
@@ -35,6 +38,8 @@ ENCRYPTED = 0x2
 COMPRESSED = 0x8
 EM_X86_64 = 62
 PT_LOAD = 1
+PF_X = 1
+STUB_MIN_SIZE = 0x1000
 PT_NOTE = 4
 PT_SCE_COMMENT = 0x6FFFFF00
 PT_SCE_VERSION = 0x6FFFFF01
@@ -143,6 +148,15 @@ def unself(data):
             notes.append(f"program header {segment} ({type_name(kind)}, {p_filesz:#x} bytes at {p_offset:#x}) is not stored in the SELF: zero-filled")
             continue
         raise UnselfError(f"program header {segment} ({type_name(kind)}, {p_filesz:#x} bytes at {p_offset:#x}) has no data in the SELF")
+
+    for segment, header in enumerate(headers):
+        kind, flags, p_offset, p_filesz = header[0], header[1], header[2], header[5]
+        if kind != PT_LOAD or not flags & PF_X or p_filesz < STUB_MIN_SIZE:
+            continue
+        nonzero = p_filesz - output[p_offset:p_offset + p_filesz].count(0)
+        if nonzero * 100 < p_filesz:
+            notes.append(f"program header {segment} (executable PT_LOAD, {p_filesz:#x} bytes) has only {nonzero} non-zero bytes: "
+                         "a placeholder module with its code stripped, its exports do not lead to real code")
     return bytes(output), notes
 
 

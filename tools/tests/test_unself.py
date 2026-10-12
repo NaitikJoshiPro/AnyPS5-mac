@@ -88,6 +88,42 @@ class UnwrapTests(unittest.TestCase):
     def test_module_variant_has_the_same_layout(self):
         self.assertEqual(unself.unself(build(magic=MODULE))[0], expected_elf())
 
+    def test_either_magic_wraps_either_kind_of_file(self):
+        module_head = bytearray(elf_head())
+        struct.pack_into("<H", module_head, 0x10, 0xFE18)
+        for magic in (EXECUTABLE, MODULE):
+            for head in (elf_head(), bytes(module_head)):
+                elf, _ = unself.unself(build(magic=magic, head=head))
+                self.assertEqual(elf[:0x10], head[:0x10])
+                self.assertEqual(elf[0x10:0x12], head[0x10:0x12])
+                self.assertEqual(elf[0x1000:0x1000 + len(TEXT)], TEXT)
+
+    def test_dynamic_data_segment_without_flags_is_copied_verbatim(self):
+        # PS5 modules keep .dynsym, .dynstr and .rela in a PT_LOAD with p_flags 0 that also holds
+        # PT_DYNAMIC; its entry is not the first one in the SELF.
+        symbols = b"".join(struct.pack("<IBBHQQ", 1 + index, 0x12, 0, 3, 0x10 + 0x10 * index, 0x10) for index in range(16))
+        headers = [
+            (unself.PT_LOAD, 5, 0x1000, 0x0, 0x0, len(TEXT), len(TEXT), 0x4000),
+            (unself.PT_LOAD, 0, 0x2000, 0x4000, 0x4000, len(symbols) + 0x20, len(symbols) + 0x20, 0x4000),
+            (2, 6, 0x2000 + len(symbols), 0x4000 + len(symbols), 0x4000 + len(symbols), 0x20, 0x20, 0x8),
+        ]
+        dynamic = symbols + struct.pack("<qQqQ", 6, 0x4000, 0, 0)
+        elf, _ = unself.unself(build(head=elf_head(headers=headers), segments=[(1, dynamic), (0, TEXT)], version=b""))
+        self.assertEqual(elf[0x2000:0x2000 + len(dynamic)], dynamic)
+        values = [struct.unpack_from("<Q", elf, 0x2000 + 24 * index + 8)[0] for index in range(16)]
+        self.assertEqual(len(set(values)), 16)
+        self.assertTrue(all(value < len(TEXT) for value in values))
+
+    def test_placeholder_module_with_stripped_code_is_reported(self):
+        stub = bytearray(0x2000)
+        stub[0x50:0x57] = bytes.fromhex("660fefc031c0c3")
+        headers = [(unself.PT_LOAD, 5, 0x1000, 0x0, 0x0, len(stub), len(stub), 0x4000)]
+        _, notes = unself.unself(build(head=elf_head(headers=headers), segments=[(0, bytes(stub))], version=b""))
+        self.assertIn("program header 0 (executable PT_LOAD, 0x2000 bytes) has only 7 non-zero bytes: a placeholder module "
+                      "with its code stripped, its exports do not lead to real code", notes)
+        _, notes = unself.unself(build())
+        self.assertFalse(any("placeholder" in note for note in notes))
+
     def test_missing_version_data_is_zero_filled_and_reported(self):
         elf, notes = unself.unself(build(version=b""))
         self.assertEqual(elf[0x2080:0x2080 + len(VERSION)], bytes(len(VERSION)))
@@ -183,11 +219,15 @@ class CommandLineTests(unittest.TestCase):
             (title / "sce_sys").mkdir()
             (title / "eboot.bin").write_bytes(build())
             (title / "sce_module" / "libc.prx").write_bytes(build(magic=MODULE))
+            (title / "sce_module" / "libSwapped.prx").write_bytes(build(magic=EXECUTABLE))
+            (title / "eboot_swapped.bin").write_bytes(build(magic=MODULE))
             (title / "sce_sys" / "param.json").write_text('{"titleId": "TEST00000"}', encoding="utf-8")
             (title / "a").write_bytes(b"\x4f\x15")
             status, output_text, errors = self.run_main(title, output)
             self.assertEqual((status, errors), (0, ""))
-            self.assertEqual(output_text.count("unwrapped"), 2)
+            self.assertEqual(output_text.count("unwrapped"), 4)
+            self.assertEqual((output / "eboot_swapped.bin").read_bytes(), expected_elf())
+            self.assertEqual((output / "sce_module" / "libSwapped.prx").read_bytes(), expected_elf())
             self.assertEqual((output / "eboot.bin").read_bytes(), expected_elf())
             self.assertEqual((output / "sce_module" / "libc.prx").read_bytes(), expected_elf())
             self.assertEqual((output / "sce_sys" / "param.json").read_bytes(), (title / "sce_sys" / "param.json").read_bytes())
