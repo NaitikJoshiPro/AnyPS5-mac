@@ -305,6 +305,16 @@ ImageSampleLayout Layout(const MemoryInfo& mem) {
     return layout;
 }
 
+// Element `element` of an image heap or the sampler heap. The prepared binding plan compacts the
+// elements a snapshot binds and supplies their positions as DescriptorIndex specialization
+// constants (default: the emission-time element), as DescriptorElementPointer on the SPIR-V path.
+std::string HeapElement(MslEmitterState& state, DescriptorBindingKind kind, std::uint32_t element) {
+    const auto checked = state.TableResource(kind, element);
+    static_cast<void>(checked);
+    const auto index = state.FunctionConstant(PipelineSpecialization::DescriptorIndex(static_cast<std::uint32_t>(kind), element), element);
+    return "aps5_table." + MslTableField(kind) + "[" + index + "]";
+}
+
 // The texture (heap element) a mode's access reads or writes.
 std::string Texture(MslEmitterState& state, const Access& access, std::uint32_t elementOffset = 0u) {
     const auto kind = DescriptorBindingForImage(access.image);
@@ -319,14 +329,14 @@ std::string Texture(MslEmitterState& state, const Access& access, std::uint32_t 
         }
         return "aps5_table." + MslTableField(kind) + "[min(" + access.tableElement + ", " + std::to_string(count - 1u) + "u)]";
     }
-    return state.TableResource(kind, state.DescriptorElement(kind, access.mem.resource) + elementOffset);
+    return HeapElement(state, kind, state.DescriptorElement(kind, access.mem.resource) + elementOffset);
 }
 
 std::string Sampler(MslEmitterState& state, const Access& access) {
     // LoadSamplerDescriptor: element 2s+1 is the point-filtered twin for integer, converted and
     // depth-bit reads.
     const bool point = access.image.numericClass == IrTextureNumericClass::Sint || access.image.conversionFormat != IrBufferFormat::Invalid || access.image.depthBits;
-    return state.TableResource(DescriptorBindingKind::Samplers, state.DescriptorElement(DescriptorBindingKind::Samplers, access.mem.sampler) + (point ? 1u : 0u));
+    return HeapElement(state, DescriptorBindingKind::Samplers, state.DescriptorElement(DescriptorBindingKind::Samplers, access.mem.sampler) + (point ? 1u : 0u));
 }
 
 std::string SwizzleSelector(MslEmitterState& state, const Access& access, std::uint32_t component) {
