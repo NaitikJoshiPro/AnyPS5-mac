@@ -642,11 +642,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         depthStencil = state.pipelines->DepthStencil(depthRequest);
     }
 
-    // Triangle fans: index lists in Vulkan's vertex order, read from the guest indices (settled)
-    // for indexed fans.
+    // Index-list expansion: triangle fans always, and lists and strips whose last vertex provokes
+    // (Metal's flat shading takes each primitive's first vertex): every primitive in Vulkan's vertex
+    // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
+    // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
+    const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
+    const bool expand = primitive.fan || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint);
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
-    if (primitive.fan) {
+    if (expand) {
         std::vector<std::byte> guest;
         if (draw.indexed) {
             state.SettleRange(indexBegin, indexBytes);
@@ -654,7 +658,6 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             std::memcpy(guest.data(), reinterpret_cast<const void*>(indexBegin), indexBytes);
         }
         const auto indexAt = [&](std::uint32_t position) -> std::uint32_t {
-            if (!draw.indexed) return position;
             if (draw.indexSize == 2u) {
                 std::uint16_t value;
                 std::memcpy(&value, guest.data() + position * 2u, 2u);
@@ -665,25 +668,68 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             return value;
         };
         const std::uint32_t restart = draw.indexSize == 2u ? 0xffffu : 0xffffffffu;
+        const auto topology = graphics.topology;
+        const bool strips = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+        std::vector<std::uint32_t> segment;
+        const auto flush = [&] {
+            const auto& v = segment;
+            const auto n = v.size();
+            const auto triangle = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+                // (a, b, c) in Vulkan order, a provoking first-vertex, c last-vertex.
+                if (lastVertex) fanIndices.insert(fanIndices.end(), {c, a, b});
+                else fanIndices.insert(fanIndices.end(), {a, b, c});
+            };
+            const auto line = [&](std::uint32_t a, std::uint32_t b) {
+                if (lastVertex) fanIndices.insert(fanIndices.end(), {b, a});
+                else fanIndices.insert(fanIndices.end(), {a, b});
+            };
+            switch (topology) {
+            case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+                for (std::size_t k = 0; k + 2 < n; k += 3) triangle(v[k], v[k + 1], v[k + 2]);
+                break;
+            case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+                for (std::size_t i = 0; i + 2 < n; ++i) {
+                    // Odd triangles: (i, i + 2, i + 1) with the first vertex provoking, (i + 1, i,
+                    // i + 2) with the last (VK_EXT_provoking_vertex): same winding.
+                    if (i % 2u == 0u) triangle(v[i], v[i + 1], v[i + 2]);
+                    else if (lastVertex) triangle(v[i + 1], v[i], v[i + 2]);
+                    else triangle(v[i], v[i + 2], v[i + 1]);
+                }
+                break;
+            case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+                // Vulkan's fan triangle i is (i + 1, i + 2, 0) with the first vertex provoking, and
+                // (0, i + 1, i + 2) with the last (VK_EXT_provoking_vertex): same winding.
+                for (std::size_t i = 0; i + 2 < n; ++i) {
+                    if (lastVertex) fanIndices.insert(fanIndices.end(), {v[i + 2], v[0], v[i + 1]});
+                    else fanIndices.insert(fanIndices.end(), {v[i + 1], v[i + 2], v[0]});
+                }
+                break;
+            case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+                for (std::size_t k = 0; k + 1 < n; k += 2) line(v[k], v[k + 1]);
+                break;
+            case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+                for (std::size_t i = 0; i + 1 < n; ++i) line(v[i], v[i + 1]);
+                break;
+            default:
+                Fail("index expansion of topology " + std::to_string(topology));
+            }
+            segment.clear();
+        };
         for (const auto& call : calls) {
             const auto first = static_cast<std::uint32_t>(fanIndices.size());
-            std::optional<std::uint32_t> center;
-            std::optional<std::uint32_t> previous;
             for (std::uint32_t position = 0; position < call.count; ++position) {
+                if (!draw.indexed) {
+                    segment.push_back(position);
+                    continue;
+                }
                 const auto value = indexAt(call.first + position);
-                if (draw.indexed && graphics.primitiveRestart && value == restart) {
-                    center.reset();
-                    previous.reset();
+                if (strips && graphics.primitiveRestart && value == restart) {
+                    flush();
                     continue;
                 }
-                if (!center) {
-                    center = value;
-                    continue;
-                }
-                if (previous) fanIndices.insert(fanIndices.end(), {*previous, value, *center});
-                previous = value;
+                segment.push_back(value);
             }
-            // Non-indexed: indices relative to the call's first vertex (baseVertex adds it).
+            flush();
             const auto vertexOffset = draw.indexed ? call.vertexOffset : static_cast<std::int32_t>(call.first);
             fanCalls.push_back({static_cast<std::uint32_t>(fanIndices.size()) - first, call.instances, first, vertexOffset, call.firstInstance});
         }
@@ -877,7 +923,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     std::uint64_t indexAddress = 0;
     std::uint64_t indexLength = 0;
     MTLIndexType indexType = draw.indexSize == 2u ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
-    const bool expanded = primitive.fan;
+    const bool expanded = expand;
+    const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
     const auto& drawCalls = expanded ? fanCalls : calls;
     const bool indexedDraw = draw.indexed || expanded;
     if (expanded) {
@@ -916,9 +963,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:static_cast<NSUInteger>(rects) * 6u instanceCount:call.instances baseInstance:call.firstInstance];
                 } else if (indexedDraw) {
                     const auto size = indexType == MTLIndexTypeUInt16 ? 2u : 4u;
-                    [encoder drawIndexedPrimitives:primitive.type indexCount:call.count indexType:indexType indexBuffer:indexAddress + static_cast<std::uint64_t>(call.first) * size indexBufferLength:indexLength - static_cast<std::uint64_t>(call.first) * size instanceCount:call.instances baseVertex:call.vertexOffset baseInstance:call.firstInstance];
+                    [encoder drawIndexedPrimitives:drawType indexCount:call.count indexType:indexType indexBuffer:indexAddress + static_cast<std::uint64_t>(call.first) * size indexBufferLength:indexLength - static_cast<std::uint64_t>(call.first) * size instanceCount:call.instances baseVertex:call.vertexOffset baseInstance:call.firstInstance];
                 } else {
-                    [encoder drawPrimitives:primitive.type vertexStart:call.first vertexCount:call.count instanceCount:call.instances baseInstance:call.firstInstance];
+                    [encoder drawPrimitives:drawType vertexStart:call.first vertexCount:call.count instanceCount:call.instances baseInstance:call.firstInstance];
                 }
                 stream.CountCommand();
                 ++recorded;
@@ -1007,7 +1054,9 @@ VkShaderStageFlags VulkanDevice::SubgroupStages() const {
 }
 
 bool VulkanDevice::ProvokingVertexLast() const {
-    return false;
+    // Draws whose last vertex provokes are expanded into index lists rotated so that vertex comes
+    // first (MetalDraw.mm RecordDraw).
+    return true;
 }
 
 bool VulkanDevice::GraphicsPipelineLibraries() const {

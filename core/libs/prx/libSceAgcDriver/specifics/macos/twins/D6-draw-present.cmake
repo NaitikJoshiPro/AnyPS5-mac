@@ -7,4 +7,5 @@ list(APPEND agcMetalTwins
 # The CMASK fast-clear test's Metal twin: hand-written MSL cover shaders instead of the SPIR-V ones.
 list(APPEND agcMetalTwins
         "tests/CmaskFastClear.cpp=specifics/macos/tests/CmaskFastClearTwin.mm"
+        "tests/execution/ProvokingVertex.cpp=specifics/macos/tests/ProvokingVertexTwin.mm"
 )
