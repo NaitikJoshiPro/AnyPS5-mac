@@ -906,6 +906,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (depth != nullptr) {
             width = std::min<std::uint32_t>(width, depth->target.extent.width);
             height = std::min<std::uint32_t>(height, depth->target.extent.height);
+            cache.passTextures.push_back(depth->texture);
             if (HasDepth(depth->format)) {
                 pass.depthAttachment.texture = depth->texture;
                 pass.depthAttachment.loadAction = depth->clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
