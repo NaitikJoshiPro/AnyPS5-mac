@@ -21,13 +21,6 @@ GuestToHostMap::GuestToHostMap()
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
 }
 
-// iOS-Madeira ml606: live/cumulative census for the L1-only A/B. `live` is what
-// matters — footprints must be compared at equal live-cache counts, not at equal
-// elapsed time, because caches are created and destroyed throughout a run.
-static std::atomic<uint64_t> LookupCacheLive {0};
-static std::atomic<uint64_t> LookupCacheCumulative {0};
-static std::atomic<uint64_t> LookupCacheBytesLive {0};
-
 LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   : ctx {CTX} {
 
@@ -97,15 +90,6 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   }
   FEXCore::Allocator::VirtualName("FEXMem_Lookup_L1", reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
 
-  {
-    const uint64_t Live = LookupCacheLive.fetch_add(1, std::memory_order_relaxed) + 1;
-    const uint64_t Cum = LookupCacheCumulative.fetch_add(1, std::memory_order_relaxed) + 1;
-    const uint64_t Bytes = LookupCacheBytesLive.fetch_add(AllocationSize, std::memory_order_relaxed) + AllocationSize;
-    LogMan::Msg::EFmt("[lookup-cache] ml606 mode={} alloc={}MB live={} cumulative={} fleet_live={}MB "
-                      "(full-layout would be {}MB/cache)",
-                      L2Enabled ? "full-l2" : "l1-only", AllocationSize >> 20, Live, Cum, Bytes >> 20, TotalCacheSize >> 20);
-  }
-
   VirtualMemSize = ctx->Config.VirtualMemSize;
 
   if (DynamicL1Cache()) {
@@ -123,9 +107,6 @@ LookupCache::~LookupCache() {
   // describe the full layout and are wrong (PagePointer is 0) in L1-only mode.
   FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(AllocationBase), AllocationSize);
   ctx->SyscallHandler->UnmarkOvercommitRange(AllocationBase, AllocationSize);
-
-  LookupCacheLive.fetch_sub(1, std::memory_order_relaxed);
-  LookupCacheBytesLive.fetch_sub(AllocationSize, std::memory_order_relaxed);
 
   // No need to free BlockLinks map.
   // These will get freed when their memory allocators are deallocated.

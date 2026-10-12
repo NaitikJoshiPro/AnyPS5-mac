@@ -62,21 +62,6 @@ $end_info$
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstring>
-
-/* iOS-Madeira ml622: mirror of rpmalloc's POD snapshot (rpmalloc.c). Declared here
- * rather than in a shared header because rpmalloc is C and vendored; keep the two
- * definitions in sync — the drain below is the only consumer. */
-extern "C" {
-struct rpm_cas_snapshot {
-  unsigned long long page_addr, block_addr, heap_addr, owner_teb;
-  unsigned long long prev_token, cur_token, ret_addr, atomic_addr;
-  unsigned int size_class, page_type, block_index, list_size;
-  unsigned int fail_changed, fail_unchanged, fail_invalid, quarantined;
-  unsigned int block_count, block_used, is_full, which_loop;
-};
-int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
-}
 #include <condition_variable>
 #include <fcntl.h>
 #include <functional>
@@ -92,34 +77,6 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <unordered_map>
 #include <utility>
 #include <xxhash.h>
-
-/* iOS-Madeira HOTRIP telemetry — plain globals (no constructors/guard vars).
- * 2026-05-14: per-thread callret tracking (GPT diagnosis: FMOD worker
- * thread leaks callret entries; need to confirm WHICH thread leaks and
- * separate game-thread vs render-thread vs FMOD-worker activity). 4 thread
- * slots hashed by Frame pointer. */
-static volatile uint64_t g_madeira_hot_count[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
-static volatile uint64_t g_madeira_max_alloc_size = 0;
-static volatile uint64_t g_madeira_last_str = 0;
-static volatile uint64_t g_madeira_last_vt = 0;
-static volatile uint64_t g_madeira_last_vt2 = 0;
-static volatile uint64_t g_madeira_callret_max = 0;
-static volatile uint64_t g_madeira_callret_min = ~(uint64_t)0;
-static volatile uint64_t g_madeira_callret_last = 0;
-
-/* Per-thread tracking (4 slots). Key = Frame ptr (unique per FEX thread).
- * Records callret_sp range, block-dispatch count, and last guest RIP seen
- * to localize WHICH thread is leaking callret entries. */
-static volatile uint64_t g_madeira_thr_key[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_crsp_min[4] = {~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0};
-static volatile uint64_t g_madeira_thr_crsp_max[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_crsp_last[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
-
-/* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
-static volatile uint64_t g_cb_total = 0;
-static volatile uint64_t g_cb_real_compiles = 0;
 
 namespace FEXCore::Context {
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
@@ -226,52 +183,6 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
 
   // Fallback to what is stored in the RIP currently.
   return Frame->State.rip;
-}
-
-/* iOS-Madeira ml549: EXACT guest RIP from a host PC, callable from C.
- *
- * WHY: our fault probes (srcwatch, the bus/segv handlers) read the guest RIP out of
- * CpuStateFrame+0x18, which FEX only syncs at BLOCK boundaries. That names the calling
- * block, never the instruction that actually executed — ml548 disassembled such a RIP
- * and found `movq %rbp,%rcx; callq` (call setup), not the store we were hunting. Every
- * "which instruction wrote this pixel" question dies on that imprecision.
- *
- * FEX already carries the answer: each JIT block appends a host-PC -> guest-RIP table
- * (JIT.cpp writes it as vl64pair entries in the block tail), and RestoreRIPFromHostPC
- * walks it for exception reconstruction. This is the same walk, minus the Thread
- * dependency, exported as plain C so ntdll-unix can call it with values it already has:
- * the block header pointer lives at CPUState offset 0 (== x28+0), and the host PC comes
- * straight from the Mach thread state.
- *
- * Zero runtime cost: no instrumentation, no extra faults, just a table walk at fault
- * time using data FEX maintains anyway. Returns 0 when the PC is outside the block or
- * the header is unusable, so the caller can tell "no answer" from a real RIP. */
-extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin, uint64_t HostPC) {
-  if (!BlockBegin) {
-    return 0;
-  }
-  const auto* InlineHeader = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
-  const auto* InlineTail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(BlockBegin + InlineHeader->OffsetToBlockTail);
-
-  if (HostPC < BlockBegin || HostPC >= (BlockBegin + InlineTail->Size)) {
-    return 0;
-  }
-
-  const auto* RIPEntry = reinterpret_cast<const uint8_t*>(BlockBegin + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
-  uint64_t StartingHostPC = BlockBegin;
-  uint64_t StartingGuestRIP = InlineTail->RIP;
-
-  for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
-    auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
-    RIPEntry += Offset.Size;
-    if (HostPC >= (StartingHostPC + Offset.IntegerARMPC)) {
-      StartingHostPC += Offset.IntegerARMPC;
-      StartingGuestRIP += Offset.IntegerX86RIP;
-    } else {
-      break;
-    }
-  }
-  return StartingGuestRIP;
 }
 
 uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs,
@@ -488,12 +399,9 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
   Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this, Thread);
   Thread->OpDispatcher->SetMultiblock(Config.Multiblock);
-  LogMan::Msg::EFmt("[TI-IC] lookupcache");
   Thread->LookupCache = fextl::make_unique<FEXCore::LookupCache>(this);
-  LogMan::Msg::EFmt("[TI-IC] decoder");
   Thread->FrontendDecoder = fextl::make_unique<FEXCore::Frontend::Decoder>(Thread);
   Thread->PassManager = fextl::make_unique<FEXCore::IR::PassManager>(this);
-  LogMan::Msg::EFmt("[TI-IC] passmanager");
 
   Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
   Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
@@ -503,9 +411,7 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
   Dispatcher->InitThreadPointers(Thread);
 
   // Create CPU backend
-  LogMan::Msg::EFmt("[TI-IC] jitcore");
   Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
-  LogMan::Msg::EFmt("[TI-IC] jitcore-done");
 
   // We finalize *after* the CPU backend is initialized, as the CPU backend will
   // provide necessary register information to the register allocation pass.
@@ -513,11 +419,9 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
 }
 
 FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Core::CPUState* NewThreadState) {
-  LogMan::Msg::EFmt("[TI-IC] createthread-enter");
   FEXCore::Core::InternalThreadState* Thread = new FEXCore::Core::InternalThreadState {
     .CTX = this,
   };
-  LogMan::Msg::EFmt("[TI-IC] threadstate-alloc");
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
   // Copy over the new thread state to the new object
@@ -602,83 +506,15 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
   FEXCore::Core::ResetCallRetStack(Thread, "core");
 }
 
-/* iOS-Madeira ml610: THE ONLY place the callret predictor is reset.
- *
- * ml609 clipped this to the [base+2MB, base+6MB) window on the theory that the
- * rest of the 16MB was unreachable, so decommitting it was pure waste. Both
- * halves of that premise were wrong and the build regressed (+388MB of `fex`
- * band at a matched cycle), so the full clear is restored here.
- *
- *  1. "UNREACHABLE" IS FALSE. BranchOps.cpp's CALL/RET guard does bound sp to
- *     [base+2MB, base+6MB) (`add 0x200000` then `lsr #22`), but the JITCallback
- *     sentinel push in Dispatcher.cpp only tests (sp - base) >> 24 -- the WHOLE
- *     16MB reservation. The callback path can therefore push outside the window
- *     the other path enforces. (How MUCH of the 16MB it actually touches is not
- *     established; that is what the unix-side census below measures.)
- *
- *  2. THE CLEAR RECLAIMS -- IT DOES NOT DIRTY. VirtualDontNeed() here is
- *     VirtualFree(MEM_DECOMMIT) + VirtualAlloc(MEM_COMMIT). This stack is not
- *     pool-aliased, so wine's decommit_pages() (virtual_ios.c) takes the
- *     anon_mmap_fixed() branch: a fresh MAP_ANON|MAP_FIXED over the range, which
- *     DROPS the old physical pages and installs zero-fill-on-demand. The
- *     MEM_COMMIT that follows only restores access; it does not touch pages.
- *     So the full clear was RETURNING up to 16MB per reset, and ml609's 4MB
- *     version left the rest of each stack resident.
- *
- * Resetting the predictor costs prediction quality only, never correctness: a
- * zeroed entry fails the `sub TMP1, TMP1, RipReg` compare and falls through to
- * the L1 lookup, which is always right.
- *
- * The counters stay, and now carry the one real finding ml609 did produce --
- * the expensive axis is FREQUENCY (10,240 resets, every one from
- * site=cpubackend). They break down by site and by CodeBuffer generation so a
- * later frequency fix has a baseline to beat, and so a redundant migration
- * (same thread cleared twice for one generation) becomes visible rather than
- * assumed absent.
- *
- * How many bytes a clear actually RETURNS is deliberately NOT measured here:
- * this TU compiles into an arm64ec PE under llvm-mingw, where __APPLE__ is
- * undefined and mincore/mach_vm_region/task_info do not exist. That
- * measurement lives at the reclaim site itself -- [dc-census] in
- * decommit_pages(), build/ntdll-unix/virtual_ios.c.
- */
-} // namespace (ml609: reopened below)
+} // namespace FEXCore::Context
 namespace FEXCore::Core {
-namespace {
-  // Keep in sync with the literals passed by the three call sites.
-  constexpr const char* CallRetSiteNames[] = {"core", "cpubackend", "jit-rollover"};
-  constexpr size_t CallRetSiteCount = sizeof(CallRetSiteNames) / sizeof(CallRetSiteNames[0]);
-} // namespace
-
-static std::atomic<uint64_t> CallRetResets {0};
-static std::atomic<uint64_t> CallRetBytesReset {0};
-static std::atomic<uint64_t> CallRetResetsBySite[CallRetSiteCount] {};
-
-void ResetCallRetStack(FEXCore::Core::InternalThreadState* Thread, const char* Site) {
+// Resets the call-return predictor stack. Prediction only: a zeroed entry
+// misses and falls back to the lookup cache.
+void ResetCallRetStack(FEXCore::Core::InternalThreadState* Thread, const char*) {
   if (!Thread || !Thread->CallRetStackBase) {
     return;
   }
-  using TS = FEXCore::Core::InternalThreadState;
-
-  // The FULL reservation -- see the note above. This decommit is what returns
-  // the pages; clipping it strands the remainder resident.
-  FEXCore::Allocator::VirtualDontNeed(Thread->CallRetStackBase, TS::CALLRET_STACK_SIZE);
-
-  for (size_t i = 0; i < CallRetSiteCount; ++i) {
-    if (Site && strcmp(Site, CallRetSiteNames[i]) == 0) {
-      CallRetResetsBySite[i].fetch_add(1, std::memory_order_relaxed);
-      break;
-    }
-  }
-
-  const uint64_t N = CallRetResets.fetch_add(1, std::memory_order_relaxed) + 1;
-  const uint64_t B = CallRetBytesReset.fetch_add(TS::CALLRET_STACK_SIZE, std::memory_order_relaxed) + TS::CALLRET_STACK_SIZE;
-
-  if ((N & 0x3ff) == 0) {
-    LogMan::Msg::EFmt("[callret] ml610 resets={} bytes={}MB per_reset={}KB site={} by_site core={} cpubackend={} jit-rollover={}", N,
-                      B >> 20, TS::CALLRET_STACK_SIZE >> 10, Site, CallRetResetsBySite[0].load(std::memory_order_relaxed),
-                      CallRetResetsBySite[1].load(std::memory_order_relaxed), CallRetResetsBySite[2].load(std::memory_order_relaxed));
-  }
+  FEXCore::Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
 }
 } // namespace FEXCore::Core
 namespace FEXCore::Context {
@@ -695,46 +531,9 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
   return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
 }
 
-/* iOS-Madeira ml623: targeted IR capture (PassManager.cpp). FEX_MadeiraIRCapTarget is the
- * absolute guest address of the ONE instruction under investigation, published by the
- * Windows-side InvalidationTracker at module load. The decode loop below marks the
- * compile when the block CONTAINS that address -- containment, not entry RIP, because
- * with multiblock a block routinely starts hundreds of bytes earlier. */
-extern "C" uint64_t FEX_MadeiraIRCapTarget;
-extern "C" void FEX_MadeiraIRCapMark(uint64_t GuestRIP);
-extern "C" void FEX_MadeiraIRCapClear();
-extern "C" uint64_t FEX_MadeiraIRCapCurrentRIP();
-
 ContextImpl::GenerateIRResult
 ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("GenerateIR");
-  FEX_MadeiraIRCapClear(); // ml623: never inherit a previous compile's mark
-
-  /* iOS-Madeira ml250: Thread->OpDispatcher has been observed NULL here, faulting as
-   * `str xzr,[x0,#0x378]` with x0=0 inside IREmitter::ResetWorkingList and killing the
-   * process (unhandled c0000005, ml247 via chromehtml.dll -> tier0_s64).
-   *
-   * It is not a missing init: the faulting thread logged the FULL [TI-IC] sequence, so
-   * InitializeCompiler ran and created the OpDispatcher. That leaves a stale/foreign
-   * InternalThreadState -- the same class as #33, where a CEF child was wired to the wrong
-   * JIT-pool ntdll copy, and pseudo-processes get CLONED .data.
-   *
-   * The caller already handles an empty IRView ("OpDispatcher IR already released"), so
-   * bail cleanly instead of dereferencing NULL, and report enough state to identify whose
-   * thread object this is. */
-  if (!Thread || !Thread->OpDispatcher) {
-    static int NullN = 0;
-    if (NullN++ < 12) {
-      LogMan::Msg::EFmt("[ir-null] Thread={} OpDispatcher={} LookupCache={} FrontendDecoder={} "
-                        "CurrentFrame={} GuestRIP={:#x} -- bailing instead of faulting",
-                        static_cast<void*>(Thread),
-                        Thread ? static_cast<void*>(Thread->OpDispatcher.get()) : nullptr,
-                        Thread ? static_cast<void*>(Thread->LookupCache.get()) : nullptr,
-                        Thread ? static_cast<void*>(Thread->FrontendDecoder.get()) : nullptr,
-                        Thread ? static_cast<void*>(Thread->CurrentFrame) : nullptr, GuestRIP);
-    }
-    return {};
-  }
 
   Thread->OpDispatcher->ResetWorkingList();
 
@@ -817,11 +616,6 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       uint64_t BlockInstructionsLength {};
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
-
-        // ml623: does THIS block contain the instruction under investigation?
-        if (FEX_MadeiraIRCapTarget && InstAddress == FEX_MadeiraIRCapTarget) {
-          FEX_MadeiraIRCapMark(GuestRIP);
-        }
         const FEXCore::X86Tables::X86InstInfo* TableInfo {nullptr};
         const FEXCore::X86Tables::DecodedInst* DecodedInfo {nullptr};
 
@@ -940,45 +734,6 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNIMPLEMENTED_INST) {
               Thread->OpDispatcher->UnimplementedOp(DecodedInfo);
             } else {
-              /* iOS-Madeira ml196: name the decode failure. The pre-existing
-               * "Invalid or Unknown instruction" message above cannot fire for this path
-               * because DecodeInstruction sets TableInfo = nullptr on exactly these
-               * errors. This branch (NOEXEC_INST / PARTIAL_DECODE_INST) is what raises
-               * FAULT_SIGSEGV -> GuestSignal_SIGSEGV -> the deliberate read of address 0
-               * that has been killing webhelper threads. Log which address failed and
-               * which status, so the guest RIP is stated rather than inferred. */
-              /* iOS-Madeira ml486 (#89): this log was UNBOUNDED. ml485's run wrote
-               * 1,117,783 copies of the SAME line for ONE address (0x7ED30A0080,
-               * inside the FEX host band) — a 148MB log, 2.26M lines, from line
-               * 16,648 to the end. NoExecOp raises SIGSEGV, the guest resumes at
-               * the same RIP, and nothing breaks the cycle; the retry loop's
-               * allocations drove phys 3276 -> 4074MB and iOS jetsam-killed the
-               * app at its 4096MB limit. So the "memory wall" was really a
-               * runaway. Bound the log and name the runaway once; no
-               * thread_local here (banned in xtajit64), so use atomics. */
-              {
-                static std::atomic<uint64_t> LastNoExecRIP {};
-                static std::atomic<uint32_t> NoExecRepeat {};
-                uint32_t n;
-                if (LastNoExecRIP.load(std::memory_order_relaxed) == GuestRIP) {
-                  n = NoExecRepeat.fetch_add(1, std::memory_order_relaxed) + 1;
-                } else {
-                  LastNoExecRIP.store(GuestRIP, std::memory_order_relaxed);
-                  NoExecRepeat.store(1, std::memory_order_relaxed);
-                  n = 1;
-                }
-                if (n <= 32 || n == 1024 || n == 65536) {
-                  LogMan::Msg::EFmt("[iOS-noexec] status={} BlockEntry={:#x} GuestRIP={:#x} repeat={} rev=ml486",
-                                    Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::NOEXEC_INST ?
-                                      "NOEXEC" : "PARTIAL",
-                                    Block.Entry, GuestRIP, n);
-                }
-                if (n == 1024) {
-                  LogMan::Msg::EFmt("[iOS-noexec] RUNAWAY: {:#x} has failed to decode 1024 times — the guest is not "
-                                    "making progress (wild control transfer); further identical lines suppressed rev=ml486",
-                                    GuestRIP);
-                }
-              }
               Thread->OpDispatcher->NoExecOp(DecodedInfo);
             }
           }
@@ -1063,7 +818,6 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     Thread->FrontendDecoder->ValidateDisownedOrFree();
     Thread->OpDispatcher->ValidateDisownedOrFree();
     // OpDispatcher IR already released in this case.
-    FEX_MadeiraIRCapClear(); // ml623
     return {{}, nullptr, 0, 0, false};
   }
 
@@ -1072,12 +826,9 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // We could lock CodeBufferWriteMutex earlier to prevent this from happening,
   // but this would increase lock contention. Redundant frontend runs aren't
   // as expensive and are easily reverted.
-  /* ml455 (#74): skip the recheck under a delivery compile — FindBlock takes
-   * the lookup read lock our interrupted frame may write-own. */
-  if (MaxInst != 1 && !FEXCore::Utils::WritePriorityMutex::IosUnpublishedCompileActive()) {
+  if (MaxInst != 1) {
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
-      FEX_MadeiraIRCapClear(); // ml623
       Thread->OpDispatcher->DelayedDisownBuffer();
       Thread->FrontendDecoder->ValidateDisownedOrFree();
       Thread->OpDispatcher->ValidateDisownedOrFree();
@@ -1095,57 +846,6 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
-
-  /* ml623: the final arm of the capture -- the host bytes actually emitted for the
-   * target instruction, bounded to [its HostEntryOffset, the next one). This is the
-   * arm that separates "the emitter dropped it" from "SMC/cache/alias lifetime rewrote
-   * it later": the hash printed here is of the bytes AT COMPILE TIME, so a runtime
-   * disassembly that disagrees convicts something after codegen. */
-  if (const uint64_t CapRIP = FEX_MadeiraIRCapCurrentRIP()) {
-    const uint64_t Target = FEX_MadeiraIRCapTarget;
-    if (Target >= CapRIP && CompiledCode.BlockBegin && DebugData) {
-      const uint64_t WantOffset = Target - CapRIP;
-      const auto& GO = DebugData->GuestOpcodes;
-      size_t Idx = GO.size();
-      for (size_t i = 0; i < GO.size(); ++i) {
-        if (GO[i].GuestEntryOffset == WantOffset) {
-          Idx = i;
-          break;
-        }
-      }
-      if (Idx == GO.size()) {
-        LogMan::Msg::EFmt("[ircap] ml623 HOST: no GuestOpcode entry for offset {:#x} among {} entries "
-                          "(rip={:#x} hostsize={})",
-                          WantOffset, GO.size(), CapRIP, DebugData->HostCodeSize);
-      } else {
-        const ptrdiff_t HostFrom = GO[Idx].HostEntryOffset;
-        const ptrdiff_t HostTo = (Idx + 1 < GO.size()) ? GO[Idx + 1].HostEntryOffset : static_cast<ptrdiff_t>(DebugData->HostCodeSize);
-        // Neighbours give the `or al,0x44` that shares the clobbered register.
-        for (size_t i = (Idx > 1 ? Idx - 2 : 0); i < GO.size() && i <= Idx + 1; ++i) {
-          LogMan::Msg::EFmt("[ircap] ml623 HOST map guest+{:#x} -> host+{:#x}{}", GO[i].GuestEntryOffset, GO[i].HostEntryOffset,
-                            i == Idx ? "   <== TARGET" : "");
-        }
-        if (HostTo > HostFrom && (HostTo - HostFrom) < 4096) {
-          const uint32_t* Words = reinterpret_cast<const uint32_t*>(CompiledCode.BlockBegin + HostFrom);
-          const size_t NumWords = static_cast<size_t>(HostTo - HostFrom) / 4;
-          uint64_t Hash = 1469598103934665603ull; // FNV-1a
-          for (size_t i = 0; i < NumWords; ++i) {
-            for (int b = 0; b < 4; ++b) {
-              Hash = (Hash ^ ((Words[i] >> (b * 8)) & 0xff)) * 1099511628211ull;
-            }
-          }
-          LogMan::Msg::EFmt("[ircap] ml623 HOST bytes blockbegin={} host+{:#x}..{:#x} words={} fnv1a={:#x}",
-                            static_cast<void*>(CompiledCode.BlockBegin), HostFrom, HostTo, NumWords, Hash);
-          for (size_t i = 0; i < NumWords; ++i) {
-            LogMan::Msg::EFmt("[ircap]   +{:#06x}  {:08x}", HostFrom + static_cast<ptrdiff_t>(i * 4), Words[i]);
-          }
-        } else {
-          LogMan::Msg::EFmt("[ircap] ml623 HOST bytes SKIPPED: implausible range host+{:#x}..{:#x}", HostFrom, HostTo);
-        }
-      }
-    }
-    FEX_MadeiraIRCapClear();
-  }
 
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
@@ -1177,563 +877,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
 
-  /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
-   *
-   * ml302 proved the JITCallback prologue writes the bad State.rip, and ml303 added an LR witness --
-   * but gated the report on a later bogus-RIP hit, which only occurs in roughly half of runs. That
-   * repeats the mistake of gating a probe on the rare downstream event instead of the thing being
-   * measured. Entry into CallbackPtr is itself the anomaly: on ARM64EC that block should be
-   * unreachable (ExecuteJITCallback is only called from ContextImpl::HandleCallback, whose sole
-   * caller is LinuxEmulation/Thunks.cpp which is not built for this target, and the emitted code
-   * before it ends in hlt(0) so fall-through is impossible).
-   *
-   * So report the first few entries directly. CompileBlock runs often enough to notice promptly and
-   * is not hot enough for a load+branch to matter. If nothing prints, CallbackPtr genuinely is not
-   * being entered in that run -- which is equally informative, and is a real negative rather than
-   * silence from an unexercised probe. */
-  /* ml306 GATE FIX: the ml304 version keyed on Frame->IosLastCallbackLR != 0, and ml306's hit
-   * showed the real entries arrive with LR == 0 -- so the gate was blind to exactly the case it
-   * existed for ([cb-entry] printed 0 in the same run whose [bogus-writer] proved a CallbackPtr
-   * entry happened). Key on the entry COUNTER in the static capture buffer instead, and print the
-   * full captured entry state; x16/x17 are the interesting ones since a `br` through an IP register
-   * is the most plausible way to arrive with LR=0. */
-  /* iOS-Madeira ml316: report ExitToX64 FFS bypasses (native short-circuit of an EC target
-   * reached via its x64 fast-forward sequence -- preserves the x4/x5 varargs contract that
-   * the emulation round trip destroys; see Module.S). Same change-detection pattern as
-   * [cb-entry] below: CompileBlock runs often enough to notice promptly. */
-
-  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
-   * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
-   * lands at RIP=0x8, which then loops compiling thousands of garbage
-   * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
-   * guest immediately so the first AV is the only AV. */
-  if (GuestRIP < 0x10000) {
-    LogMan::Msg::IFmt("[iOS] CompileBlock: REFUSING low/invalid RIP={:#x}", GuestRIP);
-    return 0;
-  }
-
-  /* iOS-Madeira ml197: NAME THE PRODUCER OF A HOST-ADDRESS "GUEST RIP".
-   *
-   * [iOS-noexec] showed FEX being asked to decode x86 at addresses that are not guest
-   * code at all:
-   *   GuestRIP=0x133f39a14   -> a JIT-POOL address (host code / module copies)
-   *   GuestRIP=0x7c600e0080  -> inside a steered 512MB FEX arena, at +0x0e0080 — the
-   *                             SAME offset seen in three runs across three arenas
-   * Decoding those yields NOEXEC/PARTIAL, which raises FAULT_SIGSEGV -> the
-   * GuestSignal_SIGSEGV trampoline -> the deliberate read of 0 that kills the thread.
-   * So the memory was never the problem; the POINTER is.
-   *
-   * ml198 CORRECTION: the first cut also flagged 0x1xxxxxxxx as "JIT pool", which was
-   * WRONG — guest PE IMAGES live in that band too (e.g. steamexe.exe maps at 0x15c800000,
-   * whose pool copy is at 0x127566000). That produced 17 false positives of perfectly
-   * legitimate RIPs. Only >= 0x7400000000 is unambiguous: that is steered-arena space and
-   * no guest image is ever placed there. Keep the check to that band only.
-   *
-   * Log the host return address (which lands in the dispatcher stub that supplied the
-   * RIP) plus State.rip, so the PRODUCER is named instead of the consumer. */
-  /* iOS-Madeira ml296: ALSO CATCH HOST-PC-IN-GUEST-RIP INSIDE FEX'S OWN CODE BUFFER.
-   *
-   * ml292/294/295 showed a SECOND leak, distinct from the 0x7c-0x7f host-heap one above and now
-   * the DOMINANT killer (3 of the last 4 runs, and it fires EARLIER -- ~24.6k calls vs ~36.4k --
-   * so it terminates the webhelper before the other one is ever reached; runs regressed from
-   * ~36,700 calls / 237 modules to ~24,600 / 216 for exactly this reason).
-   *
-   * ml295 signature: State.rip = 0x156219e14, which the [jit-pool] records place inside
-   * `tail EC_CODE rx=0x155ff8000 size=0x1000000` -- FEX'S OWN EMITTED CODE. x16 (IP0, the
-   * register the dispatcher `br`s through) held the same value, so a host branch target was
-   * written into the guest RIP field. x28 was a valid ThreadState (<arena>+0x1140, matching
-   * [vname]), so this is not a bad state pointer.
-   *
-   * The 0x7400000000 gate cannot see it, and the ml198 note in this file explains why the gate
-   * was left narrow: guest PE IMAGES also live in the 0x1xxxxxxxx band, and treating that band
-   * as "pool" produced 17 false positives. IsAddressInCodeBuffer is the exact discriminator that
-   * was missing -- FEX knows its own code-buffer bounds, so a guest RIP inside them is
-   * unambiguously a host-PC leak with no possibility of a guest-image false positive. */
-  const bool RIPInFEXCodeBuffer = IsAddressInCodeBuffer(Thread, GuestRIP);
-
-  /* iOS-Madeira ml300 (task #52): ALSO catch pool MODULE-COPY addresses, not just FEX's code buffer.
-   *
-   * ml299 hit a third variant of the same leak and the gate missed all 3,422 occurrences of it:
-   *   [fault_rip] cnt=3422 rip=0x13b2b888c
-   *   [rip-leak] guest RIP 0x13b2b888c IS POOL addr = PE 0x73d0ba488c (ntdll base 0x73d0b30000 rva 0x7488c)
-   * That is a JIT-pool copy of a PE module -- a host address, but NOT inside FEX's code buffer, so
-   * IsAddressInCodeBuffer returns false and [bogus-writer] never got a chance to name the writer.
-   *
-   * The ml198 note in this file warns that the 0x1xxxxxxxx BAND cannot be used as the test, because
-   * guest PE images live there too and flagging the whole band produced 17 false positives. But the
-   * POOL is a specific interval, [WINE_IOS_JIT_RX, +WINE_IOS_JIT_SIZE), and no guest image is ever
-   * placed inside it -- ios_jit_add_mapping owns that range. Testing the interval instead of the
-   * band is exact, and it subsumes the code-buffer case since the EC_CODE tail lives in the pool
-   * too (verified: pool [0x11e400000,0x156400000) contains both the 0x155ff8000 EC_CODE tail and
-   * ml299's 0x13b2b888c module copy).
-   *
-   * ml300 RETRACTION: the pool-interval gate added above was WRONG and manufactured 18 false
-   * positives in one run. Being inside the pool is NOT sufficient, because an ARM64EC module's
-   * CHPE CodeMap contains type-2 (X64) ranges -- real x64 entry/fast-forward thunks -- and the
-   * marking loop in virtual_ios.c deliberately leaves those unmarked precisely so FEX WILL
-   * emulate them. Compiling x86 at those pool addresses is correct behaviour. All five sampled
-   * ml300 hits classified as X64(type2): shcore+0x19516, winhttp+0x2ec63, ws2_32+0x234c6,
-   * ntdll+0x7e067, sechost+0x1e5c2. The "CONFIRMED: EnterEC wrote this" verdicts they produced
-   * are therefore NOT evidence of a bug -- EnterEC storing an x64 target in State.rip is its job.
-   *
-   * The genuine pool variant does exist (ml299: ntdll rva 0x7488c, 3,422 hits, classified
-   * ARM64EC(type1) -- native code fed to the x86 decoder), but distinguishing it needs the EC code
-   * bitmap, not a range test, and the ntdll-side [rip-leak] probe already reports exactly that case
-   * with a reverse-translate to module+rva. So detection of that variant belongs there, not here.
-   *
-   * Back to IsAddressInCodeBuffer alone, which is sound with no discrimination needed: FEX's own
-   * emitted code is never guest code under any classification. */
-  if (GuestRIP >= 0x7400000000ULL || RIPInFEXCodeBuffer) {
-    static uint32_t BogusRIPCount = 0;
-    if (BogusRIPCount < 16) {
-      BogusRIPCount++;
-      LogMan::Msg::EFmt("[iOS-bogusrip] band={} GuestRIP={:#x} State.rip={:#x} host_ret={} callret_sp={:#x}",
-                        RIPInFEXCodeBuffer ? "FEX-CODE-BUFFER(host PC leak)" : "host-heap(0x7c-0x7f)",
-                        GuestRIP, Frame ? Frame->State.rip : 0, __builtin_return_address(0),
-                        Frame ? Frame->State.callret_sp : 0);
-
-      /* iOS-Madeira ml295 (task #51): IS THE BAD RIP A GUEST VALUE OR A FEX-SYNTHESISED ONE?
-       *
-       * ml294 established, offline, that the guest CANNOT have computed this address. At fault
-       * time the guest is inside chrome_elf.dll's memset (r10 = exact image base, r11 = exact
-       * image_base+0xb440e, r9 = 0x30 -- reproduced across ml285/290/291), and that memset
-       * dispatches through a 32-bit jump table at RVA 0x112de0 whose entries span only
-       * 0xb40e1..0xb414a. target = image_base + a 32-bit entry therefore cannot exceed
-       * image_base + 0xffffffff, and the observed RIPs (e.g. 0x7e600f0080 against an image base
-       * of 0x73cd3d0000) lie far outside that window. The target is also UNNAMED memory inside
-       * FEX's own 512MB host reservations -- ml294's [vname] map shows FEXMem_ThreadState is the
-       * only named region in that band, occupying just <arena>+0x1000..+0x3000.
-       *
-       * (Earlier comments here called those arenas "PartitionAlloc"; that was wrong. All 23
-       * [bigres] 512MB requests carry guest rsp=0/rip=0, i.e. no guest context, and are issued
-       * two-per-thread at FEX thread init. They are FEX's own heap.)
-       *
-       * So the prediction is that the value is NOT in any guest GPR. Print all sixteen and say
-       * so explicitly either way -- if it DOES appear in a register the arithmetic proof above is
-       * wrong and that is the single most important thing to learn; if it does not, the value was
-       * synthesised on FEX's side and the dispatcher dump below is where to look. */
-      if (Frame) {
-        static const char* GPRNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
-                                           "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
-        int FoundIn = -1;
-        for (int i = 0; i < 16; ++i) {
-          if (Frame->State.gregs[i] == GuestRIP) {
-            FoundIn = i;
-            break;
-          }
-        }
-        LogMan::Msg::EFmt("[bogus-regs] rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x}",
-                          Frame->State.gregs[0], Frame->State.gregs[1], Frame->State.gregs[2], Frame->State.gregs[3],
-                          Frame->State.gregs[4], Frame->State.gregs[5], Frame->State.gregs[6], Frame->State.gregs[7]);
-        LogMan::Msg::EFmt("[bogus-regs] r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-                          Frame->State.gregs[8], Frame->State.gregs[9], Frame->State.gregs[10], Frame->State.gregs[11],
-                          Frame->State.gregs[12], Frame->State.gregs[13], Frame->State.gregs[14], Frame->State.gregs[15]);
-        if (FoundIn >= 0) {
-          LogMan::Msg::EFmt("[bogus-regs] *** value IS in guest {} -- guest DID hold it, ml294 arithmetic "
-                            "proof is WRONG, re-derive",
-                            GPRNames[FoundIn]);
-        } else {
-          LogMan::Msg::EFmt("[bogus-regs] value is in NO guest GPR -- FEX-synthesised, as predicted");
-        }
-
-        /* ml298 (task #52): the FEX-side state that separates the candidate writers.
-         *
-         * InlineJITBlockHeader is what RestoreRIPFromHostPC uses to reverse-map a host PC back to
-         * a guest RIP; its fallback is `return State.rip`, so if the header is stale or zero the
-         * reconstruction silently propagates whatever State.rip already held instead of repairing
-         * it. Printing it says whether reconstruction COULD have worked.
-         *
-         * callret_sp vs callret_sp_base gives the live depth against the inline guard window
-         * [base+0x200000, base+0x600000): ml297 showed sp-base = 0x2c7e70 (~2.9MB, ~80,000 leaked
-         * entries) -- inside the window, so the guard never fired and #42 is still live. Whether
-         * that is true again on the run that catches the write matters, because the suspected
-         * writer sits in the same EnterEC machinery that manages this stack. */
-        LogMan::Msg::EFmt("[bogus-state] InlineJITBlockHeader={:#x} callret_sp={:#x} base={:#x} "
-                          "depth=(sp-base)={:#x} guard_window=[+0x200000,+0x600000)",
-                          Frame->State.InlineJITBlockHeader, Frame->State.callret_sp, Frame->State.callret_sp_base,
-                          Frame->State.callret_sp - Frame->State.callret_sp_base);
-
-        /* ml299 (task #52): NAME THE WRITER, do not infer it. */
-        if (Frame->IosLastEnterECRip == GuestRIP) {
-          LogMan::Msg::EFmt("[bogus-writer] *** CONFIRMED: EnterEC wrote this value "
-                            "(IosLastEnterECRip={:#x} == GuestRIP) -- the str(EC_CALL_CHECKER_PC_REG, "
-                            "State.rip) at AbsoluteLoopTopAddressEnterEC is the leak",
-                            Frame->IosLastEnterECRip);
-        } else if (Frame->IosLastCallbackRip == GuestRIP) {
-          LogMan::Msg::EFmt("[bogus-writer] *** JITCallback wrote this value "
-                            "(IosLastCallbackRip={:#x} == GuestRIP) -- a host->guest callback was "
-                            "handed a host address. Entered with LR={:#x} -- on ARM64EC this block "
-                            "should be UNREACHABLE (only LinuxEmulation calls HandleCallback, and the "
-                            "preceding emitted code ends in hlt(0)), so that LR names the errant branch",
-                            Frame->IosLastCallbackRip, Frame->IosLastCallbackLR);
-        } else {
-          LogMan::Msg::EFmt("[bogus-writer] BY ELIMINATION: BranchOps' L1-miss store "
-                            "(EnterEC={:#x}, Callback={:#x}, neither == GuestRIP={:#x}) -- the guest "
-                            "branch target itself is the bad value, i.e. it was LOADED from guest "
-                            "memory rather than synthesised by the dispatcher",
-                            Frame->IosLastEnterECRip, Frame->IosLastCallbackRip, GuestRIP);
-        }
-      }
-
-      /* ml295: DUMP THE FEX-EMITTED CODE THAT SUPPLIED THE RIP.
-       *
-       * host_ret is the return address into the dispatcher stub / emitted block that called
-       * CompileBlock, and in ml291 it was 0x162bf83c0 -- inside the pool's tail EC_CODE area.
-       * Dumping the words around it lets the sequence be disassembled offline (free) to see
-       * whether the RIP came from an L1/L2 lookup, a callret prediction (#42 territory), or a
-       * clobbered register.
-       *
-       * Bounded to the JIT pool via the same env vars the atomic-alias helper uses, so an
-       * unexpected host_ret can never turn this probe into a fault of its own. */
-      {
-        const char* RxEnv = getenv("WINE_IOS_JIT_RX");
-        const char* SzEnv = getenv("WINE_IOS_JIT_SIZE");
-        const uint64_t RxBase = RxEnv ? strtoull(RxEnv, nullptr, 16) : 0;
-        const uint64_t RxSize = SzEnv ? strtoull(SzEnv, nullptr, 16) : 0;
-        const uint64_t HostRet = reinterpret_cast<uint64_t>(__builtin_return_address(0));
-        /* ml298: widened from -0x30 to -0xA8. The ml297 window ended at `mov x2, x12`, proving the
-         * guest RIP passed to CompileBlock comes from x12 but NOT where x12 was loaded -- the
-         * answer is further back, and a window that stops just short of the answer is a wasted
-         * run. 0xA8 back plus 0x20 forward still sits well inside the 64-byte-margin bounds check
-         * below, so widening cannot make the probe fault. */
-        if (RxBase && RxSize && HostRet >= RxBase + 0x200 && HostRet + 0x200 < RxBase + RxSize) {
-          const uint32_t* W = reinterpret_cast<const uint32_t*>(HostRet & ~3ULL);
-          for (int Row = -7; Row <= 1; ++Row) {
-            LogMan::Msg::EFmt("[bogus-host] {:+#6x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}", Row * 24, W[Row * 6 + 0],
-                              W[Row * 6 + 1], W[Row * 6 + 2], W[Row * 6 + 3], W[Row * 6 + 4], W[Row * 6 + 5]);
-          }
-          LogMan::Msg::EFmt("[bogus-host] host_ret={:#x} pooloff={:#x}", HostRet, HostRet - RxBase);
-        } else {
-          LogMan::Msg::EFmt("[bogus-host] host_ret={:#x} NOT in JIT pool [{:#x},{:#x}) -- not dumped", HostRet, RxBase,
-                            RxBase + RxSize);
-        }
-      }
-
-      /* iOS-Madeira ml292: NAME THE GUEST CALLER of the bogus RIP.
-       *
-       * Offline analysis of nine runs showed every bogus RIP has the form
-       *   <steered 512MB PA arena base> + {0xd0080, 0xe0080, 0xf0080}
-       * (0x7c00/0x7c20/0x7c60/0x7ca0/0x7e20/0x7e60/0x7ea0 all appear verbatim in the
-       * [steer] log, and NO module is mapped above 0x7400000000). So a committed RW
-       * PartitionAlloc heap address is being CALLed as code, always at one of only three
-       * offsets -- the same heap object each time. The producer is a guest function
-       * pointer, and the one thing still missing is WHO dereferenced it.
-       *
-       * BranchOps.cpp pushes `stp CallReturnAddr, HostLabel, [x17, #-0x10]!` on every
-       * guest CALL, so entry 0 at [callret_sp] is the guest return address *in the
-       * caller* -- the instruction right after the offending call. Walking up gives the
-       * guest call chain, innermost first; those are guest VAs that map directly onto the
-       * `[jit-pool] image <base>+<size> (name.dll)` lines already in the log.
-       *
-       * Reads are bounded to the real [base, base+CALLRET_STACK_SIZE) window before any
-       * dereference, so a garbage callret_sp cannot turn this probe into a second fault.
-       * Both outcomes are reportable: a live chain names the caller, while all-zero or
-       * out-of-window says the predictor stack was reset and no chain exists. */
-      const uint64_t CRBase = Frame ? Frame->State.callret_sp_base : 0;
-      const uint64_t CRSp = Frame ? Frame->State.callret_sp : 0;
-      const uint64_t CREnd = CRBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-      if (!CRBase || CRSp < CRBase || CRSp >= CREnd) {
-        LogMan::Msg::EFmt("[callret-chain] UNAVAILABLE sp={:#x} outside [{:#x},{:#x}) -- no chain", CRSp, CRBase, CREnd);
-      } else {
-        uint32_t NonZero = 0;
-        for (uint32_t i = 0; i < 12; ++i) {
-          const uint64_t Slot = CRSp + (uint64_t)i * 0x10;
-          if (Slot + 0x10 > CREnd) {
-            break;
-          }
-          const uint64_t GuestRet = *reinterpret_cast<const uint64_t*>(Slot);
-          const uint64_t HostRet = *reinterpret_cast<const uint64_t*>(Slot + 8);
-          if (GuestRet || HostRet) {
-            NonZero++;
-          }
-          LogMan::Msg::EFmt("[callret-chain] #{:<2} guest_ret={:#x} host={:#x}", i, GuestRet, HostRet);
-        }
-        LogMan::Msg::EFmt("[callret-chain] depth_used={:#x} nonzero={} (sp={:#x} base={:#x})", CRBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4 - CRSp,
-                          NonZero, CRSp, CRBase);
-      }
-    }
-  }
-
-  /* iOS-Madeira 2026-05-18: CALLRET_SP bounds-validation + RESET.
-   *
-   * Initial diagnostic showed callret_sp going 0x10..0x70 BELOW
-   * Thread->CallRetStackBase — underflow of the FEX prediction stack into
-   * the lower guard page. On iOS, Wine's VirtualAlloc(MEM_RESERVE,
-   * PAGE_NOACCESS) doesn't actually enforce NOACCESS on the guard, so the
-   * guard-page SEGV that would normally trigger CallRetStack::HandleAccessViolation
-   * never fires, and the existing reset-to-DefaultLocation logic doesn't kick
-   * in. Result: the stack drifts further into "guard" memory each iteration
-   * of Thumper's hot dispatch loop.
-   *
-   * GPT's Tier-1 fix: replicate HandleAccessViolation's reset proactively
-   * in C++, triggered at CompileBlock entry whenever we detect callret_sp
-   * outside the real [base, base+SIZE) range. The callret stack is a
-   * prediction/fast-return cache, not architectural state — resetting it
-   * degrades to slower lookup, doesn't change x86 semantics.
-   *
-   * Stack direction (per GPT): CALL push uses `stp [sp, -0x10]!`, so
-   * sp decreases. RET pop uses `ldp [sp], 0x10`, so sp increases.
-   * sp < base = too many CALL pushes (likely ARM64EC return paths that
-   * push via the dispatcher sentinel but bypass the FEX RET pop path).
-   * sp >= end = too many RET pops. Both reset to DefaultLocation. */
-  {
-    auto *Thread = Frame ? Frame->Thread : nullptr;
-    uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
-    uint64_t crbase = Thread ? reinterpret_cast<uint64_t>(Thread->CallRetStackBase) : 0;
-    uint64_t crend = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-    if (crbase != 0 && (crsp < crbase || crsp >= crend)) {
-      static volatile uint32_t oob_cnt = 0;
-      uint32_t n = __sync_add_and_fetch(&oob_cnt, 1);
-      uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
-      const char *kind = (crsp < crbase) ? "UNDERFLOW" : "OVERFLOW";
-      if (n <= 16) {
-        LogMan::Msg::EFmt("[CALLRET_OOB #{}] {} callret_sp=0x{:x}  "
-                          "base=0x{:x} end=0x{:x} delta=0x{:x}  "
-                          "GuestRIP=0x{:x} State.rip=0x{:x} Frame=0x{:x}  "
-                          "RESET→0x{:x}",
-                          n, kind, crsp, crbase, crend,
-                          (crsp < crbase) ? (crbase - crsp) : (crsp - crend),
-                          GuestRIP, Frame->State.rip,
-                          reinterpret_cast<uintptr_t>(Frame),
-                          default_loc);
-        /* Dump top 4 pseudo-entries before reset (mostly stale; useful to
-         * see if anyone wrote real callret pairs into the guard page). */
-        if (crsp >= 0x10000) {
-          for (int i = 0; i < 4; i++) {
-            uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
-            LogMan::Msg::EFmt("[CALLRET_OOB #{}]   [+0x{:x}] = {{0x{:x}, 0x{:x}}}",
-                              n, i * 0x10, pair[0], pair[1]);
-          }
-        }
-      }
-      /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
-      Frame->State.callret_sp = default_loc;
-    }
-  }
-
-  /* iOS-Madeira 2026-05-15: JIT-pool RIP detector — LOG-ONLY.
-   *
-   * Earlier attempt to "recover" by setting State.rip = callret[0].pc and
-   * compiling that as guest x86 produced a livelock: the recovered code
-   * (e.g. FMOD at 0xeaa2f060d, `mov [rbx+0xc0], rdi`) faulted on RBX=0
-   * because callret pairs are {guest_pc, host_jit_ret_target}, NOT CPU
-   * register snapshots. Setting RIP without restoring RBX/RSP/flags is
-   * not equivalent to ARM64EC opportunistic-return.
-   *
-   * Going forward: log occurrences so we can see when host PCs leak into
-   * State.rip, but do NOT mutate state. The real fix belongs in the
-   * dispatcher's EnterEC path. */
-  {
-    /* JIT pool observed at RX=0x11cc00000+0x10000000 across runs. Tighten
-     * the detector to the actual pool range so we don't false-positive on
-     * other 0x1XXXXXXXX guest addresses. ASLR jitter is ~16MB so widen by
-     * 32MB on each side. */
-    constexpr uint64_t pool_lo = 0x11c000000ULL;
-    constexpr uint64_t pool_hi = 0x12e000000ULL;
-    if (GuestRIP >= pool_lo && GuestRIP < pool_hi) {
-      uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
-      static volatile uint32_t jit_rip_dump_count = 0;
-      uint32_t dn = __sync_add_and_fetch(&jit_rip_dump_count, 1);
-      if (dn <= 8) {
-        LogMan::Msg::EFmt("[JITPOOL_RIP #{}] GuestRIP=0x{:x} (HOST PC LEAKED INTO STATE.RIP)  "
-                          "State.rip=0x{:x} callret_sp=0x{:x} Frame=0x{:x}  "
-                          "pool=0x{:x}..0x{:x}",
-                          dn, GuestRIP,
-                          Frame ? Frame->State.rip : 0, crsp,
-                          reinterpret_cast<uintptr_t>(Frame),
-                          pool_lo, pool_hi);
-        if (crsp != 0 && crsp >= 0x10000) {
-          for (int i = 0; i < 8; i++) {
-            uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
-            LogMan::Msg::EFmt("[JITPOOL_RIP #{}]   callret[+0x{:x}] = {{pc=0x{:x}, ret=0x{:x}}}",
-                              dn, i * 0x10, pair[0], pair[1]);
-          }
-        }
-      }
-      /* Log-only — no state mutation. Fall through to normal compile path.
-       * If FEX subsequently faults trying to decode the JIT pool bytes as
-       * x86, we'll see that in the Mach handler — at least we know the
-       * exact RIP that leaked. */
-    }
-  }
-
-  /* iOS-Madeira 2026-05-18 low-noise summary. Replaces per-call log (which
-   * was producing ~180K lines/run for hot RIP 0x140028d46 alone, each
-   * amplified ~6× by Wine's file trace). Counters: g_cb_total bumped
-   * every CompileBlock call; g_cb_real_compiles bumped after cache miss
-   * proves we actually compile (see below at LookupCache fallthrough).
-   * Boyer-Moore-style 1-slot hot-RIP estimator. Summary every 16K calls. */
-  {
-    static volatile uint64_t g_cb_last_summary_total = 0;
-    static volatile uint64_t g_cb_hot_rip = 0;
-    static volatile uint64_t g_cb_hot_rip_count = 0;
-    if (GuestRIP == g_cb_hot_rip) {
-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-    } else if (g_cb_hot_rip_count == 0) {
-      g_cb_hot_rip = GuestRIP;
-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
-    } else {
-      __sync_sub_and_fetch(&g_cb_hot_rip_count, 1);
-    }
-    uint64_t total = __sync_add_and_fetch(&g_cb_total, 1);
-    if ((total - g_cb_last_summary_total) >= 16384) {
-      g_cb_last_summary_total = total;
-      uint64_t reals = g_cb_real_compiles;
-      /* iOS-Madeira 2026-07-03 perf hunt: also print the JIT-visible L1
-       * lookup fields. The emitted dispatcher L1 probe reads
-       * State.L1Pointer/L1Mask; the measured ~15K CompileBlock calls per
-       * frame (~60us each = the whole frame time) with 99% cache hits mean
-       * that probe is missing for blocks the C++ path finds instantly. If
-       * State.L1Pointer here is 0 (or differs from the LookupCache's own
-       * pointer), the emitted probe reads the iOS-emulated zero page and
-       * silently misses every time — no crash, pure 60us tax per lookup. */
-      auto* T = Frame ? Frame->Thread : nullptr;
-      LogMan::Msg::EFmt("[CB_SUMMARY] total={} real_compiles={} cache_hits={} "
-                        "hit_rate={}%  hottest_rip≈0x{:x} repeats~{} "
-                        "L1ptr=0x{:x} L1mask=0x{:x} cacheL1=0x{:x}",
-                        total, reals,
-                        total - reals,
-                        (total > 0) ? (100 * (total - reals) / total) : 0,
-                        g_cb_hot_rip, g_cb_hot_rip_count,
-                        Frame ? Frame->State.L1Pointer : 0,
-                        Frame ? Frame->State.L1Mask : 0,
-                        (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
-
-      /* iOS-Madeira ml622: drain the rpmalloc remote-free CAS snapshot HERE —
-       * outside rpmalloc, where formatting is safe. The allocator side only ever
-       * copies scalars into a POD and sets a flag; it must never format, because
-       * LogMan/fmt can allocate and re-enter the very allocator that is stuck
-       * (that is how ml620 killed itself).
-       *
-       * Read the counters, not the total: fail_changed vs fail_unchanged is the
-       * discriminator, and fail_invalid outranks both. ⚠️ A changed token is NOT
-       * automatically healthy contention — it can equally be page reuse or a
-       * foreign writer, so check block_index/list_size against block_count before
-       * concluding anything. */
-    }
-  }
-
-  /* iOS-Madeira 2026-05-14: per-thread callret tracking (runs for EVERY
-   * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
-   * pointer (unique per FEX thread). Identifies WHICH thread is leaking
-   * callret entries vs healthy. */
-  {
-    uintptr_t fk = reinterpret_cast<uintptr_t>(Frame);
-    int slot = (int)((fk >> 6) & 3);
-    /* Claim the slot if empty, or use if matches; ignore on collision. */
-    if (g_madeira_thr_key[slot] == 0 || g_madeira_thr_key[slot] == fk) {
-      g_madeira_thr_key[slot] = fk;
-      uint64_t crsp = Frame->State.callret_sp;
-      g_madeira_thr_crsp_last[slot] = crsp;
-      g_madeira_thr_last_rip[slot] = GuestRIP;
-      g_madeira_thr_count[slot]++;
-      if (crsp != 0) {
-        if (crsp < g_madeira_thr_crsp_min[slot]) g_madeira_thr_crsp_min[slot] = crsp;
-        if (crsp > g_madeira_thr_crsp_max[slot]) g_madeira_thr_crsp_max[slot] = crsp;
-      }
-    }
-  }
-
-  /* iOS-Madeira 2026-05-13 lightweight HOTRIP instrumentation (v3): use
-   * plain volatile globals to avoid __cxa_guard_acquire on static-local
-   * initialization, which appears to trip a stack-cookie check on
-   * ARM64EC mingw. POD types only — no constructors. Atomicity isn't
-   * critical for telemetry; occasional torn reads are fine. */
-  {
-    /* RIPs depend on FMOD's mapped base (0xeaa1d0000 in current runs).
-     * The two critsection wrappers GPT identified live at fmod+0xba27a
-     * and fmod+0xba2fa. Match on the FMOD-relative range rather than
-     * absolute address so this works across ASLR runs. */
-    int idx = -1;
-    uint64_t fmod_off = GuestRIP - 0xeaa1d0000ull;
-    switch (GuestRIP) {
-      case 0x140006fe6ull: idx = 0; break;
-      case 0x140006febull: idx = 1; break;
-      case 0x140028d20ull: idx = 2; break;
-      case 0x140028d41ull: idx = 3; break;
-      case 0x140028d46ull: idx = 4; break;
-      case 0x1400687f0ull: idx = 5; break;
-      case 0x140068816ull: idx = 6; break;
-      default:
-        /* FMOD critsection wrappers — relative to current fmod64 base. */
-        if (GuestRIP == 0xeaa28a27aull) idx = 7;       /* EnterCriticalSection wrapper */
-        else if (GuestRIP == 0xeaa28a2faull) idx = 8;  /* LeaveCriticalSection wrapper */
-        else if (GuestRIP == 0xeaa28a9d4ull) idx = 9;  /* GPT-mentioned wrapper */
-        else if (GuestRIP == 0xeaa28a9e3ull) idx = 10; /* GPT-mentioned wrapper */
-        else if (fmod_off >= 0xba000 && fmod_off < 0xbb000) idx = 11; /* any other near these */
-        break;
-    }
-    if (idx >= 0) {
-      uint64_t n = ++g_madeira_hot_count[idx];
-
-      /* Track callret_sp range — answers "leak (monotonic) vs boundary (oscillating)". */
-      uint64_t crsp = Frame->State.callret_sp;
-      g_madeira_callret_last = crsp;
-      if (crsp > g_madeira_callret_max) g_madeira_callret_max = crsp;
-      if (crsp != 0 && crsp < g_madeira_callret_min) g_madeira_callret_min = crsp;
-
-      if (idx == 5 || idx == 6) {
-        uint64_t sz = Frame->State.gregs[FEXCore::X86State::REG_RDI];
-        if (sz > g_madeira_max_alloc_size) g_madeira_max_alloc_size = sz;
-      }
-
-      if (idx == 1) {
-        uint64_t rbx = Frame->State.gregs[FEXCore::X86State::REG_RBX];
-        uint64_t rcx = Frame->State.gregs[FEXCore::X86State::REG_RCX];
-        if (rbx >= 0x10000ull && rbx < 0x800000000000ull) {
-          uint64_t rbx_0 = *reinterpret_cast<uint64_t*>(rbx);
-          if (rbx_0 >= 0x10000ull && rbx_0 < 0x800000000000ull) {
-            uint64_t vt = *reinterpret_cast<uint64_t*>(rbx_0);
-            if (vt >= 0x10000ull && vt < 0x800000000000ull) {
-              g_madeira_last_vt = vt;
-              g_madeira_last_vt2 = *reinterpret_cast<uint64_t*>(vt + 0x10);
-            }
-          }
-        }
-        if (rcx >= 0x10000ull && rcx < 0x800000000000ull) {
-          uint64_t bytes = *reinterpret_cast<uint64_t*>(rcx);
-          uint8_t b0 = bytes & 0xff;
-          if (b0 >= 0x20 && b0 <= 0x7e) g_madeira_last_str = bytes;
-        }
-      }
-
-      if ((n & 0xFFF) == 0) {
-        /* Wall-clock elapsed since first HOT sum — answers "is the game
-         * still alive at minute N?" Uses time(NULL) for second resolution. */
-        static volatile uint64_t s_start_secs = 0;
-        uint64_t now = (uint64_t)time(NULL);
-        if (s_start_secs == 0) s_start_secs = now;
-        uint64_t elapsed = now - s_start_secs;
-        LogMan::Msg::EFmt("[HOT sum t={}s] 6fe6={} 6feb={} 28d20={} 28d41={} 28d46={} 687f0={} 68816={} "
-                           "fmod27a={} fmod2fa={} fmod9d4={} fmod9e3={} fmodNear={} "
-                           "max_alloc=0x{:x} crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "
-                           "last_vt=0x{:x} vt2=0x{:x} last_str=0x{:x}",
-                           elapsed,
-                           g_madeira_hot_count[0], g_madeira_hot_count[1], g_madeira_hot_count[2],
-                           g_madeira_hot_count[3], g_madeira_hot_count[4], g_madeira_hot_count[5],
-                           g_madeira_hot_count[6],
-                           g_madeira_hot_count[7], g_madeira_hot_count[8],
-                           g_madeira_hot_count[9], g_madeira_hot_count[10], g_madeira_hot_count[11],
-                           g_madeira_max_alloc_size,
-                           g_madeira_callret_min, g_madeira_callret_last, g_madeira_callret_max,
-                           g_madeira_last_vt, g_madeira_last_vt2, g_madeira_last_str);
-        /* Per-thread breakdown — dump all 4 slots so we can see which
-         * thread is leaking callret entries. Distance min→last is the
-         * "depth below high-water" — for the leaking thread this grows. */
-        for (int s = 0; s < 4; s++) {
-          if (g_madeira_thr_key[s] == 0) continue;
-          uint64_t mn = g_madeira_thr_crsp_min[s];
-          uint64_t la = g_madeira_thr_crsp_last[s];
-          uint64_t mx = g_madeira_thr_crsp_max[s];
-          uint64_t span = (la <= mx) ? (mx - la) : 0;
-          LogMan::Msg::EFmt("[HOT thr{} t={}s] frame=0x{:x} blocks={} "
-                             "crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "
-                             "leak_depth=0x{:x} last_rip=0x{:x}",
-                             s, elapsed, g_madeira_thr_key[s],
-                             g_madeira_thr_count[s], mn, la, mx, span,
-                             g_madeira_thr_last_rip[s]);
-        }
-      }
+  // Reset an out-of-range call-return stack pointer before it walks into
+  // unrelated memory; the stack only holds predictions.
+  if (Thread->CallRetStackBase) {
+    const uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+    const uint64_t End = Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+    if (Frame->State.callret_sp < Base || Frame->State.callret_sp >= End) [[unlikely]] {
+      Frame->State.callret_sp = Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
     }
   }
 
@@ -1788,31 +938,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheMissCount, 1);
   }
-  // iOS-Madeira: cache miss reached — count as true compile.
-  __sync_add_and_fetch(&g_cb_real_compiles, 1);
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
-  /* iOS-Madeira diag (Thumper desktop ILL 2026-07-06): three crashes branched
-   * to BlockTail+0x18 instead of a code entry — the published entry itself
-   * was wrong. Validate every entry against the block layout at publication
-   * time: an entry must land in [BlockBegin, Tail) and must not decode as
-   * the NOP prefill. */
-  if (CodePtr && CompiledCode.BlockBegin) {
-    uint32_t TailOff = *reinterpret_cast<uint32_t*>(CompiledCode.BlockBegin);
-    uint8_t* Tail = CompiledCode.BlockBegin + TailOff;
-    uint32_t FirstInsn = *reinterpret_cast<uint32_t*>(CodePtr);
-    if (reinterpret_cast<uint8_t*>(CodePtr) < CompiledCode.BlockBegin ||
-        reinterpret_cast<uint8_t*>(CodePtr) >= Tail || FirstInsn == 0xd503201fu) {
-      LogMan::Msg::EFmt("[fex-entry] BAD ENTRY at publication: rip=0x{:x} entry=0x{:x} "
-                        "block=0x{:x} tail_off=0x{:x} first_insn=0x{:08x}",
-                        GuestRIP, reinterpret_cast<uintptr_t>(CodePtr),
-                        reinterpret_cast<uintptr_t>(CompiledCode.BlockBegin), TailOff, FirstInsn);
-    }
-  }
   if (CodePtr == nullptr) {
     return 0;
   } else if (!DebugData) {
@@ -2059,7 +1190,6 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
   HasCustomIRHandlers = !CustomIRHandlers.empty();
   SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
-
 
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
   auto Thread = Frame->Thread;
