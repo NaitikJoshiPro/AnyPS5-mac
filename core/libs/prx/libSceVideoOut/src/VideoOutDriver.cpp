@@ -13,7 +13,11 @@
 #include "SDL_vulkan.h"
 #ifdef __APPLE__
 #include "SDL_metal.h"
+#include <atomic>
+#include <dispatch/dispatch.h>
+#include <functional>
 #include <mach/mach_time.h>
+#include <pthread.h>
 #endif
 #include "prx/libSceVideoOut/include/MainThread.hpp"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
@@ -613,6 +617,35 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
     std::optional<PadInput> padInput;
     std::optional<MouseInput> mouseInput;
     std::optional<KeyboardInput> keyboardInput;
+    // Pumps SDL's events and updates the inputs on the main thread; true on SDL_QUIT.
+    const auto pumpEvents = [&] {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) return true;
+            padInput->HandleEvent(event, window);
+            if (window.Handle() != nullptr) {
+                mouseInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                keyboardInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+            }
+        }
+        padInput->Update();
+        return false;
+    };
+#ifdef __APPLE__
+    // macOS: the presenter queues the pump on the main queue instead of waiting for it. A window
+    // drag or resize runs AppKit's modal tracking loop inside SDL_PollEvent, which would hold the
+    // presenter (and every flip) for the whole drag. The inputs are only touched on the main
+    // thread either way; the main queue is serial, so the inputs' final reset (OnMainThread below)
+    // runs after any queued pump. Without the main run loop (a host program that never called
+    // Aps5StartGuest) OnMainThread runs in place and the pump stays synchronous.
+    struct AsyncPump {
+        std::function<bool()> pump;
+        std::atomic<bool> queued {false};
+        std::atomic<bool> quit {false};
+    };
+    AsyncPump asyncPump {pumpEvents};
+    const bool pumpAsync = pthread_main_np() == 0 && OnMainThread([] { return pthread_main_np() != 0; });
+#endif
 #if APS5_ENABLE_TIMING_LOG
     std::unique_ptr<FrameTimingLog> timingLog;
 #endif
@@ -637,19 +670,27 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 }
             }
 
-            const bool quit = OnMainThread([&] {
-                SDL_Event event;
-                while (SDL_PollEvent(&event)) {
-                    if (event.type == SDL_QUIT) return true;
-                    padInput->HandleEvent(event, window);
-                    if (window.Handle() != nullptr) {
-                        mouseInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
-                        keyboardInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
-                    }
+#ifdef __APPLE__
+            bool quit = false;
+            if (pumpAsync) {
+                if (!asyncPump.queued.exchange(true, std::memory_order_acq_rel)) {
+                    dispatch_async_f(dispatch_get_main_queue(), &asyncPump, [](void* context) {
+                        auto& pump = *static_cast<AsyncPump*>(context);
+                        try {
+                            if (pump.pump()) pump.quit.store(true, std::memory_order_release);
+                        } catch (const std::exception& error) {
+                            std::fprintf(stderr, "[videoout] input event handling failed: %s\n", error.what());
+                        }
+                        pump.queued.store(false, std::memory_order_release);
+                    });
                 }
-                padInput->Update();
-                return false;
-            });
+                quit = asyncPump.quit.load(std::memory_order_acquire);
+            } else {
+                quit = OnMainThread(pumpEvents);
+            }
+#else
+            const bool quit = OnMainThread(pumpEvents);
+#endif
             if (quit) {
                 LibcRequestExit_nid_postfix(0);
                 throw ProcessShutdown{};
