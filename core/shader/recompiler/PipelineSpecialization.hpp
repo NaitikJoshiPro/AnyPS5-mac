@@ -33,6 +33,12 @@ inline constexpr std::uint32_t DescriptorIndexStride = 128u;
 inline constexpr std::uint32_t ImageModeBase = 32768u;
 inline constexpr std::uint32_t ImageModeStride = 256u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
+// Min/max reduction samplers (Metal ignores MTLSamplerDescriptor.reductionMode): per sampler s,
+// word 0 = reduction | mip filter << 2 | min LOD raw << 4 | max LOD raw << 16 and word 1 = the raw
+// LOD bias | XY mag filter << 16 | XY min filter << 18, at ReductionBase + s * ReductionWords; supplied only for reducing samplers (MSL
+// backends emulate the reduction, SPIR-V modules have no such constants).
+inline constexpr std::uint32_t ReductionBase = 57408u;
+inline constexpr std::uint32_t ReductionWords = 2u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;

@@ -260,6 +260,15 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
         if (FoldsTexelOffsets(info.samplers[index])) plan.specialization.push_back({PipelineSpecialization::FoldOffsetBase + index, unnormalized.samplers[index] ? 1u : 0u});
     }
+    for (std::uint32_t index = 0; index < info.samplers.size() && index < snapshot.samplers.size(); ++index) {
+        if ((info.samplers[index].uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) == 0u) continue;
+        const auto& words = snapshot.samplers[index].dwords;
+        const auto reduction = (words[0] >> 29u) & 3u;
+        if (reduction == 0u) continue;
+        const auto packed = reduction | (((words[2] >> 26u) & 3u) << 2u) | ((words[1] & 0xfffu) << 4u) | (((words[1] >> 12u) & 0xfffu) << 16u);
+        plan.specialization.push_back({PipelineSpecialization::ReductionBase + index * PipelineSpecialization::ReductionWords, packed});
+        plan.specialization.push_back({PipelineSpecialization::ReductionBase + index * PipelineSpecialization::ReductionWords + 1u, (words[2] & 0x3fffu) | (((words[2] >> 20u) & 0xfu) << 16u)});
+    }
     std::vector<std::uint32_t> compareStates(info.images.size());
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
         if (!info.images[index].depthCompare) continue;
