@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -222,12 +223,17 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     if (window.metalLayer != nullptr) presenter->layer = (__bridge CAMetalLayer*)window.metalLayer(window.context);
 #endif
     if (presenter->layer != nil) {
+        // Layer properties change off the main thread inside an explicit transaction (an implicit
+        // one on a thread without a run loop is never committed).
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         presenter->layer.device = device;
         presenter->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         presenter->layer.framebufferOnly = YES;
         presenter->layer.maximumDrawableCount = 3;
         presenter->layer.displaySyncEnabled = YES;
         if (width != 0u && height != 0u) presenter->layer.drawableSize = CGSizeMake(width, height);
+        [CATransaction commit];
         // Metal 4: drawables are resident through the layer's own residency set on the queue.
         [queue addResidencySet:presenter->layer.residencySet];
     }
@@ -286,7 +292,12 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     presenter->target = nil;
     presenter->width = width;
     presenter->height = height;
-    if (presenter->layer != nil) presenter->layer.drawableSize = CGSizeMake(width, height);
+    if (presenter->layer != nil) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        presenter->layer.drawableSize = CGSizeMake(width, height);
+        [CATransaction commit];
+    }
     presenter->MakeOffscreen();
 }
 
