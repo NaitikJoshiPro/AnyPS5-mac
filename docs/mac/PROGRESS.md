@@ -129,3 +129,15 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - **Next**:
     - DRAW (fresh agent, D6 draws and presentation) started; SHD moves to B6 (stage interfaces); TEX finishes Attach, the pending-storage family and image int64 atomics.
     - Open: D3 Metal twins still missing (`agc_host_import_unmap`, `agc_unit_shadow`, `agc_unchanged_cpu_stamps`, `agc_storage_baseline_settled`).
+- 2026-10-13 ~03:15: **user order: no GPU or CPU tests until the user greenlights** (gaming on the laptop). Agents code and build-check only (`nice -n 15`, -j2). Earlier, ~02:07–03:15, GPU runs were refused anyway because the user's Docker Desktop VM held load at 45–88.
+  - Last validated runs before the freeze:
+    - G3 **7/34** (from 0; `shd-g3a`).
+    - G1 181/182 (depth_fast_clear and shader_fusion now pass).
+    - G2 **38/43** on the upstream image path (`20261012T214250Z-G2_re…`).
+    - agc_driver_image_atomics64 passes, so G6 has everything but the quarantined look_back_scan.
+  - TEX handed back (`.mac-work/coord/tex-handoff.md`).
+    - The upstream image path is the default (`12dddd4ce`, not yet GPU-verified); the bring-up path is deleted after G1/G2/G4 verification.
+    - Left over: 3 pending-storage G2 tests (need GPU diagnosis), and emulated_color_compare (now SHD's: per-mode sampler uses in the reflection).
+  - DRAW: draw path, presentation (CAMetalLayer + headless) and CMASK landed. Being fixed offline: copy fallback for executable/unreadable guest memory (13 G3 tests), layered targets, the vertex_fetch ABI check, dual source, stencil export.
+  - SHD: B6 vertex/fragment emission plus rect lists; corpus 313/359 compile. Being fixed offline: pixel LDS, wave64 pixel reduction, draw offsets. Also the GDS append bug.
+  - Quarantined: agc_driver_look_back_scan (20 s GPU batch timeout, machine recovered; fix `28a79003` awaiting a supervised rerun).
