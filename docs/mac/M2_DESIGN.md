@@ -437,3 +437,18 @@ Reflection fields appended (Version 3):
 Rect lists: DRAW's vertex-ID expansion under `APS5_RECT_LIST=1` (6 host vertices per rect, the guest program runs for the rect's 3 guest vertices and the 4th corner is derived per parameter: v3 = v1 + v2 - v0 for non-flat ones), not a mesh function: the emitter wraps the guest body in a function called once per guest vertex.
 Pixel LDS (device arena for pixel stages): not supported in the first cut (throws naming B6); no G3 test needs it before the basic draws pass.
 Geometry/tessellation/mesh: rejected (KnownDrawRejection) until after G3.
+
+### TEX results: D4 textures, B4 MSL images, D5 descriptors/samplers/pipelines (2026-10-13)
+
+- **Image path:** the upstream twins are the default: Texture.mm, ShaderResources.mm (with a `MetalImagesOnly` mode), Sampler.mm, PlaceholderImages.mm, TextureDetiler.mm (MSL kernels), UnitShadow.mm and GpuColorTransfer.mm. They run on Metal through the `Metal::Vk` shim (MetalVulkanImages.mm). `ImageCache::Attach` builds the image Context, and `ImageBindings` prepares, writes and commits each dispatch's table entries. `APS5_METAL_UPSTREAM_IMAGES=0` keeps the bring-up path (MetalTextures.mm's CPU detile and re-upload) until the flipped default is verified on G1/G2/G4. After that, the bring-up path is deleted in its own commit.
+- **MSL images (B4):** sampling, gathers, loads and stores, queries, 32-bit atomics and 64-bit atomics (atomicLocks table) are implemented, as are bindless tables, BVH, emulated depth compare and min/max reduction. Min/max is emulated in the shader because Metal ignores `reductionMode` on M3 (ReductionBase function constants). Heap elements are remapped by `DescriptorIndex` function constants.
+- **Pipelines (D5):** `PipelineCache` (MetalPipelineCache.h) gives `Compute`, `Render(RenderPipelineRequest)` and `DepthStencil(DepthStencilRequest)`, plus `Prepare*` for background compiles. It keeps an MTL4Archive per GPU and OS build, which is skipped under shader validation. On the second run, 0 pipelines compile (agc_metal_pipeline_cache).
+- **Last verified (upstream path, `--validation`, log .mac-work/logs/gpu-suite/20261012T214250Z-G2_re…):**
+  - G2: 38/43 (baseline 0/43, bring-up path 32–33/43).
+  - G1 image tests: 4/4.
+  - agc_driver_image_atomics64: passes.
+  - D3 twins: 3 pass; agc_unit_shadow then skipped (test-context fix committed, not yet run).
+- **Open:**
+  - dcc_keys_first_write, depth_compare_copy and storage_one_slice_alias: pending-storage interplay.
+  - The two emulated_color_compare tests: MSL keeps unselected modes' sampler references, so a reflection field is needed.
+  - The flipped default and the test-context fixes are not yet GPU-verified (tests paused by the user).
