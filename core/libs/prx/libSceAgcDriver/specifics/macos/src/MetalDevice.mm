@@ -420,6 +420,8 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
     static const bool log = std::getenv("APS5_METAL_TEARDOWN_LOG") != nullptr;
     Metal::TeardownReport report;
     report.atExit = atExit;
+    // Sync() drops the wrappers itself once the recorder is idle: count them before it runs.
+    const auto heldWrappers = wrappers.size();
     @autoreleasepool {
         // 1. Every submitted batch completes before anything it may use is released. A Sync that
         //    throws (a fault record, a failed completion) has still retired the batches before the
@@ -441,7 +443,7 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         context.recorder = nullptr;
         // 3. The guest-memory wrappers (no-copy buffers over guest and static __DATA pages) and
         //    the cached BDA table holding their addresses.
-        report.wrappersDropped = wrappers.size();
+        report.wrappersDropped = std::max(heldWrappers, wrappers.size());
         if (residency != nil) {
             for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
         }
