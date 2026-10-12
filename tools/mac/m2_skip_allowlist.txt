@@ -19,3 +19,4 @@ agc_driver_pipeline_optimized_readback_d16_fast | graphics pipeline libraries ar
 agc_driver_pipeline_optimized_readback_d32 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_d32_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_conservative_rasterization | has no VK_EXT_conservative_rasterization | metal-conservative-rasterization
+agc_driver_interpolation_f16 | the device has no fragmentShaderBarycentric | metal-per-vertex-values
