@@ -9,6 +9,7 @@
 #elif defined(__APPLE__)
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #else
 // Linux
 #include <stdlib.h>
@@ -142,7 +143,24 @@ inline void VirtualFree(void* Ptr, size_t Size) {
   FEXCore::Allocator::munmap(Ptr, Size);
 }
 inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
+#ifdef __APPLE__
+  // Callers rely on Linux's MADV_DONTNEED, which zero-fills private anonymous pages (stale lookup-cache and
+  // call-return entries would point at code buffers that have been reused). Darwin's MADV_DONTNEED keeps the
+  // contents, so zero the whole pages with MADV_ZERO and the partial pages at either end with memset.
+  const uintptr_t Begin = reinterpret_cast<uintptr_t>(Ptr);
+  const uintptr_t End = Begin + Size;
+  const uintptr_t PageSize = static_cast<uintptr_t>(getpagesize());
+  const uintptr_t AlignedBegin = (Begin + PageSize - 1) & ~(PageSize - 1);
+  const uintptr_t AlignedEnd = End & ~(PageSize - 1);
+  if (AlignedBegin >= AlignedEnd || ::madvise(reinterpret_cast<void*>(AlignedBegin), AlignedEnd - AlignedBegin, MADV_ZERO) != 0) {
+    memset(Ptr, 0, Size);
+    return;
+  }
+  memset(Ptr, 0, AlignedBegin - Begin);
+  memset(reinterpret_cast<void*>(AlignedEnd), 0, End - AlignedEnd);
+#else
   ::madvise(reinterpret_cast<void*>(Ptr), Size, MADV_DONTNEED);
+#endif
 }
 inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
   int prot {PROT_NONE};
