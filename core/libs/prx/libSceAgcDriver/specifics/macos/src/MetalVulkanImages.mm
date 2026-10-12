@@ -340,7 +340,12 @@ VkResult CreateImageView(VkDevice, const VkImageViewCreateInfo* info, const VkAl
     const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
     const auto layerTotal = texture.textureType == MTLTextureType3D ? 1u : texture.arrayLength;
     const auto layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS ? layerTotal - range.baseArrayLayer : range.layerCount;
-    const auto swizzle = MTLTextureSwizzleChannelsMake(SwizzleOf(info->components.r, MTLTextureSwizzleRed), SwizzleOf(info->components.g, MTLTextureSwizzleGreen), SwizzleOf(info->components.b, MTLTextureSwizzleBlue), SwizzleOf(info->components.a, MTLTextureSwizzleAlpha));
+    auto swizzle = MTLTextureSwizzleChannelsMake(SwizzleOf(info->components.r, MTLTextureSwizzleRed), SwizzleOf(info->components.g, MTLTextureSwizzleGreen), SwizzleOf(info->components.b, MTLTextureSwizzleBlue), SwizzleOf(info->components.a, MTLTextureSwizzleAlpha));
+    // B4G4R4A4_UNORM_PACK16 is Metal's ABGR4Unorm with red and blue exchanged (MetalTextureFormat.mm).
+    if (info->format == VK_FORMAT_B4G4R4A4_UNORM_PACK16) {
+        const auto exchange = [](MTLTextureSwizzle channel) { return channel == MTLTextureSwizzleRed ? MTLTextureSwizzleBlue : channel == MTLTextureSwizzleBlue ? MTLTextureSwizzleRed : channel; };
+        swizzle = MTLTextureSwizzleChannelsMake(exchange(swizzle.red), exchange(swizzle.green), exchange(swizzle.blue), exchange(swizzle.alpha));
+    }
     auto viewFormat = Required(info->format);
     if (type == MTLTextureType3D && viewFormat == MTLPixelFormatDepth16Unorm) viewFormat = MTLPixelFormatR16Unorm;
     if (type == MTLTextureType3D && viewFormat == MTLPixelFormatDepth32Float) viewFormat = MTLPixelFormatR32Float;
