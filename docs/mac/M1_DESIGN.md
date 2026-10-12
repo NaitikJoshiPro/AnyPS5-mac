@@ -281,6 +281,16 @@ For stack arguments: 14 exports take more than 8 integer-class arguments (`.mac-
 - **Size:** libc 60, libkernel and runner 60, tests 100 LOC; 1 d.
 - **Dependencies:** none. **Overlap:** D, G (Bridge.cpp).
 
+**Result (2026-10-12):**
+- **Images:** registered eagerly, not at `RegisterMainImage`: `Aps5RegisterGuestImage` calls libc's `GuestAllocations::RegisterRunnerImage` (L/libc/src/GuestAllocations.cpp), so registration does not depend on when the registry first registers the dyld images. Pages are 16 KiB host pages; segments sharing one get the union of their access (the fixtures' 4 KiB-linked ELFs put `.text` and `.data` in one page).
+- **Stubs:** one hook in libc instead of a third `Aps5SetGuestLoader` callback, because libc needs it too: the runner sets `Aps5SetBridgeCallable_nid_no_patch` (R/GuestProgram.cpp), and `LibcGuestCallable_nid_no_patch` (L/libc/src/specifics/macos/GuestImages.cpp) serves libkernel's `dlsym` path (DynamicLoader.cpp) and libc's `set_terminate`/`get_terminate` (`std::abort` maps to libc's own `abort` export). `get_new_handler` needs nothing: its default is null.
+- **`Bridge::StubFor(address, name)`:** one stub per native address, so `dlsym` and imports agree. Data comes back as its address. 0 for anything outside the PS5 libraries (any `*.prx`, not only the ones the runner opened), so `dlsym(0, "strlen")` skips libSystem's `strlen` and finds libc.prx's by NID. Stubs can now be added while guest threads run: a recursive lock, `functions.reserve(StubCapacity)`, and an acquire-loaded `stubCount` as `Call`'s bound. D2 can use `StubFor` for native function pointers it returns to the guest.
+- **Arena:** reserved on macOS as on Linux (`SeedAppleUsedRanges`: `mach_vm_region` over [8 GiB, 0xFC_0000_0000), free gaps reserved in 1 GiB `mach_vm_map(VM_FLAGS_FIXED, VM_PROT_NONE)` chunks, about 2 ms). On this M3 (macOS 27.0.1) the host already holds the shared region (6 to 63 GiB), guard ranges up to 448 GiB and malloc's regions between 448 and 512 GiB; 536 GiB stays for the guest. DirectMemory's Linux arena paths (fixed, hinted, anywhere, unmap) now also run on Apple. A fixed mapping below 4 GiB throws naming `__PAGEZERO`. AMM works: `guest_amm_placement` (which skipped before) and `guest_ampr_markers`'s AMM checks now run on every host with no macOS skip or gate, and pass on arm64.
+- **Extra:** on arm64, guest `PROT_CPU_EXEC` no longer makes host pages executable (`LinuxProtFromSce`). x86 bytes must fault into the runner, and macOS refuses W+X pages outside MAP_JIT (EACCES, measured).
+- **Tests:**
+  - fixtures `image-protect` and `dlsym-host` (T/image_protect.cpp, T/dlsym_host.cpp); `fex_fixtures` passes with 23 programs.
+  - `ctest -LE "gpu|slow"`: 458 tests, 2 failures. `fex_bridge_tables` was already failing (D1/D2). `write_watch_threads` timed out at load average 66; it links neither libc nor libkernel.
+
 ### F. Code cache, AOT discovery, coverage report
 **DiskCache wiring (after R):**
 - In R/GuestCpu.cpp:392-397, set `DiskCache=1` and the cache directory before `CreateNewContext`. The directory is `~/Library/Caches/AnyPS5/<title id>/fex`, or a test directory under the build.
