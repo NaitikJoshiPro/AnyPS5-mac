@@ -373,6 +373,8 @@ void GetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkForm
     if (!compressed && !depth) features |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
     if (!compressed && !depth && !srgb && !packed16 && !sharedExponent) features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
     if (depth) features |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // Texture atomics: R32Uint/R32Sint (32-bit), RG32Uint (64-bit min/max, the R64 formats).
+    if (entry->metal == MTLPixelFormatR32Uint || entry->metal == MTLPixelFormatR32Sint || entry->metal == MTLPixelFormatRG32Uint) features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
     properties->optimalTilingFeatures = features;
 }
 
