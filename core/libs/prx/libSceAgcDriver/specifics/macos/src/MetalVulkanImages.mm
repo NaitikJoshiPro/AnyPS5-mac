@@ -255,6 +255,12 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
         FailImages("unknown image type");
     }
     descriptor.pixelFormat = Required(info->format);
+    // Metal depth textures are 2D or cube only: a 3D "depth" image (the comparison heap's 3D
+    // placeholder, which MSL declares texture3d<float>) is its color twin.
+    if (info->imageType == VK_IMAGE_TYPE_3D) {
+        if (descriptor.pixelFormat == MTLPixelFormatDepth16Unorm) descriptor.pixelFormat = MTLPixelFormatR16Unorm;
+        if (descriptor.pixelFormat == MTLPixelFormatDepth32Float) descriptor.pixelFormat = MTLPixelFormatR32Float;
+    }
     descriptor.width = info->extent.width;
     descriptor.height = std::max(info->extent.height, 1u);
     descriptor.depth = std::max(info->extent.depth, 1u);
@@ -334,7 +340,10 @@ VkResult CreateImageView(VkDevice, const VkImageViewCreateInfo* info, const VkAl
     const auto layerTotal = texture.textureType == MTLTextureType3D ? 1u : texture.arrayLength;
     const auto layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS ? layerTotal - range.baseArrayLayer : range.layerCount;
     const auto swizzle = MTLTextureSwizzleChannelsMake(SwizzleOf(info->components.r, MTLTextureSwizzleRed), SwizzleOf(info->components.g, MTLTextureSwizzleGreen), SwizzleOf(info->components.b, MTLTextureSwizzleBlue), SwizzleOf(info->components.a, MTLTextureSwizzleAlpha));
-    id<MTLTexture> result = [texture newTextureViewWithPixelFormat:Required(info->format) textureType:type levels:NSMakeRange(range.baseMipLevel, levels) slices:NSMakeRange(type == MTLTextureType3D ? 0u : range.baseArrayLayer, type == MTLTextureType3D ? 1u : layers) swizzle:swizzle];
+    auto viewFormat = Required(info->format);
+    if (type == MTLTextureType3D && viewFormat == MTLPixelFormatDepth16Unorm) viewFormat = MTLPixelFormatR16Unorm;
+    if (type == MTLTextureType3D && viewFormat == MTLPixelFormatDepth32Float) viewFormat = MTLPixelFormatR32Float;
+    id<MTLTexture> result = [texture newTextureViewWithPixelFormat:viewFormat textureType:type levels:NSMakeRange(range.baseMipLevel, levels) slices:NSMakeRange(type == MTLTextureType3D ? 0u : range.baseArrayLayer, type == MTLTextureType3D ? 1u : layers) swizzle:swizzle];
     if (result == nil) {
         *view = VK_NULL_HANDLE;
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
