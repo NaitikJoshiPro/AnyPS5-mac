@@ -58,3 +58,10 @@ Context: the user provides no titles ("make do with whatever you have"); commerc
 - SuperTuxKart `STKT00001` (project-oops/oops-apps `c590060e`), port code Apache-2.0 OR MIT, STK GPL-3.0+, stk-assets with per-folder licences. Mesa radeonsi command buffers via `sceAgcDriverSubmitDcb`. Never run upstream. sha256 `09bbc989…ec49` (GitHub digest; tag is rebuilt, digest saved beside it).
 Excluded for licence/provenance: ccleste, Yamagi Quake II demo data, Quake3e, vkQuake (no data/licence), Unity-based titles, FSR4 Showcase, anything needing commercial data or ROMs.
 These are test data run as guests, never linked into our code, so their GPL-3.0 licences don't affect the project's GPL-2.0-only code. Consequences: merge upstream PR #4030 when M3 starts; shader compilation must not stall a submission for ~2 s (compile in the background at registration, persistent cache); `tools/unself.py` must accept either fSELF magic for either file (the two SDKs swap them).
+
+## D15: Build and test conventions for the arm64 fork (2026-10-12)
+- The full macOS build defaults to arm64 (top-level CMakeLists.txt); x86_64 stays selectable with `-DCMAKE_OSX_ARCHITECTURES=x86_64`. Reason: this fork's product is arm64-only (D2).
+- GPU tests carry an explicit per-test `gpu` label (468 tests in libSceAgcDriver, libSceAgc, libSceVideoOut): `ctest -LE gpu` is the non-GPU suite; `-L gpu` is run one at a time with timeouts only (GPU safety). A directory `LABELS` property is not enough: CTest ignored it for tests that set `WORKING_DIRECTORY`.
+- `no_x86_build_path` (the M0 "no x86 on the arm64 path" proof, ~12 min on all cores) carries the `slow` label: routine runs use `-LE "gpu|slow"`, milestone ends run it.
+- Guest-state operations (getcontext/setcontext/makecontext/swapcontext, sigsetjmp/siglongjmp, the sceKernelRaiseException register snapshot) on arm64 go through runner hooks; without a runner they validate arguments and throw a `std::runtime_error` naming the function, and their tests skip with that reason (M1 package G wires them).
+- Agents sharing one worktree commit only named paths (`git commit -- <paths>`), because the index is shared.
