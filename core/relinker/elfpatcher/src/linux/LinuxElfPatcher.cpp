@@ -93,6 +93,26 @@ std::vector<std::uint8_t> LinuxElfPatcher::Patch(
     const std::uint16_t phEntSize = *reinterpret_cast<const std::uint16_t*>(buf.data() + kEhdrPhEntSizeOffset);
     const std::uint16_t phNum = *reinterpret_cast<const std::uint16_t*>(buf.data() + kEhdrPhNumOffset);
 
+    // A PS5 SDK executable has spare program header slots for the headers written here; one built with
+    // another toolchain (homebrew) may have none, but its table is usually followed by zero padding up to
+    // the first segment's file data. Zero slots that no segment's file range touches extend the table.
+    std::uint16_t phSlots = phNum;
+    if (phEntSize >= 56 && phOff >= 64) {
+        const auto usable = [&](const std::uint64_t start) {
+            if (start > buf.size() || phEntSize > buf.size() - start)
+                return false;
+            for (const auto& ph : originalHeaders)
+                if (ph.FileSize != 0 && ph.Offset < start + phEntSize && start < ph.Offset + ph.FileSize)
+                    return false;
+            return std::all_of(buf.begin() + static_cast<std::ptrdiff_t>(start), buf.begin() + static_cast<std::ptrdiff_t>(start + phEntSize),
+                               [](const std::uint8_t byte) { return byte == 0; });
+        };
+        while (phSlots < std::numeric_limits<std::uint16_t>::max()
+               && phOff <= std::numeric_limits<std::uint64_t>::max() / 2 - static_cast<std::uint64_t>(phSlots) * phEntSize
+               && usable(phOff + static_cast<std::uint64_t>(phSlots) * phEntSize))
+            ++phSlots;
+    }
+
     const auto alignBuf = [](std::vector<std::uint8_t>& b, std::size_t alignment) {
         while (b.size() % alignment != 0)
             b.push_back(0);
@@ -192,7 +212,7 @@ std::vector<std::uint8_t> LinuxElfPatcher::Patch(
     ProgramHeaderLayoutRequest layoutRequest{};
     layoutRequest.PhOff = phOff;
     layoutRequest.PhEntSize = phEntSize;
-    layoutRequest.PhNum = phNum;
+    layoutRequest.PhNum = phSlots;
     layoutRequest.OriginalHeaders = originalHeaders;
     layoutRequest.ExtraBlockOffset = extraBlockOff;
     layoutRequest.ExtraBlockVaddr = extraBlockVaddr;
