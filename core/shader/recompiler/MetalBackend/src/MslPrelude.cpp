@@ -17,7 +17,7 @@ struct Aps5DriverData {
     uint workgroupBase[3];
     uint loopGuardLimit;
     ulong faultBuffer;
-    uint reserved[2];
+    ulong atomicLocks;
 };
 
 )";

@@ -908,7 +908,29 @@ std::optional<MslAtomicOp> BufferAtomicOp(IrOpcode opcode) {
     }
 }
 
-bool IsBufferAtomic64(IrOpcode opcode) {
+std::optional<MslAtomicOp> BufferAtomic64Op(IrOpcode opcode) {
+    switch (opcode) {
+    case IrOpcode::BufferAtomicSwap64: return MslAtomicOp::Swap;
+    case IrOpcode::BufferAtomicCmpSwap64: return MslAtomicOp::CmpSwap;
+    case IrOpcode::BufferAtomicIAdd64: return MslAtomicOp::Add;
+    case IrOpcode::BufferAtomicISub64: return MslAtomicOp::Sub;
+    case IrOpcode::BufferAtomicSMin64: return MslAtomicOp::SMin;
+    case IrOpcode::BufferAtomicUMin64: return MslAtomicOp::UMin;
+    case IrOpcode::BufferAtomicSMax64: return MslAtomicOp::SMax;
+    case IrOpcode::BufferAtomicUMax64: return MslAtomicOp::UMax;
+    case IrOpcode::BufferAtomicAnd64: return MslAtomicOp::And;
+    case IrOpcode::BufferAtomicOr64: return MslAtomicOp::Or;
+    case IrOpcode::BufferAtomicXor64: return MslAtomicOp::Xor;
+    case IrOpcode::BufferAtomicFCmpSwap64: return MslAtomicOp::FCmpSwap;
+    case IrOpcode::BufferAtomicFMin64: return MslAtomicOp::FMin;
+    case IrOpcode::BufferAtomicFMax64: return MslAtomicOp::FMax;
+    case IrOpcode::BufferAtomicInc64: return MslAtomicOp::Inc;
+    case IrOpcode::BufferAtomicDec64: return MslAtomicOp::Dec;
+    default: return std::nullopt;
+    }
+}
+
+[[maybe_unused]] bool IsBufferAtomic64(IrOpcode opcode) {
     switch (opcode) {
     case IrOpcode::BufferAtomicSwap64:
     case IrOpcode::BufferAtomicCmpSwap64:
@@ -944,8 +966,9 @@ bool AtomicZeroSkipEnabled() {
     return !disabled;
 }
 
-// EmitRuntimeBufferAtomic (32-bit): arguments {V#, index, offset, soffset, [desired,] value, exec}.
-void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicOp op) {
+// EmitRuntimeBufferAtomic: arguments {V#, index, offset, soffset, [desired,] value, exec}. 64-bit
+// atomics (`wide`) run under the lock table of package B3 (MslDeviceAtomic64).
+void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicOp op, bool wide = false) {
     const auto& memory = state.Memory(instruction);
     if (memory.kind != ResourceKind::Buffer) state.Fail(instruction, "must access a buffer resource");
     state.RequirePrelude(MslPreludeChunk::RuntimeBuffer);
@@ -955,21 +978,30 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
     const auto comparator = compares ? state.Arg(instruction, count - 2u) : std::string("0u");
     const IrValue* operand = instruction.Argument(count - 2u)->Resolve();
     const bool nonZeroImmediate = operand->HasImmediate() && operand->Type() == IrType::U32 && operand->ImmediateU32() != 0u;
-    const bool zeroIdentity = AtomicZeroSkipEnabled() && HasZeroIdentity(op) && !nonZeroImmediate;
+    const bool zeroIdentity = !wide && AtomicZeroSkipEnabled() && HasZeroIdentity(op) && !nonZeroImmediate;
     const bool zeroSkip = zeroIdentity && !instruction.HasUses();
     const auto result = state.Name(instruction);
-    state.Line(result + " = 0u;");
+    const std::uint32_t bytes = wide ? 8u : 4u;
+    const std::string mask = wide ? "7u" : "3u";
+    const std::string shift = wide ? "3u" : "2u";
+    state.Line(result + " = " + MslType(instruction.Type()) + "(0);");
     auto active = ActiveArgument(state, instruction);
     if (zeroSkip) active = "(" + active + " && " + value + " != 0u)";
     state.Line("if (" + active + ") {");
     state.Indent();
     const auto descriptor = MakeDescriptor(state, instruction, true);
     const auto access = state.Temporary("aps5_a");
-    state.Line("const Aps5BufferAccess " + access + " = " + AccessExpression(state, instruction, descriptor, 0u, 4u) + ";");
+    state.Line("const Aps5BufferAccess " + access + " = " + AccessExpression(state, instruction, descriptor, 0u, bytes) + ";");
     state.Line("if (" + access + ".inBounds) {");
     state.Indent();
     const auto apply = [&](const std::string& object) {
         const auto fence = MslAtomicFence();
+        if (wide) {
+            const auto address = object.substr(object.find('(') + 1u, object.rfind(')') - object.find('(') - 1u);
+            state.Line(result + " = " + MslDeviceAtomic64(state, instruction, op, address, value, compares ? comparator : std::string()) + ";");
+            if (!fence.empty()) state.Line(fence);
+            return;
+        }
         const auto operation = MslAtomic32Expression(op, object, value, comparator);
         if (!zeroIdentity || zeroSkip) {
             state.Line(result + " = " + operation + ";");
@@ -985,14 +1017,15 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         const auto buffer = state.TableBuffer(DescriptorBindingKind::Buffers, element);
         const auto byte = state.Temporary("aps5_ab");
         state.Line("const uint " + byte + " = " + access + ".byte + " + state.MemoryByteOffset(element) + ";");
-        state.Line("if ((" + byte + " & 3u) != 0u) {");
+        state.Line("if ((" + byte + " & " + mask + ") != 0u) {");
         state.Indent();
-        state.Line(MslRecordFault(state, 7u, descriptor.base + " + ulong(" + access + ".byte)", "4u", MslB5Pc(instruction)));
+        state.Line(MslRecordFault(state, 7u, descriptor.base + " + ulong(" + access + ".byte)", std::to_string(bytes) + "u", MslB5Pc(instruction)));
         if (MslBdaStops(state)) state.Line("return;");
         state.Outdent();
-        state.Line("} else if ((" + byte + " >> 2u) < (" + buffer + ".bytes >> 2u)) {");
+        state.Line("} else if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
         state.Indent();
-        apply("(reinterpret_cast<device atomic_uint*>(" + buffer + ".address) + (" + byte + " >> 2u))");
+        if (wide) apply("(" + buffer + ".address + ulong(" + byte + "))");
+        else apply("(reinterpret_cast<device atomic_uint*>(" + buffer + ".address) + (" + byte + " >> 2u))");
         state.Outdent();
         state.Line("}");
     } else {
@@ -1003,17 +1036,18 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         state.Line("bool " + overflow + " = false;");
         state.Line("const ulong " + address + " = aps5_bda_add(" + descriptor.bda + ", " + descriptor.base + ", ulong(" + access + ".byte), false, " + descriptor.pc + ", " + overflow + ");");
         MslB5StopIf(state, overflow);
-        state.Line("if ((" + address + " & 3ul) != 0ul) {");
+        state.Line("if ((" + address + " & " + mask + "l) != 0ul) {");
         state.Indent();
-        state.Line("aps5_bda_fault(" + descriptor.bda + ", 7u, " + address + ", 4u, " + descriptor.pc + ");");
+        state.Line("aps5_bda_fault(" + descriptor.bda + ", 7u, " + address + ", " + std::to_string(bytes) + "u, " + descriptor.pc + ");");
         if (descriptor.stops) state.Line("return;");
         state.Outdent();
         state.Line("} else {");
         state.Indent();
-        state.Line("const ulong " + physical + " = aps5_bda_lookup(" + descriptor.bda + ", " + address + ", 4u, " + descriptor.pc + ", 3u, true);");
+        state.Line("const ulong " + physical + " = aps5_bda_lookup(" + descriptor.bda + ", " + address + ", " + std::to_string(bytes) + "u, " + descriptor.pc + ", 3u, true);");
         state.Line("if (" + physical + " != 0ul) {");
         state.Indent();
-        apply("reinterpret_cast<device atomic_uint*>(" + physical + ")");
+        if (wide) apply("(" + physical + ")");
+        else apply("reinterpret_cast<device atomic_uint*>(" + physical + ")");
         state.Line("aps5_bda_note_write(" + descriptor.bda + ".faults, " + address + ");");
         state.Outdent();
         state.Line("}");
@@ -1071,7 +1105,10 @@ bool EmitMslBufferInstruction(MslEmitterState& state, const IrValue& instruction
         BufferAtomic(state, instruction, *op);
         return true;
     }
-    if (IsBufferAtomic64(instruction.Opcode())) state.Fail(instruction, "64-bit buffer atomics are not implemented in the MSL backend yet (Apple GPUs have only 64-bit min/max: the emulation is work package B3's Atomics64 chunk)");
+    if (const auto op = BufferAtomic64Op(instruction.Opcode())) {
+        BufferAtomic(state, instruction, *op, true);
+        return true;
+    }
     return EmitMslAddressInstruction(state, instruction);
 }
 

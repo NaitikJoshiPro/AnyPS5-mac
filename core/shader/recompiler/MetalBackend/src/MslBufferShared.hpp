@@ -9,6 +9,7 @@
 
 #include "MetalBackend/MslEmitterState.hpp"
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -62,6 +63,9 @@ struct MslB5Storage {
 // (plus the lock dword when SpirvRequirements::ldsLock), or the workgroup's slice of the device
 // arena (`device uint* aps5_lds`) when it exceeds threadgroup memory. MslB5Lds forwards here.
 [[nodiscard]] MslB5Storage MslLdsStorage(MslEmitterState& state);
+// Package B3: runs `critical` (a plain read-modify-write of LDS) under the LDS lock, once per
+// invocation that reaches this point (SpirvRequirements::ldsLock programs: LockedLdsUpdate).
+void MslLdsLocked(MslEmitterState& state, const IrValue& instruction, const std::function<void()>& critical);
 // An `atomic_uint*` expression for LDS dword `index` in the LDS's address space.
 [[nodiscard]] std::string MslLdsAtomicPointer(MslEmitterState& state, std::string_view index);
 

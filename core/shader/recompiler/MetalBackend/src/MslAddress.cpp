@@ -332,28 +332,83 @@ std::optional<MslAtomicOp> AddressAtomicOp(IrOpcode opcode) {
     }
 }
 
-bool IsAddressAtomic64(IrOpcode opcode) {
+std::optional<MslAtomicOp> AddressAtomic64Op(IrOpcode opcode) {
     switch (opcode) {
-    case IrOpcode::AddressAtomicSwap64:
-    case IrOpcode::AddressAtomicCmpSwap64:
-    case IrOpcode::AddressAtomicIAdd64:
-    case IrOpcode::AddressAtomicISub64:
-    case IrOpcode::AddressAtomicSMin64:
-    case IrOpcode::AddressAtomicUMin64:
-    case IrOpcode::AddressAtomicSMax64:
-    case IrOpcode::AddressAtomicUMax64:
-    case IrOpcode::AddressAtomicAnd64:
-    case IrOpcode::AddressAtomicOr64:
-    case IrOpcode::AddressAtomicXor64:
-    case IrOpcode::AddressAtomicFCmpSwap64:
-    case IrOpcode::AddressAtomicFMin64:
-    case IrOpcode::AddressAtomicFMax64:
-    case IrOpcode::AddressAtomicInc64:
-    case IrOpcode::AddressAtomicDec64:
-        return true;
-    default:
-        return false;
+    case IrOpcode::AddressAtomicSwap64: return MslAtomicOp::Swap;
+    case IrOpcode::AddressAtomicCmpSwap64: return MslAtomicOp::CmpSwap;
+    case IrOpcode::AddressAtomicIAdd64: return MslAtomicOp::Add;
+    case IrOpcode::AddressAtomicISub64: return MslAtomicOp::Sub;
+    case IrOpcode::AddressAtomicSMin64: return MslAtomicOp::SMin;
+    case IrOpcode::AddressAtomicUMin64: return MslAtomicOp::UMin;
+    case IrOpcode::AddressAtomicSMax64: return MslAtomicOp::SMax;
+    case IrOpcode::AddressAtomicUMax64: return MslAtomicOp::UMax;
+    case IrOpcode::AddressAtomicAnd64: return MslAtomicOp::And;
+    case IrOpcode::AddressAtomicOr64: return MslAtomicOp::Or;
+    case IrOpcode::AddressAtomicXor64: return MslAtomicOp::Xor;
+    case IrOpcode::AddressAtomicFCmpSwap64: return MslAtomicOp::FCmpSwap;
+    case IrOpcode::AddressAtomicFMin64: return MslAtomicOp::FMin;
+    case IrOpcode::AddressAtomicFMax64: return MslAtomicOp::FMax;
+    case IrOpcode::AddressAtomicInc64: return MslAtomicOp::Inc;
+    case IrOpcode::AddressAtomicDec64: return MslAtomicOp::Dec;
+    default: return std::nullopt;
     }
+}
+
+// AddressAtomic (64-bit), FlatAtomicNext64 / ApertureAtomic64: global memory through the lock table
+// of package B3, the shared aperture under the LDS lock, scratch as a plain update.
+void AddressAtomic64(MslEmitterState& state, const IrValue& instruction, MslAtomicOp op) {
+    const auto& memory = state.Memory(instruction);
+    if (memory.kind != ResourceKind::Flat && memory.kind != ResourceKind::Global) state.Fail(instruction, "must access a physical address resource");
+    const auto result = state.Name(instruction);
+    state.Line(result + " = " + MslType(instruction.Type()) + "(0);");
+    state.Line("if (" + Active(state, instruction) + ") {");
+    state.Indent();
+    const auto access = Prepare(state, instruction, memory);
+    const auto address = GuestAddress(state, instruction, memory, access);
+    const bool compares = op == MslAtomicOp::CmpSwap || op == MslAtomicOp::FCmpSwap;
+    const auto value = "ulong(" + state.Arg(instruction, 3u) + ")";
+    const auto comparator = compares ? "ulong(" + state.Arg(instruction, 4u) + ")" : std::string("0ul");
+    state.RequirePrelude(MslPreludeChunk::RuntimeBuffer);
+    state.RequirePrelude(MslPreludeChunk::Atomics64);
+    const auto global = [&] {
+        const auto physical = state.Temporary("aps5_pa");
+        state.Line("const ulong " + physical + " = aps5_bda_atomic_address(" + access.bda + ", " + address + ", 8u, 2u, " + access.pc + ");");
+        state.Line("if (" + physical + " != 0ul) {");
+        state.Indent();
+        state.Line(result + " = " + MslDeviceAtomic64(state, instruction, op, physical, value, compares ? comparator : std::string()) + ";");
+        if (const auto fence = MslAtomicFence(); !fence.empty()) state.Line(fence);
+        state.Line("aps5_bda_note_write(" + access.bda + ".faults, " + address + ");");
+        state.Outdent();
+        state.Line("}");
+    };
+    if (!RoutesApertures(state, memory)) {
+        global();
+    } else {
+        const auto aperture = [&](bool shared) {
+            const auto low = state.Temporary("aps5_lo");
+            state.Line("const uint " + low + " = uint(" + address + ");");
+            state.Line("if ((" + low + " & 7u) != 0u) " + MslRecordFault(state, 7u, address, "8u", access.pc));
+            const auto storage = shared ? MslB5Lds(state) : MslB5Scratch(state);
+            if (storage.words.empty()) return;
+            state.Line("else if ((" + low + " >> 2u) + 1u < " + std::to_string(storage.dwords) + "u) {");
+            state.Indent();
+            const auto update = [&] {
+                const auto index = "(" + low + " >> 2u)";
+                state.Line(result + " = ulong(" + storage.words + "[" + index + "]) | (ulong(" + storage.words + "[" + index + " + 1u]) << 32u);");
+                const auto next = state.Temporary("aps5_n64");
+                state.Line("const ulong " + next + " = aps5_atomic64_next(" + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + result + ", " + value + ", " + comparator + ");");
+                state.Line(storage.words + "[" + index + "] = uint(" + next + ");");
+                state.Line(storage.words + "[" + index + " + 1u] = uint(" + next + " >> 32u);");
+            };
+            if (shared) MslLdsLocked(state, instruction, update);
+            else update();
+            state.Outdent();
+            state.Line("}");
+        };
+        RouteFlat(state, address, [&] { aperture(true); }, [&] { aperture(false); }, global);
+    }
+    state.Outdent();
+    state.Line("}");
 }
 
 // AddressAtomic (32-bit): arguments {address, low, high, value, [comparator,] exec}.
@@ -395,10 +450,15 @@ void AddressAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomic
             if (storage.words.empty()) return;
             state.Line("else if ((" + low + " >> 2u) < " + std::to_string(storage.dwords) + "u) {");
             state.Indent();
-            if (shared) {
-                if (state.requirements.ldsLock) state.Fail(instruction, "a 32-bit flat atomic on LDS in a program with locked 64-bit LDS atomics needs the LDS lock (work package B3)");
-                state.Line(result + " = " + MslAtomic32Expression(op, "(reinterpret_cast<threadgroup atomic_uint*>(" + storage.words + ") + (" + low + " >> 2u))", value, comparator) + ";");
-                state.Line("atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);");
+            if (shared && state.requirements.ldsLock) {
+                // Every LDS atomic of a program with 64-bit LDS atomics runs under the LDS lock (B3).
+                MslLdsLocked(state, instruction, [&] {
+                    state.Line(result + " = " + storage.words + "[" + low + " >> 2u];");
+                    state.Line(storage.words + "[" + low + " >> 2u] = aps5_atomic_next(" + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + result + ", " + value + ", " + comparator + ");");
+                });
+            } else if (shared) {
+                state.Line(result + " = " + MslAtomic32Expression(op, MslLdsAtomicPointer(state, low + " >> 2u"), value, comparator) + ";");
+                state.Line("atomic_thread_fence(" + state.LdsMemoryFlags() + ", memory_order_acq_rel, thread_scope_threadgroup);");
             } else {
                 state.Line(result + " = aps5_scratch_atomic(&" + storage.words + "[" + low + " >> 2u], " + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + value + ", " + comparator + ");");
             }
@@ -458,7 +518,10 @@ bool EmitMslAddressInstruction(MslEmitterState& state, const IrValue& instructio
         AddressAtomic(state, instruction, *op);
         return true;
     }
-    if (IsAddressAtomic64(instruction.Opcode())) state.Fail(instruction, "64-bit flat/global atomics are not implemented in the MSL backend yet (Apple GPUs have only 64-bit min/max: the emulation is work package B3's Atomics64 chunk)");
+    if (const auto op = AddressAtomic64Op(instruction.Opcode())) {
+        AddressAtomic64(state, instruction, *op);
+        return true;
+    }
     return false;
 }
 

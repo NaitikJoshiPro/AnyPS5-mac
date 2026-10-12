@@ -513,6 +513,19 @@ MslB5Storage MslLdsStorage(MslEmitterState& state) {
     return {"aps5_lds", dwords};
 }
 
+void MslLdsLocked(MslEmitterState& state, const IrValue& instruction, const std::function<void()>& critical) {
+    if (!state.requirements.ldsLock) state.Fail(instruction, "an LDS update under the lock in a program without the LDS lock (work package B3)");
+    const auto storage = MslLdsStorage(state);
+    Shared shared;
+    shared.words = storage.words;
+    shared.length = U32(storage.dwords);
+    shared.space = state.LdsInDeviceMemory() ? "device" : "threadgroup";
+    shared.flags = state.LdsMemoryFlags();
+    shared.scope = "thread_scope_threadgroup";
+    shared.locked = true;
+    Locked(state, instruction, shared, critical);
+}
+
 std::string MslLdsAtomicPointer(MslEmitterState& state, std::string_view index) {
     const auto storage = MslLdsStorage(state);
     return "(reinterpret_cast<" + std::string(state.LdsInDeviceMemory() ? "device" : "threadgroup") + " atomic_uint*>(" + storage.words + ") + (" + std::string(index) + "))";

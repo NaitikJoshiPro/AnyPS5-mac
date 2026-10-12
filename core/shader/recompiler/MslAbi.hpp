@@ -40,7 +40,7 @@
 
 namespace ShaderRecompiler::MslAbi {
 
-inline constexpr std::uint32_t Version = 1u;
+inline constexpr std::uint32_t Version = 2u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -152,8 +152,16 @@ struct DriverData {
     std::uint32_t loopGuardLimit;
     // GPU address of the BdaAbi fault buffer, 0 when the dispatch has none.
     std::uint64_t faultBuffer;
-    std::array<std::uint32_t, 2> reserved;
+    // Version 2: GPU address of the 64-bit atomic lock table (AtomicLockTableBytes, zero-filled
+    // once, never written by the CPU afterwards): Apple GPUs lack 64-bit device atomics beyond
+    // min/max, so MetalBackend serialises each 64-bit read-modify-write on a lock word hashed from
+    // the address. 0: the dispatch has none (a 64-bit atomic then records a LoopLimit fault and
+    // leaves memory unchanged).
+    std::uint64_t atomicLocks;
 };
+
+// Size of the lock table DriverData::atomicLocks points at (1024 lock words).
+inline constexpr std::uint32_t AtomicLockTableBytes = 4096u;
 
 static_assert(std::is_standard_layout_v<DriverData> && sizeof(DriverData) == 32u && offsetof(DriverData, faultBuffer) == 16u);
 
