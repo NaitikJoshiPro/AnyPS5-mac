@@ -93,7 +93,7 @@ ShaderRecompiler::RecompileResult Recompile(const AgcDriver::VulkanDevice& devic
 
 id<MTLLibrary> CompileLibrary(id<MTLDevice> device, const std::string& name, const std::string& source) {
     MTLCompileOptions* options = [MTLCompileOptions new];
-    options.languageVersion = MTLLanguageVersion4_0;
+    options.languageVersion = static_cast<MTLLanguageVersion>((ShaderRecompiler::MslAbi::LanguageMajor << 16u) | ShaderRecompiler::MslAbi::LanguageMinor);
     options.mathMode = MTLMathModeSafe;
     NSError* error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:options error:&error];
