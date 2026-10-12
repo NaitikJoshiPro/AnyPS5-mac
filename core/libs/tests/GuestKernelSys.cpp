@@ -42,6 +42,7 @@ int APS5_VABI unlinkat_nid_postfix(int, const char*, int);
 std::int64_t APS5_VABI readlinkat_nid_postfix(int, const char*, char*, std::size_t);
 int APS5_VABI mkdirat_nid_postfix(int, const char*, std::uint16_t);
 int APS5_VABI renameat_nid_postfix(int, const char*, int, const char*);
+int APS5_VABI fchmodat_nid_postfix(int, const char*, int, int);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::uint16_t APS5_VABI umask_nid_postfix(std::uint16_t);
 int* APS5_VABI __error_nid_postfix();
@@ -447,6 +448,23 @@ int main() {
     Require(sceKernelClose(subFd) == 0);
     Require(renameat_nid_postfix(-100, (root / "made.bin").string().c_str(), -100, (root / "final.bin").string().c_str()) == 0);
     Require(std::filesystem::is_regular_file(root / "final.bin"));
+    Require(fchmodat_nid_postfix(base, "file.txt", 0600, 0x0200) == 0);
+    Require(fchmodat_nid_postfix(-100, (root / "file.txt").string().c_str(), 0644, 0) == 0);
+#ifndef _WIN32
+    Require((std::filesystem::status(root / "file.txt").permissions() & std::filesystem::perms::all) ==
+        (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write | std::filesystem::perms::group_read | std::filesystem::perms::others_read));
+#endif
+    Require(fchmodat_nid_postfix(base, "missing.bin", 0600, 0) == -1 && Error() == 2);
+    Require(fchmodat_nid_postfix(base, nullptr, 0600, 0) == -1 && Error() == 14);
+    Require(fchmodat_nid_postfix(base, "", 0600, 0) == -1 && Error() == 2);
+    Require(fchmodat_nid_postfix(base, "file.txt", 0600, 0x4000) == -1 && Error() == 22);
+    Require(fchmodat_nid_postfix(-1, "file.txt", 0600, 0) == -1 && Error() == 9);
+#ifndef _WIN32
+    Require(symlink_nid_postfix("loop", (root / "loop").string().c_str()) == 0);
+    Require(fchmodat_nid_postfix(base, "loop/x", 0600, 0) == -1 && Error() == 62);
+    const std::string longName(300, 'a');
+    Require(fchmodat_nid_postfix(base, longName.c_str(), 0600, 0) == -1 && Error() == 63);
+#endif
     Require(sceKernelClose(base) == 0);
     std::filesystem::remove_all(root);
     return 0;
