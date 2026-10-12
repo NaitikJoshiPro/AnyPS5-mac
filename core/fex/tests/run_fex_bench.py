@@ -41,7 +41,7 @@ IMPORTS = {
                       "scePthreadJoin"],
 }
 FLAGS = ["-std=c++20", "-O2"]
-FREESTANDING = ["-ffreestanding", "-fno-builtin"]
+FREESTANDING = ["-ffreestanding", "-fno-builtin", "-fno-stack-protector"]
 LINE = re.compile(r"^BENCH (\S+) threads=(\d+) work=(\d+) sum=([0-9a-f]+) extra=(\d+) stable=([01]) ns=([\d,]+)$")
 GROUPS = ["int", "mem", "simd", "atomic", "bridge"]
 
