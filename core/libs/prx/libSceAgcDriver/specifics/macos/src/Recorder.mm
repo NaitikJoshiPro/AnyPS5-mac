@@ -3652,8 +3652,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Metal::Fail("recorded batch " + std::to_string(failed) + " failed on the GPU: " + failure);
         }
     }
-    if (batch->metal != nullptr && batch->metal->feedback != nullptr && batch->metal->feedback->delivered.load(std::memory_order_acquire) && batch->metal->timestamps == nil) {
-        // Without timestamps the batch stamps come from the commit feedback, when it is in.
+    if (BatchStampsEnabled() && batch->metal != nullptr && batch->metal->feedback != nullptr && batch->metal->feedback->delivered.load(std::memory_order_acquire) && batch->metal->timestamps == nil) {
+        // Stamps asked for but no counter heap (its creation failed): the commit feedback's GPU
+        // times, when it is in. Never with profiling off (the stamps stay 0 then, as upstream).
         batch->gpuStartNs = batch->metal->feedback->gpuStartSeconds * 1e9;
         batch->gpuEndNs = batch->metal->feedback->gpuEndSeconds * 1e9;
     }
