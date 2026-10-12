@@ -198,14 +198,6 @@ MTLCompareFunction CompareOf(VkCompareOp op) {
     }
 }
 
-MTLSamplerReductionMode ReductionOf(VkSamplerReductionMode mode) {
-    switch (mode) {
-    case VK_SAMPLER_REDUCTION_MODE_MIN: return MTLSamplerReductionModeMinimum;
-    case VK_SAMPLER_REDUCTION_MODE_MAX: return MTLSamplerReductionModeMaximum;
-    default: return MTLSamplerReductionModeWeightedAverage;
-    }
-}
-
 }
 
 // --- ImageCache ----------------------------------------------------------------------------------
@@ -297,7 +289,9 @@ id<MTLSamplerState> ImageCache::Sampler(std::span<const std::uint32_t> words, bo
     descriptor.lodMinClamp = decoded.minLod;
     descriptor.lodMaxClamp = decoded.maxLod;
     descriptor.lodBias = decoded.lodBias;
-    descriptor.reductionMode = ReductionOf(decoded.reductionMode);
+    // MTLSamplerDescriptor.reductionMode is ignored on this GPU (agc_metal_sampler_reduction) and
+    // some combinations fail Metal's descriptor validation: refuse min/max reduction.
+    if (decoded.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) FailD5("min/max sampler reduction is not supported: Metal ignores MTLSamplerDescriptor.reductionMode on this GPU (agc_metal_sampler_reduction)");
     if (compare) descriptor.compareFunction = CompareOf(decoded.compareOp);
     if (decoded.unnormalizedCoordinates) {
         descriptor.normalizedCoordinates = NO;

@@ -255,11 +255,16 @@ int Reduction() {
     [commands waitUntilCompleted];
     const auto* values = static_cast<const float*>(output.contents);
     std::printf("argument buffer: average %f, min %f, max %f; direct: average %f, min %f, max %f\n", values[0], values[1], values[2], values[4], values[5], values[6]);
-    Check(values[0] == 15.0f, "weighted average reduction");
-    Check(values[1] == 10.0f, "minimum reduction (argument-buffer sampler)");
-    Check(values[2] == 20.0f, "maximum reduction (argument-buffer sampler)");
+    // On the M3 under macOS 27.0.1 MTLSamplerDescriptor.reductionMode is ignored (every mode filters
+    // as the weighted average, bound directly or through an argument buffer): the device reports no
+    // min/max reduction (SamplerFilterMinmax false) and the sampler path refuses it. This probe
+    // fails when the behaviour is mixed, and says when a later OS starts honouring it.
+    Check(values[0] == 15.0f && values[4] == 15.0f, "weighted average reduction");
+    const bool honoured = values[1] == 10.0f && values[2] == 20.0f && values[5] == 10.0f && values[6] == 20.0f;
+    const bool ignored = values[1] == 15.0f && values[2] == 15.0f && values[5] == 15.0f && values[6] == 15.0f;
+    Check(honoured || ignored, "min/max reduction is honoured inconsistently");
     if (failures != 0) return 1;
-    std::printf("PASS: agc_metal_sampler_reduction\n");
+    std::printf("PASS: agc_metal_sampler_reduction (min/max reduction %s by this GPU)\n", honoured ? "honoured: enable SamplerFilterMinmax" : "ignored");
     return 0;
 }
 
