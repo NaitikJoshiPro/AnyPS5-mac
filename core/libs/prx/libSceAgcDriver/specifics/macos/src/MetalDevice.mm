@@ -506,6 +506,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
             state->capabilities.push_back(static_cast<std::uint32_t>(capability));
         }
+        // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
+        state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityFloat64));
         std::ranges::sort(state->capabilities);
         state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
         if (compileOnly) return;
