@@ -32,6 +32,40 @@ static inline bool unlinkat(int fd, const char* path, bool dir) {
   return true;
 }
 
+#ifdef __APPLE__
+// macOS has no getdents64(2), so the listing is read with readdir(3) from a duplicate of the descriptor;
+// fdopendir() takes ownership of the duplicate and the caller keeps and closes its own.
+// Visit returns false to stop; the result is false when Visit stopped or reading failed.
+template<typename VisitFn>
+static bool ForEachDirEntry(int dir_fd, VisitFn&& Visit) {
+  const int stream_fd = ::dup(dir_fd);
+  if (stream_fd == -1) {
+    return false;
+  }
+  DIR* dir = ::fdopendir(stream_fd);
+  if (!dir) {
+    ::close(stream_fd);
+    return false;
+  }
+
+  bool Result = true;
+  while (true) {
+    errno = 0;
+    const struct dirent* path_dirent = ::readdir(dir);
+    if (!path_dirent) {
+      Result = errno == 0;
+      break;
+    }
+    if (!Visit(path_dirent)) {
+      Result = false;
+      break;
+    }
+  }
+  ::closedir(dir);
+  return Result;
+}
+#endif
+
 static bool RecursiveRemoveDirectory(int parent_fd, const char* Directory) {
   // Don't follow symlinks and ensure it closes on exec.
   constexpr int DIR_FLAGS = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
@@ -44,6 +78,28 @@ static bool RecursiveRemoveDirectory(int parent_fd, const char* Directory) {
     }
   }
 
+#ifdef __APPLE__
+  if (dir_fd == -1) {
+    return false;
+  }
+  const bool Removed = ForEachDirEntry(dir_fd, [dir_fd](const struct dirent* path_dirent) {
+    std::string_view path_name_view = path_dirent->d_name;
+    if (path_name_view == "." || path_name_view == "..") {
+      // Skip these two special files.
+      return true;
+    }
+    if (path_dirent->d_type == DT_DIR && !RecursiveRemoveDirectory(dir_fd, path_dirent->d_name)) {
+      return false;
+    }
+    if (!unlinkat(dir_fd, path_dirent->d_name, path_dirent->d_type == DT_DIR)) {
+      LogMan::Msg::IFmt("Failed to remove file: {}", path_name_view);
+      return false;
+    }
+    return true;
+  });
+  close(dir_fd);
+  return Removed;
+#else
   // Walk the directory listing.
   bool Result = true;
   // Four pages arbitrary chosen to be a balance between NFS wanting to return data in page-size granules and
@@ -123,6 +179,7 @@ end:
 
   close(dir_fd);
   return Result;
+#endif
 }
 
 FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Directory) {
@@ -140,6 +197,19 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
       return;
     }
   }
+#ifdef __APPLE__
+  if (dir_fd == -1) {
+    return;
+  }
+  ForEachDirEntry(dir_fd, [&Callback, user_data](const struct dirent* path_dirent) {
+    std::string_view path_name_view = path_dirent->d_name;
+    if (path_name_view != "." && path_name_view != "..") {
+      Callback(path_name_view, path_dirent->d_type == DT_DIR, user_data);
+    }
+    return true;
+  });
+  close(dir_fd);
+#else
   // Four pages arbitrary chosen to be a balance between NFS wanting to return data in page-size granules and
   // local filesystems returning arbitrary sizes.
   size_t dirent_size = 4096 * 4;
@@ -199,6 +269,7 @@ end:
   }
 
   close(dir_fd);
+#endif
 }
 
 #else
