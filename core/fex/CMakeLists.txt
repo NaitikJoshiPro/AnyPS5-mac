@@ -50,6 +50,7 @@ ExternalProject_Add(fexcore
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
 add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
+target_sources(aps5-fex-runtime PRIVATE src/CodePool.cpp)
 add_dependencies(aps5-fex-runtime fexcore)
 target_compile_features(aps5-fex-runtime PUBLIC cxx_std_20)
 target_include_directories(aps5-fex-runtime PUBLIC
@@ -66,6 +67,12 @@ add_executable(aps5-fex src/Main.cpp)
 target_link_libraries(aps5-fex PRIVATE aps5-fex-runtime)
 
 if(BUILD_TESTING)
+    add_test_executable(fex_code_pool_tests tests/CodePool.cpp src/CodePool.cpp)
+    target_compile_features(fex_code_pool_tests PRIVATE cxx_std_20)
+    target_include_directories(fex_code_pool_tests PRIVATE src ${APS5_FEX_SOURCE_DIR}/FEXCore/include ${APS5_FEX_BINARY_DIR}/include
+        ${APS5_FEX_SOURCE_DIR}/External/fmt/include)
+    add_dependencies(fex_code_pool_tests fexcore)
+    add_test(NAME fex_code_pool COMMAND fex_code_pool_tests)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME fex_fixtures COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
@@ -77,6 +84,9 @@ if(BUILD_TESTING)
         add_test(NAME fex_bench_smoke COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_bench.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --smoke)
         set_tests_properties(fex_bench_smoke PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+        add_test(NAME fex_code_churn COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --only code-churn)
+        set_tests_properties(fex_code_churn PROPERTIES TIMEOUT 300 ENVIRONMENT APS5_FEX_CLEAR_CODE=1)
 
         add_test_executable(aps5-fex-asm tests/asm/AsmHarness.cpp)
         target_link_libraries(aps5-fex-asm PRIVATE aps5-fex-runtime)

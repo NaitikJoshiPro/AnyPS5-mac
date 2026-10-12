@@ -2,6 +2,7 @@
 
 #include "BareGuest.hpp"
 #include "Bridge.hpp"
+#include "CodePool.hpp"
 #include "GuestProgram.hpp"
 #include "Options.hpp"
 
@@ -40,35 +41,22 @@ namespace Aps5Fex {
 namespace {
 
 constexpr std::size_t PoolSize = std::size_t {1} << 30;
-std::uint8_t* poolCode = nullptr;
-std::atomic<std::size_t> poolUsed {0};
+CodePool* pool = nullptr;
 
 void CreateCodePool() {
-    mach_vm_address_t writable = 0;
-    mach_vm_address_t executable = 0;
-    if (mach_vm_allocate(mach_task_self(), &writable, PoolSize, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-        throw std::runtime_error("cannot allocate the JIT pool");
-    vm_prot_t current {};
-    vm_prot_t maximum {};
-    if (mach_vm_remap(mach_task_self(), &executable, PoolSize, 0, VM_FLAGS_ANYWHERE, mach_task_self(), writable, FALSE, &current, &maximum,
-                      VM_INHERIT_NONE) != KERN_SUCCESS ||
-        mprotect(reinterpret_cast<void*>(executable), PoolSize, PROT_READ | PROT_EXEC) != 0)
-        throw std::runtime_error("cannot map the JIT pool executable");
-    poolCode = reinterpret_cast<std::uint8_t*>(executable);
-    FEXCore::DualMap::WriteOffset = static_cast<std::int64_t>(writable) - static_cast<std::int64_t>(executable);
+    if (pool != nullptr) return;
+    pool = new CodePool(PoolSize); // lives as long as the process: FEX code may run until exit
+    FEXCore::DualMap::WriteOffset = pool->WriteOffset();
 }
 
+// FEXCore maps code buffers read-write-execute through these hooks; they come from the dual-mapped pool instead.
 void* PoolMmap(void* address, std::size_t length, int protection, int flags, int file, off_t offset) {
     if ((protection & PROT_EXEC) == 0 || address != nullptr) return ::mmap(address, length, protection, flags, file, offset);
-    const std::size_t aligned = (length + 0x3fff) & ~std::size_t {0x3fff};
-    const std::size_t start = poolUsed.fetch_add(aligned);
-    if (start + aligned > PoolSize) return MAP_FAILED;
-    return poolCode + start;
+    return pool->Allocate(length);
 }
 
 int PoolMunmap(void* address, std::size_t length) {
-    const auto* byte = static_cast<const std::uint8_t*>(address);
-    if (poolCode != nullptr && byte >= poolCode && byte < poolCode + PoolSize) return 0;
+    if (pool != nullptr && pool->Free(address, length)) return 0;
     return ::munmap(address, length);
 }
 
@@ -325,6 +313,7 @@ void CallGuest(ThreadState* thread, std::uint64_t target, Aps5GuestCallFrame* fr
     state.gregs[REG_R8] = frame->gpr[4];
     state.gregs[REG_R9] = frame->gpr[5];
     std::memcpy(state.xmm.sse.data, frame->vector, sizeof(frame->vector));
+    if (guestDepth == 0 && ClearCodeOnGuestEntry()) thread->CTX->ClearCodeCache(thread);
     ++guestDepth;
     thread->CTX->HandleCallback(thread, target);
     --guestDepth;

@@ -1,7 +1,7 @@
 """Relink the programs in fex_fixtures.py, and the C++ programs of the macOS fixtures when the tools
 in fex_toolchain.py are there, and run them with aps5-fex.
 
-    python3 run_fex_fixtures.py <relinker> <aps5-fex> <patched prx directory>
+    python3 run_fex_fixtures.py <relinker> <aps5-fex> <patched prx directory> [--only <fixture>...]
 
 Each program reports its result through its exit status and standard output."""
 import os
@@ -131,6 +131,8 @@ COMPILED = {
                       "libkernel.prx": ["sceKernelMprotect", "sceKernelQueryMemoryProtection"]}), 43),
     "unaligned": (lambda d: compiled_executable(d, [str(HERE / "unaligned.cpp")], {"libc.prx": ["exit"],
                   "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, ["-O2"]), 43),
+    "code-churn": (lambda d: compiled_executable(d, [str(HERE / "code_churn.cpp")], {"libc.prx": ["exit"],
+                   "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, ["-O2"]), 43),
     "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
                    "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }
@@ -138,6 +140,7 @@ COMPILED = {
 
 def main():
     relinker, runner, libraries = (pathlib.Path(argument).resolve() for argument in sys.argv[1:4])
+    only = set(sys.argv[sys.argv.index("--only") + 1:]) if "--only" in sys.argv else None
     failures = []
     cases = {name: (lambda d, name=name: (d / "input.elf").write_bytes(fex_fixtures.FIXTURES[name]()), status, output)
              for name, (status, output) in EXPECTED.items()}
@@ -145,6 +148,11 @@ def main():
         cases.update({name: (build, status, None) for name, (build, status) in COMPILED.items()})
     else:
         print("compiled programs skipped: clang, llvm-nm or an LLVM ELF linker is missing")
+    if only is not None:
+        unknown = only - cases.keys()
+        if unknown:
+            sys.exit(f"unknown fixtures: {', '.join(sorted(unknown))}")
+        cases = {name: case for name, case in cases.items() if name in only}
     for name, (build, status, output) in cases.items():
         with tempfile.TemporaryDirectory(prefix=f"aps5-fex-{name}-") as directory:
             directory = pathlib.Path(directory)

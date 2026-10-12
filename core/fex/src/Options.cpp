@@ -30,6 +30,7 @@ constexpr std::pair<std::string_view, qos_class_t> QosClasses[] = {
 };
 
 qos_class_t threadQos = QOS_CLASS_UNSPECIFIED;
+bool clearCode = false;
 
 void SetConfig(std::string_view entry) {
     const auto equals = entry.find('=');
@@ -51,6 +52,7 @@ void LoadOptions() {
             rest = comma == std::string_view::npos ? std::string_view {} : rest.substr(comma + 1);
         }
     }
+    if (const char* clear = std::getenv("APS5_FEX_CLEAR_CODE")) clearCode = std::string_view(clear) == "1";
     if (const char* qos = std::getenv("APS5_FEX_QOS"); qos != nullptr && *qos != 0) {
         const std::string_view name(qos);
         const auto* found = std::find_if(std::begin(QosClasses), std::end(QosClasses), [name](const auto& known) { return known.first == name; });
@@ -58,6 +60,10 @@ void LoadOptions() {
             throw std::runtime_error("APS5_FEX_QOS: " + std::string(name) + " is not user-interactive, user-initiated, default, utility or background");
         threadQos = found->second;
     }
+}
+
+bool ClearCodeOnGuestEntry() {
+    return clearCode;
 }
 
 void ApplyThreadQos() {
