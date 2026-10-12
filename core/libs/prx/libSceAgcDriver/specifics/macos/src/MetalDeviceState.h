@@ -244,6 +244,8 @@ struct VulkanDevice::State {
     // wrapped guest range, and the recording of one draw into the open batch.
     Metal::DrawCache& Draws();
     void SettleRange(std::uint64_t address, std::uint64_t bytes);
+    // CMASK fast clears expanded into guest memory (MetalDraw.mm).
+    void MaterializeCmask(const Graphics::ColorTarget& color);
     id<MTLBuffer> BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset);
     void RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots);
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).

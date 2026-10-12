@@ -35,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -222,6 +223,10 @@ struct DrawCache {
     };
     std::vector<std::shared_ptr<TiledTarget>> tiled;
 
+    // CMASK codes other than 0 (cleared) and 15 (expanded) a materialization met (bit per code),
+    // reported by the next one (as upstream's detiler reports its GPU pass's codes).
+    std::uint32_t cmaskErrors = 0;
+
     // The attachments of the render pass the recorder holds open (valid while its key matches).
     std::uint64_t passKey = 0;
     std::vector<id<MTLTexture>> passTextures;
@@ -296,6 +301,59 @@ void VulkanDevice::State::SettleRange(std::uint64_t address, std::uint64_t bytes
 }
 
 // The GPU buffer and offset holding guest memory [address, address + bytes) (wrapped in place).
+// CMASK fast clears (upstream Draw.cpp materializeCmaskClear, CPU path): the 8x8 tiles whose CMASK
+// code is 0 (fast-cleared) get the clear register's texel in guest memory, and the CMASK is left
+// expanded (all 0xff), before a draw or a CB fast-clear eliminate reads the target. Codes other than
+// 0 and 15 are recorded and reported by the next materialization, as upstream reports its GPU
+// pass's codes.
+void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color) {
+    auto& cache = Draws();
+    if (const auto codes = std::exchange(cache.cmaskErrors, 0u); codes != 0u) {
+        if ((codes & 1u) != 0u) Fail("a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
+        std::string listed;
+        for (std::uint32_t code = 1; code < 15; ++code) {
+            if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
+        }
+        Fail("CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
+    }
+    if (color.cmaskAddress == 0u) return;
+    const Graphics::CmaskLayout layout(color.extent.width, color.extent.height);
+    const auto bytes = layout.Bytes();
+    if (color.cmaskBytes != bytes) Fail("CMASK size differs from the color target's CMASK layout");
+    SettleRange(color.cmaskAddress, bytes);
+    const auto* mask = reinterpret_cast<const std::uint8_t*>(color.cmaskAddress);
+    if (std::all_of(mask, mask + bytes, [](std::uint8_t value) { return value == 0xffu; })) return;
+    std::vector<std::uint32_t> cleared;
+    for (std::uint32_t tileY = 0; tileY < layout.TilesY(); ++tileY) {
+        for (std::uint32_t tileX = 0; tileX < layout.TilesX(); ++tileX) {
+            const auto nibble = layout.Nibble(tileX, tileY);
+            const auto code = (static_cast<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
+            if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
+            else if (code != 0xfu) cache.cmaskErrors |= 1u << code;
+        }
+    }
+    if (!cleared.empty()) {
+        if (color.dccAddress != 0u) Fail("CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys");
+        if (color.elementBytes == 0u || color.elementBytes > sizeof(color.clearWords)) Fail("the CMASK register clear of a texel over 64 bits is not modeled");
+        // The texels are patched in guest memory: recorded GPU work over the target (and a tiled
+        // target's pending write-back) lands first.
+        if (recorder->PendingWriteOverlaps(color.address, color.bytes)) {
+            Recorder::CountSync(2);
+            recorder->SyncThrough(color.address, color.bytes);
+        }
+        const Graphics::ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, color.pipeBankXor);
+        auto* texels = reinterpret_cast<std::byte*>(color.address);
+        for (const auto tile : cleared) {
+            const auto x0 = (tile % layout.TilesX()) * 8u;
+            const auto y0 = (tile / layout.TilesX()) * 8u;
+            for (auto y = y0; y < std::min(y0 + 8u, color.extent.height); ++y) {
+                for (auto x = x0; x < std::min(x0 + 8u, color.extent.width); ++x) std::memcpy(texels + surface.Offset(x, y), color.clearWords.data(), color.elementBytes);
+            }
+        }
+    }
+    std::memset(reinterpret_cast<void*>(color.cmaskAddress), 0xff, bytes);
+}
+
 id<MTLBuffer> VulkanDevice::State::BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) {
     auto& state = *this;
     state.Wrap(address, bytes);
@@ -399,7 +457,6 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (target.exportIndex >= 8u) Fail("color target location " + std::to_string(target.exportIndex));
         if (target.samples > 1u) Fail("multisampled color targets");
         if (target.dccAddress != 0u) Fail("DCC-compressed color targets");
-        if (target.cmaskFastClear) Fail("CMASK fast-cleared color targets");
         if (target.depth > 1u || target.arrayAddress != 0u || target.mip != 0u || target.mipCount > 1u) Fail("color targets with mips, slices or array layers");
         const auto format = Graphics::Metal::PixelFormatOf(target.format);
         if (format.format == MTLPixelFormatInvalid) Fail("color target format " + std::to_string(target.format) + " has no Metal pixel format");
@@ -411,6 +468,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (written) targetPlan.writes.push_back({attachment.begin, attachment.end});
         colors.push_back(attachment);
     }
+
+    // CMASK fast clears land in guest memory before the targets load from it.
+    for (const auto& target : graphics.colors) state.MaterializeCmask(target);
 
     const StageBindings* plans[] = {&vertexPlan, &fragmentPlan, &targetPlan};
     state.SettleBindings(plans);
@@ -977,8 +1037,15 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
     return std::nullopt;
 }
 
-void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass&) {
-    Unimplemented("ColorMetadataPass", "work package D6");
+// CB metadata passes: a fast-clear eliminate (or a DCC decompress of a target without DCC) expands
+// the CMASK into guest memory as a draw would; DCC and MSAA resolves are not implemented.
+void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
+    if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device has no color metadata passes");
+    if (pass.mode == Graphics::ColorMetadataPass::Mode::Resolve) Fail("CB resolves (multisampled targets)");
+    for (const auto& color : pass.targets) {
+        if (color.dccAddress != 0u) Fail("CB metadata passes over DCC-compressed targets");
+        state->MaterializeCmask(color);
+    }
 }
 
 RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State&, const Pm4::DrawParameters&, std::span<const Graphics::CompiledShader>, std::span<const Graphics::GuestMemorySnapshot>, const std::shared_ptr<const DrawRecipe>&) {
