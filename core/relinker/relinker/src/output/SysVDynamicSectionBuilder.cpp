@@ -143,7 +143,9 @@ SysVDynamicSection SysVDynamicSectionBuilder::BuildDynamicSection(
     for (const NidReference* slotPtr : nonPltRefs) {
         const NidReference& ref = *slotPtr;
         const std::uint32_t nameOff = _appendStr(result.DynStrData, stripHashSuffix(ref.Nid));
-        const auto info = static_cast<std::uint8_t>((STB_GLOBAL << 4) | STT_FUNC);
+        const bool tls = ref.RelocationTypeValue == R_X86_64_DTPMOD64 || ref.RelocationTypeValue == R_X86_64_DTPOFF64
+            || ref.RelocationTypeValue == R_X86_64_TPOFF64;
+        const auto info = static_cast<std::uint8_t>((STB_GLOBAL << 4) | (tls ? STT_TLS : STT_FUNC));
         _appendElfSym(result.DynSymData, nameOff, info, STV_DEFAULT, 0, 0, 0);
 
         const std::uint64_t relaInfo = (static_cast<std::uint64_t>(symIdx) << 32) | ref.RelocationTypeValue;

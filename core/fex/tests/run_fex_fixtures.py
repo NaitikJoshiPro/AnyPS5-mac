@@ -46,14 +46,14 @@ def current_umask():
 CHECKS = {"opening": created_with_mode}
 
 
-def compiled_executable(directory, sources, libraries, extra=()):
+def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
     """Builds input.elf from C and C++ sources whose imports come from the named stub libraries, or
-    from libc.prx when libraries is None."""
+    from libc.prx when libraries is None; with tpoff, its initial-exec TLS keeps TPOFF64 relocations."""
     objects = []
     imported, defined = set(), set()
     for source in sources:
         obj = directory / (pathlib.Path(source).stem + ".o")
-        fex_toolchain.compile(MACOS / source, obj, extra=(["-x", "c"] if source.endswith(".c") else []) + list(extra))
+        fex_toolchain.compile(MACOS / source, obj, pic=tpoff, extra=(["-x", "c"] if source.endswith(".c") else []) + list(extra))
         imported.update(fex_toolchain.symbols(obj, "-u"))
         defined.update(fex_toolchain.symbols(obj, "-g", "--defined-only"))
         objects.append(obj)
@@ -65,7 +65,7 @@ def compiled_executable(directory, sources, libraries, extra=()):
     for obj in objects:
         fex_toolchain.nidify(obj, obj.with_suffix(".nid.o"))
         renamed.append(obj.with_suffix(".nid.o"))
-    fex_toolchain.link_executable(renamed, stubs, directory / "input.elf")
+    (fex_toolchain.link_tpoff_executable if tpoff else fex_toolchain.link_executable)(renamed, stubs, directory / "input.elf")
     fex_toolchain.make_header_room(directory / "input.elf")
 
 
@@ -158,6 +158,8 @@ COMPILED = {
     "tls-modules": (lambda d: compiled_modules(d, [("tls_owner.cpp", "libowner.prx", []), ("tls_user.cpp", "libuser.prx", ["libowner.prx"])],
                     "tls_modules_main.cpp", {"libc.prx": ["exit", "__tls_get_addr"],
                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 47),
+    "tls-exec": (lambda d: compiled_executable(d, [str(HERE / "tls_exec.cpp")], {"libc.prx": ["exit"],
+                 "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, tpoff=True), 43),
     "image-protect": (lambda d: compiled_executable(d, [str(HERE / "image_protect.cpp")], {"libc.prx": ["exit"],
                       "libkernel.prx": ["sceKernelMprotect", "sceKernelQueryMemoryProtection"]}), 43),
     "unaligned": (lambda d: compiled_executable(d, [str(HERE / "unaligned.cpp")], {"libc.prx": ["exit"],

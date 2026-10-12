@@ -129,6 +129,14 @@ def link_executable(objs, libs, out):
           *map(str, objs), *map(str, libs), "-o", str(out)])
 
 
+def link_tpoff_executable(objs, libs, out):
+    """Like link_executable, linked as a shared object: an executable link relaxes initial-exec TLS to
+    local exec, while a PS5 eboot keeps R_X86_64_TPOFF64 GOT relocations for the loader."""
+    link(["-shared", "-z", "now", "--hash-style=sysv", "--eh-frame-hdr", "-e", "_start",
+          *map(str, objs), *map(str, libs), "-o", str(out)])
+    clear_static_tls_flag(out)
+
+
 def symbol(path, name):
     """The address and size of a symbol in an ELF file's symbol table, or of a C++ variable of that name
     with internal linkage."""
