@@ -9,6 +9,9 @@
 #import <Metal/Metal.h>
 
 #include "../src/MetalImages.h"
+#include "MetalTestDevice.h"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
@@ -138,6 +141,69 @@ std::array<std::uint32_t, 8> TextureWords(const void* data, std::uint32_t format
         0u,
         0u,
     };
+}
+
+
+// The MSL detile/retile kernels (TextureDetiler.mm) against the CPU detiler, per tile mode and
+// element size: tiled random bytes detiled on the GPU equal the CPU detile, and a GPU retile of the
+// result rebuilds every element's bytes.
+int DetileGpu() {
+    AgcDriver::Graphics::MetalTest::Device device;
+    TextureDetiler detiler(device.context);
+    const TextureTileMode modes[] = {TextureTileMode::kLinear, TextureTileMode::kStandard4KB, TextureTileMode::kStandard64KB, TextureTileMode::kD4KB, TextureTileMode::kZ64KBX, TextureTileMode::kR64KBX, TextureTileMode::kS64KBX};
+    const std::uint32_t formats[] = {1u, 14u, 20u, 62u, 77u};
+    std::uint32_t cases = 0;
+    for (const auto mode : modes) {
+        for (const auto format : formats) {
+            GuestTextureResource resource{};
+            resource.width = 70u;
+            resource.height = 33u;
+            resource.mipCount = 2u;
+            resource.tileMode = mode;
+            resource.dimension = TextureDimension::k2D;
+            resource.format = format;
+            const auto geometry = DescribeSurface(resource);
+            const auto bytes = BytesPerElement(format);
+            const auto& mip = geometry.mips[0];
+            const DetileLevel level{mode, bytes, &mip, 0u, false, 0u};
+            const auto tiled = Pattern(geometry.guestBytes, format * 13u + static_cast<std::uint32_t>(mode));
+            std::vector<std::byte> expected(mip.linearSize);
+            try {
+                DetileCpu(level, tiled.data() + mip.tiledOffset, tiled.size() - mip.tiledOffset, expected.data(), mip.pitchBytes, bytes);
+            } catch (const std::exception&) {
+                continue;  // no equation for this combination
+            }
+            Buffer tiledBuffer(device.context, geometry.guestBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            Buffer linearBuffer(device.context, mip.linearSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            Buffer retiledBuffer(device.context, geometry.guestBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            std::memcpy(tiledBuffer.Bytes().data(), tiled.data(), tiled.size());
+            std::memset(linearBuffer.Bytes().data(), 0, mip.linearSize);
+            std::memset(retiledBuffer.Bytes().data(), 0, geometry.guestBytes);
+            {
+                CommandBatch batch(device.context);
+                detiler.Dispatch(batch.Handle(), mode, bytes, tiledBuffer.Handle(), mip.tiledOffset, linearBuffer.Handle(), 0, mip, false);
+                Metal::Stream(batch.Handle()).PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                detiler.Dispatch(batch.Handle(), mode, bytes, linearBuffer.Handle(), 0, retiledBuffer.Handle(), mip.tiledOffset, mip, true);
+                batch.SubmitAndWait();
+            }
+            const auto* linear = linearBuffer.Bytes().data();
+            bool same = true;
+            for (std::uint32_t y = 0; y < mip.height && same; ++y) same = std::memcmp(linear + y * mip.pitchBytes, expected.data() + y * mip.pitchBytes, static_cast<std::size_t>(mip.width) * bytes) == 0;
+            Check(same, "GPU detile of tile mode " + std::to_string(static_cast<int>(mode)) + ", format " + std::to_string(format) + " differs from the CPU detiler");
+            bool rebuilt = true;
+            for (std::uint32_t y = 0; y < mip.height && rebuilt; ++y) {
+                for (std::uint32_t x = 0; x < mip.width && rebuilt; ++x) {
+                    const auto offset = mip.tiledOffset + TiledElementOffset(level, x, y);
+                    rebuilt = std::memcmp(retiledBuffer.Bytes().data() + offset, tiled.data() + offset, bytes) == 0;
+                }
+            }
+            Check(rebuilt, "GPU retile of tile mode " + std::to_string(static_cast<int>(mode)) + ", format " + std::to_string(format) + " does not rebuild the elements");
+            ++cases;
+        }
+    }
+    if (failures != 0) return 1;
+    std::printf("PASS: agc_metal_texture_detile_gpu (%u cases)\n", cases);
+    return 0;
 }
 
 int Images() {
@@ -276,6 +342,7 @@ int main(int argc, char** argv) {
             if (argc == 2 && std::strcmp(argv[1], "--detile") == 0) return Detile();
             if (argc == 2 && std::strcmp(argv[1], "--images") == 0) return Images();
             if (argc == 2 && std::strcmp(argv[1], "--reduction") == 0) return Reduction();
+            if (argc == 2 && std::strcmp(argv[1], "--detile-gpu") == 0) return DetileGpu();
             std::fprintf(stderr, "usage: agc_metal_texture_tests --detile | --images\n");
             return 1;
         } catch (const std::exception& error) {

@@ -6,4 +6,7 @@ list(APPEND agcMetalTwins
         "Execution/src/VulkanDevice.cpp=specifics/macos/src/MetalTextureFormat.mm"
         "Execution/src/VulkanDevice.cpp=specifics/macos/src/MetalTextureDetiler.mm"
         "Execution/src/VulkanDevice.cpp=specifics/macos/src/MetalTextures.mm"
+        "Execution/src/VulkanDevice.cpp=specifics/macos/src/MetalVulkanImages.mm"
+        "Graphics/src/TextureDetiler.cpp=specifics/macos/src/TextureDetiler.mm"
+        "Graphics/src/TextureDetilerDescriptors.cpp=specifics/macos/src/TextureDetiler.mm"
 )

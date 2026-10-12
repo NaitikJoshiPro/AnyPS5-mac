@@ -202,7 +202,46 @@ MTLCompareFunction CompareOf(VkCompareOp op) {
 
 // --- ImageCache ----------------------------------------------------------------------------------
 
+namespace {
+
+struct CacheRegistry {
+    std::mutex mutex;
+    std::vector<std::pair<void*, ImageCache*>> caches;
+};
+
+CacheRegistry& Caches() {
+    static CacheRegistry registry;
+    return registry;
+}
+
+}
+
+ImageCache* ImageCache::For(id<MTLDevice> device) {
+    if (device == nil) return nullptr;
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    for (const auto& [key, cache] : registry.caches) {
+        if (key == (__bridge void*)device) return cache;
+    }
+    return nullptr;
+}
+
+void ImageCache::Track(id<MTLTexture> texture) {
+    const std::array<id<MTLTexture>, 1> one{texture};
+    MakeResident(one);
+}
+
+void ImageCache::Untrack(id<MTLTexture> texture) {
+    const std::array<id<MTLTexture>, 1> one{texture};
+    Release(one);
+}
+
 ImageCache::ImageCache(id<MTLDevice> device, id<MTL4CommandQueue> queue) : device(device), queue(queue) {
+    {
+        auto& registry = Caches();
+        std::lock_guard lock(registry.mutex);
+        registry.caches.emplace_back((__bridge void*)device, this);
+    }
     MTLResidencySetDescriptor* descriptor = [MTLResidencySetDescriptor new];
     descriptor.label = @"aps5 images";
     NSError* error = nil;
@@ -216,6 +255,11 @@ ImageCache::~ImageCache() {
 }
 
 void ImageCache::Teardown() noexcept {
+    {
+        auto& registry = Caches();
+        std::lock_guard lock(registry.mutex);
+        std::erase_if(registry.caches, [&](const auto& entry) { return entry.second == this; });
+    }
     std::lock_guard lock(mutex);
     if (tornDown) return;
     tornDown = true;

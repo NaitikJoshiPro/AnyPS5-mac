@@ -167,6 +167,12 @@ public:
     // A 1x1 (one layer) zero texture of an image heap's type (RuntimeAbi binding 1-56).
     id<MTLTexture> Placeholder(std::uint32_t heap);
 
+    // The image cache of a device (the one constructed with it), or null: the textures the
+    // Vulkan-shaped twins make (MetalVulkanImages.mm) are tracked by it.
+    static ImageCache* For(id<MTLDevice> device);
+    // A texture the twins made: resident until Untrack (DestroyImage, after the batches using it).
+    void Track(id<MTLTexture> texture);
+    void Untrack(id<MTLTexture> texture);
     // Residency of textures in flight: added before the batch is submitted, removed when it completes.
     void MakeResident(std::span<const id<MTLTexture>> textures);
     void Release(std::span<const id<MTLTexture>> textures);
