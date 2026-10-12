@@ -273,7 +273,9 @@ std::string MslEmitterState::GuestLane() {
         const auto lane = Builtin(MslBuiltin::ThreadIndexInSimdgroup);
         return half == 0u ? lane : "(" + lane + " + 32u)";
     }
-    if (hostSubgroupSize < program.WaveSize()) return "(" + Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " & " + std::to_string(program.WaveSize() - 1u) + "u)";
+    // Graphics stages have no threadgroup index: their wave64 programs keep the host SIMD lane, and
+    // cross-lane reads past it fail (WaveBallot).
+    if (hostSubgroupSize < program.WaveSize() && program.Resources().stage == IrShaderStage::Compute) return "(" + Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " & " + std::to_string(program.WaveSize() - 1u) + "u)";
     return Builtin(MslBuiltin::ThreadIndexInSimdgroup);
 }
 
@@ -306,21 +308,32 @@ std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
     return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "])";
 }
 
+// Graphics stages (no threadgroups): a wave64 program runs at one lane per invocation and its guest
+// wave spans two host SIMD groups. Each SIMD group then acts as a 32-lane view of the wave: lane ids
+// are the SIMD lane, ballots hold the group's lanes in the low word, votes cover the group. EXEC
+// masks saved and restored through ballots stay per lane, and branch votes stay correct because the
+// lanes' EXEC bits still guard every effect; operations that need the other half fail (ReadLane of a
+// lane past 31) or see only this group (bit counts of a whole-wave mask: TechnicalDebt).
+bool MslGraphicsHalfWave(const MslEmitterState& state) {
+    return state.laneCount == 1u && state.program.WaveSize() > state.hostSubgroupSize && state.program.Resources().stage != IrShaderStage::Compute;
+}
+
 std::string MslEmitterState::WaveBallot(const IrValue* predicate) {
     if (laneCount == 2u) return "uint2(" + Vote(HalfValue(predicate, 0u)) + ", " + Vote(HalfValue(predicate, 1u)) + ")";
+    if (MslGraphicsHalfWave(*this)) return "uint2(" + Vote(Value(predicate)) + ", 0u)";
     if (program.WaveSize() > hostSubgroupSize) Fail("a ballot of a wave64 program at one lane per invocation spans two host SIMD groups");
     return "uint2(" + Vote(Value(predicate)) + ", 0u)";
 }
 
 std::string MslEmitterState::WaveAny(const IrValue* predicate) {
     if (laneCount == 2u) return "bool(uint(simd_any(" + HalfValue(predicate, 0u) + ")) | uint(simd_any(" + HalfValue(predicate, 1u) + ")))";
-    if (program.WaveSize() > hostSubgroupSize) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
+    if (program.WaveSize() > hostSubgroupSize && !MslGraphicsHalfWave(*this)) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
     return "simd_any(" + Value(predicate) + ")";
 }
 
 std::string MslEmitterState::WaveAll(const IrValue* predicate) {
     if (laneCount == 2u) return "bool(uint(simd_all(" + HalfValue(predicate, 0u) + ")) & uint(simd_all(" + HalfValue(predicate, 1u) + ")))";
-    if (program.WaveSize() > hostSubgroupSize) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
+    if (program.WaveSize() > hostSubgroupSize && !MslGraphicsHalfWave(*this)) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
     return "simd_all(" + Value(predicate) + ")";
 }
 
@@ -414,7 +427,8 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     if (stage == IrShaderStage::Compute) state.waveUniform = WaveUniformValues(program);
     static const bool survey = std::getenv("APS5_MSL_SURVEY") != nullptr;
     state.survey = survey;
-    if (stage != IrShaderStage::Compute) state.Fail("only compute shaders are implemented in the MSL backend so far");
+    if (stage != IrShaderStage::Compute && stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel) state.Fail("only compute, vertex and pixel shaders are implemented in the MSL backend so far (work package B6)");
+    if (stage == IrShaderStage::Vertex && inputInfo.vertex == nullptr) state.Fail("vertex input info is missing (work package B6)");
     state.waveLdsScope = MslWaveLdsScope(state);
     EmitMslFunctionBody(state);
     const auto entry = EmitMslEntryPoint(state);

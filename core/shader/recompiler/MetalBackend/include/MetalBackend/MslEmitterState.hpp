@@ -145,6 +145,10 @@ public:
     std::string Builtin(MslBuiltin builtin);
     std::bitset<static_cast<std::size_t>(MslBuiltin::Count)> builtins;
     bool usesTable = false;
+    // Graphics stages (MslStageIo.cpp, B6): fragment inputs read (Vulkan location -> interpolation
+    // qualifier, e.g. ", flat"), and whether the pixel valid mask (kill) is used.
+    std::map<std::uint32_t, std::string> fragmentInputs;
+    bool usesValidMask = false;
     // Descriptor kinds the emitted code references (TableResource): the table holds only these ranges,
     // as the SPIR-V path drops unused descriptor variables (so the binding plan drops them too).
     std::set<DescriptorBindingKind> usedKinds;
@@ -225,6 +229,9 @@ private:
     std::set<std::string, std::less<>> parameterSet;
 };
 
+// A wave64 graphics program at one lane per invocation: each host SIMD group is a 32-lane view of
+// the guest wave (MslEmitter.cpp).
+[[nodiscard]] bool MslGraphicsHalfWave(const MslEmitterState& state);
 [[nodiscard]] std::string MslType(IrType type);
 [[nodiscard]] std::string MslHex(std::uint64_t value);
 [[nodiscard]] std::string MslTableField(DescriptorBindingKind kind);
@@ -238,6 +245,15 @@ private:
 
 // The stage function's signature and module-scope declarations (MslEntryPoint.cpp).
 [[nodiscard]] std::string EmitMslEntryPoint(MslEmitterState& state);
+// Graphics stages (MslStageIo.cpp, B6): the stage-function output/input struct declarations and the
+// statements after the guest body (vertex z remap and y flip; fragment discard), for EmitMslEntryPoint.
+struct MslGraphicsInterface {
+    std::string declarations;
+    std::string outputType;   // empty: the function returns void
+    std::string attributes;   // before the stage keyword ([[early_fragment_tests]])
+    std::string epilogue;
+};
+[[nodiscard]] MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state);
 // The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
 // laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.
 [[nodiscard]] std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInputInfo& workgroup, std::uint32_t laneCount);

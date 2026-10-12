@@ -115,17 +115,66 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         state.RequirePrelude(MslPreludeChunk::Common);
         parameters.push_back("constant Aps5DriverData& aps5_driver [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DriverData)) + ")]]");
     }
+    if (state.reflection.stage == MslAbi::Stage::Vertex && state.builtins.any()) {
+        // Vertex functions have no [[thread_index_in_simdgroup]]: the lane is the number of active
+        // lanes below this one (the hardware lane while the SIMD group is full, as vertex groups are
+        // except at the draw's end).
+        if (state.builtins.count() != 1u || !state.builtins.test(static_cast<std::size_t>(MslBuiltin::ThreadIndexInSimdgroup))) state.Fail("threadgroup builtins are not available to vertex functions (work package B6)");
+        state.builtins.reset();
+        state.prologue = "    const uint aps5_simd_lane = simd_prefix_exclusive_sum(1u);\n" + state.prologue;
+    }
     for (std::size_t index = 0; index < state.builtins.size(); ++index) {
         if (state.builtins.test(index)) parameters.push_back(BuiltinParameter(static_cast<MslBuiltin>(index)));
     }
     parameters.insert(parameters.end(), state.parameters.begin(), state.parameters.end());
 
-    if (state.reflection.stage != MslAbi::Stage::Kernel) state.Fail("only kernel stage functions are implemented in the MSL backend so far");
-    text += "kernel void " + std::string(MslAbi::EntryPoint) + "(";
-    for (std::size_t index = 0; index < parameters.size(); ++index) {
-        text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];
+    if (state.reflection.stage == MslAbi::Stage::Kernel) {
+        text += "kernel void " + std::string(MslAbi::EntryPoint) + "(";
+        for (std::size_t index = 0; index < parameters.size(); ++index) {
+            text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];
+        }
+        text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n";
+        return text;
     }
-    text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n";
+    if (state.reflection.stage != MslAbi::Stage::Vertex && state.reflection.stage != MslAbi::Stage::Fragment) state.Fail("only kernel, vertex and fragment stage functions are implemented in the MSL backend so far (work package B6)");
+    // Vertex and fragment functions (B6): the guest body runs in aps5_body, which takes every stage
+    // parameter (without its attribute) and the output struct by reference, so the body's returns
+    // end the guest program and the stage function applies the epilogue (MslGraphicsInterfaceOf).
+    const bool fragment = state.reflection.stage == MslAbi::Stage::Fragment;
+    if (fragment) parameters.insert(parameters.begin(), "Aps5FragmentIn aps5_in [[stage_in]]");
+    const auto graphics = MslGraphicsInterfaceOf(state);
+    text += graphics.declarations;
+    std::vector<std::string> helperParameters;
+    std::vector<std::string> arguments;
+    for (const auto& parameter : parameters) {
+        const auto attribute = parameter.find(" [[");
+        const auto declaration = parameter.substr(0, attribute);
+        const auto name = declaration.substr(declaration.find_last_of(" &*") + 1u);
+        helperParameters.push_back(declaration);
+        arguments.push_back(name);
+    }
+    if (!graphics.outputType.empty()) {
+        helperParameters.push_back("thread " + graphics.outputType + "& aps5_out");
+        arguments.push_back("aps5_out");
+    }
+    if (state.usesValidMask) {
+        helperParameters.push_back("thread uint& aps5_valid");
+        arguments.push_back("aps5_valid");
+    }
+    text += "static void aps5_body(";
+    for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
+    text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n\n";
+    const auto returnType = graphics.outputType.empty() ? std::string("void") : graphics.outputType;
+    text += graphics.attributes + (fragment ? "fragment " : "vertex ") + returnType + " " + std::string(MslAbi::EntryPoint) + "(";
+    for (std::size_t index = 0; index < parameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];
+    text += ")\n{\n";
+    if (!graphics.outputType.empty()) text += "    " + graphics.outputType + " aps5_out = {};\n";
+    if (state.usesValidMask) text += "    uint aps5_valid = 1u;\n";
+    text += "    aps5_body(";
+    for (std::size_t index = 0; index < arguments.size(); ++index) text += (index == 0u ? "" : ", ") + arguments[index];
+    text += ");\n" + graphics.epilogue;
+    if (!graphics.outputType.empty()) text += "    return aps5_out;\n";
+    text += "}\n";
     return text;
 }
 

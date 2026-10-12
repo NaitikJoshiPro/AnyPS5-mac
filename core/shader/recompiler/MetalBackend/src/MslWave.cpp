@@ -1,5 +1,9 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include <algorithm>
+#include <array>
+#include <optional>
 #include <stdexcept>
+#include <unordered_set>
 #include <string>
 
 namespace ShaderRecompiler {
@@ -27,7 +31,7 @@ bool OneLanePerInvocationNarrow(const MslEmitterState& state) {
 }
 
 void RequireHostWave(MslEmitterState& state, const IrValue& instruction) {
-    if (OneLanePerInvocationNarrow(state)) state.Fail(instruction, "a cross-lane read of a wave64 program at one lane per invocation spans two host SIMD groups (work package B3)");
+    if (OneLanePerInvocationNarrow(state) && !MslGraphicsHalfWave(state)) state.Fail(instruction, "a cross-lane read of a wave64 program at one lane per invocation spans two host SIMD groups (work package B3)");
 }
 
 // A lane of the guest wave as a statement-level temporary.
@@ -133,6 +137,335 @@ std::string DsMaskedLaneRead(MslEmitterState& state, const IrValue& instruction,
     return "((" + active + " != 0u && ((" + live + " >> uint(" + host + ")) & 1u) != 0u) ? " + value + " : 0u)";
 }
 
+// Half-wave reduction scans (SpirvAluEmitterMath.cpp MatchHalfWaveScan, IR-level matching copied
+// as is): a wave64 graphics program at one lane per invocation reads lane 31/63 of a DPP row scan;
+// each host SIMD group then reduces its own 32 keys, and the upper half's lane reads the identity
+// when the scan's keys are proven zero/identity there (UpperLaneWalk, EntryLaneWalk).
+struct WaveReduction {
+    IrOpcode opcode;
+    std::uint32_t identity;
+    const char* reduce;
+    bool floating = false;
+};
+
+constexpr std::array<WaveReduction, 9> WaveReductions{{
+    {IrOpcode::UMin32, 0xffffffffu, "simd_min(uint("},
+    {IrOpcode::UMax32, 0u, "simd_max(uint("},
+    {IrOpcode::SMin32, 0x7fffffffu, "as_type<uint>(simd_min(as_type<int>("},
+    {IrOpcode::SMax32, 0x80000000u, "as_type<uint>(simd_max(as_type<int>("},
+    {IrOpcode::IAdd32, 0u, "simd_sum(uint("},
+    {IrOpcode::BitwiseAnd32, 0xffffffffu, "simd_and(uint("},
+    {IrOpcode::BitwiseOr32, 0u, "simd_or(uint("},
+    {IrOpcode::FPMin32, 0x7f800000u, "", true},
+    {IrOpcode::FPMax32, 0xff800000u, "", true},
+}};
+
+struct HalfWaveScan {
+    const WaveReduction* reduction = nullptr;
+    const IrValue* source = nullptr;
+};
+
+const IrValue* Resolved(const IrValue* value) {
+    return value != nullptr ? value->Resolve() : nullptr;
+}
+
+bool Is(const IrValue* value, IrOpcode opcode) {
+    return value != nullptr && !value->HasImmediate() && value->Opcode() == opcode;
+}
+
+bool IsU32(const IrValue* value, std::uint32_t expected) {
+    const auto* resolved = Resolved(value);
+    return resolved != nullptr && resolved->HasImmediate() && resolved->Type() == IrType::U32 && resolved->ImmediateU32() == expected;
+}
+
+template<typename TMatch>
+bool EitherOrder(const IrValue* value, TMatch&& match) {
+    return match(Resolved(value->Argument(0)), Resolved(value->Argument(1))) || match(Resolved(value->Argument(1)), Resolved(value->Argument(0)));
+}
+
+template<typename TMatch>
+bool EitherOrder(const std::array<const IrValue*, 2>& operands, TMatch&& match) {
+    return match(operands[0], operands[1]) || match(operands[1], operands[0]);
+}
+
+std::optional<std::array<const IrValue*, 2>> LaneBitWords(const IrValue* bit) {
+    const IrValue* masked = nullptr;
+    const IrValue* shifted = nullptr;
+    if (!Is(bit, IrOpcode::INotEqual32) || !EitherOrder(bit, [&](const IrValue* value, const IrValue* zero) { masked = value; return IsU32(zero, 0u) && Is(value, IrOpcode::BitwiseAnd32); })) return std::nullopt;
+    if (!EitherOrder(masked, [&](const IrValue* value, const IrValue* one) { shifted = value; return IsU32(one, 1u) && Is(value, IrOpcode::ShiftRightLogical32); })) return std::nullopt;
+    const auto* index = Resolved(shifted->Argument(1));
+    if (!Is(index, IrOpcode::BitwiseAnd32) || !EitherOrder(index, [](const IrValue* lane, const IrValue* mask) { return Is(lane, IrOpcode::LaneId) && IsU32(mask, 31u); })) return std::nullopt;
+    const auto* word = Resolved(shifted->Argument(0));
+    if (!Is(word, IrOpcode::SelectU32)) return std::array<const IrValue*, 2>{word, word};
+    const auto* low = Resolved(word->Argument(0));
+    if (!Is(low, IrOpcode::ULessThan32) || !Is(Resolved(low->Argument(0)), IrOpcode::LaneId) || !IsU32(low->Argument(1), 32u)) return std::nullopt;
+    return std::array<const IrValue*, 2>{Resolved(word->Argument(1)), Resolved(word->Argument(2))};
+}
+
+bool AllOnesWord(const IrValue* word) {
+    if (IsU32(word, 0xffffffffu)) return true;
+    return Is(word, IrOpcode::BitwiseOr32) && EitherOrder(word, [](const IrValue* inverted, const IrValue* other) {
+        return AllOnesWord(inverted) || (Is(inverted, IrOpcode::BitwiseNot32) && Resolved(inverted->Argument(0)) == other);
+    });
+}
+
+bool AllLanesBit(const IrValue* bit) {
+    const auto words = LaneBitWords(Resolved(bit));
+    return words && AllOnesWord((*words)[0]) && AllOnesWord((*words)[1]);
+}
+
+bool EveryInvocationEnters(IrShaderStage stage) {
+    return stage == IrShaderStage::Vertex || stage == IrShaderStage::Local || stage == IrShaderStage::TessellationControl || stage == IrShaderStage::TessellationEvaluation;
+}
+
+class EntryLaneWalk {
+public:
+    explicit EntryLaneWalk(IrShaderStage stage) : everyInvocationEnters(EveryInvocationEnters(stage)) {}
+
+    bool ZeroBit(const IrValue* bit) {
+        bit = Resolved(bit);
+        if (bit == nullptr || !Spend()) return false;
+        if (bit->HasImmediate()) return bit->Type() == IrType::Bool && !bit->ImmediateBool();
+        if (Is(bit, IrOpcode::LogicalAnd)) return ZeroBit(bit->Argument(0)) || ZeroBit(bit->Argument(1));
+        if (Is(bit, IrOpcode::SelectU1)) return ZeroBit(bit->Argument(1)) && ZeroBit(bit->Argument(2));
+        if (Is(bit, IrOpcode::Phi)) return Incoming(bit, [this](const IrValue* incoming) { return ZeroBit(incoming); });
+        const auto words = LaneBitWords(bit);
+        return words && Word((*words)[0], 0u) && Word((*words)[1], 1u);
+    }
+
+private:
+    bool Spend() {
+        if (budget == 0u) return false;
+        --budget;
+        return true;
+    }
+
+    bool NotHelper(const IrValue* predicate) {
+        predicate = Resolved(predicate);
+        if (predicate == nullptr || !Spend()) return false;
+        if (predicate->HasImmediate()) return everyInvocationEnters && predicate->Type() == IrType::Bool && predicate->ImmediateBool();
+        switch (predicate->Opcode()) {
+            case IrOpcode::LogicalAnd: return NotHelper(predicate->Argument(0)) || NotHelper(predicate->Argument(1));
+            case IrOpcode::IEqual32: return EitherOrder(predicate, [](const IrValue* builtin, const IrValue* zero) { return IsU32(zero, 0u) && Is(builtin, IrOpcode::GetBuiltin) && IsU32(builtin->Argument(0), static_cast<std::uint32_t>(StageInputKind::HelperInvocation)) && IsU32(builtin->Argument(1), 0u); });
+            default: return ZeroBit(predicate);
+        }
+    }
+
+    bool Word(const IrValue* word, std::uint32_t half) {
+        word = Resolved(word);
+        if (word == nullptr || !Spend()) return false;
+        if (word->HasImmediate()) return IsU32(word, 0u);
+        switch (word->Opcode()) {
+            case IrOpcode::CompositeExtractU32x4: {
+                const auto* ballot = Resolved(word->Argument(0));
+                return IsU32(word->Argument(1), half) && Is(ballot, IrOpcode::Ballot) && NotHelper(ballot->Argument(0));
+            }
+            case IrOpcode::CompositeExtractU64: return IsU32(word->Argument(1), half) && Word64(word->Argument(0), half);
+            case IrOpcode::BitwiseAnd32: return Word(word->Argument(0), half) || Word(word->Argument(1), half);
+            case IrOpcode::BitwiseOr32: return Word(word->Argument(0), half) && Word(word->Argument(1), half);
+            case IrOpcode::Phi: return Incoming(word, [this, half](const IrValue* incoming) { return Word(incoming, half); });
+            default: return false;
+        }
+    }
+
+    bool Word64(const IrValue* mask, std::uint32_t half) {
+        mask = Resolved(mask);
+        if (mask == nullptr || !Spend()) return false;
+        if (mask->HasImmediate()) return mask->Type() == IrType::U64 && static_cast<std::uint32_t>(mask->ImmediateU64() >> (32u * half)) == 0u;
+        switch (mask->Opcode()) {
+            case IrOpcode::CompositeConstructU64: return Word(mask->Argument(half), half);
+            case IrOpcode::Phi: return Incoming(mask, [this, half](const IrValue* incoming) { return Word64(incoming, half); });
+            default: return false;
+        }
+    }
+
+    template<typename TCheck>
+    bool Incoming(const IrValue* phi, TCheck&& check) {
+        if (!phis.insert(phi).second) return true;
+        bool result = phi->ArgumentCount() != 0u;
+        for (std::size_t index = 0; result && index < phi->ArgumentCount(); ++index) result = check(phi->Argument(index));
+        phis.erase(phi);
+        return result;
+    }
+
+    bool everyInvocationEnters;
+    std::unordered_set<const IrValue*> phis;
+    std::uint32_t budget = 512u;
+};
+
+bool EveryLaneBit(const IrValue* bit, bool constantTrue) {
+    const auto* resolved = Resolved(bit);
+    if (constantTrue && resolved != nullptr && resolved->HasImmediate()) return resolved->Type() == IrType::Bool && resolved->ImmediateBool();
+    return AllLanesBit(resolved);
+}
+
+bool WritesEveryLane(const IrValue& update) {
+    const auto flags = update.Flags<DppMoveFlags>();
+    return flags.boundControl && flags.rowMask == 0xfu && flags.bankMask == 0xfu && EveryLaneBit(update.Argument(2), true);
+}
+
+bool KeepsNoOldValue(const IrValue& permlane) {
+    const auto flags = permlane.Flags<PermlaneFlags>();
+    return flags.fetchInactive || flags.boundControl || EveryLaneBit(permlane.Argument(3), true);
+}
+
+bool UpperLaneTest(const IrValue* bit) {
+    const auto* compare = Resolved(bit);
+    return Is(compare, IrOpcode::UGreaterThanEqual32) && Is(Resolved(compare->Argument(0)), IrOpcode::LaneId) && IsU32(compare->Argument(1), 32u);
+}
+
+class UpperLaneWalk {
+public:
+    explicit UpperLaneWalk(IrShaderStage stage) : enters(EveryInvocationEnters(stage)), laneIndexed(enters && stage != IrShaderStage::TessellationControl) {}
+
+    bool ZeroValue(const IrValue* value) {
+        value = Resolved(value);
+        if (!enters || value == nullptr || !spend()) return false;
+        if (value->HasImmediate()) return IsU32(value, 0u);
+        if (zeroValues.contains(value)) return true;
+        bool zero = false;
+        switch (value->Opcode()) {
+            case IrOpcode::SelectU32: zero = ZeroValue(value->Argument(2)) && (zeroBit(value->Argument(0)) || ZeroValue(value->Argument(1))); break;
+            case IrOpcode::BitwiseOr32: zero = ZeroValue(value->Argument(0)) && ZeroValue(value->Argument(1)); break;
+            case IrOpcode::DppMoveU32: zero = ZeroValue(value->Argument(0)); break;
+            case IrOpcode::DppUpdateU32: zero = ZeroValue(value->Argument(0)) && (WritesEveryLane(*value) || ZeroValue(value->Argument(1))); break;
+            case IrOpcode::Permlane16U32: zero = ZeroValue(value->Argument(0)) && (KeepsNoOldValue(*value) || ZeroValue(value->Argument(4))); break;
+            case IrOpcode::Phi: zero = incoming(value, [this](const IrValue* source) { return ZeroValue(source); }); break;
+            default: break;
+        }
+        if (zero && phis.empty()) zeroValues.insert(value);
+        return zero;
+    }
+
+private:
+    bool spend() {
+        if (budget == 0u) return false;
+        --budget;
+        return true;
+    }
+
+    bool zeroBit(const IrValue* bit) {
+        bit = Resolved(bit);
+        if (bit == nullptr || !spend()) return false;
+        if (bit->HasImmediate()) return bit->Type() == IrType::Bool && !bit->ImmediateBool();
+        switch (bit->Opcode()) {
+            case IrOpcode::LogicalAnd: return zeroBit(bit->Argument(0)) || zeroBit(bit->Argument(1));
+            case IrOpcode::SelectU1: return zeroBit(bit->Argument(2)) && (zeroBit(bit->Argument(0)) || zeroBit(bit->Argument(1)));
+            case IrOpcode::Phi: return incoming(bit, [this](const IrValue* source) { return zeroBit(source); });
+            case IrOpcode::INotEqual32: return EitherOrder(bit, [this](const IrValue* value, const IrValue* zero) { return IsU32(zero, 0u) && ZeroValue(value); });
+            case IrOpcode::ULessThan32: return belowUpperLanes(bit->Argument(0), bit->Argument(1));
+            case IrOpcode::UGreaterThan32: return belowUpperLanes(bit->Argument(1), bit->Argument(0));
+            default: return false;
+        }
+    }
+
+    bool belowUpperLanes(const IrValue* index, const IrValue* bound) {
+        const auto* limit = Resolved(bound);
+        return limit != nullptr && limit->HasImmediate() && limit->Type() == IrType::U32 && limit->ImmediateU32() <= 32u && upperLaneIndex(index);
+    }
+
+    bool upperLaneIndex(const IrValue* index) {
+        index = Resolved(index);
+        if (!laneIndexed || index == nullptr || !spend()) return false;
+        if (Is(index, IrOpcode::LaneId)) return true;
+        if (Is(index, IrOpcode::BitCount32)) {
+            const auto* mask = Resolved(index->Argument(0));
+            return Is(mask, IrOpcode::SelectU32) && IsU32(mask->Argument(1), 0xffffffffu) && UpperLaneTest(mask->Argument(0));
+        }
+        return Is(index, IrOpcode::IAdd32) && EitherOrder(index, [this](const IrValue* counted, const IrValue* added) { return Is(added, IrOpcode::BitCount32) && upperLaneIndex(counted); });
+    }
+
+    template<typename TCheck>
+    bool incoming(const IrValue* phi, TCheck&& check) {
+        if (!phis.insert(phi).second) return true;
+        bool result = phi->ArgumentCount() != 0u;
+        for (std::size_t index = 0; result && index < phi->ArgumentCount(); ++index) result = check(phi->Argument(index));
+        phis.erase(phi);
+        return result;
+    }
+
+    bool enters;
+    bool laneIndexed;
+    std::unordered_set<const IrValue*> zeroValues;
+    std::unordered_set<const IrValue*> phis;
+    std::uint32_t budget = 1024u;
+};
+
+bool RowShiftFlags(const IrValue* value, std::uint32_t control, bool zeroFill) {
+    const auto flags = value->Flags<DppMoveFlags>();
+    return flags.control == control && flags.rowMask == 0xfu && flags.bankMask == 0xfu && (!flags.boundControl || zeroFill) && !flags.fetchInactive;
+}
+
+const IrValue* Unflushed(const IrValue* value) {
+    if (!Is(value, IrOpcode::SelectU32)) return value;
+    const auto* kept = Resolved(value->Argument(2));
+    const auto masked = [kept](const IrValue* candidate, std::uint32_t mask) {
+        return Is(candidate, IrOpcode::BitwiseAnd32) && EitherOrder(candidate, [&](const IrValue* source, const IrValue* constant) { return source == kept && IsU32(constant, mask); });
+    };
+    const auto* condition = Resolved(value->Argument(0));
+    const bool exponentZero = Is(condition, IrOpcode::IEqual32) && EitherOrder(condition, [&](const IrValue* exponent, const IrValue* zero) { return IsU32(zero, 0u) && masked(exponent, 0x7f800000u); });
+    return exponentZero && masked(Resolved(value->Argument(1)), 0x80000000u) ? kept : value;
+}
+
+std::optional<std::array<const IrValue*, 2>> ReductionOperands(const IrValue* combined, const WaveReduction& reduction) {
+    if (reduction.floating) {
+        combined = Unflushed(combined);
+        if (!Is(combined, IrOpcode::BitCastU32F32)) return std::nullopt;
+        combined = Resolved(combined->Argument(0));
+    }
+    if (!Is(combined, reduction.opcode)) return std::nullopt;
+    std::array<const IrValue*, 2> operands{Resolved(combined->Argument(0)), Resolved(combined->Argument(1))};
+    if (!reduction.floating) return operands;
+    for (auto& operand : operands) {
+        if (!Is(operand, IrOpcode::BitCastF32U32)) return std::nullopt;
+        operand = Unflushed(Resolved(operand->Argument(0)));
+    }
+    return operands;
+}
+
+const IrValue* RowScanStepInput(const IrValue* step, const WaveReduction& reduction, std::uint32_t control, bool narrow) {
+    const bool zeroFill = narrow && reduction.identity == 0u && !reduction.floating;
+    if (!Is(step, IrOpcode::DppUpdateU32) || !RowShiftFlags(step, control, zeroFill) || !EveryLaneBit(step->Argument(2), narrow)) return nullptr;
+    const auto* previous = zeroFill && WritesEveryLane(*step) ? nullptr : Resolved(step->Argument(1));
+    const IrValue* input = nullptr;
+    const auto operands = ReductionOperands(Resolved(step->Argument(0)), reduction);
+    const bool matched = operands && EitherOrder(*operands, [&](const IrValue* moved, const IrValue* own) {
+        input = own;
+        return (previous == nullptr || own == previous) && Is(moved, IrOpcode::DppMoveU32) && RowShiftFlags(moved, control, zeroFill) && Resolved(moved->Argument(0)) == own && EveryLaneBit(moved->Argument(1), narrow);
+    });
+    return matched ? input : nullptr;
+}
+
+const IrValue* Unmasked(const IrValue* value, bool narrow) {
+    while (Is(value, IrOpcode::SelectU32) && EveryLaneBit(value->Argument(0), narrow)) value = Resolved(value->Argument(1));
+    return value;
+}
+
+bool CrossesRowsOf(const IrValue* value, const IrValue* scan, bool narrow) {
+    const auto* permlane = Unmasked(value, narrow);
+    if (!Is(permlane, IrOpcode::Permlane16U32)) return false;
+    const auto flags = permlane->Flags<PermlaneFlags>();
+    return flags.x16 && !flags.fetchInactive && Resolved(permlane->Argument(0)) == scan && IsU32(permlane->Argument(1), 0xffffffffu) && IsU32(permlane->Argument(2), 0xffffffffu) && EveryLaneBit(permlane->Argument(3), narrow);
+}
+
+std::optional<HalfWaveScan> MatchHalfWaveScan(const IrValue* value, IrShaderStage stage, bool narrow) {
+    const auto* combined = Unmasked(Resolved(value), narrow);
+    std::optional<std::array<const IrValue*, 2>> operands;
+    const auto reduction = std::find_if(WaveReductions.begin(), WaveReductions.end(), [&](const WaveReduction& candidate) { return (operands = ReductionOperands(combined, candidate)).has_value(); });
+    const IrValue* scan = nullptr;
+    if (reduction == WaveReductions.end() || !EitherOrder(*operands, [&](const IrValue* own, const IrValue* crossed) { scan = own; return CrossesRowsOf(crossed, own, narrow); })) return std::nullopt;
+    for (const auto control : {0x118u, 0x114u, 0x112u, 0x111u}) {
+        scan = RowScanStepInput(scan, *reduction, control, narrow);
+        if (scan == nullptr) return std::nullopt;
+    }
+    const auto* source = Unmasked(scan, narrow);
+    const bool entryKeys = Is(source, IrOpcode::SelectU32) && IsU32(source->Argument(2), reduction->identity) && EntryLaneWalk{stage}.ZeroBit(source->Argument(0));
+    const bool upperKeys = narrow && reduction->identity == 0u && !reduction->floating && UpperLaneWalk{stage}.ZeroValue(source);
+    if (!entryKeys && !upperKeys) return std::nullopt;
+    return HalfWaveScan{&*reduction, source};
+}
+
+
 void Ballot(MslEmitterState& state, const IrValue& instruction) {
     // Both guest lane halves for wave64 on 32-wide SIMD groups (core helper).
     const auto type = MslType(instruction.Type());
@@ -152,6 +485,25 @@ void ReadFirstLane(MslEmitterState& state, const IrValue& instruction) {
 
 void ReadLane(MslEmitterState& state, const IrValue& instruction) {
     RequireHostWave(state, instruction);
+    if (MslGraphicsHalfWave(state)) {
+        const IrValue* selector = instruction.Argument(1u)->Resolve();
+        const auto lane = selector->HasImmediate() ? selector->ImmediateU32() & 63u : 64u;
+        if (lane < 64u && (lane & 31u) == 31u) {
+            if (const auto scan = MatchHalfWaveScan(instruction.Argument(0u), state.program.Resources().stage, true)) {
+                if (lane >= 32u) {
+                    state.Define(instruction, MslHex(scan->reduction->identity) + "u");
+                    return;
+                }
+                if (!scan->reduction->floating) {
+                    std::string reduce = scan->reduction->reduce;
+                    const bool signedReduce = reduce.find("as_type<int>") != std::string::npos;
+                    state.Define(instruction, reduce + state.Value(scan->source) + (signedReduce ? ")))" : "))"));
+                    return;
+                }
+            }
+        }
+        if (lane >= 32u) state.Fail(instruction, "v_readlane_b32 of a lane outside the 32-lane host SIMD group that runs this wave64 graphics program (work package B6)");
+    }
     const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & " + U32(state.program.WaveSize() - 1u), "aps5_rl");
     state.Define(instruction, Shuffle(state, instruction, 0u, lane));
 }
