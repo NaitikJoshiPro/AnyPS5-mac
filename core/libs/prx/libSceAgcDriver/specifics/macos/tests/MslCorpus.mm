@@ -178,13 +178,15 @@ private:
                 return;
             }
             request.target.backend = ShaderRecompiler::ShaderBackend::Spirv;
+            result.detail = FirstLines(message, 1);
             try {
                 static_cast<void>(ShaderRecompiler::Recompile(request));
                 result.outcome = Outcome::MslPathFailed;
-            } catch (const std::exception&) {
-                result.outcome = Outcome::FrontEndRejected;
+            } catch (const std::exception& reference) {
+                const auto spirv = FirstLines(reference.what(), 1);
+                result.outcome = spirv == result.detail ? Outcome::FrontEndRejected : Outcome::MslPathFailed;
+                if (spirv != result.detail) result.detail += " (SpirvBackend fails differently: " + spirv + ")";
             }
-            result.detail = FirstLines(message, 1);
             return;
         }
         if (compiled.msl.empty()) {
