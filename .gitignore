@@ -109,3 +109,6 @@ cookies.txt
 
 .env
 .env.local
+
+# Native Mac port working area (downloads, titles, traces, scratch)
+.mac-work/
