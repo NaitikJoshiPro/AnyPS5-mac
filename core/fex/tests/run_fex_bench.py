@@ -123,7 +123,8 @@ def run(command, cwd, environment, timeout):
             results[name] = {"threads": int(threads), "work": int(work), "sum": digest, "extra": int(extra),
                              "stable": stable == "1", "ns": [int(value) for value in times.split(",")],
                              "cpu": [int(value) for value in cpu.split(",")]}
-    return results, done.returncode, done.stderr.strip()[-600:]
+    lines = done.stderr.strip().splitlines()
+    return results, done.returncode, "\n".join([line for line in lines if not line.startswith("[FEXCore]")] or lines)[-600:]
 
 
 def kernel_names(native, environment):
@@ -216,7 +217,7 @@ def benchmark(arguments, native, guests):
             for binary, (command, cwd, environment) in binaries.items():
                 results, status, errors = run([*command, name, str(arguments.permille), str(arguments.reps)], cwd, environment,
                                               arguments.timeout)
-                if status != 0 or name not in results:
+                if name not in results or status not in (0, 3):
                     entry.setdefault("errors", {})[binary] = f"exit {status}: {errors}"
                     continue
                 result = results[name]
@@ -249,8 +250,11 @@ def benchmark(arguments, native, guests):
 
 
 def speed(entry, variant, clock="median"):
-    """Native time over guest time; by CPU time only for kernels that run on one thread."""
+    """Native time over guest time, for a guest that gave the native result; by CPU time only for kernels
+    that run on one thread."""
     if "native" not in entry or variant not in entry or (clock == "cpu_median" and entry.get("threads", 1) != 1):
+        return None
+    if variant in entry.get("errors", {}) or entry.get("sum", {}).get(variant) != entry.get("sum", {}).get("native"):
         return None
     return entry["native"][clock] / entry[variant][clock] if entry[variant][clock] else None
 
