@@ -76,3 +76,8 @@ Full text with evidence: `docs/mac/M2_DESIGN.md` §1 (on `mac-native-metal`). Su
 - **No SPIRV-Cross on the critical path** (MetalBackend already runs real tests; hardware-measured expected values are the oracle).
 - **Skips** only for documented Apple hardware limits, via `tools/mac/m2_skip_allowlist.txt` + `check_skips.py --job macos`; f64 and 64-bit atomics are emulated, not skipped.
 Foundation result: `agc_driver_vop1_control` passes end to end on the GPU via MetalBackend; G1 baseline 29/196 compute tests pass, 29 skip, 138 fail, 0 hangs.
+
+## D17: FEX's AI policy files, GDB symbols, third-party notices (2026-10-12)
+- FEX-2610 ships `CLAUDE.md`/`AGENTS.md` stating that AI must not be used to generate code for contributions to FEX-Emu. We respect it: our vendored copy's patches (the ported macOS series and anything we add) are local to this GPL-2.0 fork, used under FEX's MIT licence, and are never submitted to FEX-Emu (already the rule in D6). The files stay in `3rdparty/FEX` unmodified. Keep FEX edits minimal; prefer runner-side code in `core/fex`.
+- FEX enables `ENABLE_GDB_SYMBOLS` whenever GDB's GPL-3 `jit-reader.h` is installed: the runner passes `-DENABLE_GDB_SYMBOLS=OFF` and `tools/mac/check_fex_licence.py` checks it.
+- Binaries must carry notices for everything compiled into the runner: FEX (MIT), VIXL (BSD-3, compiled into FEXCore; missing so far), fmt (MIT), xxHash library (BSD-2), cephes (BSD), SoftFloat-3e (BSD-3), unordered_dense (MIT), range-v3 (BSL-1.0, configure-time only).
