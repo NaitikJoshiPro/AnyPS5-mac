@@ -39,6 +39,7 @@ class ShaderResources;
 class TextureDetiler;
 class PlaceholderImages;
 class SamplerCache;
+class TextureCache;
 struct Context;
 }
 
@@ -216,6 +217,7 @@ private:
     std::unique_ptr<TextureDetiler> detiler;
     std::unique_ptr<PlaceholderImages> placeholderImages;
     std::unique_ptr<SamplerCache> upstreamSamplers;
+    std::unique_ptr<TextureCache> textureCache;
     Statistics statistics;
     bool tornDown = false;
 };

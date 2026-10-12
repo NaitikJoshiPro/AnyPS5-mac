@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
@@ -303,6 +304,8 @@ void ImageCache::Attach(const Context& deviceContext) {
     context.placeholderImages = placeholderImages.get();
     upstreamSamplers = std::make_unique<SamplerCache>();
     context.samplerCache = upstreamSamplers.get();
+    textureCache = std::make_unique<TextureCache>(context);
+    context.textureCache = textureCache.get();
 }
 
 void ImageCache::Teardown() noexcept {
@@ -315,6 +318,7 @@ void ImageCache::Teardown() noexcept {
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[metal-textures] teardown: %s\n", error.what());
         }
+        textureCache.reset();
         upstreamSamplers.reset();
         placeholderImages.reset();
         detiler.reset();
