@@ -113,3 +113,19 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - **TEX**: D4/B4/D5 textures, images, pipelines and the pipeline cache → G2.
   - B6/D6 (draws, presentation → G3/G5) start once TEX's render pipelines land.
 - Protocol (coord/m2.md): agents commit their own files before every gpu_suite run, because D19 refuses while the tree is dirty.
+- 2026-10-13 wave R status (all counts under `--validation`, logs `.mac-work/logs/gpu-suite/`):
+  - **DRV done**: D1 recorder integration and D3 guest memory (M2_DESIGN "DRV results", `b6cd25d1c`; hand-off `.mac-work/coord/drv-handoff.md`).
+    - BDA table built per dispatch; MslAbi v2 atomic lock table; overlapping V#s share one mapping; faults reported (not thrown) as upstream; host imports are no-copy buffers; pipeline cache wired.
+    - G1 **178/182**, G4 **18/39** (was 14), G7 24 pass / 2 fail / 29 skip.
+  - **SHD**: G1 104 → 178/182; G6 10 → **23/24**. Only image int64 atomics left, now with TEX.
+    - MSL 4.1, wave/LDS/GDS, 64-bit atomics through the lock table.
+    - `agc_driver_lds_atomics64` passed one supervised validation run (`--rerun-held`, `2e6f803c`); still held for normal runs.
+  - **TEX**: G2 0 → **33/43**.
+    - Pipeline cache: second run compiles 0 pipelines (exit criterion 4).
+    - MSL min/max sampler reduction emulated (Metal ignores reductionMode on the M3).
+    - Texture.mm and ShaderResources.mm twins of upstream.
+    - Re-applying `images->Attach(context)` failed validation twice (depth placeholder texture type, then the placeholder clear); reverted both times, being fixed with a dedicated Attach-path test.
+  - Coordinator fixed the shader-cache reviewed-names build break (`9e932a592`).
+  - **Next**:
+    - DRAW (fresh agent, D6 draws and presentation) started; SHD moves to B6 (stage interfaces); TEX finishes Attach, the pending-storage family and image int64 atomics.
+    - Open: D3 Metal twins still missing (`agc_host_import_unmap`, `agc_unit_shadow`, `agc_unchanged_cpu_stamps`, `agc_storage_baseline_settled`).
