@@ -1291,6 +1291,12 @@ void EmitSampling(MslEmitterState& state, const Access& access) {
     if (ImageConversionFormat(access.image).type == SpirvFormatComponentType::Unorm) state.Fail(access.inst, "samples or gathers a converted unorm image, which needs filtering in the shader and is not implemented");
     if (ImageConversionFormat(access.image).type == SpirvFormatComponentType::Float) state.Fail(access.inst, "samples or gathers a converted float image, which needs filtering in the shader and is not implemented");
     const auto texture = Texture(state, access);
+    if (dref && access.inst.Opcode() != IrOpcode::ImageGatherRaw && (access.image.emulatedCompare & EmulatedCompare::Enabled) != 0u) {
+        // The emulated comparison reads texels itself: it references no sampler (the binding plan
+        // then drops the sampler binding and its image associations, as the SPIR-V module does).
+        EmitEmulatedCompareSample(state, access, layout, texture);
+        return;
+    }
     const auto sampler = Sampler(state, access);
     const auto coord = CoordF32(state, access, layout.coord, texture);
     if (access.inst.Opcode() == IrOpcode::ImageGatherRaw) {
