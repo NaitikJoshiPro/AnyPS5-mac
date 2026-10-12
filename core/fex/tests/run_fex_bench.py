@@ -8,8 +8,9 @@ three guest targets: sse2 (-march=x86-64), sse4 (-march=x86-64-v2) and avx2 (-ma
 --smoke runs every kernel at a tiny size natively and as the avx2 guest and checks each result
 against the native one (the ctest fex_bench_smoke). Otherwise each kernel runs in its own process:
 one cold repetition, which for a guest includes translating its code, then warm ones. The table of
-median times and of speed relative to native (native time / guest time) goes to stdout, the samples,
-machine and load averages to a JSON file in .mac-work/bench/."""
+median times and of speed relative to native (native time / guest time, by the clock and, for one
+thread, by the CPU time of that thread, which a loaded machine disturbs less) goes to stdout, the
+samples, machine and load averages to a JSON file in .mac-work/bench/."""
 import argparse
 import concurrent.futures
 import datetime
@@ -38,12 +39,12 @@ SMOKE_PERMILLE = 10
 KERNEL_SOURCES = ["kernels.cpp", "bench_main.cpp"]
 IMPORTS = {
     "libc.prx": ["memcpy", "memset", "qsort", "puts", "exit"],
-    "libkernel.prx": ["sceKernelGetProcessTimeCounter", "sceKernelGetProcessTimeCounterFrequency", "scePthreadCreate",
-                      "scePthreadJoin"],
+    "libkernel.prx": ["sceKernelGetProcessTimeCounter", "sceKernelGetProcessTimeCounterFrequency", "clock_gettime",
+                      "scePthreadCreate", "scePthreadJoin"],
 }
 FLAGS = ["-std=c++20", "-O2"]
 FREESTANDING = ["-ffreestanding", "-fno-builtin", "-fno-stack-protector"]
-LINE = re.compile(r"^BENCH (\S+) threads=(\d+) work=(\d+) sum=([0-9a-f]+) extra=(\d+) stable=([01]) ns=([\d,]+)$")
+LINE = re.compile(r"^BENCH (\S+) threads=(\d+) work=(\d+) sum=([0-9a-f]+) extra=(\d+) stable=([01]) ns=([\d,]+) cpu=([\d,]+)$")
 GROUPS = ["int", "mem", "simd", "atomic", "bridge"]
 
 
@@ -118,9 +119,10 @@ def run(command, cwd, environment, timeout):
     results = {}
     for line in done.stdout.splitlines():
         if found := LINE.match(line.strip()):
-            name, threads, work, digest, extra, stable, times = found.groups()
+            name, threads, work, digest, extra, stable, times, cpu = found.groups()
             results[name] = {"threads": int(threads), "work": int(work), "sum": digest, "extra": int(extra),
-                             "stable": stable == "1", "ns": [int(value) for value in times.split(",")]}
+                             "stable": stable == "1", "ns": [int(value) for value in times.split(",")],
+                             "cpu": [int(value) for value in cpu.split(",")]}
     return results, done.returncode, done.stderr.strip()[-600:]
 
 
@@ -164,10 +166,12 @@ def smoke(arguments, native, guests):
     return 0
 
 
-def summary(samples):
-    """Cold time and the median of the warm repetitions, in nanoseconds."""
+def summary(samples, cpu):
+    """Cold time and the median of the warm repetitions, in nanoseconds, by the clock and as the CPU time
+    of the thread that timed them."""
     warm = [value for process in samples for value in process[1:]]
-    return {"cold": samples[0][0], "median": statistics.median(warm), "min": min(warm), "max": max(warm), "count": len(warm)}
+    return {"cold": samples[0][0], "median": statistics.median(warm), "min": min(warm), "max": max(warm), "count": len(warm),
+            "cpu_median": statistics.median(value for process in cpu for value in process[1:]), "samples": samples, "cpu": cpu}
 
 
 def geometric_mean(values):
@@ -204,6 +208,7 @@ def benchmark(arguments, native, guests):
     for name in names:
         entry = {"load": os.getloadavg()[0]}
         samples = {binary: [] for binary in binaries}
+        cpu = {binary: [] for binary in binaries}
         for _ in range(arguments.processes):
             for binary, (command, cwd, environment) in binaries.items():
                 results, status, errors = run([*command, name, str(arguments.permille), str(arguments.reps)], cwd, environment,
@@ -216,17 +221,20 @@ def benchmark(arguments, native, guests):
                 entry.setdefault("extra", {})[binary] = result["extra"]
                 if not result["stable"]:
                     entry.setdefault("errors", {})[binary] = "the repetitions gave different results"
+                entry["threads"] = result["threads"]
                 samples[binary].append(result["ns"])
+                cpu[binary].append(result["cpu"])
         for binary, values in samples.items():
             if values:
-                entry[binary] = {**summary(values), "samples": values}
+                entry[binary] = summary(values, cpu[binary])
         digests = set(entry.get("sum", {}).values())
         entry["matches"] = len(digests) == 1 and "errors" not in entry
         report["kernels"][name] = entry
         print(row(name, entry, guests), flush=True)
     report["load_end"] = os.getloadavg()
-    report["speed"] = {variant: {group: geometric_mean([speed(entry, variant) for name, entry in report["kernels"].items()
-                                                        if name.startswith(group + "_") and speed(entry, variant)])
+    for key, clock in (("speed", "median"), ("cpu_speed", "cpu_median")):
+        report[key] = {variant: {group: geometric_mean([speed(entry, variant, clock) for name, entry in report["kernels"].items()
+                                                        if name.startswith(group + "_") and speed(entry, variant, clock)])
                                  for group in GROUPS} for variant in guests}
     report["bridge"] = {variant: bridge_costs(report["kernels"], variant) for variant in guests}
     print(table(report, guests))
@@ -237,20 +245,22 @@ def benchmark(arguments, native, guests):
     return 0 if all(entry["matches"] for entry in report["kernels"].values()) else 1
 
 
-def speed(entry, variant):
-    if "native" not in entry or variant not in entry:
+def speed(entry, variant, clock="median"):
+    """Native time over guest time; by CPU time only for kernels that run on one thread."""
+    if "native" not in entry or variant not in entry or (clock == "cpu_median" and entry.get("threads", 1) != 1):
         return None
-    return entry["native"]["median"] / entry[variant]["median"]
+    return entry["native"][clock] / entry[variant][clock] if entry[variant][clock] else None
 
 
 def row(name, entry, guests):
     cells = [name, f"{entry['native']['median'] / 1e6:.2f}" if "native" in entry else "-"]
     for variant in guests:
         if variant in entry:
-            cells += [f"{entry[variant]['median'] / 1e6:.2f}", f"{speed(entry, variant):.2f}" if speed(entry, variant) else "-",
-                      f"{entry[variant]['cold'] / 1e6:.2f}"]
+            cells += [f"{entry[variant]['median'] / 1e6:.2f}"]
+            cells += [f"{value:.2f}" if (value := speed(entry, variant, clock)) else "-" for clock in ("median", "cpu_median")]
+            cells.append(f"{entry[variant]['cold'] / 1e6:.2f}")
         else:
-            cells += ["-", "-", "-"]
+            cells += ["-", "-", "-", "-"]
     cells.append(f"{entry['load']:.1f}")
     cells.append("ok" if entry["matches"] else "MISMATCH " + "; ".join(f"{k}: {v}" for k, v in entry.get("errors", {}).items()))
     return "| " + " | ".join(cells) + " |"
@@ -276,7 +286,7 @@ def bridge_costs(kernels, variant):
 def header(guests):
     cells = ["kernel", "native ms"]
     for variant in guests:
-        cells += [f"{variant} ms", f"{variant} speed", f"{variant} cold ms"]
+        cells += [f"{variant} ms", f"{variant} speed", f"{variant} cpu speed", f"{variant} cold ms"]
     cells += ["load 1m", "result"]
     return ["| " + " | ".join(cells) + " |", "|" + "---|" * len(cells)]
 
@@ -286,7 +296,9 @@ def table(report, guests):
     lines += [row(name, entry, guests) for name, entry in report["kernels"].items()]
     lines.append("")
     for group in GROUPS:
-        values = [f"{variant} {report['speed'][variant][group]:.2f}" for variant in guests if report["speed"][variant][group]]
+        values = [f"{variant} {report['speed'][variant][group]:.2f}"
+                  + (f" (cpu {report['cpu_speed'][variant][group]:.2f})" if report["cpu_speed"][variant][group] else "")
+                  for variant in guests if report["speed"][variant][group]]
         if values:
             lines.append(f"geometric mean speed, {group}: {', '.join(values)}")
     for variant in guests:

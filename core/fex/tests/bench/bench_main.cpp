@@ -98,6 +98,7 @@ bool Measure(const BenchKernel& kernel, u64 permille, u64 repetitions) {
     u64 work = kernel.work * permille / 1000;
     if (work == 0) work = 1;
     u64 times[MaxRepetitions];
+    u64 cpuTimes[MaxRepetitions];
     u64 first = 0;
     u64 firstExtra = 0;
     bool stable = true;
@@ -105,9 +106,11 @@ bool Measure(const BenchKernel& kernel, u64 permille, u64 repetitions) {
         if (kernel.prepare != nullptr) kernel.prepare();
         benchExtra = 0;
         benchElapsed = 0;
+        const u64 cpuStart = BenchCpuNow();
         const u64 start = BenchNow();
         const u64 sum = kernel.run(work);
         const u64 end = BenchNow();
+        cpuTimes[repetition] = BenchCpuNow() - cpuStart;
         times[repetition] = benchElapsed != 0 ? benchElapsed : end - start;
         if (repetition == 0) {
             first = sum;
@@ -133,6 +136,11 @@ bool Measure(const BenchKernel& kernel, u64 permille, u64 repetitions) {
     for (u64 repetition = 0; repetition < repetitions; ++repetition) {
         if (repetition != 0) line.Append(",");
         line.Append(times[repetition]);
+    }
+    line.Append(" cpu=");
+    for (u64 repetition = 0; repetition < repetitions; ++repetition) {
+        if (repetition != 0) line.Append(",");
+        line.Append(cpuTimes[repetition]);
     }
     BenchWrite(line.Text());
     return stable;

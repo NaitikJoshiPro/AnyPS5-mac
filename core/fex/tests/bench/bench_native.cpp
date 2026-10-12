@@ -38,6 +38,12 @@ u64 BenchNow() {
     return static_cast<u64>(now.tv_sec) * 1000000000ULL + static_cast<u64>(now.tv_nsec);
 }
 
+u64 BenchCpuNow() {
+    timespec now {};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return static_cast<u64>(now.tv_sec) * 1000000000ULL + static_cast<u64>(now.tv_nsec);
+}
+
 void BenchWrite(const char* line) {
     std::puts(line);
 }

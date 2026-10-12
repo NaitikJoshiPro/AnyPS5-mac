@@ -8,12 +8,20 @@ void qsort(void* base, unsigned long count, unsigned long size, int (*compare)(c
 int puts(const char* text);
 [[noreturn]] void exit(int status);
 u64 sceKernelGetProcessTimeCounter();
+int clock_gettime(int clock, i64* time);
 u64 sceKernelGetProcessTimeCounterFrequency();
 int scePthreadCreate(void** thread, const void* attributes, void* (*entry)(void*), void* argument, const char* name);
 int scePthreadJoin(void* thread, void** value);
 
 u64 BenchNow() {
     return sceKernelGetProcessTimeCounter();
+}
+
+u64 BenchCpuNow() {
+    constexpr int ThreadCpuTime = 14;
+    i64 time[2] = {0, 0};
+    clock_gettime(ThreadCpuTime, time);
+    return static_cast<u64>(time[0]) * 1000000000ULL + static_cast<u64>(time[1]);
 }
 
 void BenchWrite(const char* line) {

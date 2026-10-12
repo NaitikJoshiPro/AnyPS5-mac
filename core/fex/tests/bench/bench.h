@@ -12,6 +12,7 @@ using i64 = long long;
 extern "C" {
 
 u64 BenchNow();
+u64 BenchCpuNow();
 void BenchWrite(const char* line);
 void* BenchCopy(void* destination, const void* source, unsigned long size);
 void* BenchFill(void* destination, int value, unsigned long size);
