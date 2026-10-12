@@ -310,6 +310,20 @@ class SuiteRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(log, "")
 
+    def test_a_quarantined_test_reruns_only_alone_under_validation(self):
+        plan = {"agc_driver_ok": ["run", "", ""], "agc_driver_f16_denormal_flush": ["run", "", "rerun"]}
+        tests = {"agc_driver_ok": (None, "tests/execution/A.cpp"), "agc_driver_f16_denormal_flush": (None, "tests/execution/F16DenormalFlush.cpp")}
+        result, _, log = self.run_suite(plan, "agc_driver_f16_denormal_flush", "--rerun-quarantined", tests=tests)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+        result, _, log = self.run_suite(plan, "re:^agc_driver_", "--rerun-quarantined", "--validation", tests=tests)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+        result, files, log = self.run_suite(plan, "agc_driver_f16_denormal_flush", "--rerun-quarantined", "--validation", tests=tests)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("^agc_driver_f16_denormal_flush$", log)
+        self.assertEqual(json.loads(files["summary.json"])["meta"]["quarantine_rerun"], ["agc_driver_f16_denormal_flush"])
+
     def test_selecting_only_held_tests_runs_nothing(self):
         result, _, log = self.run_suite({"agc_driver_lds_atomics64": ["run", "", ""]}, "agc_driver_lds_atomics64")
         self.assertEqual(result.returncode, 1)
