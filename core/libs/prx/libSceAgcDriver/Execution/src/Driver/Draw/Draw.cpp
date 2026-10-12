@@ -257,7 +257,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         rectListBuilt = true;
         phaseTiming.Phase(DrawRowRectList);
     };
-    if (graphics.rectList) buildRectList();
+    // Rect lists become tessellation stages on the SPIR-V path; the Metal device expands them in
+    // the vertex function instead (MslAbi::RectListMacro, work package D6), with no extra stages.
+    const bool rectListStages = localDevice->Target().backend != ShaderRecompiler::ShaderBackend::Msl;
+    if (graphics.rectList && rectListStages) buildRectList();
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active) {
         require(!graphics.rectList && graphics.stages.path == Graphics::ShaderPath::Vertex && programs.size() == 2 && programResults[0] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric needs a vertex shader before it");
         results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits()));
@@ -347,7 +350,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
             fold(*programResults[0], direct);
-            if (graphics.rectList && patched.contains(0)) buildRectList();
+            if (graphics.rectList && rectListStages && patched.contains(0)) buildRectList();
             snapshot();
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
                 rejected = std::move(*known);
