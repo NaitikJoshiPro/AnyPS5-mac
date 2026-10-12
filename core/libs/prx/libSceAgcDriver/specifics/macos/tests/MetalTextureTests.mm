@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
@@ -249,17 +250,25 @@ int Images() {
             Check(false, "placeholder of heap " + std::to_string(heap) + ": " + error.what());
         }
     }
-    // The PlaceholderImages twin (what ShaderResources binds for absent images): every heap's
-    // placeholder is a valid Metal texture of the heap's type (under MTL_DEBUG_LAYER a bad
-    // descriptor aborts here).
+    // What device creation does (MetalDevice.mm): a complete Context with its recorder, the image
+    // cache attached to it (detiler, PlaceholderImages, sampler cache). Every heap's placeholder
+    // must be a valid Metal texture of the heap's type: under MTL_DEBUG_LAYER a bad texture or
+    // clear descriptor aborts here before any device test meets it.
     {
         AgcDriver::Graphics::MetalTest::Device testDevice;
-        ImageCache attached(testDevice.device, nil);
-        PlaceholderImages placeholders(testDevice.context);
+        Recorder recorder(testDevice.context);
+        testDevice.context.recorder = &recorder;
+        recorder.Activate();
+        ImageCache attached(testDevice.device, testDevice.queue);
+        attached.Attach(testDevice.context);
+        const auto* context = attached.ImageContext();
+        Check(context != nullptr && context->placeholderImages != nullptr && context->detiler != nullptr && context->samplerCache != nullptr, "Attach equips the image context");
         for (std::uint32_t heap = ShaderRecompiler::RuntimeAbi::FirstImageBinding; heap < static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers); ++heap) {
-            id<MTLTexture> view = Metal::TextureOfView(placeholders.View(heap));
+            id<MTLTexture> view = Metal::TextureOfView(context->placeholderImages->View(heap));
             Check(view != nil, "PlaceholderImages view of heap " + std::to_string(heap));
         }
+        recorder.Sync();
+        attached.Teardown();
     }
     // Samplers: equal words share one sampler state; different words do not.
     const std::array<std::uint32_t, 4> pointClamp{0x00000092u, 0x00fff000u, 0x00000000u, 0x00000000u};

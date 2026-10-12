@@ -613,7 +613,14 @@ void ClearByRenderPass(VkCommandBuffer commands, id<MTLTexture> texture, const V
             const auto slices = volume ? std::max<NSUInteger>(texture.depth >> level, 1u) : layers;
             for (NSUInteger slice = 0; slice < slices; ++slice) {
                 MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
-                if (depth != nullptr) {
+                const bool depthTexture = texture.pixelFormat == MTLPixelFormatDepth32Float || texture.pixelFormat == MTLPixelFormatDepth16Unorm;
+                VkClearColorValue depthAsColor{};
+                if (depth != nullptr && !depthTexture) {
+                    // A depth clear of a depth image's color twin (3D, CreateImage).
+                    depthAsColor.float32[0] = depth->depth;
+                    color = &depthAsColor;
+                }
+                if (depth != nullptr && depthTexture) {
                     pass.depthAttachment.texture = texture;
                     pass.depthAttachment.level = level;
                     pass.depthAttachment.slice = volume ? 0u : range.baseArrayLayer + slice;
