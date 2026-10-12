@@ -5,7 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSet);
@@ -56,6 +60,7 @@ int Fail(int error) {
     return -1;
 }
 
+#if defined(__x86_64__)
 std::uint32_t HostMxcsrMask() {
     static const std::uint32_t mask = [] {
         alignas(16) std::uint8_t image[512]{};
@@ -66,9 +71,19 @@ std::uint32_t HostMxcsrMask() {
     }();
     return mask;
 }
+#else
+// On arm64 the guest's x86-64 registers live in the translator (the FEXCore runner), not in host registers. Its
+// bridge hooks (libc RegisterContext.cpp) give the general registers and the MXCSR and x87 control words, but not
+// the FXSAVE state and RFLAGS a ucontext carries, so capturing or resuming a context needs the runner to provide them.
+[[noreturn]] void NeedsRunner(const char* function) {
+    throw std::runtime_error(std::string(function) + " needs the arm64 guest runner: the guest's x86-64 registers live in the "
+        "translator, whose bridge hooks do not expose the FXSAVE state and RFLAGS a ucontext holds");
+}
+#endif
 
 }
 
+#if defined(__x86_64__)
 extern "C" [[noreturn]] void APS5_VABI Aps5ContextRestore_nid_no_patch(const RegisterFrame* frame);
 
 asm(".text\n"
@@ -150,8 +165,16 @@ asm(".text\n"
     "    mov 0x78(%r12), %r15\n"
     "    mov 0x60(%r12), %r12\n"
     "    iretq\n");
+#endif
 
 extern "C" {
+
+#if !defined(__x86_64__)
+int APS5_VABI getcontext_nid_postfix(UserUcontext* context) {
+    if (context == nullptr) return Fail(GuestEinval);
+    NeedsRunner("getcontext");
+}
+#endif
 
 int APS5_VABI Aps5GetcontextFinish_nid_no_patch(UserUcontext* context, const RegisterFrame* frame) {
     if (context == nullptr) return Fail(GuestEinval);
@@ -188,6 +211,9 @@ int APS5_VABI setcontext_nid_postfix(const UserUcontext* context) {
     if (context == nullptr) return Fail(GuestEinval);
     const auto& machine = context->mcontext;
     if (machine.len != sizeof(UserMcontext) || (machine.flags & ~McontextFlagMask) != 0) return Fail(GuestEinval);
+#if !defined(__x86_64__)
+    NeedsRunner("setcontext");
+#else
     RegisterFrame frame{};
     frame.rax = machine.rax;
     frame.rbx = machine.rbx;
@@ -214,6 +240,7 @@ int APS5_VABI setcontext_nid_postfix(const UserUcontext* context) {
     std::memcpy(frame.fxsave + FxsaveMxcsr, &mxcsr, sizeof(mxcsr));
     sigprocmask_nid_postfix(GuestSigSetmask, context->sigmask, nullptr);
     Aps5ContextRestore_nid_no_patch(&frame);
+#endif
 }
 
 }

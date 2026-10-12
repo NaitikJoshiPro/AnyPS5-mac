@@ -578,7 +578,8 @@ if(BUILD_TESTING)
     configure_windows_unwind(guest_user_context_tests)
     add_test(NAME guest_user_context COMMAND guest_user_context_tests)
     add_test(NAME guest_user_context_exit COMMAND guest_user_context_tests exit-on-return)
-    set_tests_properties(guest_user_context guest_user_context_exit PROPERTIES TIMEOUT 20)
+    # Exits 77 on arm64, where capturing and resuming a context needs the guest runner.
+    set_tests_properties(guest_user_context guest_user_context_exit PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
     if(WIN32)
         target_compile_definitions(guest_user_context_tests PRIVATE _WIN32_WINNT=0x0602)
         set_tests_properties(guest_user_context guest_user_context_exit PROPERTIES ENVIRONMENT_MODIFICATION
@@ -663,7 +664,8 @@ if(BUILD_TESTING)
     target_link_libraries(guest_raise_exception_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_raise_exception_tests)
     add_test(NAME guest_raise_exception COMMAND guest_raise_exception_tests)
-    set_tests_properties(guest_raise_exception PROPERTIES TIMEOUT 30)
+    # Exits 77 on arm64, where delivering the exception needs the guest runner.
+    set_tests_properties(guest_raise_exception PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(guest_raise_exception PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
