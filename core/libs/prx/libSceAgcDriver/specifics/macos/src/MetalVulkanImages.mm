@@ -276,10 +276,8 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
     if ((info->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0u && (multisample || depthFormat)) usage |= MTLTextureUsageRenderTarget;
     if ((info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0u) usage |= MTLTextureUsageRenderTarget;
     // Texture atomics need the usage on a 32-bit integer image (storage images of R32 formats).
-    if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u && !multisample) {
-        const auto bytes = PixelFormatOf(info->format).blockBytes;
-        if (bytes == 4u || bytes == 8u) usage |= MTLTextureUsageShaderAtomic;
-    }
+    // (Metal allows the usage only on R32Uint, R32Sint and RG32Uint textures.)
+    if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u && !multisample && (descriptor.pixelFormat == MTLPixelFormatR32Uint || descriptor.pixelFormat == MTLPixelFormatR32Sint || descriptor.pixelFormat == MTLPixelFormatRG32Uint)) usage |= MTLTextureUsageShaderAtomic;
     descriptor.usage = usage;
     id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
     if (texture == nil && (usage & MTLTextureUsageShaderAtomic) != 0u) {
