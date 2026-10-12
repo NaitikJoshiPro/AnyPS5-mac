@@ -141,3 +141,19 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - DRAW: draw path, presentation (CAMetalLayer + headless) and CMASK landed. Being fixed offline: copy fallback for executable/unreadable guest memory (13 G3 tests), layered targets, the vertex_fetch ABI check, dual source, stencil export.
   - SHD: B6 vertex/fragment emission plus rect lists; corpus 313/359 compile. Being fixed offline: pixel LDS, wave64 pixel reduction, draw offsets. Also the GDS append bug.
   - Quarantined: agc_driver_look_back_scan (20 s GPU batch timeout, machine recovered; fix `28a79003` awaiting a supervised rerun).
+- 2026-10-13 (test freeze continues):
+  - SHD handed back (`.mac-work/coord/shd-handoff.md`). SHD2 did the B6 remainder offline, build-checked only (`51a07a73f`, `5b828b370`, `104f66274`):
+    - wave64 readlane and pixel half-wave fixes;
+    - raster-order pixel shaders (MslAbi v4, fragment slot 5);
+    - graphics LDS per invocation, no arena;
+    - interpolation_f16 allowlisted as an Apple9 limit (Feature Set Tables 2026-05-21: per-vertex values are Apple10).
+    - Its test queue is in M2_DESIGN "SHD2 results".
+  - DRAW (still active): resident colour targets, pending flushes, depth-only passes, M3 macOS window/input/audio survey and fixes (HiDPI drawable, title throttling).
+    - Doing next offline: main-thread event pump, Cmd+Ctrl+F fullscreen, mach_wait_until vblank.
+    - After the freeze: SDL_X11/SDL_VULKAN off on Apple, raster-order slot 5 binding, gds_append_consume trace.
+  - **When the user greenlights tests:**
+    - Run DRAW's queue: draw tests, cmask, G3, G4, G1.
+    - Run SHD2's queue.
+    - Verify the upstream image default on G1/G2/G4, then delete the bring-up path.
+    - look_back_scan supervised rerun.
+    - First windowed run (supervised).
