@@ -217,6 +217,11 @@ int DetileGpu() {
 // red/blue swap, and tiles back to the guest bytes.
 int ColorTransfer() {
     AgcDriver::Graphics::MetalTest::Device device;
+    // The limits the device's setup gives its Context (MetalDevice.mm), which the test device leaves at zero.
+    const auto bufferLength = static_cast<std::uint64_t>(device.device.maxBufferLength);
+    device.context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
+    device.context.limits.maxUniformBufferRange = device.context.limits.maxStorageBufferRange;
+    device.context.limits.maxComputeWorkGroupCount[0] = device.context.limits.maxComputeWorkGroupCount[1] = device.context.limits.maxComputeWorkGroupCount[2] = 65535u;
     constexpr std::uint32_t width = 256u;
     constexpr std::uint32_t height = 128u;
     const ColorTargetLayout layout(width, height, ColorTileMode::RenderTarget, 4u);

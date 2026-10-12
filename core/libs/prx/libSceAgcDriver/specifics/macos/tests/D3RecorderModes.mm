@@ -68,6 +68,13 @@ using AgcDriver::GuestMemory::GpuMutex;
 class Device {
 public:
     Device() : cache(test.device, test.queue) {
+    // The limits the device's setup gives its Context (MetalDevice.mm), which the test device leaves at zero.
+    const auto bufferLength = static_cast<std::uint64_t>(test.device.maxBufferLength);
+    test.context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
+    test.context.limits.maxUniformBufferRange = test.context.limits.maxStorageBufferRange;
+    test.context.limits.maxComputeWorkGroupCount[0] = test.context.limits.maxComputeWorkGroupCount[1] = test.context.limits.maxComputeWorkGroupCount[2] = 65535u;
+        // Host imports as the device's setup enables them: no-copy buffers over whole 16 KiB pages.
+        test.context.hostImportAlignment = 16384u;
         cache.Attach(test.context, true);
     }
     const Context& GetContext() const { return *cache.ImageContext(); }
