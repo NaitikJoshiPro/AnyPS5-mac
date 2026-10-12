@@ -17,6 +17,7 @@
 #include "RuntimeAbi.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -288,6 +289,8 @@ int Reduction() {
     id<MTLTexture> texture = [device newTextureWithDescriptor:textureDescriptor];
     const float texels[2] = {10.0f, 20.0f};
     [texture replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+    const char* layer = std::getenv("MTL_DEBUG_LAYER");
+    const bool debugLayer = layer != nullptr && std::strcmp(layer, "0") != 0;
     id<MTLSamplerState> samplers[3];
     const MTLSamplerReductionMode modes[3] = {MTLSamplerReductionModeWeightedAverage, MTLSamplerReductionModeMinimum, MTLSamplerReductionModeMaximum};
     for (int index = 0; index < 3; ++index) {
@@ -295,7 +298,9 @@ int Reduction() {
         descriptor.minFilter = MTLSamplerMinMagFilterLinear;
         descriptor.magFilter = MTLSamplerMinMagFilterLinear;
         descriptor.supportArgumentBuffers = YES;
-        descriptor.reductionMode = modes[index];
+        // Metal's debug layer asserts on some reduction descriptors: under it only the average is
+        // probed (the min/max probe needs a run without MTL_DEBUG_LAYER).
+        if (!debugLayer) descriptor.reductionMode = modes[index];
         samplers[index] = [device newSamplerStateWithDescriptor:descriptor];
     }
     id<MTLBuffer> table = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
@@ -326,6 +331,11 @@ int Reduction() {
     // min/max reduction (SamplerFilterMinmax false) and the sampler path refuses it. This probe
     // fails when the behaviour is mixed, and says when a later OS starts honouring it.
     Check(values[0] == 15.0f && values[4] == 15.0f, "weighted average reduction");
+    if (debugLayer) {
+        if (failures != 0) return 1;
+        std::printf("PASS: agc_metal_sampler_reduction (average only: the min/max probe runs without MTL_DEBUG_LAYER)\n");
+        return 0;
+    }
     const bool honoured = values[1] == 10.0f && values[2] == 20.0f && values[5] == 10.0f && values[6] == 20.0f;
     const bool ignored = values[1] == 15.0f && values[2] == 15.0f && values[5] == 15.0f && values[6] == 15.0f;
     Check(honoured || ignored, "min/max reduction is honoured inconsistently");
