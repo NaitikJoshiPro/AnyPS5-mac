@@ -2,6 +2,7 @@
 
 #include "Bridge.hpp"
 #include "GuestProgram.hpp"
+#include "Options.hpp"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
@@ -273,6 +274,7 @@ thread_local AdoptedThread adoptedThread;
 
 ThreadState* CurrentThread() {
     if (currentThread == nullptr) {
+        ApplyThreadQos();
         adoptedThread.thread = std::make_unique<GuestThread>(0, 0, ThreadStackSize);
         currentThread = adoptedThread.thread->Thread();
     }
@@ -393,6 +395,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     FEXCore::Config::Load();
     FEXCore::Config::ReloadMetaLayer();
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+    LoadOptions();
 
     state.reset(new State {BridgeSyscalls(bridge), CallbackReturns(bridge), FEXCore::Context::Context::CreateNewContext(HostFeatures())});
     state->context->SetSyscallHandler(&state->syscalls);
@@ -439,6 +442,7 @@ void GuestCpu::Start(Bridge& bridge, std::uint64_t start, std::uint64_t block, s
 }
 
 std::uint64_t GuestCpu::Run(std::uint64_t rip, std::uint64_t rsp, const std::vector<std::uint64_t>& initializers) {
+    ApplyThreadQos();
     GuestThread main(rip, rsp, 0);
     currentThread = main.Thread();
     for (const std::uint64_t initializer : initializers) {

@@ -40,7 +40,7 @@ ExternalProject_Add(fexcore
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
-add_executable(aps5-fex src/Main.cpp src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Trampolines.S)
+add_executable(aps5-fex src/Main.cpp src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
 add_dependencies(aps5-fex fexcore)
 target_compile_features(aps5-fex PRIVATE cxx_std_20)
 target_include_directories(aps5-fex PRIVATE
