@@ -749,3 +749,11 @@ Apple GPU and Metal limits behind the skips that [m2_skip_allowlist.txt](../../t
 - <a id="metal-d24s8"></a>D24S8: never supported on Apple silicon; 24-bit depth targets become Depth32Float_Stencil8 (D4)
 - <a id="metal-logic-ops"></a>Logic ops: Metal has no logic-op state; they are emulated with programmable blending (`[[color(n)]]` reads) where a test needs them (D5, B6)
 - <a id="metal-msaa-depth-shader-writes"></a>Shader writes to MSAA or depth textures: `texture2d_ms` and depth textures are read-only in shaders, so guest stores to them need an emulation (B4, D4)
+
+### MetalBackend core (macOS)
+
+Gaps of the MSL emitter's core ([MslEmitter.cpp](../../core/shader/recompiler/MetalBackend/src/MslEmitter.cpp), [MslFlowEmitter.cpp](../../core/shader/recompiler/MetalBackend/src/MslFlowEmitter.cpp), [MslEntryPoint.cpp](../../core/shader/recompiler/MetalBackend/src/MslEntryPoint.cpp); work package B1 in [M2_DESIGN.md](../mac/M2_DESIGN.md)). Each throws `MSL emission failed: ... reason=...` naming the feature.
+
+- Device-memory LDS: a program whose LDS does not fit threadgroup memory (`ShaderInfo::sharedMemoryBytes != 0`, RuntimeAbi's workgroup memory arena) throws "device-memory LDS is not implemented in the MSL backend yet". The LDS accesses into the arena at `MslAbi::BufferIndex::WorkgroupMemory` (B3) and the arena binding with `Reflection::workgroupMemoryStrideDwords` (D1) are missing; `agc_driver_lds_src2` and `agc_driver_oversized_dispatch` stop there
+- Graphics stages: only kernels are emitted; vertex, pixel, mesh and tessellation programs throw "only compute shaders are implemented in the MSL backend so far" until the stage functions and their interfaces exist (B6; `MslEmitterState::AddParameter`/`AddPrologue`/`AddDeclaration` are the hooks). `agc_driver_depth_fast_clear`, `agc_driver_prepared_graphics` and `agc_driver_prepared_unregistered_graphics` stop there
+- Wave64 at one lane per invocation: a wave64 program whose guest wave spans two host SIMD groups (graphics stages, or `APS5_SINGLE_LANE`) cannot vote or ballot over its wave, so `MslEmitterState::WaveBallot`, `WaveAny` and `WaveAll` throw, as the SPIR-V path refuses cross-lane reads outside the host subgroup. Compute programs take two lanes per invocation instead (laneCount 2)
