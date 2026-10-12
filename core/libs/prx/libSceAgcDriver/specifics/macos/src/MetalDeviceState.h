@@ -37,6 +37,9 @@ namespace AgcDriver {
 
 namespace Metal {
 
+// D6's per-device draw objects (MetalDraw.mm).
+struct DrawCache;
+
 [[noreturn]] inline void Unimplemented(const char* what, const char* package) {
     throw std::runtime_error(std::string("Metal device: ") + what + " is not implemented yet (" + package + ", docs/mac/M2_DESIGN.md)");
 }
@@ -165,6 +168,10 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Metal::PipelineCache> pipelines;
     // D4/D5's image cache: textures and samplers of dispatch bindings, its residency set on the queue.
     std::unique_ptr<Graphics::Metal::ImageCache> images;
+    // D6's draw objects (MetalDraw.mm): argument tables, depth surfaces, tiled target textures.
+    // Destroyed in Teardown after the recorder is idle, before `images` (whose residency set holds
+    // their textures).
+    std::shared_ptr<Metal::DrawCache> draws;
 
     std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
     // Wrap without throwing: 0 when the range cannot be wrapped (unmapped, executable, unreadable).
@@ -216,6 +223,14 @@ struct VulkanDevice::State {
     // fault check of the batch.
     void NoteBindings(const StageBindings& plan);
     void CheckFaultsOnComplete();
+
+    // Draws (MetalDraw.mm, D6): the device's draw objects (made at the first draw), a sync when
+    // recorded GPU work writes guest memory the CPU is about to read, the GPU buffer holding a
+    // wrapped guest range, and the recording of one draw into the open batch.
+    Metal::DrawCache& Draws();
+    void SettleRange(std::uint64_t address, std::uint64_t bytes);
+    id<MTLBuffer> BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset);
+    void RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots);
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).
     void Sync();
     void CheckFaults();

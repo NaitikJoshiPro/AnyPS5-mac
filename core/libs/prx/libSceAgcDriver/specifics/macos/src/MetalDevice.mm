@@ -513,6 +513,9 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
             report.residencyRemoved = true;
         }
         // The image cache's residency set leaves the queue (D4/D5, MetalImages.h).
+        // D6's draw objects (depth surfaces, tiled targets) release their textures from the
+        // image cache's residency set before the cache goes.
+        draws.reset();
         if (images != nullptr) images->Teardown();
         images.reset();
         // The pipeline cache after the recorder: joins its background workers, saves the archive.
@@ -649,6 +652,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.backend = ShaderRecompiler::ShaderBackend::Msl;
     // Formats whose sRGB decode the image path does in the texture view (D4, MetalImages.h).
     target.srgbDecodeFormats = Graphics::Metal::SrgbDecodeFormats();
+    // MslAbi: pixel push constants start at byte 128 of the push block (slot 1), whatever the
+    // vertex stage uses.
+    target.fixedPushSlots = true;
     return target;
 }
 
