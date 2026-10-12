@@ -2,4 +2,5 @@
 # tools/mac/gpu_suite.sh refuses to run them (and runs nothing when this file is missing or malformed).
 # A test leaves this list only with evidence: the cause found and fixed, or a supervised rerun under the
 # docs/dev/TechnicalDebt.md entry's conditions. Format: <ctest name> | <reason> | <TechnicalDebt anchor>
-agc_driver_f16_denormal_flush | kernel panic 2026-10-12 20:20 IST (IOGPUFamily data abort at NULL+0x10 while the test process was terminating; macOS 27.0.1, M3) | metal-gpu-quarantine
+# released 2026-10-12 after a supervised rerun (passed under validation, see docs/dev/TechnicalDebt.md#metal-gpu-quarantine):
+# agc_driver_f16_denormal_flush | kernel panic 2026-10-12 20:20 IST (IOGPUFamily data abort at NULL+0x10 while the test process was terminating; macOS 27.0.1, M3) | metal-gpu-quarantine

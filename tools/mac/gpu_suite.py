@@ -422,7 +422,8 @@ def summarize(results, groups, held, selectors, meta, allow_errors, allow_warnin
     lines.append("")
     if held:
         lines.append("held back (never run by gpu_suite): " + " ".join(sorted(held)))
-        lines += [f"  quarantined {name}: {gpu_groups.quarantine_reason(name)}" for name in sorted(held) if gpu_groups.quarantine_reason(name)]
+        quarantined = meta.get("quarantine", {})
+        lines += [f"  quarantined {name}: {quarantined[name]}" for name in sorted(held) if name in quarantined]
         lines.append("")
     broken = [result for result in results if result["outcome"] in ("failed", "timeout", "not-built")]
     if broken:
@@ -464,6 +465,7 @@ def main():
     parser.add_argument("--batch-seconds", type=float, default=240.0, help="worst-case test seconds per batch in --dry-run listings (default: 240); every test runs in its own ctest process")
     parser.add_argument("--canaries", type=Path, default=CANARIES, help="canary list run first (default: tools/mac/gpu_canaries.txt)")
     parser.add_argument("--busy-wait", type=float, default=300.0, help="seconds to wait for load/compilers to go away before refusing (default: 300)")
+    parser.add_argument("--quarantine", type=Path, default=gpu_groups.QUARANTINE, help="quarantine list (default: tools/mac/gpu_quarantine.txt); missing or malformed: nothing runs")
     parser.add_argument("--rerun-quarantined", action="store_true", help="the supervised rerun of ONE quarantined test (D19.4/6): needs exactly one selected test, --validation, and runs it alone after the canaries; the test stays quarantined until the list is edited with this run as evidence")
     parser.add_argument("--pause", type=float, default=PAUSE_SECONDS, help=f"seconds between tests (default and minimum: {PAUSE_SECONDS:g})")
     parser.add_argument("--validation", action="store_true", help="run with MTL_SHADER_VALIDATION=1 (reported to stderr) and MTL_DEBUG_LAYER=1")
@@ -496,7 +498,7 @@ def main():
     except (ValueError, re.error) as error:
         parser.error(str(error))
     try:
-        quarantine = gpu_groups.load_quarantine()
+        quarantine = gpu_groups.load_quarantine(args.quarantine)
     except (OSError, ValueError) as error:
         print(f"refusing to run GPU tests: the quarantine list cannot be read ({error})", file=sys.stderr)
         return 2
@@ -511,7 +513,7 @@ def main():
     for name in chosen:
         if name in quarantine and name not in rerun:
             print(f"refusing to run quarantined test {name}: {quarantine[name]}")
-    held = [name for name in chosen if gpu_groups.HOLD.search(name) or ((name in quarantine or gpu_groups.held(name)) and name not in rerun)]
+    held = [name for name in chosen if gpu_groups.HOLD.search(name) or (name in quarantine and name not in rerun)]
     runnable = [name for name in chosen if name not in held]
     timeouts = {name: registered[name]["properties"].get("TIMEOUT") for name in runnable}
     planned = list(batches(runnable, timeouts, args.timeout, args.batch_seconds))
@@ -531,7 +533,7 @@ def main():
     except Refused as error:
         print(f"refusing to run GPU tests: {error}", file=sys.stderr)
         return 3
-    missing_canaries = [name for name in canaries if name not in registered or name in quarantine or gpu_groups.held(name)]
+    missing_canaries = [name for name in canaries if name not in registered or name in quarantine or gpu_groups.HOLD.search(name)]
     if missing_canaries:
         print(f"refusing to run GPU tests: canaries not registered or held back: {' '.join(missing_canaries)}", file=sys.stderr)
         return 3
@@ -648,7 +650,7 @@ def main():
         "started": started_wall, "finished": finished_wall, "seconds": time.monotonic() - started, "batches": len(cases),
         "git": git_start, "build": os.path.relpath(build, REPO), "environment": extra,
         "rebuilt": rebuilt, "prx": {"path": PRX, "sha256": prx_before}, "guards": guards, "canaries": canary_results,
-        "stopped": stopped, "not_run": not_run, "timeout_cap": MAX_TIMEOUT, "pause": args.pause, "quarantine_rerun": rerun,
+        "stopped": stopped, "not_run": not_run, "timeout_cap": MAX_TIMEOUT, "pause": args.pause, "quarantine_rerun": rerun, "quarantine": {name: quarantine[name] for name in held if name in quarantine},
     }
     table, summary = summarize(results, groups, held, args.selectors, meta, allow_errors, allow_warnings)
     (out / "summary.txt").write_text(summary + "\n", encoding="utf-8")

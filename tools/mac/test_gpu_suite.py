@@ -172,9 +172,7 @@ class GroupTests(unittest.TestCase):
                 self.assertFalse(bool(gpu_groups.HOLD.search(name)), name)
 
     def test_quarantine_file(self):
-        committed = gpu_groups.load_quarantine()
-        self.assertIn("kernel panic", committed["agc_driver_f16_denormal_flush"])
-        self.assertTrue(gpu_groups.held("agc_driver_f16_denormal_flush"))
+        gpu_groups.load_quarantine()  # the committed list parses (it may be empty)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "quarantine.txt"
             path.write_text("# comment\nagc_x | it panicked | anchor-x\n\n")
@@ -240,6 +238,7 @@ class SuiteRunTests(unittest.TestCase):
                 tool.write_text(text)
                 tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
             (root / "plan.json").write_text(json.dumps(plan))
+            (root / "quarantine.txt").write_text("agc_driver_f16_denormal_flush | kernel panic in a test | metal-gpu-quarantine\n")
             (root / "canaries.txt").write_text("# canaries\n" + "".join(f"{name}\n" for name in canaries))
             environment = dict(os.environ, PATH=f"{bin_directory}{os.pathsep}{os.environ.get('PATH', '')}",
                                FAKE_CTEST_PLAN=str(root / "plan.json"), FAKE_CTEST_LOG=str(root / "ctest.log"),
@@ -251,7 +250,7 @@ class SuiteRunTests(unittest.TestCase):
             out = root / "out"
             started = time.monotonic()
             result = subprocess.run([sys.executable, "-I", str(HERE / "gpu_suite.py"), *arguments, "--build", str(build), "--out", str(out),
-                                     "--canaries", str(root / "canaries.txt"), "--busy-wait", "0"],
+                                     "--canaries", str(root / "canaries.txt"), "--quarantine", str(root / "quarantine.txt"), "--busy-wait", "0"],
                                     capture_output=True, text=True, env=environment)
             result.seconds = time.monotonic() - started
             files = {name: (out / name).read_text() for name in ("summary.txt", "summary.json", "junit.xml") if (out / name).exists()}
