@@ -515,7 +515,10 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         result.outputType = "Aps5FragmentOut";
     }
     if (pixel.psSampleShading) state.reflection.perSample = true;
-    if (pixel.psOrderedPixelShader) state.Fail("primitive-ordered pixel shaders (raster order groups) are not implemented in the MSL backend yet (work package B6)");
+    // Primitive-ordered pixel shaders (the SPIR-V path's PixelInterlockOrderedEXT around the whole
+    // program): the stage function brackets the guest body with raster-order-group accesses
+    // (EmitMslEntryPoint, BufferIndex::RasterOrder).
+    if (pixel.psOrderedPixelShader) state.reflection.rasterOrder = true;
     if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable && !pixel.psStencilRefExportEnable && !pixel.psAlphaToCoverage) {
         result.attributes = "[[early_fragment_tests]] ";
         state.reflection.earlyFragmentTests = true;

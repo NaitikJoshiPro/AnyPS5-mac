@@ -40,7 +40,7 @@
 
 namespace ShaderRecompiler::MslAbi {
 
-inline constexpr std::uint32_t Version = 3u;
+inline constexpr std::uint32_t Version = 4u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -60,7 +60,11 @@ enum class BufferIndex : std::uint32_t {
     // Version 3: vertex functions only, the VertexFetchRecord array indexed by Vulkan location
     // (Reflection::vertexFetchLocations), for vertex pulling.
     VertexFetch = 4u,
-    Count = 5u
+    // Version 4: fragment functions with Reflection::rasterOrder only (primitive-ordered pixel
+    // shaders): any device buffer of at least RasterOrderBytes, declared [[raster_order_group(0)]].
+    // Its contents are ignored and never read back; it may be shared by every draw.
+    RasterOrder = 5u,
+    Count = 6u
 };
 
 inline constexpr std::uint32_t Index(BufferIndex index) {
@@ -197,6 +201,12 @@ inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";
 //   APS5_COLOR<n>_TYPE.
 inline constexpr const char* ColorTypeMacroPrefix = "APS5_COLOR";
 
+// Version 4: minimum size of the buffer at BufferIndex::RasterOrder. A primitive-ordered fragment
+// function reads one dword of it (picked by the pixel position) before the guest program and writes
+// it back after, so Metal orders the guest program's memory accesses between overlapping fragments
+// as the guest's ordered (POPS) pixel shaders and SPV_EXT_fragment_shader_interlock do.
+inline constexpr std::uint32_t RasterOrderBytes = 16384u;
+
 // Size of the lock table DriverData::atomicLocks points at (1024 lock words).
 inline constexpr std::uint32_t AtomicLockTableBytes = 4096u;
 
@@ -252,6 +262,11 @@ struct Reflection {
     // SPIR-V path's optimizer drops the unused sampler variable).
     std::vector<std::uint32_t> samplerModeUses;
     bool samplerUnconditional = false;
+    // Version 4, fragment functions: a primitive-ordered pixel shader; the driver binds a buffer of
+    // at least RasterOrderBytes at BufferIndex::RasterOrder. Vertex and fragment functions never use
+    // BufferIndex::WorkgroupMemory (graphics-stage LDS is per invocation, in thread memory, as the
+    // SPIR-V path's Function-storage LDS), so workgroupMemoryStrideDwords stays 0 for them.
+    bool rasterOrder = false;
 
     bool operator==(const Reflection& other) const = default;
 };

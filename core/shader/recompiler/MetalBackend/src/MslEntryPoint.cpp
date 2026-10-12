@@ -172,6 +172,10 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         helperParameters.push_back("thread uint& aps5_valid");
         arguments.push_back("aps5_valid");
     }
+    // Primitive-ordered pixel shaders: the raster order group buffer is a stage-function parameter
+    // only (the guest body never touches it).
+    const bool rasterOrder = fragment && state.reflection.rasterOrder;
+    if (rasterOrder) parameters.push_back("device uint* aps5_rog [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::RasterOrder)) + "), raster_order_group(0)]]");
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
     text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n\n";
@@ -221,6 +225,19 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "    const bool aps5_valid_rect = aps5_edges == 1u && aps5_w > 0.0f && aps5_v[1].aps5_position.w == aps5_w && aps5_v[2].aps5_position.w == aps5_w && all(isfinite(aps5_out.aps5_position));\n";
         text += "    if (!aps5_valid_rect) aps5_out.aps5_position = float4(0.0f);\n";
         text += "#else\n    " + call("aps5_vertex_id", "aps5_out") + "\n#endif\n";
+    } else if (rasterOrder) {
+        // The guest program is the critical section, as the SPIR-V path's Begin/End invocation
+        // interlock around it: the read of the pixel's raster-order-group dword waits until every
+        // earlier overlapping fragment wrote it back, and the write-back after the body releases the
+        // next one. The guest's own memory accesses are device pointers made from addresses, which
+        // the compiler cannot prove apart from aps5_rog, so they stay between the two accesses; the
+        // fences make the previous fragment's stores visible (MslAbi::RasterOrderBytes).
+        text += "    const uint aps5_rog_slot = (uint(aps5_in.aps5_position.x) & 63u) | ((uint(aps5_in.aps5_position.y) & 63u) << 6u);\n";
+        text += "    const uint aps5_rog_ticket = aps5_rog[aps5_rog_slot];\n";
+        text += "    atomic_thread_fence(mem_flags::mem_device, memory_order_acquire, thread_scope_device);\n";
+        text += "    " + call("aps5_vertex_id", "aps5_out") + "\n";
+        text += "    atomic_thread_fence(mem_flags::mem_device, memory_order_release, thread_scope_device);\n";
+        text += "    aps5_rog[aps5_rog_slot] = aps5_rog_ticket + 1u;\n";
     } else {
         text += "    " + call("aps5_vertex_id", "aps5_out") + "\n";
     }
