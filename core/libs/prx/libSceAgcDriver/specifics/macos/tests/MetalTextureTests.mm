@@ -194,6 +194,67 @@ int Images() {
     return 0;
 }
 
+
+// Min/max sampler reduction through argument-buffer samplers on the GPU: a 2x1 R32Float texture
+// (10, 20) sampled bilinearly at its centre must give 15 (average), 10 (min), 20 (max).
+int Reduction() {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil || ![device supportsFamily:MTLGPUFamilyMetal4]) {
+        std::printf("skipped, the machine has no Metal 4 device\n");
+        return 77;
+    }
+    NSError* error = nil;
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion4_0;
+    NSString* source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct Table { texture2d<float> image; array<sampler, 3> samplers; };\n"
+        "kernel void probe(constant Table& table [[buffer(0)]], device float* out [[buffer(1)]], uint index [[thread_position_in_grid]]) {\n"
+        "    out[index] = table.image.sample(table.samplers[index], float2(0.5, 0.5), level(0.0)).x;\n"
+        "}\n";
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&error];
+    if (library == nil) return (std::fprintf(stderr, "FAIL: %s\n", error.localizedDescription.UTF8String), 1);
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"probe"] error:&error];
+    MTLTextureDescriptor* textureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:2 height:1 mipmapped:NO];
+    textureDescriptor.storageMode = MTLStorageModeShared;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:textureDescriptor];
+    const float texels[2] = {10.0f, 20.0f};
+    [texture replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+    id<MTLSamplerState> samplers[3];
+    const MTLSamplerReductionMode modes[3] = {MTLSamplerReductionModeWeightedAverage, MTLSamplerReductionModeMinimum, MTLSamplerReductionModeMaximum};
+    for (int index = 0; index < 3; ++index) {
+        MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
+        descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+        descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+        descriptor.supportArgumentBuffers = YES;
+        descriptor.reductionMode = modes[index];
+        samplers[index] = [device newSamplerStateWithDescriptor:descriptor];
+    }
+    id<MTLBuffer> table = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+    auto* ids = static_cast<std::uint64_t*>(table.contents);
+    ids[0] = texture.gpuResourceID._impl;
+    for (int index = 0; index < 3; ++index) ids[1 + index] = samplers[index].gpuResourceID._impl;
+    id<MTLBuffer> output = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> commands = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:table offset:0 atIndex:0];
+    [encoder setBuffer:output offset:0 atIndex:1];
+    [encoder useResource:texture usage:MTLResourceUsageRead];
+    [encoder dispatchThreads:MTLSizeMake(3, 1, 1) threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
+    [encoder endEncoding];
+    [commands commit];
+    [commands waitUntilCompleted];
+    const auto* values = static_cast<const float*>(output.contents);
+    std::printf("average %f, min %f, max %f\n", values[0], values[1], values[2]);
+    Check(values[0] == 15.0f, "weighted average reduction");
+    Check(values[1] == 10.0f, "minimum reduction (argument-buffer sampler)");
+    Check(values[2] == 20.0f, "maximum reduction (argument-buffer sampler)");
+    if (failures != 0) return 1;
+    std::printf("PASS: agc_metal_sampler_reduction\n");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -201,6 +262,7 @@ int main(int argc, char** argv) {
         try {
             if (argc == 2 && std::strcmp(argv[1], "--detile") == 0) return Detile();
             if (argc == 2 && std::strcmp(argv[1], "--images") == 0) return Images();
+            if (argc == 2 && std::strcmp(argv[1], "--reduction") == 0) return Reduction();
             std::fprintf(stderr, "usage: agc_metal_texture_tests --detile | --images\n");
             return 1;
         } catch (const std::exception& error) {
