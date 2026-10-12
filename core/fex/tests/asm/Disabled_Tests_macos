@@ -1,0 +1,23 @@
+# Tests aps5-fex-asm does not run on macOS arm64, one per line: <test>[ [nasm2|nasm3]]: <reason>
+# macOS arm64 cannot map the low 4 GiB (__PAGEZERO), so prepare_asm_tests.py moves every mapped
+# address up by 0x100_0000_0000. These tests reach memory through 32-bit addresses, which the move
+# cannot follow.
+
+Displacement_Encoding.asm: absolute 32-bit displacements ([abs 0x7FFF_F000], [abs 0x7FFF_FFF8]) address memory below 4 GiB
+MemoryData.asm: an absolute 32-bit displacement ([abs 0x10000000]) addresses memory below 4 GiB
+FEX_bugs/a32_lods.asm: a32 lodsq truncates RSI to the 32-bit address 0x80000, below 4 GiB
+FEX_bugs/a32_rep_lods.asm: a32 rep lodsq truncates RSI to the 32-bit address 0x80000, below 4 GiB
+FEX_bugs/mov_address_size_override.asm: a raw-encoded (db 0x67) instruction uses a 32-bit address of the scratch memory
+Primary/Primary_A0.asm: a raw-encoded (db 0x67) moffs load uses a 32-bit address of the scratch memory, and dq/dd keep scratch addresses in data
+Primary/Primary_A2.asm: a raw-encoded (db 0x67) moffs store uses a 32-bit address of the scratch memory, and dq/dd keep scratch addresses in data
+Primary/Primary_A6_addrmod.asm: raw-encoded (db 0x67) cmps uses 32-bit addresses of the scratch memory
+Primary/Primary_A6_REP_addrmod.asm: raw-encoded (db 0x67) rep cmps uses 32-bit addresses of the scratch memory
+Primary/Primary_AE_addrmod.asm: raw-encoded (db 0x67) scas uses a 32-bit address of the scratch memory
+PrimaryGroup/5_FF_05_03_o32.asm: call far dword [esp] uses a 32-bit address of the stack and a 32-bit code offset
+PrimaryGroup/5_FF_05_03_o32_imm.asm: call far dword [esp] uses a 32-bit address of the stack and a 32-bit code offset
+VEX/vmovq_vmovd_reg.asm: vmovd [edx] uses a 32-bit address of the scratch memory
+PrimaryGroup/5_FF_05.asm: lea edi, [rel .success] truncates a code address to 32 bits for jmp far [rsp]
+PrimaryGroup/5_FF_05_03_o64.asm: lea edi, [rel .success] truncates a code address to 32 bits for o64 call far [rsp]
+PrimaryGroup/5_FF_05_03_o64_imm.asm: lea edi, [rel .success] truncates a code address to 32 bits for o64 call far [rsp]
+TwoByte/0F_02.asm: makes the Linux time syscall (201); aps5-fex has no Linux syscall layer, guest syscalls are bridge calls
+Secondary/07_XX_04.asm [nasm3]: nasm 3 encodes smsw rax, smsw cx and 66-prefixed smsw rdi without their REX.W and 0x66 prefixes (0F 01 E0/E1/E7), so the x86 results recorded with nasm 2 do not apply

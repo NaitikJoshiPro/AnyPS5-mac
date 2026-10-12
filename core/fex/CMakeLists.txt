@@ -40,17 +40,21 @@ ExternalProject_Add(fexcore
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
-add_executable(aps5-fex src/Main.cpp src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
-add_dependencies(aps5-fex fexcore)
-target_compile_features(aps5-fex PRIVATE cxx_std_20)
-target_include_directories(aps5-fex PRIVATE
+add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
+add_dependencies(aps5-fex-runtime fexcore)
+target_compile_features(aps5-fex-runtime PUBLIC cxx_std_20)
+target_include_directories(aps5-fex-runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${APS5_FEX_SOURCE_DIR}/FEXCore/include
     ${APS5_FEX_BINARY_DIR}/include
     ${APS5_FEX_SOURCE_DIR}/FEXHeaderUtils
     ${APS5_FEX_SOURCE_DIR}/External/fmt/include
     ${APS5_FEX_SOURCE_DIR}/External/range-v3/include
     ${APS5_FEX_SOURCE_DIR}/External/unordered_dense/include)
-target_link_libraries(aps5-fex PRIVATE ${APS5_FEX_LIBRARIES})
+target_link_libraries(aps5-fex-runtime PUBLIC ${APS5_FEX_LIBRARIES})
+
+add_executable(aps5-fex src/Main.cpp)
+target_link_libraries(aps5-fex PRIVATE aps5-fex-runtime)
 
 if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
@@ -64,6 +68,34 @@ if(BUILD_TESTING)
         add_test(NAME fex_bench_smoke COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_bench.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --smoke)
         set_tests_properties(fex_bench_smoke PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+
+        add_test_executable(aps5-fex-asm tests/asm/AsmHarness.cpp)
+        target_link_libraries(aps5-fex-asm PRIVATE aps5-fex-runtime)
+        set(APS5_FEX_ASM_ROOT ${APS5_FEX_SOURCE_DIR}/unittests/ASM)
+        set(APS5_FEX_ASM_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/asm)
+        add_test(NAME fex_asm_prepare COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/asm/prepare_asm_tests.py
+            ${APS5_FEX_ASM_ROOT} ${CMAKE_CURRENT_SOURCE_DIR}/tests/asm ${APS5_FEX_ASM_OUTPUT})
+        set_tests_properties(fex_asm_prepare PROPERTIES TIMEOUT 1200 FIXTURES_SETUP fex_asm_prepared)
+        add_test(NAME fex_asm_prepare_tests COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prepare_asm_tests.py)
+        set(APS5_FEX_ASM_NASM "" CACHE FILEPATH "nasm for the FEX ASM tests (nasm 2.16 gives the bytes FEX recorded its results with); empty uses nasm on PATH")
+        if(APS5_FEX_ASM_NASM)
+            set_property(TEST fex_asm_prepare fex_asm_prepare_tests APPEND PROPERTY ENVIRONMENT NASM=${APS5_FEX_ASM_NASM})
+        endif()
+        file(GLOB_RECURSE APS5_FEX_ASM_TESTS CONFIGURE_DEPENDS RELATIVE ${APS5_FEX_ASM_ROOT} ${APS5_FEX_ASM_ROOT}/*.asm)
+        foreach(asmTest IN LISTS APS5_FEX_ASM_TESTS)
+            set(asmOptions)
+            if(asmTest MATCHES "^SelfModifyingCode/")
+                set(asmOptions --option FEX_SMCCHECKS=full)
+            endif()
+            add_test(NAME fex_asm/${asmTest} COMMAND aps5-fex-asm --variant default --option FEX_MAXINST=500 --option FEX_MULTIBLOCK=1
+                ${asmOptions} ${APS5_FEX_ASM_OUTPUT}/${asmTest}.cfg)
+            set_tests_properties(fex_asm/${asmTest} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 125 FIXTURES_REQUIRED fex_asm_prepared
+                LABELS fex_asm)
+            add_test(NAME fex_asm_full/${asmTest} COMMAND aps5-fex-asm --variant full --option FEX_MAXINST=1 --option FEX_MULTIBLOCK=0
+                ${asmOptions} ${APS5_FEX_ASM_OUTPUT}/${asmTest}.cfg)
+            set_tests_properties(fex_asm_full/${asmTest} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 125 FIXTURES_REQUIRED fex_asm_prepared
+                LABELS "fex_asm_full;slow")
+        endforeach()
     endif()
 endif()
 
