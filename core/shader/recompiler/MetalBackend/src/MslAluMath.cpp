@@ -497,13 +497,12 @@ std::string Median(const std::string& a, const std::string& b, const std::string
     return "max(min(" + a + ", " + b + "), min(max(" + a + ", " + b + "), " + c + "))";
 }
 
-// The relative-addressing window of vector registers (v_movrels/v_movreld): a function-scope array,
-// as the SPIR-V path's Function-storage `vector_window`.
+// The relative-addressing window of vector registers (v_movrels/v_movreld): a function-scope array per
+// guest lane of the invocation, as the SPIR-V path's Function-storage `vector_window` per lane half.
 std::string VectorWindow(MslEmitterState& state, const IrValue& instruction) {
     const auto size = state.program.Metadata().vectorWindowSize;
     if (size == 0u) state.Fail(instruction, "has no relative-addressing window in the program metadata");
-    if (state.laneCount != 1u) state.Fail(instruction, "relative addressing with two guest lanes per invocation is not implemented in the MSL backend yet (package B2)");
-    const std::string name = "aps5_vector_window";
+    const std::string name = state.half == 0u ? "aps5_vector_window" : "aps5_vector_window_h";
     if (state.locals.find(" " + name + "[") == std::string::npos) state.DeclareLocal("uint", name + "[" + std::to_string(size) + "]", "{}");
     return name + "[" + state.Arg(instruction, 0u) + "]";
 }
