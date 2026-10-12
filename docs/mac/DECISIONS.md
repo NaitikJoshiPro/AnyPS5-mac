@@ -85,3 +85,12 @@ Foundation result: `agc_driver_vop1_control` passes end to end on the GPU via Me
 ## D18: Runner defaults: strict split locks, opt-in disk cache (2026-10-12)
 - FEX's `StrictInProcessSplitLocks` is on by default: unaligned locked accesses that cross 16 bytes are otherwise emulated with two CASes and tear (measured: 11 of 12 wrong counts across 4 concurrent copies without it, 12/12 correct with it).
 - The JIT disk cache (FEX-2610 DiskCache, content-checked) is enabled when `APS5_FEX_CACHE_DIR` is set or a directory above the executable is named after a title ID; `aps5-fex --precompile` seeds it ahead of time from `.eh_frame` FDEs, exports, relocation targets, init/fini arrays and the entry point.
+
+## D19: GPU safety rules after the 2026-10-12 kernel panic (user-approved 2026-10-12)
+Evidence: `.mac-work/feedback/gpu-safety-proposal.md` (panic during process teardown of a test using an untested, half-edited Metal 4 device; one residency set never removed from the queue). The user lifted the GPU freeze ("all gpu tests are allowed now") on these terms:
+1. GPU tests run only through `tools/mac/gpu_suite.py` (or a ctest call wrapped by it), which refuses when the build that produced the binaries has uncommitted changes under `core/`, when any GPU test binary or the prx is stale vs its inputs, when the 1-minute load average is > 6, or when a compiler/linker is running. Record prx hash + HEAD per run.
+2. Canaries first in every session (3 known-good tests); stop on any failure.
+3. A shader corpus that doesn't compile (offline `xcrun metal` once installed, else `agc_metal_msl_compile`) means its tests are not launched.
+4. Validation (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`) for new shader families, device/recorder/residency/teardown changes and quarantined-test reruns.
+5. Driver teardown hygiene: every residency set removed from the queue, wait for the last submitted value before releasing, drop `__DATA` wrappers, join the release thread.
+6. One test per process, timeout ≤30 s, 2 s pause between tests. Quarantine list fails closed.
