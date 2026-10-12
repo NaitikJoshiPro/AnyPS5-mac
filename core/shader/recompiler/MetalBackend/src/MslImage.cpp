@@ -7,6 +7,8 @@
 #include "MslBufferShared.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "PipelineSpecialization.hpp"
+#include "RuntimeAbi.hpp"
+#include <cstddef>
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -102,6 +104,75 @@ static inline float aps5_cube_layer(float value) {
     const uint guest = uint(value);
     return float(guest - ((guest >> 3u) << 1u));
 }
+// Emulated depth comparison of a color texture (SpirvImageEmitter.cpp EmitEmulatedCompareSample):
+// p = (function, linear, clamp x, clamp y), q = (reference mode, border white).
+static inline int aps5_ec_address(int index, int extent, uint mode) {
+    if (mode == 0u) {
+        const int remainder = index % extent;
+        return remainder < 0 ? remainder + extent : remainder;
+    }
+    return clamp(index, 0, extent - 1);
+}
+
+static inline float4 aps5_ec_fetch(texture2d<float> t, uint x, uint y, uint layer) {
+    return t.read(uint2(x, y), 0u);
+}
+
+static inline float4 aps5_ec_fetch(texture2d_array<float> t, uint x, uint y, uint layer) {
+    return t.read(uint2(x, y), layer, 0u);
+}
+
+template <typename T>
+static inline float aps5_ec_texel(T t, int x, int y, uint layer, int width, int height, uint4 p, uint2 q, uint4 swizzle, float reference) {
+    const float4 texel = aps5_ec_fetch(t, uint(aps5_ec_address(x, width, p.z)), uint(aps5_ec_address(y, height, p.w)), layer);
+    float red = texel.w;
+    for (uint channel = 3u; channel-- > 0u;) {
+        if (swizzle[channel] == 4u) red = texel[channel];
+    }
+    const float border = q.y == 1u ? 1.0f : 0.0f;
+    if (p.z == 2u && !(x >= 0 && x < width)) red = border;
+    if (p.w == 2u && !(y >= 0 && y < height)) red = border;
+    float result = p.x == 7u ? 1.0f : 0.0f;
+    switch (p.x) {
+    case 1u: result = reference < red ? 1.0f : 0.0f; break;
+    case 2u: result = reference == red ? 1.0f : 0.0f; break;
+    case 3u: result = reference <= red ? 1.0f : 0.0f; break;
+    case 4u: result = reference > red ? 1.0f : 0.0f; break;
+    case 5u: result = (reference < red || reference > red) ? 1.0f : 0.0f; break;
+    case 6u: result = reference >= red ? 1.0f : 0.0f; break;
+    default: break;
+    }
+    return q.x == 3u ? 0.0f : result;
+}
+
+template <typename T>
+static inline float4 aps5_ec_sample(T t, float2 coord, uint layer, int2 offset, uint4 p, uint2 q, uint4 swizzle, float reference) {
+    if (q.x == 1u) reference = clamp(reference, 0.0f, 1.0f);
+    if (q.x == 2u) reference = clamp(reference, -1.0f, 1.0f);
+    const int width = int(t.get_width(0));
+    const int height = int(t.get_height(0));
+    const float u = coord.x * float(width);
+    const float v = coord.y * float(height);
+    float result;
+    if (p.y == 0u) {
+        result = aps5_ec_texel(t, int(floor(u)) + offset.x, int(floor(v)) + offset.y, layer, width, height, p, q, swizzle, reference);
+    } else {
+        const float cu = u - 0.5f;
+        const float cv = v - 0.5f;
+        const float fu = floor(cu);
+        const float fv = floor(cv);
+        const float wu = cu - fu;
+        const float wv = cv - fv;
+        const int x0 = int(fu) + offset.x;
+        const int y0 = int(fv) + offset.y;
+        const float top = mix(aps5_ec_texel(t, x0, y0, layer, width, height, p, q, swizzle, reference), aps5_ec_texel(t, x0 + 1, y0, layer, width, height, p, q, swizzle, reference), wu);
+        const float bottom = mix(aps5_ec_texel(t, x0, y0 + 1, layer, width, height, p, q, swizzle, reference), aps5_ec_texel(t, x0 + 1, y0 + 1, layer, width, height, p, q, swizzle, reference), wu);
+        result = mix(top, bottom, wv);
+    }
+    float4 value;
+    for (uint channel = 0u; channel < 4u; ++channel) value[channel] = swizzle[channel] == 0u ? 0.0f : (swizzle[channel] == 1u ? 1.0f : result);
+    return value;
+}
 )MSL";
 
 struct Access {
@@ -109,7 +180,24 @@ struct Access {
     const MemoryInfo& mem;
     const ImageResource& image;
     const IrValue& address;
+    // Bindless image tables (ImageResource::indirectRoot): the RuntimeAbi::ResourceMetadata index
+    // of the image (a literal for direct images), the heap element the table slot selected (empty:
+    // the static element) and whether the key was mapped (empty: always).
+    std::string metadata = {};
+    std::string tableElement = {};
+    std::string mapped = {};
 };
+
+// Dword `member` of the image's RuntimeAbi::ResourceMetadata in the shader data.
+std::string MetadataDword(MslEmitterState& state, const std::string& index, std::uint32_t member) {
+    const IrBindingLayout& layout = state.program.Metadata().bindings;
+    const auto dword = "(" + std::to_string(layout.ImageMetadataDword() + member) + "u + (" + index + ") * " + std::to_string(sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t)) + "u)";
+    if (layout.UsesPushData()) {
+        state.usesPushData = true;
+        return "aps5_push[" + state.FunctionConstant(PipelineSpecialization::PushDataOffset, layout.pushDataStartDword) + " + " + dword + "]";
+    }
+    return "reinterpret_cast<device const uint*>(" + state.TableBuffer(DescriptorBindingKind::ShaderData, 0u) + ".address)[" + dword + "]";
+}
 
 bool HasFlag(const MemoryInfo& mem, std::uint32_t flag) {
     return (mem.imageSampleFlags & flag) != 0u;
@@ -220,6 +308,17 @@ ImageSampleLayout Layout(const MemoryInfo& mem) {
 // The texture (heap element) a mode's access reads or writes.
 std::string Texture(MslEmitterState& state, const Access& access, std::uint32_t elementOffset = 0u) {
     const auto kind = DescriptorBindingForImage(access.image);
+    if (!access.tableElement.empty()) {
+        // TableImageIndex: the slot's heap element (ResourceMetadata.firstElement), bounded by the
+        // range the table declares.
+        state.TableResource(kind, 0u);
+        const auto& descriptors = state.program.Metadata().bindings.descriptors;
+        std::size_t count = 1u;
+        for (const auto& descriptor : descriptors) {
+            if (descriptor.kind == kind) count = std::max<std::size_t>(descriptor.resources.size(), 1u);
+        }
+        return "aps5_table." + MslTableField(kind) + "[min(" + access.tableElement + ", " + std::to_string(count - 1u) + "u)]";
+    }
     return state.TableResource(kind, state.DescriptorElement(kind, access.mem.resource) + elementOffset);
 }
 
@@ -231,7 +330,10 @@ std::string Sampler(MslEmitterState& state, const Access& access) {
 }
 
 std::string SwizzleSelector(MslEmitterState& state, const Access& access, std::uint32_t component) {
-    if (access.image.indirectRoot != ImageResource::NoIndirectImage) state.Fail(access.inst, "uses a bindless image table, which the MSL backend does not implement yet (work package B4)");
+    if (access.image.indirectRoot != ImageResource::NoIndirectImage) {
+        const auto index = access.metadata.empty() ? std::to_string(access.mem.resource) + "u" : access.metadata;
+        return "((" + MetadataDword(state, index, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + 3u) + " >> " + U(component * 3u) + ") & 7u)";
+    }
     return state.FunctionConstant(PipelineSpecialization::ImageBase + access.mem.resource * PipelineSpecialization::ImageWords + 1u + component, component + 4u);
 }
 
@@ -1025,10 +1127,33 @@ void EmitGather(MslEmitterState& state, const Access& access, const ImageSampleL
     state.Define(access.inst, ResultVector(state, access, UnpackImageGather(state, access, gathered), numeric, false, true));
 }
 
+void EmitEmulatedCompareSample(MslEmitterState& state, const Access& access, const ImageSampleLayout& layout, const std::string& texture) {
+    const auto& mem = access.mem;
+    const auto& image = access.image;
+    if (HasFlag(mem, RdnaImageSampleFlagDerivative) || HasFlag(mem, RdnaImageSampleFlagLod)) state.Fail(access.inst, "compares against a color texture with gradients or an explicit LOD, which is not implemented");
+    const bool arrayed = image.dimension == RdnaImageDimension::Dim2DArray;
+    if (image.dimension != RdnaImageDimension::Dim2D && !arrayed) state.Fail(access.inst, "compares against a color texture that is not a 2D or 2D array view, which is not implemented");
+    if (layout.dref == NoImageComponent || mem.imageAddressComponents <= layout.dref) state.Fail(access.inst, "has no depth reference in the image address");
+    const auto parameter = [&](std::uint32_t word) { return state.FunctionConstant(PipelineSpecialization::CompareBase + mem.resource * PipelineSpecialization::CompareWords + word, 0u); };
+    const auto coordinate = [&](std::uint32_t index) { return AddressF32(state, access, layout.coord + index); };
+    std::string layer = "0u";
+    if (arrayed) layer = "uint(clamp(int(floor(" + coordinate(2) + " + 0.5f)), 0, int(" + texture + ".get_array_size()) - 1))";
+    const auto offset = layout.offset != NoImageComponent ? "int2(" + PackedOffset(state, access, layout) + ".xy)" : std::string("int2(0)");
+    std::string swizzle = "uint4(";
+    for (std::uint32_t channel = 0; channel < 4u; ++channel) swizzle += (channel != 0u ? ", " : "") + SwizzleSelector(state, access, channel);
+    swizzle += ")";
+    const auto value = state.Temporary("aps5_ec");
+    state.Line("const float4 " + value + " = aps5_ec_sample(" + texture + ", float2(" + coordinate(0) + ", " + coordinate(1) + "), " + layer + ", " + offset + ", uint4(" + parameter(0) + ", " + parameter(1) + ", " + parameter(2) + ", " + parameter(3) + "), uint2(" + parameter(4) + ", " + parameter(5) + "), " + swizzle + ", " + AddressF32(state, access, layout.dref) + ");");
+    state.Define(access.inst, ResultVector(state, access, value, IrTextureNumericClass::Float, false, false));
+}
+
 void EmitSample(MslEmitterState& state, const Access& access, const ImageSampleLayout& layout, bool dref, const SampleCoord& coord, const std::string& texture, const std::string& sampler) {
     const auto& mem = access.mem;
     const auto& image = access.image;
-    if (dref && (image.emulatedCompare & EmulatedCompare::Enabled) != 0u) state.Fail(access.inst, "compares against a color texture (emulated depth compare), which the MSL backend does not implement yet (work package B4)");
+    if (dref && (image.emulatedCompare & EmulatedCompare::Enabled) != 0u) {
+        EmitEmulatedCompareSample(state, access, layout, texture);
+        return;
+    }
     const bool explicitLod = ImageSampleExplicitLod(mem.imageSampleFlags, state.program.Resources().stage);
     const auto spatial = Dimension(image.dimension).spatialComponents;
     std::string options;
@@ -1124,11 +1249,18 @@ const IrValue& ImageAddress(MslEmitterState& state, const IrValue& inst, const I
     return *resolved;
 }
 
-void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& mode) {
+struct TableSelection {
+    std::string metadata;
+    std::string element;
+    std::string mapped;
+};
+
+void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& mode, const TableSelection& table) {
     const auto& mem = state.Memory(inst);
     const auto info = ImageOpcodeInfoOf(inst.Opcode());
     const auto& address = ImageAddress(state, inst, inst.Argument(info.needsSampler ? 2 : 1));
-    const Access access{inst, mem, mode, address};
+    const Access access{inst, mem, mode, address, table.metadata, table.element, table.mapped};
+    if (!table.element.empty() && (info.access == ImageAccess::Write || info.access == ImageAccess::Atomic)) state.Fail(inst, info.access == ImageAccess::Write ? "stores through a bindless image table are unsupported" : "atomics through a bindless image table are unsupported");
     if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) {
         if (inst.Opcode() != IrOpcode::ImageRead || mem.dataBits != 32u) state.Fail(inst, "FMASK requires a 32-bit image read");
         state.Define(inst, state.Arg(inst, 2) + " ? uint4(0x76543210u, 0xfedcba98u, 0u, 0u) : uint4(0u)");
@@ -1161,27 +1293,94 @@ void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& 
     }
 }
 
+// TableSlot/EmitIndirectImageSelector: the bindless table key (a handle argument) searched in the
+// flattened SRT's sorted (key, metadata index) mapping; the selected metadata index names the
+// heap element (ResourceMetadata.firstElement). Direct images keep their own metadata index.
+TableSelection TableSlot(MslEmitterState& state, const IrValue& inst, const MemoryInfo& mem, const ImageResource& image) {
+    TableSelection table;
+    if (image.indirectRoot != mem.resource) {
+        table.metadata = U(mem.resource);
+        return table;
+    }
+    const auto* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
+    const auto& sources = state.program.Resources().descriptorSources;
+    if (handle == nullptr || image.source >= sources.size() || !sources[image.source].indirectImage.has_value() || sources[image.source].indirectImage->keyArg >= handle->ArgumentCount()) state.Fail(inst, "has invalid bindless image table key provenance");
+    if (image.indirectSearchIterations == 0u) state.Fail(inst, "has no bindless image table runtime mapping");
+    state.RequirePrelude(MslPreludeChunk::RuntimeBuffer);
+    const auto srt = state.TableBuffer(DescriptorBindingKind::FlattenedSrt, 0u);
+    const auto key = state.Value(handle->Argument(sources[image.source].indirectImage->keyArg));
+    const auto tag = state.Temporary("aps5_bt");
+    const auto mapping = U(image.indirectMappingOffset);
+    state.DeclareLocal("uint", tag + "_slot", "0u");
+    state.DeclareLocal("bool", tag + "_mapped", "false");
+    state.Line("{");
+    state.Indent();
+    state.Line("uint aps5_low = 0u;");
+    state.Line("uint aps5_high = aps5_srt_word(" + srt + ", " + mapping + ");");
+    state.Line(tag + "_slot = " + U(image.indirectRoot) + ";");
+    state.Line(tag + "_mapped = false;");
+    state.Line("for (uint aps5_step = 0u; aps5_step < " + U(image.indirectSearchIterations) + "; ++aps5_step) {");
+    state.Indent();
+    state.Line("const bool aps5_active = aps5_low < aps5_high;");
+    state.Line("const uint aps5_mid = (aps5_low + aps5_high) >> 1u;");
+    state.Line("const uint aps5_entry = " + mapping + " + ((aps5_active ? aps5_mid : 0u) << 1u) + 1u;");
+    state.Line("const uint aps5_key = aps5_srt_word(" + srt + ", aps5_entry);");
+    state.Line("const uint aps5_candidate = aps5_srt_word(" + srt + ", aps5_entry + 1u);");
+    state.Line("if (aps5_active && aps5_key == " + key + ") {");
+    state.Line("    " + tag + "_slot = aps5_candidate;");
+    state.Line("    " + tag + "_mapped = true;");
+    state.Line("}");
+    state.Line("const bool aps5_less = aps5_key < " + key + ";");
+    state.Line("if (aps5_active && aps5_less) aps5_low = aps5_mid + 1u;");
+    state.Line("if (aps5_active && !aps5_less) aps5_high = aps5_mid;");
+    state.Outdent();
+    state.Line("}");
+    state.Outdent();
+    state.Line("}");
+    table.metadata = tag + "_slot";
+    table.mapped = tag + "_mapped";
+    table.element = MetadataDword(state, table.metadata, offsetof(RuntimeAbi::ResourceMetadata, firstElement) / sizeof(std::uint32_t));
+    return table;
+}
+
 void EmitImage(MslEmitterState& state, const IrValue& inst) {
     state.RequirePrelude(MslPreludeChunk::Image);
     const auto& mem = state.Memory(inst);
     const auto& base = state.program.Resources().info.images.at(mem.resource);
-    if (base.indirectRoot != ImageResource::NoIndirectImage) state.Fail(inst, "accesses a bindless image table, which the MSL backend does not implement yet (work package B4)");
     const auto modes = ResourceMaterializer::RuntimeImageModes(base);
-    if (modes.size() == 1u) {
+    const bool indirect = base.indirectRoot != ImageResource::NoIndirectImage;
+    TableSelection table;
+    if (indirect) table = TableSlot(state, inst, mem, base);
+    const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
+    const auto finish = [&] {
+        // TableResult: zeros for a key the table does not map.
+        if (!table.mapped.empty() && returnsValue) state.Line("if (!" + table.mapped + ") " + state.Name(inst) + " = " + MslType(inst.Type()) + "(0);");
+    };
+    if (modes.size() == 1u && !indirect) {
         state.Line("{");
         state.Indent();
-        EmitMode(state, inst, modes.front());
+        EmitMode(state, inst, modes.front(), table);
         state.Outdent();
         state.Line("}");
         return;
     }
-    const auto selector = state.FunctionConstant(PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords, 0u);
+    const auto selector = indirect ? "(" + MetadataDword(state, table.metadata, offsetof(RuntimeAbi::ResourceMetadata, flags) / sizeof(std::uint32_t)) + " >> 1u)" : state.FunctionConstant(PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords, 0u);
     // The result keeps its previous value for an invalid selector (the SPIR-V path: undefined).
     state.Line("switch (" + selector + ") {");
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         state.Line("case " + U(index) + ": {");
         state.Indent();
-        EmitMode(state, inst, modes[index]);
+        if (indirect) {
+            // ImageModeBase: a mode the bindless table never selects is compiled out.
+            const auto enabled = state.FunctionConstant(PipelineSpecialization::ImageModeBase + mem.resource * PipelineSpecialization::ImageModeStride + index, 1u);
+            state.Line("if (" + enabled + " != 0u) {");
+            state.Indent();
+            EmitMode(state, inst, modes[index], table);
+            state.Outdent();
+            state.Line("}");
+        } else {
+            EmitMode(state, inst, modes[index], table);
+        }
         state.Line("break;");
         state.Outdent();
         state.Line("}");
@@ -1189,6 +1388,153 @@ void EmitImage(MslEmitterState& state, const IrValue& inst) {
     state.Line("default:");
     state.Line("    break;");
     state.Line("}");
+    finish();
+}
+
+
+// image_bvh_intersect_ray / image_bvh64_intersect_ray (SpirvImageEmitter.cpp EmitImageBvhIntersectRay):
+// one node of a BVH read through the BDA page table, a triangle (types 0, 1) or a box node of
+// fp16 (4) or fp32 (5) bounds; inactive or invalid nodes return four 0xffffffff.
+constexpr std::string_view BvhText = R"MSL(
+static inline float aps5_bvh_f16(uint packed, uint index) {
+    return float(as_type<half>(ushort(index % 2u == 0u ? (packed & 0xffffu) : (packed >> 16u))));
+}
+
+static inline void aps5_bvh_read(Aps5Bda bda, ulong address, uint count, uint pc, thread uint* d) {
+    const ulong physical = aps5_bda_lookup(bda, address, count * 4u, pc, 1u, true);
+    const bool mapped = physical != 0ul && (physical & 3ul) == 0ul;
+    for (uint i = 0u; i < count; ++i) d[i] = mapped ? reinterpret_cast<device const uint*>(physical)[i] : 0u;
+}
+
+static inline float aps5_bvh_nanmax(float a, float b) { return (isnan(a) || a > b) ? a : b; }
+static inline float aps5_bvh_nanmin(float a, float b) { return (isnan(a) || a < b) ? a : b; }
+
+static uint4 aps5_bvh_intersect(Aps5Bda bda, uint4 word, ulong node, uint nodeLow, bool node64, float extent, float3 origin, float3 direction, float3 inverse, uint pc) {
+    const uint invalid = 0xffffffffu;
+    const uint type = nodeLow & 7u;
+    const ulong nodeIndex = node >> 3u;
+    const ulong baseUnits = ulong(word.x) | (ulong(word.y & 0xffu) << 32u);
+    const ulong lastNode = ulong(word.z) | (ulong(word.w & 0x3ffu) << 32u);
+    const uint boxGrow = (word.y >> 23u) & 0xffu;
+    const bool boxSort = (word.y & 0x80000000u) != 0u;
+    const bool barycentrics = (word.w & (1u << 24u)) != 0u;
+    const ulong nodeAddress = (baseUnits << 8u) + ((node & ~7ul) << 3u);
+    const bool baseValid = node64 || baseUnits != 0ul;
+    const bool valid = baseValid && nodeIndex <= lastNode;
+    const bool isTriangle = valid && type <= 1u;
+    const bool isBox16 = valid && type == 4u;
+    const bool isBox32 = baseValid && nodeIndex < lastNode && type == 5u;
+    if (isBox32 || isBox16) {
+        uint d[28];
+        const bool fp16 = !isBox32;
+        aps5_bvh_read(bda, nodeAddress, fp16 ? 16u : 28u, pc, d);
+        const float growFactor = 1.0f + float(boxGrow) * as_type<float>(0x33800000u);
+        uint4 children;
+        float4 keys;
+        for (uint child = 0u; child < 4u; ++child) {
+            float enter = 0.0f;
+            float leave = 0.0f;
+            for (uint axis = 0u; axis < 3u; ++axis) {
+                const uint low = child * 6u + axis;
+                const uint high = low + 3u;
+                const float boundLow = fp16 ? aps5_bvh_f16(d[4u + low / 2u], low) : as_type<float>(d[4u + low]);
+                const float boundHigh = fp16 ? aps5_bvh_f16(d[4u + high / 2u], high) : as_type<float>(d[4u + high]);
+                const float planeMin = (boundLow - origin[axis]) * inverse[axis];
+                const float planeMax = (boundHigh - origin[axis]) * inverse[axis];
+                const bool positive = inverse[axis] >= 0.0f;
+                const float near = positive ? planeMin : planeMax;
+                const float far = positive ? planeMax : planeMin;
+                enter = axis == 0u ? near : aps5_bvh_nanmax(enter, near);
+                leave = axis == 0u ? far : aps5_bvh_nanmin(leave, far);
+            }
+            const bool nan = isnan(enter) || isnan(leave);
+            const float minT = nan ? as_type<float>(0x7f800000u) : (enter > 0.0f ? enter : 0.0f);
+            const float maxT = nan ? as_type<float>(0xff800000u) : (leave < extent ? leave : extent);
+            const bool hit = minT <= maxT * growFactor;
+            children[child] = hit ? d[child] : invalid;
+            keys[child] = minT;
+        }
+        uint4 sorted = children;
+        const uint2 pairs[5] = {uint2(0u, 2u), uint2(1u, 3u), uint2(0u, 1u), uint2(2u, 3u), uint2(1u, 2u)};
+        for (uint index = 0u; index < 5u; ++index) {
+            const uint a = pairs[index].x;
+            const uint b = pairs[index].y;
+            const bool swap = (sorted[b] != invalid && keys[b] < keys[a]) || sorted[a] == invalid;
+            const uint sa = swap ? sorted[b] : sorted[a];
+            const uint sb = swap ? sorted[a] : sorted[b];
+            const float ka = swap ? keys[b] : keys[a];
+            const float kb = swap ? keys[a] : keys[b];
+            sorted[a] = sa;
+            sorted[b] = sb;
+            keys[a] = ka;
+            keys[b] = kb;
+        }
+        return boxSort ? sorted : children;
+    }
+    if (!isTriangle) return uint4(invalid);
+    uint d[16];
+    aps5_bvh_read(bda, nodeAddress, 16u, pc, d);
+    const bool second = type == 1u;
+    float3 v1;
+    float3 v2;
+    float3 v3;
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        v1[axis] = second ? as_type<float>(d[3u + axis]) : as_type<float>(d[axis]);
+        v2[axis] = second ? as_type<float>(d[9u + axis]) : as_type<float>(d[3u + axis]);
+        v3[axis] = as_type<float>(d[6u + axis]);
+    }
+    const float3 e1 = v2 - v1;
+    const float3 e2 = v3 - v1;
+    const float3 e3 = origin - v1;
+    const float3 s1 = float3(direction.y * e2.z - direction.z * e2.y, direction.z * e2.x - direction.x * e2.z, direction.x * e2.y - direction.y * e2.x);
+    const float3 s2 = float3(e3.y * e1.z - e3.z * e1.y, e3.z * e1.x - e3.x * e1.z, e3.x * e1.y - e3.y * e1.x);
+    float tNum = (e2.x * s2.x + e2.y * s2.y) + e2.z * s2.z;
+    float tDenom = (s1.x * e1.x + s1.y * e1.y) + s1.z * e1.z;
+    const float iNum = (e3.x * s1.x + e3.y * s1.y) + e3.z * s1.z;
+    const float jNum = (direction.x * s2.x + direction.y * s2.y) + direction.z * s2.z;
+    const float t = tNum / tDenom;
+    const float u = iNum / tDenom;
+    const float v = jNum / tDenom;
+    const bool missed = u < 0.0f || u > 1.0f || v < 0.0f || u + v > 1.0f || t < 0.0f;
+    tNum = missed ? as_type<float>(0x7f800000u) : tNum;
+    tDenom = missed ? 1.0f : tDenom;
+    const uint triangleId = d[15];
+    const uint shift = type << 3u;
+    const float rest = (tDenom - iNum) - jNum;
+    const uint source0 = (triangleId >> shift) & 3u;
+    const uint source2 = (triangleId >> (shift + 2u)) & 3u;
+    const float bary0 = source0 == 1u ? iNum : (source0 == 2u ? jNum : rest);
+    const float bary2 = source2 == 1u ? iNum : (source2 == 2u ? jNum : rest);
+    return uint4(as_type<uint>(tNum), as_type<uint>(tDenom), barycentrics ? as_type<uint>(bary0) : triangleId, barycentrics ? as_type<uint>(bary2) : (missed ? 0u : 1u));
+}
+)MSL";
+
+void EmitBvhIntersectRay(MslEmitterState& state, const IrValue& inst) {
+    const auto& mem = state.Memory(inst);
+    const auto& address = ImageAddress(state, inst, inst.Argument(1));
+    const auto bda = MslBdaContext(state);
+    if (state.declarations.find("aps5_bvh_intersect") == std::string::npos) state.AddDeclaration(BvhText);
+    const auto component = [&](std::uint32_t index) { return state.Value(address.Argument(index)); };
+    const bool a16 = (mem.imageSampleFlags & RdnaImageSampleFlagA16) != 0u;
+    const bool node64 = mem.addressIsFull;
+    const std::uint32_t ray = node64 ? 2u : 1u;
+    const auto node = node64 ? "(ulong(" + component(0) + ") | (ulong(" + component(1) + ") << 32u))" : "ulong(" + component(0) + ")";
+    std::array<std::string, 3> origin;
+    std::array<std::string, 3> direction;
+    std::array<std::string, 3> inverse;
+    for (std::uint32_t axis = 0; axis < 3u; ++axis) {
+        origin[axis] = "as_type<float>(" + component(ray + 1u + axis) + ")";
+        if (!a16) {
+            direction[axis] = "as_type<float>(" + component(ray + 4u + axis) + ")";
+            inverse[axis] = "as_type<float>(" + component(ray + 7u + axis) + ")";
+            continue;
+        }
+        const auto half = [&](std::uint32_t index) { return "aps5_f16_value(" + std::string(index % 2u == 0u ? "" : "(") + component(ray + 4u + index / 2u) + (index % 2u == 0u ? "" : " >> 16u)") + ")"; };
+        direction[axis] = half(axis);
+        inverse[axis] = half(3u + axis);
+    }
+    const auto vector = [](const std::array<std::string, 3>& values) { return "float3(" + values[0] + ", " + values[1] + ", " + values[2] + ")"; };
+    state.Define(inst, state.Arg(inst, 2) + " ? aps5_bvh_intersect(" + bda + ", " + state.Arg(inst, 0) + ", " + node + ", " + component(0) + ", " + MslBool(node64) + ", as_type<float>(" + component(ray) + "), " + vector(origin) + ", " + vector(direction) + ", " + vector(inverse) + ", " + MslB5Pc(inst) + ") : uint4(0xffffffffu)");
 }
 
 }
@@ -1201,7 +1547,9 @@ bool EmitMslImageInstruction(MslEmitterState& state, const IrValue& instruction)
         // Handles and packed addresses: the image instructions read their operands directly.
         return true;
     case IrOpcode::ImageBvhIntersectRay:
-        state.Fail(instruction, "is a BVH ray intersection, which the MSL backend does not implement yet (work package B4, MslBvh.cpp)");
+        state.RequirePrelude(MslPreludeChunk::Image);
+        EmitBvhIntersectRay(state, instruction);
+        return true;
     default:
         break;
     }
