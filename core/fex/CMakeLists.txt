@@ -5,6 +5,10 @@ ProcessorCount(APS5_FEX_JOBS)
 if(APS5_FEX_JOBS EQUAL 0)
     set(APS5_FEX_JOBS 1)
 endif()
+# The outer ninja runs alongside; keep FEX's own build from taking every core.
+if(APS5_FEX_JOBS GREATER 4)
+    set(APS5_FEX_JOBS 4)
+endif()
 
 set(APS5_FEX_SOURCE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/FEX)
 set(APS5_FEX_BINARY_DIR ${CMAKE_BINARY_DIR}/3rdparty/FEX)
@@ -41,6 +45,8 @@ ExternalProject_Add(fexcore
         -DENABLE_GDB_SYMBOLS=OFF
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target FEXCore FEXCore_Base JemallocLibs xxhash --parallel ${APS5_FEX_JOBS}
     INSTALL_COMMAND ""
+    # FEX is vendored and patched in tree: rebuild it whenever the runner builds (a no-op ninja when unchanged).
+    BUILD_ALWAYS TRUE
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
 add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
