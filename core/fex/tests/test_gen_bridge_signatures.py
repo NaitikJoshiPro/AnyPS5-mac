@@ -81,7 +81,10 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(reasons(integer(4), X87), ["x87-argument"])
 
     def test_int128_and_variadic(self):
-        self.assertEqual(reasons(VOID, integer(4), INT128), ["int128"])
+        # Apple's arm64 convention does not round __int128 up to an even register: x1:x2 like rsi:rdx.
+        self.assertEqual(reasons(VOID, integer(4), INT128), [])
+        # With one register left the guest moves it to the stack; arm64 still has x5:x6.
+        self.assertEqual(reasons(VOID, *[integer(4)] * 5, INT128), ["int128"])
         self.assertEqual(reasons(integer(4), POINTER, variadic=True), ["variadic"])
 
     def test_layouts(self):

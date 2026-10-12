@@ -98,7 +98,31 @@ def compiled_modules(directory, modules, main, libraries):
     fex_toolchain.make_header_room(staged / "eboot.elf")
 
 
+def with_abi_library(directory, source, libraries, extra=()):
+    """Like compiled_executable, plus the test library libAps5BridgeAbi.prx staged beside the build's
+    libraries (directory/libs: links to each of them and to the test library)."""
+    compiled_executable(directory, [str(HERE / source)], {**libraries, "libAps5BridgeAbi.prx": ABI_EXPORTS}, extra)
+    staged = directory / "libs"
+    staged.mkdir()
+    for library in LIBRARIES.iterdir():
+        (staged / library.name).symlink_to(library)
+    (staged / "libAps5BridgeAbi.prx").symlink_to(RUNNER.parent / "abi-libs" / "libAps5BridgeAbi.prx")
+
+
+ABI_EXPORTS = ["Aps5AbiHfa", "Aps5AbiStack", "Aps5AbiMixed", "Aps5AbiLarge", "Aps5AbiLongDouble", "Aps5AbiInt128", "Aps5AbiPosition",
+               "Aps5AbiManyDoubles", "Aps5AbiCallInts", "Aps5AbiCallShaped", "Aps5AbiCallLarge", "Aps5AbiCallLongDouble",
+               "Aps5AbiStore", "Aps5AbiLoad", "Aps5AbiCallStored"]
+LIBRARIES = RUNNER = None
+
 COMPILED = {
+    "abi-registers": (lambda d: with_abi_library(d, "abi_registers.cpp", {"libc.prx": ["exit"]}), 43),
+    "abi-stack": (lambda d: with_abi_library(d, "abi_stack.cpp", {"libc.prx": ["exit"],
+                  "libSceAgc.prx": ["sceAgcCbReleaseMem", "sceAgcDcbDmaData"]}), 43),
+    "abi-memory": (lambda d: with_abi_library(d, "abi_memory.cpp", {"libc.prx": ["exit", "_ZSt17current_exceptionv"]}), 43),
+    "abi-long-double": (lambda d: with_abi_library(d, "abi_long_double.cpp", {"libc.prx": ["exit", "acosl", "atanl", "coshl", "cosl",
+                        "exp2l", "expl", "frexpl", "ldexpl", "log10l", "logl", "powl", "sinhl", "sinl", "tanhl", "tanl", "truncl",
+                        "strtold", "wcstold", "__signbitl"]}), 43),
+    "abi-variadic": (lambda d: compiled_executable(d, [str(HERE / "abi_variadic.cpp")], {"libc.prx": ["exit", "snprintf", "swprintf"]}), 43),
     "exception": (lambda d: compiled_executable(d, ["exception.cpp"], None), 43),
     "c-cleanup": (lambda d: compiled_executable(d, ["c_cleanup.c", "c_cleanup_main.cpp"], None), 47),
     "threads": (lambda d: compiled_executable(d, ["threads.cpp"], {"libc.prx": ["exit"],
@@ -139,7 +163,9 @@ COMPILED = {
 
 
 def main():
+    global LIBRARIES, RUNNER
     relinker, runner, libraries = (pathlib.Path(argument).resolve() for argument in sys.argv[1:4])
+    LIBRARIES, RUNNER = libraries, runner
     only = set(sys.argv[sys.argv.index("--only") + 1:]) if "--only" in sys.argv else None
     failures = []
     cases = {name: (lambda d, name=name: (d / "input.elf").write_bytes(fex_fixtures.FIXTURES[name]()), status, output)
@@ -164,7 +190,8 @@ def main():
             if relinked.returncode != 0:
                 failures.append(f"{name}: relink failed: {relinked.stderr.strip()}")
                 continue
-            (directory / "libs").symlink_to(libraries, target_is_directory=True)
+            if not (directory / "libs").exists():
+                (directory / "libs").symlink_to(libraries, target_is_directory=True)
             executed = subprocess.run([str(runner), "eboot.elf"], cwd=directory, capture_output=True, text=True, timeout=60)
             if executed.returncode != status or (output is not None and executed.stdout != output):
                 failures.append(f"{name}: exit {executed.returncode}, expected {status}; output {executed.stdout!r}, "

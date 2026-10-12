@@ -97,6 +97,48 @@ void CheckMarshalling() {
     Require(Has(signbitl, BridgeReason::X87Argument) && BridgeParameters(signbitl)[0].kind == BridgeKind::X87);
 }
 
+bool IsPiece(const BridgePiece& piece, BridgePlace place, unsigned reg, unsigned at, unsigned offset, unsigned size) {
+    return piece.place == place && piece.reg == reg && piece.at == at && piece.offset == offset && piece.size == size && !piece.reference;
+}
+
+void CheckLayouts() {
+    for (const BridgeSignature& signature : BridgeSignatures())
+        for (std::size_t value = 0; value <= signature.parameterCount; ++value) {
+            for (const BridgePiece& piece : BridgeGuestPieces(signature, value)) Require(piece.size != 0);
+            for (const BridgePiece& piece : BridgeHostPieces(signature, value)) Require(piece.size != 0);
+        }
+
+    // long double: 16 bytes on the guest stack and st(0), a double in d0 on arm64.
+    const BridgeSignature& acosl = Find("acosl_nid_postfix");
+    Require(BridgeGuestPieces(acosl, 0).size() == 1 && BridgeGuestPieces(acosl, 0)[0].place == BridgePlace::X87);
+    Require(IsPiece(BridgeGuestPieces(acosl, 1)[0], BridgePlace::Stack, 0, 0, 0, 16));
+    Require(IsPiece(BridgeHostPieces(acosl, 1)[0], BridgePlace::Vector, 0, 0, 0, 8));
+    Require(IsPiece(BridgeHostPieces(acosl, 0)[0], BridgePlace::Vector, 0, 0, 0, 8));
+
+    // The ninth and tenth arguments of sceAgcCbReleaseMem: 8-byte guest slots, packed u16s on arm64.
+    const BridgeSignature& releaseMem = Find("sceAgcCbReleaseMem");
+    Require(IsPiece(BridgeGuestPieces(releaseMem, 9)[0], BridgePlace::Stack, 0, 16, 0, 2));
+    Require(IsPiece(BridgeHostPieces(releaseMem, 9)[0], BridgePlace::Stack, 0, 0, 0, 2));
+    Require(IsPiece(BridgeHostPieces(releaseMem, 10)[0], BridgePlace::Stack, 0, 2, 0, 2));
+    Require(IsPiece(BridgeHostPieces(releaseMem, 12)[0], BridgePlace::Stack, 0, 8, 0, 4));
+
+    // A float HFA: two SSE eightbytes on the guest, three s registers on arm64.
+    const BridgeSignature& coefficients = Find("sceAudioOut2GetSpeakerArrayCoefficients");
+    Require(BridgeGuestPieces(coefficients, 2).size() == 2 && BridgeHostPieces(coefficients, 2).size() == 3);
+    Require(IsPiece(BridgeGuestPieces(coefficients, 2)[1], BridgePlace::Vector, 1, 0, 8, 4));
+    Require(IsPiece(BridgeHostPieces(coefficients, 2)[2], BridgePlace::Vector, 2, 0, 8, 4));
+
+    // Hidden results: rdi on the guest, x8 on arm64.
+    const BridgeSignature& currentException = Find("_ZSt17current_exceptionv_nid_postfix");
+    Require(BridgeGuestPieces(currentException, 0)[0].place == BridgePlace::Sret && BridgeGuestPieces(currentException, 0)[0].reference);
+    Require(BridgeHostPieces(currentException, 0)[0].place == BridgePlace::Sret);
+
+    // GuestLongDouble results: st(0) on the guest, x0:x1 on arm64.
+    const BridgeSignature& strtold = Find("strtold_nid_postfix");
+    Require(BridgeGuestPieces(strtold, 0)[0].place == BridgePlace::X87 && BridgeHostPieces(strtold, 0).size() == 2);
+    Require(IsPiece(BridgeHostPieces(strtold, 0)[1], BridgePlace::Gpr, 1, 0, 8, 8));
+}
+
 }
 
 int main() {
@@ -104,6 +146,7 @@ int main() {
     CheckPositional();
     CheckCallbacks();
     CheckMarshalling();
+    CheckLayouts();
     std::printf("%zu bridge signatures checked\n", BridgeSignatures().size());
     return 0;
 }

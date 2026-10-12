@@ -49,7 +49,7 @@ ExternalProject_Add(fexcore
     BUILD_ALWAYS TRUE
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
-add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
+add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/BridgeSignatures.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/Options.cpp src/Trampolines.S)
 target_sources(aps5-fex-runtime PRIVATE src/CodePool.cpp)
 add_dependencies(aps5-fex-runtime fexcore)
 target_compile_features(aps5-fex-runtime PUBLIC cxx_std_20)
@@ -88,6 +88,11 @@ if(BUILD_TESTING)
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --only code-churn)
         set_tests_properties(fex_code_churn PROPERTIES TIMEOUT 300 ENVIRONMENT APS5_FEX_CLEAR_CODE=1)
 
+        add_test_executable(fex_x87_convert_tests tests/X87Convert.cpp)
+        target_compile_features(fex_x87_convert_tests PRIVATE cxx_std_20)
+        target_include_directories(fex_x87_convert_tests PRIVATE src)
+        add_test(NAME fex_x87_convert COMMAND fex_x87_convert_tests)
+
         add_test_executable(aps5-fex-asm tests/asm/AsmHarness.cpp)
         target_link_libraries(aps5-fex-asm PRIVATE aps5-fex-runtime)
         set(APS5_FEX_ASM_ROOT ${APS5_FEX_SOURCE_DIR}/unittests/ASM)
@@ -118,7 +123,27 @@ if(BUILD_TESTING)
     endif()
 endif()
 
-option(APS5_FEX_BRIDGE_SIGNATURES "Compile the bridge signature table derived from the prx library sources into the runner" OFF)
+# A test-only PS5 library with one export per ABI class the bridge marshals (tests/prx/libAps5BridgeAbi),
+# NID-patched like the libraries in core/libs. The abi_*.cpp fixtures load it from a staged libs directory.
+if(BUILD_TESTING AND TARGET nid_patcher AND TARGET libc)
+    set(APS5_FEX_ABI_LIBRARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/abi-libs)
+    add_library(libAps5BridgeAbi SHARED tests/prx/libAps5BridgeAbi/Export.cpp)
+    set_target_properties(libAps5BridgeAbi PROPERTIES PREFIX "" SUFFIX .prx
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/abi-unpatched)
+    add_custom_command(OUTPUT ${APS5_FEX_ABI_LIBRARY_DIR}/libAps5BridgeAbi.prx
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:libAps5BridgeAbi> ${APS5_FEX_ABI_LIBRARY_DIR}/libAps5BridgeAbi.prx
+        COMMAND codesign --remove-signature ${APS5_FEX_ABI_LIBRARY_DIR}/libAps5BridgeAbi.prx
+        COMMAND $<TARGET_FILE:nid_patcher> libAps5BridgeAbi --preserve-exports $<TARGET_FILE:libc>
+            ${APS5_FEX_ABI_LIBRARY_DIR}/libAps5BridgeAbi.prx
+        COMMAND codesign --force --sign - ${APS5_FEX_ABI_LIBRARY_DIR}/libAps5BridgeAbi.prx
+        DEPENDS nid_patcher libAps5BridgeAbi libc
+        COMMENT "Patching NIDs for libAps5BridgeAbi")
+    add_custom_target(aps5-fex-abi-library ALL DEPENDS ${APS5_FEX_ABI_LIBRARY_DIR}/libAps5BridgeAbi.prx)
+endif()
+
+# Without the table the bridge maps every export positionally, which is wrong for the exports listed in
+# docs/mac/M1_DESIGN.md (package D): long double math, structs, stack arguments, hidden results.
+option(APS5_FEX_BRIDGE_SIGNATURES "Compile the bridge signature table derived from the prx library sources into the runner" ON)
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
     set(APS5_FEX_SIGNATURES_DIR ${CMAKE_CURRENT_BINARY_DIR}/signatures)
@@ -132,6 +157,9 @@ if(Python3_Interpreter_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
             list(APPEND APS5_FEX_PRX_TARGETS ${prxName})
         endif()
     endforeach()
+    if(TARGET libAps5BridgeAbi)
+        list(APPEND APS5_FEX_PRX_TARGETS libAps5BridgeAbi)
+    endif()
     list(REMOVE_DUPLICATES APS5_FEX_PRX_TARGETS)
     add_custom_command(OUTPUT ${APS5_FEX_SIGNATURES_DIR}/BridgeSignatures.inc ${APS5_FEX_SIGNATURES_JSON}
         COMMAND ${Python3_EXECUTABLE} ${APS5_FEX_SIGNATURES_TOOL} generate --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json
@@ -146,7 +174,6 @@ if(Python3_Interpreter_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
         if(TARGET aps5-fex-runtime)
             set(APS5_FEX_BRIDGE_TARGET aps5-fex-runtime)
         endif()
-        target_sources(${APS5_FEX_BRIDGE_TARGET} PRIVATE src/BridgeSignatures.cpp)
         target_compile_definitions(${APS5_FEX_BRIDGE_TARGET} PRIVATE APS5_FEX_BRIDGE_SIGNATURES)
         target_include_directories(${APS5_FEX_BRIDGE_TARGET} PRIVATE ${APS5_FEX_SIGNATURES_DIR})
         add_dependencies(${APS5_FEX_BRIDGE_TARGET} aps5-fex-bridge-signatures)

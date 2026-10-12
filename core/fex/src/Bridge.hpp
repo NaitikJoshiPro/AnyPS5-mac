@@ -68,7 +68,12 @@ private:
         std::uint8_t fixed;
         bool x87Result;
         const BridgeSignature* signature = nullptr;
+        bool shaped = false;
     };
+
+    static bool IsShaped(const BridgeSignature* signature);
+    static bool GuestX87Result(const BridgeSignature* signature);
+    bool Invoke(FEXCore::Core::CPUState& state, const Function& function, std::uint64_t block);
 
     static constexpr std::size_t StubBytes = 16;
     static constexpr std::size_t StubCapacity = 0x10000;
@@ -78,7 +83,7 @@ private:
     static constexpr std::uint32_t FirstStub = 0x41500000;
 
     std::uint64_t AddStub(void* address, const std::string& name, Variadic variadic = Variadic::None, std::uint8_t fixed = 0,
-                          bool x87Result = false);
+                          bool x87Result = false, const BridgeSignature* signature = nullptr);
 
     std::filesystem::path directory;
     std::vector<void*> handles;

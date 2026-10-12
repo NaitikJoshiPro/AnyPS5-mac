@@ -15,7 +15,14 @@ constexpr std::array<BridgeLeaf, 0> Leaves {};
 constexpr std::array<BridgeValue, 0> Values {};
 constexpr std::array<BridgeSignature, 0> Callbacks {};
 constexpr std::array<BridgeSignature, 0> Signatures {};
+constexpr std::array<BridgePiece, 0> Pieces {};
+constexpr std::array<BridgeLayout, 0> Layouts {};
 #endif
+
+static_assert(Layouts.size() == Values.size());
+static_assert(std::ranges::all_of(Layouts, [](const BridgeLayout& layout) {
+    return layout.guest + layout.guestCount <= Pieces.size() && layout.host + layout.hostCount <= Pieces.size();
+}));
 
 static_assert(std::ranges::adjacent_find(Signatures, std::ranges::greater_equal {}, &BridgeSignature::name) == Signatures.end());
 
@@ -59,6 +66,16 @@ std::span<const BridgeLeaf> BridgeLeaves(const BridgeValue& value) {
 
 const BridgeSignature* BridgeCallback(const BridgeValue& value) {
     return value.callback == NoBridgeCallback ? nullptr : &std::span<const BridgeSignature>(Callbacks)[value.callback];
+}
+
+std::span<const BridgePiece> BridgeGuestPieces(const BridgeSignature& signature, std::size_t value) {
+    const BridgeLayout& layout = std::span<const BridgeLayout>(Layouts)[signature.firstValue + value];
+    return std::span<const BridgePiece>(Pieces).subspan(layout.guest, layout.guestCount);
+}
+
+std::span<const BridgePiece> BridgeHostPieces(const BridgeSignature& signature, std::size_t value) {
+    const BridgeLayout& layout = std::span<const BridgeLayout>(Layouts)[signature.firstValue + value];
+    return std::span<const BridgePiece>(Pieces).subspan(layout.host, layout.hostCount);
 }
 
 }

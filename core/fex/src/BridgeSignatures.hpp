@@ -1,6 +1,7 @@
 #ifndef CORE_FEX_SRC_BRIDGESIGNATURES_HPP
 #define CORE_FEX_SRC_BRIDGESIGNATURES_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -69,6 +70,34 @@ struct BridgeValue {
     std::uint32_t callback;
 };
 
+// Where one part of a value lives: a general register (guest: rdi..r9 for arguments, rax/rdx for a result;
+// host: x0..x7), a vector register and byte, a byte offset into the stack arguments, st(0), or the memory a
+// hidden result pointer names (guest: rdi in, rax out; host: x8).
+enum class BridgePlace : std::uint8_t {
+    Gpr,
+    Vector,
+    Stack,
+    X87,
+    Sret,
+};
+
+struct BridgePiece {
+    BridgePlace place;
+    std::uint8_t reg;
+    std::uint16_t at;
+    std::uint16_t offset;
+    std::uint16_t size;
+    bool reference;
+};
+
+// Per value (the result, then the parameters): its pieces under SysV (guest) and Apple arm64 (host).
+struct BridgeLayout {
+    std::uint32_t guest;
+    std::uint32_t guestCount;
+    std::uint32_t host;
+    std::uint32_t hostCount;
+};
+
 struct BridgeSignature {
     std::string_view name;
     std::uint32_t firstValue;
@@ -84,6 +113,9 @@ const BridgeValue& BridgeResult(const BridgeSignature& signature);
 std::span<const BridgeValue> BridgeParameters(const BridgeSignature& signature);
 std::span<const BridgeLeaf> BridgeLeaves(const BridgeValue& value);
 const BridgeSignature* BridgeCallback(const BridgeValue& value);
+// value 0 is the result, value i + 1 parameter i.
+std::span<const BridgePiece> BridgeGuestPieces(const BridgeSignature& signature, std::size_t value);
+std::span<const BridgePiece> BridgeHostPieces(const BridgeSignature& signature, std::size_t value);
 
 }
 

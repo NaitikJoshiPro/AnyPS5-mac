@@ -3,6 +3,7 @@
 #include "BridgeSignatures.hpp"
 #include "GuestCpu.hpp"
 #include "GuestImage.hpp"
+#include "X87Convert.hpp"
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -17,6 +18,8 @@
 #include <exception>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
@@ -26,13 +29,14 @@ struct Aps5NativeArguments {
     std::uint8_t vector[8][16];
     const std::uint64_t* stack;
     std::uint64_t stackSlots;
+    std::uint64_t x8;
 };
 static_assert(offsetof(Aps5NativeArguments, vector) == 64 && offsetof(Aps5NativeArguments, stack) == 192 &&
-              offsetof(Aps5NativeArguments, stackSlots) == 200);
+              offsetof(Aps5NativeArguments, stackSlots) == 200 && offsetof(Aps5NativeArguments, x8) == 208);
 
 struct Aps5NativeResult {
     std::uint64_t gpr[2];
-    std::uint8_t vector[2][16];
+    std::uint8_t vector[4][16];
 };
 static_assert(offsetof(Aps5NativeResult, vector) == 16);
 
@@ -163,12 +167,12 @@ constexpr VariadicExport VariadicExports[] = {
     {"sprintf_s_nid_postfix", GuestList, 3},
     {"sscanf_nid_postfix", GuestList, 2},
     {"sscanf_s_nid_postfix", GuestList, 2},
+    {"swprintf_nid_postfix", GuestList, 3},
     {"swscanf_s_nid_postfix", GuestList, 2},
     {"syslog_nid_postfix", GuestList, 2},
     {"wprintf_nid_postfix", GuestList, 1},
     {"_open_nid_postfix", Integers, 2},
     {"fcntl_nid_postfix", Integers, 2},
-    {"swprintf_nid_postfix", Unsupported, 3},
 };
 
 constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix"};
@@ -304,7 +308,8 @@ std::uint64_t Bridge::TlsGetAddrStub() {
     return tlsGetAddrStub;
 }
 
-std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic variadic, std::uint8_t fixed, bool x87Result) {
+std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic variadic, std::uint8_t fixed, bool x87Result,
+                              const BridgeSignature* signature) {
     std::lock_guard lock(stubMutex);
     if (FirstStubOffset + (functions.size() + 1) * StubBytes > StubSize()) throw std::runtime_error("too many imported functions");
     const auto number = static_cast<std::uint32_t>(FirstStub + functions.size());
@@ -316,7 +321,7 @@ std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic v
         static_cast<std::uint8_t>(jump >> 16), static_cast<std::uint8_t>(jump >> 24)};
     std::memset(stub, 0xcc, StubBytes);
     std::memcpy(stub, code, sizeof(code));
-    functions.push_back({address, name, variadic, fixed, x87Result});
+    functions.push_back({address, name, variadic, fixed, x87Result, signature, IsShaped(signature)});
     stubCount.store(functions.size(), std::memory_order_release);
     return reinterpret_cast<std::uint64_t>(stub);
 }
@@ -351,12 +356,14 @@ std::uint64_t Bridge::StubFor(void* address, const std::string& name) {
                 if (auto* setter = dlsym(library, "Aps5SetBridgeVaList_nid_no_patch")) setBridgeVaList = reinterpret_cast<void (*)(void*)>(setter);
             if (setBridgeVaList == nullptr) throw std::runtime_error("libc has no Aps5SetBridgeVaList_nid_no_patch");
         }
-        const bool x87Result = info.dli_sname != nullptr && info.dli_saddr == address &&
+        bool x87Result = info.dli_sname != nullptr && info.dli_saddr == address &&
             std::find(std::begin(X87Results), std::end(X87Results), info.dli_sname) != std::end(X87Results);
-        guest = AddStub(address, name, variadic, fixed, x87Result);
-#if defined(APS5_FEX_BRIDGE_SIGNATURES)
-        if (info.dli_sname != nullptr && info.dli_saddr == address) functions.back().signature = FindBridgeSignature(info.dli_sname);
-#endif
+        const BridgeSignature* signature = nullptr;
+        if (info.dli_sname != nullptr && info.dli_saddr == address) signature = FindBridgeSignature(info.dli_sname);
+        // With the generated signatures, every export whose arguments or result positional mapping gets wrong is
+        // marshalled from its layouts, the x87 results included (X87Results then only names the same exports).
+        if (signature != nullptr) x87Result = GuestX87Result(signature);
+        guest = AddStub(address, name, variadic, fixed, x87Result, signature);
     }
     guestAddresses.emplace(address, guest);
     return guest;
@@ -377,6 +384,257 @@ std::uint64_t Bridge::Resolve(const std::string& name, bool weak) {
     return guest;
 }
 
+namespace {
+
+// Marshalling of the exports whose arguments or result the positional mapping places wrongly, from the
+// layouts the signature generator computed for both conventions (BridgeSignatures.hpp).
+struct ShapedFrame {
+    Aps5NativeArguments arguments {};
+    Aps5NativeResult result {};
+    alignas(16) std::uint8_t hostStack[256] {};
+    alignas(16) std::uint8_t scratch[512] {};
+    std::size_t used = 0;
+
+    std::uint8_t* Allocate(std::size_t size) {
+        const std::size_t at = (used + 15) & ~std::size_t {15};
+        if (at + size > sizeof(scratch)) throw std::runtime_error("a bridged value is too large");
+        used = at + size;
+        return scratch + at;
+    }
+};
+
+std::uint8_t* GuestPlace(const BridgePiece& piece, std::uint64_t block) {
+    switch (piece.place) {
+    case BridgePlace::Gpr: return reinterpret_cast<std::uint8_t*>(block + 8 * piece.reg);
+    case BridgePlace::Vector: return reinterpret_cast<std::uint8_t*>(block + BlockVectors + 16 * piece.reg + piece.at);
+    case BridgePlace::Stack: return reinterpret_cast<std::uint8_t*>(block + BlockSize + 8 + piece.at);
+    case BridgePlace::X87: return reinterpret_cast<std::uint8_t*>(block);
+    case BridgePlace::Sret: break;
+    }
+    throw std::runtime_error("a guest value in no place");
+}
+
+std::uint8_t* HostArgumentPlace(const BridgePiece& piece, ShapedFrame& shaped) {
+    switch (piece.place) {
+    case BridgePlace::Gpr: return reinterpret_cast<std::uint8_t*>(&shaped.arguments.gpr[piece.reg]);
+    case BridgePlace::Vector: return shaped.arguments.vector[piece.reg] + piece.at;
+    case BridgePlace::Stack:
+        if (piece.at + piece.size > sizeof(shaped.hostStack)) throw std::runtime_error("too many stack arguments");
+        return shaped.hostStack + piece.at;
+    case BridgePlace::X87:
+    case BridgePlace::Sret: break;
+    }
+    throw std::runtime_error("a host argument in no place");
+}
+
+std::uint8_t* HostResultPlace(const BridgePiece& piece, ShapedFrame& shaped) {
+    switch (piece.place) {
+    case BridgePlace::Gpr: return reinterpret_cast<std::uint8_t*>(&shaped.result.gpr[piece.reg]);
+    case BridgePlace::Vector: return shaped.result.vector[piece.reg] + piece.at;
+    default: break;
+    }
+    throw std::runtime_error("a host result in no place");
+}
+
+void ExtendInteger(const BridgeValue& value, const BridgePiece& piece, std::uint8_t* place) {
+    if (value.kind != BridgeKind::Signed || piece.size >= 8 || piece.place != BridgePlace::Gpr) return;
+    std::uint64_t word = 0;
+    std::memcpy(&word, place, 8);
+    const unsigned shift = 64 - 8 * piece.size;
+    word = static_cast<std::uint64_t>(static_cast<std::int64_t>(word << shift) >> shift);
+    std::memcpy(place, &word, 8);
+}
+
+// The arguments in arm64 places; returns the guest's hidden result pointer, or 0.
+std::uint64_t MarshalArguments(const BridgeSignature& signature, std::uint64_t block, ShapedFrame& shaped) {
+    const auto parameters = BridgeParameters(signature);
+    for (std::size_t index = 0; index < parameters.size(); ++index) {
+        const BridgeValue& value = parameters[index];
+        const auto guest = BridgeGuestPieces(signature, index + 1);
+        const auto host = BridgeHostPieces(signature, index + 1);
+        if (guest.empty()) continue;
+        if (guest[0].reference) {
+            std::memcpy(HostArgumentPlace(host[0], shaped), GuestPlace(guest[0], block), 8);
+            continue;
+        }
+        const std::uint8_t* bytes = nullptr;
+        if (guest.size() == 1 && guest[0].place == BridgePlace::Stack) {
+            bytes = GuestPlace(guest[0], block);
+        } else {
+            std::uint8_t* gathered = shaped.Allocate(std::max<std::size_t>(value.size, 16));
+            for (const BridgePiece& piece : guest)
+                std::memcpy(gathered + piece.offset, GuestPlace(piece, block), piece.size);
+            bytes = gathered;
+        }
+        if (value.kind == BridgeKind::LongDouble) {
+            const double converted = X87ToDouble(bytes);
+            std::uint8_t* narrowed = shaped.Allocate(sizeof(converted));
+            std::memcpy(narrowed, &converted, sizeof(converted));
+            bytes = narrowed;
+        }
+        for (const BridgePiece& piece : host) {
+            std::uint8_t* place = HostArgumentPlace(piece, shaped);
+            if (piece.reference) {
+                const auto pointer = reinterpret_cast<std::uint64_t>(bytes + piece.offset);
+                std::memcpy(place, &pointer, 8);
+                continue;
+            }
+            std::memcpy(place, bytes + piece.offset, piece.size);
+            ExtendInteger(value, piece, place);
+        }
+    }
+    std::uint64_t hidden = 0;
+    const auto guestResult = BridgeGuestPieces(signature, 0);
+    const auto hostResult = BridgeHostPieces(signature, 0);
+    if (!guestResult.empty() && guestResult[0].place == BridgePlace::Sret) hidden = reinterpret_cast<const std::uint64_t*>(block)[0];
+    if (!hostResult.empty() && hostResult[0].place == BridgePlace::Sret)
+        shaped.arguments.x8 = hidden != 0 ? hidden : reinterpret_cast<std::uint64_t>(shaped.Allocate(BridgeResult(signature).size));
+    std::uint64_t slots = 0;
+    for (std::size_t index = 0; index < parameters.size(); ++index)
+        for (const BridgePiece& piece : BridgeHostPieces(signature, index + 1))
+            if (piece.place == BridgePlace::Stack) slots = std::max<std::uint64_t>(slots, (piece.at + piece.size + 7) / 8);
+    shaped.arguments.stack = reinterpret_cast<const std::uint64_t*>(shaped.hostStack);
+    shaped.arguments.stackSlots = slots;
+    return hidden;
+}
+
+void UnmarshalResult(const BridgeSignature& signature, std::uint64_t block, std::uint64_t hidden, ShapedFrame& shaped) {
+    const auto guest = BridgeGuestPieces(signature, 0);
+    const auto host = BridgeHostPieces(signature, 0);
+    auto* registers = reinterpret_cast<std::uint64_t*>(block);
+    if (guest.empty()) return;
+    const bool hostHidden = !host.empty() && host[0].place == BridgePlace::Sret;
+    if (hidden != 0) {
+        if (!hostHidden)
+            for (const BridgePiece& piece : host)
+                std::memcpy(reinterpret_cast<std::uint8_t*>(hidden) + piece.offset, HostResultPlace(piece, shaped), piece.size);
+        registers[0] = hidden;
+        return;
+    }
+    const BridgeValue& value = BridgeResult(signature);
+    std::uint8_t* bytes = hostHidden ? reinterpret_cast<std::uint8_t*>(shaped.arguments.x8) : shaped.Allocate(std::max<std::size_t>(value.size, 16));
+    if (!hostHidden)
+        for (const BridgePiece& piece : host)
+            std::memcpy(bytes + piece.offset, HostResultPlace(piece, shaped), piece.size);
+    if (guest[0].place == BridgePlace::X87) {
+        if (value.kind == BridgeKind::LongDouble) {
+            double result = 0;
+            std::memcpy(&result, bytes, sizeof(result));
+            DoubleToX87(result, GuestPlace(guest[0], block));
+        } else {
+            std::memcpy(GuestPlace(guest[0], block), bytes, 16);
+        }
+        return;
+    }
+    for (const BridgePiece& piece : guest) {
+        std::uint8_t* place = GuestPlace(piece, block);
+        if (piece.place == BridgePlace::Gpr) std::memset(place, 0, 8);
+        std::memcpy(place, bytes + piece.offset, piece.size);
+        ExtendInteger(value, piece, place);
+    }
+}
+
+}
+
+bool Bridge::IsShaped(const BridgeSignature* signature) {
+    return signature != nullptr && !signature->variadic && (signature->reasons & ~BridgeReason::Variadic) != 0;
+}
+
+bool Bridge::GuestX87Result(const BridgeSignature* signature) {
+    if (signature == nullptr) return false;
+    const auto guest = BridgeGuestPieces(*signature, 0);
+    return !guest.empty() && guest[0].place == BridgePlace::X87;
+}
+
+// Runs a native export for a guest call whose registers the import trampoline saved at block. Returns
+// true when the export resumed a guest frame instead of returning: state then holds that frame.
+bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, std::uint64_t block) {
+    if (function.address == nullptr) {
+        std::fprintf(stderr, "[aps5-fex] the guest called %s, which no library exports\n", function.name.c_str());
+        std::abort();
+    }
+    auto* registers = reinterpret_cast<std::uint64_t*>(block);
+    if (trace) {
+        std::fprintf(stderr, "[aps5-fex] %s(%#llx, %#llx, %#llx, %#llx, %#llx, %#llx)\n", function.name.c_str(),
+                     static_cast<unsigned long long>(registers[0]), static_cast<unsigned long long>(registers[1]),
+                     static_cast<unsigned long long>(registers[2]), static_cast<unsigned long long>(registers[3]),
+                     static_cast<unsigned long long>(registers[4]), static_cast<unsigned long long>(registers[5]));
+    }
+    auto* guestStack = reinterpret_cast<std::uint64_t*>(block + BlockSize + 8);
+    ShapedFrame* shaped = nullptr;
+    std::optional<ShapedFrame> shapedStorage;
+    Aps5NativeArguments positional;
+    Aps5NativeResult positionalResult {};
+    std::uint64_t slots[2 + StackArgumentSlots];
+    VaList list {static_cast<std::uint32_t>(8 * function.fixed), 48, guestStack, registers};
+    std::uint64_t variadicSlots[6 + StackArgumentSlots];
+    std::uint64_t hidden = 0;
+    const Aps5NativeArguments* arguments = &positional;
+    Aps5NativeResult* result = &positionalResult;
+    if (function.shaped) {
+        shaped = &shapedStorage.emplace();
+        hidden = MarshalArguments(*function.signature, block, *shaped);
+        arguments = &shaped->arguments;
+        result = &shaped->result;
+    } else {
+        std::memcpy(slots, guestStack, ReadableBytes(guestStack, sizeof(slots)));
+        const std::uint64_t* stack = slots;
+        positional = {
+            {registers[0], registers[1], registers[2], registers[3], registers[4], registers[5], stack[0], stack[1]},
+            {},
+            stack + 2,
+            StackArgumentSlots,
+            0,
+        };
+        std::memcpy(positional.vector, reinterpret_cast<const void*>(block + BlockVectors), sizeof(positional.vector));
+        switch (function.variadic) {
+        case Variadic::None: break;
+        case Variadic::GuestList: setBridgeVaList(&list); break;
+        case Variadic::Integers:
+            std::memcpy(variadicSlots, registers + function.fixed, (6 - function.fixed) * sizeof(std::uint64_t));
+            std::memcpy(variadicSlots + 6 - function.fixed, stack, StackArgumentSlots * sizeof(std::uint64_t));
+            positional.stack = variadicSlots;
+            positional.stackSlots = 6 - function.fixed + StackArgumentSlots;
+            break;
+        case Variadic::Unsupported:
+            std::fprintf(stderr, "[aps5-fex] %s: its variadic arguments cannot be bridged\n", function.name.c_str());
+            std::abort();
+        }
+    }
+    const GuestCall call {&state, block, currentCall};
+    currentCall = &call;
+    try {
+        Aps5NativeCall(function.address, arguments, result);
+    } catch (const GuestFrame& frame) {
+        currentCall = call.outer;
+        if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
+        for (std::size_t i = 0; i < 16; ++i) state.gregs[DwarfRegisters[i]] = frame.registers[i];
+        state.rip = frame.registers[16];
+        return true;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[aps5-fex] %s: %s\n", function.name.c_str(), error.what());
+        std::abort();
+    }
+    currentCall = call.outer;
+    if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
+    if (shaped != nullptr) {
+        try {
+            UnmarshalResult(*function.signature, block, hidden, *shaped);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[aps5-fex] %s: %s\n", function.name.c_str(), error.what());
+            std::abort();
+        }
+        if (trace)
+            std::fprintf(stderr, "[aps5-fex] %s returned %#llx:%#llx\n", function.name.c_str(), static_cast<unsigned long long>(registers[0]),
+                         static_cast<unsigned long long>(registers[1]));
+        return false;
+    }
+    registers[0] = result->gpr[0];
+    registers[1] = result->gpr[1];
+    std::memcpy(reinterpret_cast<void*>(block + BlockVectors), result->vector, 2 * sizeof(result->vector[0]));
+    return false;
+}
+
 std::uint64_t Bridge::Call(FEXCore::Core::CPUState& state, std::uint64_t number, std::uint64_t block) {
     const std::uint64_t rip = state.rip;
     state.rip = rip + 2;
@@ -386,64 +644,8 @@ std::uint64_t Bridge::Call(FEXCore::Core::CPUState& state, std::uint64_t number,
         return static_cast<std::uint64_t>(-ENOSYS);
     }
     const Function& function = functions[number - FirstStub];
-    if (function.address == nullptr) {
-        std::fprintf(stderr, "[aps5-fex] the guest called %s, which no library exports\n", function.name.c_str());
-        std::abort();
-    }
-    auto* registers = reinterpret_cast<std::uint64_t*>(block);
-    auto* guestStack = reinterpret_cast<std::uint64_t*>(block + BlockSize + 8);
-    std::uint64_t slots[2 + StackArgumentSlots] {};
-    std::memcpy(slots, guestStack, ReadableBytes(guestStack, sizeof(slots)));
-    const std::uint64_t* stack = slots;
-    if (trace) {
-        std::fprintf(stderr, "[aps5-fex] %s(%#llx, %#llx, %#llx, %#llx, %#llx, %#llx)\n", function.name.c_str(),
-                     static_cast<unsigned long long>(registers[0]), static_cast<unsigned long long>(registers[1]),
-                     static_cast<unsigned long long>(registers[2]), static_cast<unsigned long long>(registers[3]),
-                     static_cast<unsigned long long>(registers[4]), static_cast<unsigned long long>(registers[5]));
-    }
-    Aps5NativeArguments arguments {
-        {registers[0], registers[1], registers[2], registers[3], registers[4], registers[5], stack[0], stack[1]},
-        {},
-        stack + 2,
-        StackArgumentSlots,
-    };
-    std::memcpy(arguments.vector, reinterpret_cast<const void*>(block + BlockVectors), sizeof(arguments.vector));
-    VaList list {static_cast<std::uint32_t>(8 * function.fixed), 48, guestStack, registers};
-    std::uint64_t variadicSlots[6 + StackArgumentSlots];
-    switch (function.variadic) {
-    case Variadic::None: break;
-    case Variadic::GuestList: setBridgeVaList(&list); break;
-    case Variadic::Integers:
-        std::memcpy(variadicSlots, registers + function.fixed, (6 - function.fixed) * sizeof(std::uint64_t));
-        std::memcpy(variadicSlots + 6 - function.fixed, stack, StackArgumentSlots * sizeof(std::uint64_t));
-        arguments.stack = variadicSlots;
-        arguments.stackSlots = 6 - function.fixed + StackArgumentSlots;
-        break;
-    case Variadic::Unsupported:
-        std::fprintf(stderr, "[aps5-fex] %s: its variadic arguments cannot be bridged\n", function.name.c_str());
-        std::abort();
-    }
-    Aps5NativeResult result {};
-    const GuestCall call {&state, block, currentCall};
-    currentCall = &call;
-    try {
-        Aps5NativeCall(function.address, &arguments, &result);
-    } catch (const GuestFrame& frame) {
-        currentCall = call.outer;
-        if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
-        for (std::size_t i = 0; i < 16; ++i) state.gregs[DwarfRegisters[i]] = frame.registers[i];
-        state.rip = frame.registers[16];
-        return frame.registers[0];
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[aps5-fex] %s: %s\n", function.name.c_str(), error.what());
-        std::abort();
-    }
-    currentCall = call.outer;
-    if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
-    registers[0] = result.gpr[0];
-    registers[1] = result.gpr[1];
-    std::memcpy(reinterpret_cast<void*>(block + BlockVectors), result.vector, sizeof(result.vector));
-    return result.gpr[0];
+    if (Invoke(state, function, block)) return state.gregs[REG_RAX];
+    return reinterpret_cast<const std::uint64_t*>(block)[0];
 }
 
 }

@@ -38,9 +38,11 @@ _Aps5NativeCall:
     ldp x2, x3, [x17, #16]
     ldp x4, x5, [x17, #32]
     ldp x6, x7, [x17, #48]
+    ldr x8, [x17, #208]
     blr x16
     stp x0, x1, [x19, #0]
     stp q0, q1, [x19, #16]
+    stp q2, q3, [x19, #48]
     mov sp, x29
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32

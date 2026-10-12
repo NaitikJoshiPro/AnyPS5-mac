@@ -7,7 +7,7 @@
 
 generate: libclang (APS5_LIBCLANG, or the libclang.dylib beside the compiler that compile_commands.json
 names) parses every translation unit of a prx library target (it defines <target>_EXPORTS, lives under
-core/libs/prx and not in a tests directory). Each extern "C" function that a library defines with
+core/libs/prx, or under core/fex/tests/prx for the bridge's test library, and not in a tests directory). Each extern "C" function that a library defines with
 external linkage and default visibility is an export. Its result and parameters are classified
 (integer, pointer, function pointer with the callback's own signature, float, double, long double,
 GuestLongDouble, __int128, vector, empty, struct with its layout and whether C++ passes it through a
@@ -104,7 +104,7 @@ REASONS = {
     "struct-memory": ("StructMemory", "a struct over 16 bytes by value: copied to the guest stack, passed by pointer on arm64"),
     "sret": ("HiddenResult", "a result through a hidden pointer: rdi on the guest (returned in rax), x8 on arm64"),
     "struct-result": ("StructResult", "a struct result in registers that the positional mapping places wrongly"),
-    "int128": ("Int128", "__int128: arm64 starts it at an even register"),
+    "int128": ("Int128", "__int128: a register pair that positional mapping places differently (or splits from the stack)"),
     "unclassified": ("Unclassified", "a type the generator cannot classify"),
 }
 
@@ -295,7 +295,7 @@ class UnitReader:
     def __init__(self, clang, root, full):
         self.clang = clang
         self.full = full
-        self.libraries = str(Path(root) / "core" / "libs") + os.sep
+        self.libraries = (str(Path(root) / "core" / "libs") + os.sep, str(Path(root) / "core" / "fex" / "tests" / "prx") + os.sep)
         self.root = str(Path(root)) + os.sep
         self.texts = {}
         self.indirect_records = {}
@@ -596,13 +596,15 @@ def unit_arguments(entry, sdk):
 
 def library_units(commands, root):
     """The translation units of prx library targets: file -> its compile command and the libraries built from it."""
-    prx = str(Path(root) / "core" / "libs" / "prx") + os.sep
+    # core/fex/tests/prx holds test-only libraries (the bridge's ABI fixture library), built only with tests.
+    prefixes = [str(Path(root) / "core" / "libs" / "prx") + os.sep, str(Path(root) / "core" / "fex" / "tests" / "prx") + os.sep]
     units = {}
     for entry in commands:
         source = os.path.normpath(os.path.join(entry["directory"], entry["file"]))
         command = " ".join(entry["arguments"]) if "arguments" in entry else entry["command"]
         target = re.search(r"CMakeFiles/([^/]+)\.dir/", entry.get("output", "")) or re.search(r"-o\s+\S*CMakeFiles/([^/]+)\.dir/", command)
-        if not source.startswith(prx) or "tests" in Path(source[len(prx):]).parts:
+        prx = next((prefix for prefix in prefixes if source.startswith(prefix)), None)
+        if prx is None or "tests" in Path(source[len(prx):]).parts:
             continue
         if not re.search(r"-D\S+_EXPORTS\b", command) or target is None:
             continue
@@ -844,8 +846,8 @@ def host_layout(signature):
                 stack += align_to(size, 8)
         else:
             words = (size + 7) // 8
-            if value.get("align", 8) >= 16:
-                integer = align_to(integer, 2)
+            # Apple's convention does not start a 16-byte aligned value (__int128, an aligned struct) at an
+            # even register, unlike AAPCS64 (checked with clang -target arm64-apple-macos14 and by verify).
             if integer + words <= 8:
                 parameters.append([[f"x{integer + index}", 8 * index, min(8, size - 8 * index), how] for index in range(words)])
                 integer += words
@@ -976,11 +978,54 @@ def merge(units, results, root):
     return result, problems, len(host_only)
 
 
+def piece_row(location, offset, size, how, result):
+    """A BridgePiece initialiser: where one part of a value lives under one convention."""
+    if location == "sret":
+        place, register, at = "Sret", 0, 0
+    elif location == "st0":
+        place, register, at = "X87", 0, 0
+    elif location.startswith("stack+"):
+        place, register, at = "Stack", 0, int(location[6:])
+    elif "+" in location:
+        register, at = location.split("+")
+        place, register, at = "Vector", int(register.lstrip("xmv")), int(at)
+    elif result and location in ("rax", "rdx"):
+        place, register, at = "Gpr", ("rax", "rdx").index(location), 0
+    elif location in GUEST_REGISTERS:
+        place, register, at = "Gpr", GUEST_REGISTERS.index(location), 0
+    elif location.startswith("x") and location[1:].isdigit():
+        place, register, at = "Gpr", int(location[1:]), 0
+    else:
+        raise RuntimeError(f"no bridge place for {location}")
+    reference = "true" if how == "reference" else "false"
+    return f"{{BridgePlace::{place}, {register}, {at}, {offset}, {size}, {reference}}}"
+
+
 class TableWriter:
     """Writes the C++ table that BridgeSignatures.cpp includes."""
 
     def __init__(self):
         self.leaves, self.values, self.callbacks = [], [], []
+        self.pieces, self.layouts = [], []
+
+    def pieces_of(self, pieces, result):
+        first = len(self.pieces)
+        self.pieces += [piece_row(*piece, result) for piece in pieces]
+        return first, len(pieces)
+
+    def layout(self, signature):
+        """One BridgeLayout per value (result first): its pieces under SysV (guest) and under Apple arm64 (host)."""
+        count = 1 + len(signature["parameters"])
+        if any(value["kind"] == "unsupported" for value in [signature["result"], *signature["parameters"]]):
+            return ["{0, 0, 0, 0}"] * count
+        guest, host = guest_layout(signature), host_layout(signature)
+        rows = []
+        for index, (guest_pieces, host_pieces) in enumerate(zip([guest["result"], *guest["parameters"]],
+                                                                  [host["result"], *host["parameters"]])):
+            guest_first, guest_count = self.pieces_of(guest_pieces, index == 0)
+            host_first, host_count = self.pieces_of(host_pieces, index == 0)
+            rows.append(f"{{{guest_first}, {guest_count}, {host_first}, {host_count}}}")
+        return rows
 
     def value(self, value):
         kind = value["kind"]
@@ -1001,6 +1046,7 @@ class TableWriter:
         values = [self.value(value) for value in [signature["result"], *signature["parameters"]]]
         first = len(self.values)
         self.values += values
+        self.layouts += self.layout(signature)
         reasons = " | ".join(f"BridgeReason::{REASONS[reason][0]}" for reason in signature.get("reasons", [])) or "0"
         table.append(f'{{"{name}", {first}, {len(signature["parameters"])}, {"true" if signature["variadic"] else "false"}, {reasons}}}')
         return len(table) - 1
@@ -1011,7 +1057,8 @@ class TableWriter:
             self.signature(export["name"], export, signatures)
         lines = []
         for type_name, name, rows in (("BridgeLeaf", "Leaves", self.leaves), ("BridgeValue", "Values", self.values),
-                                      ("BridgeSignature", "Callbacks", self.callbacks), ("BridgeSignature", "Signatures", signatures)):
+                                      ("BridgeSignature", "Callbacks", self.callbacks), ("BridgeSignature", "Signatures", signatures),
+                                      ("BridgePiece", "Pieces", self.pieces), ("BridgeLayout", "Layouts", self.layouts)):
             if rows:
                 lines.append(f"constexpr std::array<{type_name}, {len(rows)}> {name} {{{{")
                 lines += [f"    {row}," for row in rows]
