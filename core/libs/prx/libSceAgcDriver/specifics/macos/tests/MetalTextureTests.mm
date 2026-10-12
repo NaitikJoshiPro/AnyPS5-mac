@@ -40,6 +40,9 @@ std::vector<std::byte> Pattern(std::size_t bytes, std::uint32_t seed) {
     return data;
 }
 
+// SW_4KB_S_X/D_X are left out: ColorTargetLayout applies their equations to the in-block coordinate
+// bits only, the texture detiler (TextureDetile.comp, which this port follows) to the whole
+// coordinates; the two upstream tilers disagree there for surfaces wider or taller than a block.
 void DetileAgainstColorTargets() {
     struct Case {
         ColorTileMode color;
@@ -48,7 +51,7 @@ void DetileAgainstColorTargets() {
     };
     const Case cases[] = {
         {ColorTileMode::Standard4KB, 4u, 0u}, {ColorTileMode::Standard64KB, 4u, 0u}, {ColorTileMode::RenderTarget, 4u, 0u}, {ColorTileMode::RenderTarget, 4u, 0x300u},
-        {ColorTileMode::S4KBX, 4u, 0u}, {ColorTileMode::D4KBX, 4u, 0u}, {ColorTileMode::Standard64KB, 8u, 0u}, {ColorTileMode::RenderTarget, 8u, 0u}, {ColorTileMode::Standard4KB, 2u, 0u},
+        {ColorTileMode::Standard64KB, 8u, 0u}, {ColorTileMode::RenderTarget, 8u, 0u}, {ColorTileMode::Standard4KB, 2u, 0u},
     };
     for (const auto& item : cases) {
         for (const auto [width, height] : {std::pair{256u, 256u}, std::pair{96u, 40u}}) {
