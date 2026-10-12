@@ -214,14 +214,15 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     presenter->residency = [device newResidencySetWithDescriptor:descriptor error:&error];
     if (presenter->residency == nil) Fail("cannot create the presentation residency set: " + Metal::Describe(error));
     [queue addResidencySet:presenter->residency];
+    // The Metal view first: the drawable size is the view's (pixels, HiDPI) once it exists.
+#ifdef __APPLE__
+    if (window.metalLayer != nullptr) presenter->layer = (__bridge CAMetalLayer*)window.metalLayer(window.context);
+#endif
     std::uint32_t width = window.width;
     std::uint32_t height = window.height;
     if (window.getDrawableSize != nullptr) window.getDrawableSize(window.context, &width, &height);
     presenter->width = width;
     presenter->height = height;
-#ifdef __APPLE__
-    if (window.metalLayer != nullptr) presenter->layer = (__bridge CAMetalLayer*)window.metalLayer(window.context);
-#endif
     if (presenter->layer != nil) {
         // Layer properties change off the main thread inside an explicit transaction (an implicit
         // one on a thread without a run loop is never committed).
