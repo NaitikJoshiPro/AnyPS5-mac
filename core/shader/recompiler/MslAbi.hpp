@@ -190,6 +190,12 @@ inline constexpr const char* VertexOutputsHighMacro = "APS5_VERTEX_OUTPUTS_HI";
 inline constexpr const char* RectListMacro = "APS5_RECT_LIST";
 // - vertex: 1 when the guest clip space has z in [-w, w] (the function remaps z = (z + w) / 2).
 inline constexpr const char* DepthNegativeOneToOneMacro = "APS5_DEPTH_NEGATIVE_ONE_TO_ONE";
+// - fragment: 1 when the pipeline blends with two sources (PipelineSpecialization::DualSourceBlend):
+//   colour location 1 becomes color(0) index(1) (Reflection::dualSource: the function writes it);
+inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";
+// - fragment: the MSL type of colour output n (float4, uint4 or int4; default from pixelInfo),
+//   APS5_COLOR<n>_TYPE.
+inline constexpr const char* ColorTypeMacroPrefix = "APS5_COLOR";
 
 // Size of the lock table DriverData::atomicLocks points at (1024 lock words).
 inline constexpr std::uint32_t AtomicLockTableBytes = 4096u;
@@ -229,7 +235,8 @@ struct Reflection {
     std::uint32_t vertexFetchLocations = 0;
     // Version 3, fragment functions: color(n) outputs written (bit n); depth, stencil and sample
     // mask exports; a dual-source second colour (color(0), index(1)); per-sample shading (reads
-    // sample_id); [[early_fragment_tests]]; the function can discard.
+    // sample_id); [[early_fragment_tests]]; the function can discard. dualSource: the function writes
+    // colour location 1, which APS5_DUAL_SOURCE turns into the second blend source.
     std::uint32_t colorOutputs = 0;
     bool exportsDepth = false;
     bool exportsStencil = false;

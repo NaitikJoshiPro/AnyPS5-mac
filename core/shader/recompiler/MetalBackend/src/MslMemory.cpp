@@ -122,8 +122,20 @@ struct Shared {
 Shared SharedOf(MslEmitterState& state, const IrValue& instruction) {
     const auto& memory = state.Memory(instruction);
     Shared shared;
+    if (memory.kind == ResourceKind::Lds && state.program.Resources().stage != IrShaderStage::Compute) {
+        // Function LDS (SpirvRequirements::functionLds): graphics stages keep LDS per invocation, at the
+        // constant lane addresses the front end assigns (FunctionLdsLaneAddresses), as on the SPIR-V path.
+        if (!state.requirements.functionLds) state.Fail(instruction, "LDS in a graphics stage without function LDS");
+        const auto dwords = state.requirements.functionLdsDwords != 0u ? state.requirements.functionLdsDwords : FunctionLdsDwordLimit;
+        if (state.prologue.find(" aps5_flds[") == std::string::npos) state.AddPrologue("uint aps5_flds[" + std::to_string(dwords) + "] = {};");
+        shared.words = "aps5_flds";
+        shared.length = U32(dwords);
+        shared.space = "thread";
+        shared.flags = "mem_flags::mem_none";
+        shared.scope = "thread_scope_thread";
+        return shared;
+    }
     if (memory.kind == ResourceKind::Lds) {
-        if (state.program.Resources().stage != IrShaderStage::Compute) state.Fail(instruction, "LDS outside compute programs is not implemented in the MSL backend yet (work package B6)");
         const auto storage = MslLdsStorage(state);
         if (storage.words.empty()) state.Fail(instruction, "accesses LDS, but the workgroup has none");
         shared.words = storage.words;
@@ -204,7 +216,14 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bit
     state.Indent();
     const auto shared = SharedOf(state, instruction);
     const auto address = ByteAddress(state, instruction);
-    if (bits < 32u) {
+    if (bits < 32u && shared.space == "thread") {
+        const auto index = state.Temporary("aps5_di");
+        const auto shift = state.Temporary("aps5_ds");
+        const auto mask = bits == 8u ? std::string("0xffu") : std::string("0xffffu");
+        state.Line("const uint " + index + " = " + address + " >> 2u;");
+        state.Line("const uint " + shift + " = (" + address + " & 3u) << 3u;");
+        state.Line("if (" + index + " < " + shared.length + ") " + shared.words + "[" + index + "] = (" + shared.words + "[" + index + "] & ~(" + mask + " << " + shift + ")) | ((uint(" + state.Arg(instruction, instruction.ArgumentCount() - 2u) + ") & " + mask + ") << " + shift + ");");
+    } else if (bits < 32u) {
         // Neighbouring lanes write the other bytes of the dword: one compare-exchange per field.
         const auto index = state.Temporary("aps5_di");
         const auto shift = state.Temporary("aps5_ds");
@@ -359,7 +378,10 @@ void SharedAtomic32(MslEmitterState& state, const IrValue& instruction) {
     state.Line("const uint " + index + " = " + address + " >> 2u;");
     state.Line("if (" + index + " < " + shared.length + ") {");
     state.Indent();
-    if (shared.locked) {
+    if (shared.space == "thread") {
+        state.Line(result + " = " + shared.words + "[" + index + "];");
+        state.Line(shared.words + "[" + index + "] = " + atomic.next(result) + ";");
+    } else if (shared.locked) {
         Locked(state, instruction, shared, [&] {
             state.Line(result + " = " + shared.words + "[" + index + "];");
             state.Line(shared.words + "[" + index + "] = " + atomic.next(result) + ";");
@@ -468,6 +490,7 @@ void AppendConsume(MslEmitterState& state, const IrValue& instruction, bool appe
     }
     const auto& memory = state.Memory(instruction);
     const auto shared = SharedOf(state, instruction);
+    if (shared.space == "thread") state.Fail(instruction, "ds_append/ds_consume on function LDS is not implemented in the MSL backend (work package B6)");
     const bool gds = memory.kind == ResourceKind::Gds;
     const auto index = state.Temporary("aps5_di");
     std::string bounds;

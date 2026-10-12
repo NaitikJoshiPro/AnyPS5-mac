@@ -476,7 +476,15 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             const auto location = std::to_string(output.location);
             const bool uintOutput = output.index < std::size(pixel.targetOutputMode) && pixel.targetOutputMode[output.index] == 7u;
             text += "#ifndef APS5_COLOR" + location + "_TYPE\n#define APS5_COLOR" + location + "_TYPE " + (uintOutput ? "uint4" : "float4") + "\n#endif\n";
-            members += "    APS5_COLOR" + location + "_TYPE c" + location + " [[color(" + location + ")]];\n";
+            if (output.location == 1u) {
+                // Dual-source blending (APS5_DUAL_SOURCE, the PipelineSpecialization::DualSourceBlend
+                // flag as a macro): the second colour is color(0) index(1), as the SPIR-V path's
+                // fragment output specialization moves location 1 to location 0 index 1.
+                members += "#if defined(APS5_DUAL_SOURCE) && APS5_DUAL_SOURCE\n    APS5_COLOR1_TYPE c1 [[color(0), index(1)]];\n#else\n    APS5_COLOR1_TYPE c1 [[color(1)]];\n#endif\n";
+                state.reflection.dualSource = true;
+            } else {
+                members += "    APS5_COLOR" + location + "_TYPE c" + location + " [[color(" + location + ")]];\n";
+            }
             state.reflection.colorOutputs |= 1u << output.location;
             break;
         }
