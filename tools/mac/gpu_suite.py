@@ -63,6 +63,9 @@ CANARIES = HERE / "gpu_canaries.txt"
 MAX_TIMEOUT = 30
 PAUSE_SECONDS = 2.0
 LOAD_LIMIT = 6.0
+# The supervised rerun of a held test (--rerun-held) waits for a quieter machine.
+HELD_LOAD_LIMIT = 3.0
+load_limit = LOAD_LIMIT
 GUARDED_PATHS = ("core", "specifics")
 PRX = "core/libs/libs/unpatched/libSceAgcDriver.prx"
 # Compilers and linkers whose work loads the machine (and, for metal, the GPU compiler service).
@@ -195,8 +198,8 @@ def busy_processes():
 def machine_busy():
     """Why the machine is too busy for a GPU test, or None."""
     load = load_average()
-    if load > LOAD_LIMIT:
-        return f"1-minute load average {load:.2f} > {LOAD_LIMIT:g}"
+    if load > load_limit:
+        return f"1-minute load average {load:.2f} > {load_limit:g}"
     running = busy_processes()
     if running:
         return "compiler/linker running: " + " ".join(running)
@@ -466,6 +469,7 @@ def main():
     parser.add_argument("--canaries", type=Path, default=CANARIES, help="canary list run first (default: tools/mac/gpu_canaries.txt)")
     parser.add_argument("--busy-wait", type=float, default=300.0, help="seconds to wait for load/compilers to go away before refusing (default: 300)")
     parser.add_argument("--quarantine", type=Path, default=gpu_groups.QUARANTINE, help="quarantine list (default: tools/mac/gpu_quarantine.txt); missing or malformed: nothing runs")
+    parser.add_argument("--rerun-held", metavar="NAME", help="the supervised run of ONE test gpu_groups.HOLD holds back (e.g. agc_driver_lds_atomics64, with the coordinator's agreement): NAME must be the only selected test, needs --validation, runs alone after the canaries with a 1-minute load limit of 3; the test stays held for normal runs")
     parser.add_argument("--rerun-quarantined", action="store_true", help="the supervised rerun of ONE quarantined test (D19.4/6): needs exactly one selected test, --validation, and runs it alone after the canaries; the test stays quarantined until the list is edited with this run as evidence")
     parser.add_argument("--pause", type=float, default=PAUSE_SECONDS, help=f"seconds between tests (default and minimum: {PAUSE_SECONDS:g})")
     parser.add_argument("--validation", action="store_true", help="run with MTL_SHADER_VALIDATION=1 (reported to stderr) and MTL_DEBUG_LAYER=1")
@@ -510,10 +514,22 @@ def main():
             parser.error("--rerun-quarantined needs --validation (DECISIONS D19.4)")
         rerun = list(chosen)
         print(f"supervised rerun of quarantined test {chosen[0]} ({quarantine[chosen[0]]})")
+    rerun_held = []
+    if args.rerun_held:
+        if chosen != [args.rerun_held] or not gpu_groups.HOLD.search(args.rerun_held):
+            parser.error("--rerun-held NAME needs NAME to be the only selected test, and gpu_groups.HOLD must hold it back")
+        if args.rerun_quarantined or args.rerun_held in quarantine:
+            parser.error("--rerun-held cannot run a quarantined test (use --rerun-quarantined)")
+        if not args.validation:
+            parser.error("--rerun-held needs --validation (DECISIONS D19.4)")
+        global load_limit
+        load_limit = HELD_LOAD_LIMIT
+        rerun_held = list(chosen)
+        print(f"supervised run of held test {args.rerun_held} (load limit {HELD_LOAD_LIMIT:g})")
     for name in chosen:
         if name in quarantine and name not in rerun:
             print(f"refusing to run quarantined test {name}: {quarantine[name]}")
-    held = [name for name in chosen if gpu_groups.HOLD.search(name) or (name in quarantine and name not in rerun)]
+    held = [name for name in chosen if (gpu_groups.HOLD.search(name) and name not in rerun_held) or (name in quarantine and name not in rerun)]
     runnable = [name for name in chosen if name not in held]
     timeouts = {name: registered[name]["properties"].get("TIMEOUT") for name in runnable}
     planned = list(batches(runnable, timeouts, args.timeout, args.batch_seconds))
@@ -650,7 +666,7 @@ def main():
         "started": started_wall, "finished": finished_wall, "seconds": time.monotonic() - started, "batches": len(cases),
         "git": git_start, "build": os.path.relpath(build, REPO), "environment": extra,
         "rebuilt": rebuilt, "prx": {"path": PRX, "sha256": prx_before}, "guards": guards, "canaries": canary_results,
-        "stopped": stopped, "not_run": not_run, "timeout_cap": MAX_TIMEOUT, "pause": args.pause, "quarantine_rerun": rerun, "quarantine": {name: quarantine[name] for name in held if name in quarantine},
+        "stopped": stopped, "not_run": not_run, "timeout_cap": MAX_TIMEOUT, "pause": args.pause, "quarantine_rerun": rerun, "held_rerun": rerun_held, "quarantine": {name: quarantine[name] for name in held if name in quarantine},
     }
     table, summary = summarize(results, groups, held, args.selectors, meta, allow_errors, allow_warnings)
     (out / "summary.txt").write_text(summary + "\n", encoding="utf-8")

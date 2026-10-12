@@ -323,6 +323,26 @@ class SuiteRunTests(unittest.TestCase):
         self.assertIn("^agc_driver_f16_denormal_flush$", log)
         self.assertEqual(json.loads(files["summary.json"])["meta"]["quarantine_rerun"], ["agc_driver_f16_denormal_flush"])
 
+    def test_a_held_test_runs_only_alone_under_validation(self):
+        plan = {"agc_driver_ok": ["run", "", ""], "agc_driver_lds_atomics64": ["run", "", "held rerun"]}
+        result, _, log = self.run_suite(plan, "agc_driver_lds_atomics64", "--rerun-held", "agc_driver_lds_atomics64")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+        result, _, log = self.run_suite(plan, "re:^agc_driver_", "--rerun-held", "agc_driver_lds_atomics64", "--validation")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+        result, _, log = self.run_suite(plan, "agc_driver_ok", "--rerun-held", "agc_driver_ok", "--validation")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(log, "")
+        result, files, log = self.run_suite(plan, "agc_driver_lds_atomics64", "--rerun-held", "agc_driver_lds_atomics64", "--validation")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("^agc_driver_lds_atomics64$", log)
+        self.assertNotIn("agc_driver_ok$", log)
+        self.assertEqual(json.loads(files["summary.json"])["meta"]["held_rerun"], ["agc_driver_lds_atomics64"])
+        result, _, log = self.run_suite(plan, "agc_driver_lds_atomics64", "--validation")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(log, "")
+
     def test_selecting_only_held_tests_runs_nothing(self):
         result, _, log = self.run_suite({"agc_driver_lds_atomics64": ["run", "", ""]}, "agc_driver_lds_atomics64")
         self.assertEqual(result.returncode, 1)
