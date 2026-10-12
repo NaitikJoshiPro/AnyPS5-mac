@@ -112,6 +112,28 @@ bool ReadRelativeSymbolicLink(const std::filesystem::path& native, std::string& 
     return true;
 }
 #endif
+
+std::int64_t ReadNativeLink(const std::filesystem::path& native, char* buffer, std::size_t size) {
+#ifdef _WIN32
+    const DWORD attributes = GetFileAttributesW(native.wstring().c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        std::string target;
+        if (!ReadRelativeSymbolicLink(native, target)) {
+            NotImplemented_nid_no_patch("readlink of a Windows reparse point other than a relative symbolic link");
+            return -1;
+        }
+        return CopyLinkTarget(target, buffer, size);
+    }
+#endif
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(native, error);
+    if (error) return Fail(GuestError(error));
+    if (status.type() == std::filesystem::file_type::not_found) return Fail(GuestEnoent);
+    if (!std::filesystem::is_symlink(status)) return Fail(GuestEinval);
+    const auto target = std::filesystem::read_symlink(native, error).generic_string();
+    if (error) return Fail(GuestError(error));
+    return CopyLinkTarget(target, buffer, size);
+}
 }
 
 extern "C" {
@@ -141,25 +163,19 @@ std::int64_t APS5_VABI readlink_nid_postfix(const char* path, char* buffer, std:
     if (size > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) return Fail(GuestEinval);
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return Fail(error);
-#ifdef _WIN32
-    const DWORD attributes = GetFileAttributesW(native.wstring().c_str());
-    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        std::string target;
-        if (!ReadRelativeSymbolicLink(native, target)) {
-            NotImplemented_nid_no_patch("readlink of a Windows reparse point other than a relative symbolic link");
-            return -1;
-        }
-        return CopyLinkTarget(target, buffer, size);
-    }
-#endif
-    std::error_code error;
-    const auto status = std::filesystem::symlink_status(native, error);
-    if (error) return Fail(GuestError(error));
-    if (status.type() == std::filesystem::file_type::not_found) return Fail(GuestEnoent);
-    if (!std::filesystem::is_symlink(status)) return Fail(GuestEinval);
-    const auto target = std::filesystem::read_symlink(native, error).generic_string();
-    if (error) return Fail(GuestError(error));
-    return CopyLinkTarget(target, buffer, size);
+    return ReadNativeLink(native, buffer, size);
+}
+
+std::int64_t APS5_VABI readlinkat_nid_postfix(int fd, const char* path, char* buffer, std::size_t size) {
+    if (path == nullptr) return Fail(GuestEfault);
+    if (*path == '\0') return Fail(GuestEnoent);
+    if (size > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) return Fail(GuestEinval);
+    if (fd == GuestAtFdcwd || *path == '/') return readlink_nid_postfix(path, buffer, size);
+    int error = 0;
+    const char* base = GetDirectoryDescriptorPath_nid_no_patch(fd, &error);
+    if (base == nullptr) return Fail(error);
+    return ReadNativeLink(std::filesystem::path(reinterpret_cast<const char8_t*>(base)) /
+                          std::filesystem::path(reinterpret_cast<const char8_t*>(path)), buffer, size);
 }
 
 int APS5_VABI link_nid_postfix(const char* existing, const char* created) {
