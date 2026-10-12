@@ -132,16 +132,15 @@ def kernel_names(native, environment):
 
 
 def environments(arguments):
+    """The native program's environment and a guest environment for each --config."""
     native = {**os.environ, "APS5_FEX_QOS": arguments.qos}
-    guest = dict(native)
-    guest.pop("APS5_FEX_CONFIG", None)
-    if arguments.config:
-        guest["APS5_FEX_CONFIG"] = arguments.config
-    return native, guest
+    native.pop("APS5_FEX_CONFIG", None)
+    return native, {config: {**native, **({"APS5_FEX_CONFIG": config} if config else {})} for config in arguments.config or [""]}
 
 
 def smoke(arguments, native, guests):
-    native_environment, guest_environment = environments(arguments)
+    native_environment, guest_environments = environments(arguments)
+    guest_environment = next(iter(guest_environments.values()))
     names = kernel_names(native, native_environment)
     expected, status, errors = run([str(native), "all", str(SMOKE_PERMILLE), "2"], None, native_environment, 20)
     failures = [] if status == 0 else [f"native: exit {status}: {errors}"]
@@ -192,15 +191,19 @@ def machine():
 
 
 def benchmark(arguments, native, guests):
-    native_environment, guest_environment = environments(arguments)
+    native_environment, guest_environments = environments(arguments)
     names = [name for name in kernel_names(native, native_environment)
              if not arguments.kernels or any(re.fullmatch(pattern, name) for pattern in arguments.kernels.split(","))]
     binaries = {"native": ([str(native)], None, native_environment)}
-    binaries.update({variant: ([str(arguments.runner), "eboot.elf"], eboot.parent, guest_environment) for variant, eboot in guests.items()})
+    columns = {}
+    for variant, eboot in guests.items():
+        for config, environment in guest_environments.items():
+            columns[f"{variant}:{config}" if config else variant] = {"march": VARIANTS[variant], "config": config}
+            binaries[f"{variant}:{config}" if config else variant] = ([str(arguments.runner), "eboot.elf"], eboot.parent, environment)
+    guests = list(columns)
     report = {"date": datetime.datetime.now().isoformat(timespec="seconds"), "machine": machine(), "load_start": os.getloadavg(),
               "permille": arguments.permille, "repetitions": arguments.reps, "processes": arguments.processes,
-              "qos": arguments.qos, "fex_config": arguments.config or "", "label": arguments.label,
-              "variants": {v: VARIANTS[v] for v in guests},
+              "qos": arguments.qos, "label": arguments.label, "variants": columns,
               "kernels": {}}
     print(f"load average {' '.join(f'{value:.2f}' for value in report['load_start'])}; {len(names)} kernels, "
           f"{arguments.processes} process(es) of {arguments.reps} repetitions each", flush=True)
@@ -343,7 +346,8 @@ def main():
     parser.add_argument("--permille", type=int, default=1000, help="work per repetition, in thousandths of the full work")
     parser.add_argument("--reps", type=int, default=8, help="repetitions per process, the first one cold")
     parser.add_argument("--processes", type=int, default=1, help="processes per kernel and program")
-    parser.add_argument("--config", default="", help="APS5_FEX_CONFIG for the guests, e.g. TSOEnabled=0")
+    parser.add_argument("--config", action="append", help="APS5_FEX_CONFIG for the guests, e.g. TSOEnabled=0; repeat it to "
+                        "run each guest under several (an empty value is FEX's defaults)")
     parser.add_argument("--qos", default="user-interactive", help="APS5_FEX_QOS for every thread of both programs")
     parser.add_argument("--label", default="default", help="suffix of the JSON file")
     parser.add_argument("--timeout", type=int, default=300, help="seconds per process")
