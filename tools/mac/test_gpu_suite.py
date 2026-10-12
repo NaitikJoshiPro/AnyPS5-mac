@@ -43,8 +43,14 @@ FAKE_NINJA = r'''#!/usr/bin/env python3
 import os, sys
 with open(os.environ["FAKE_NINJA_LOG"], "a") as log:
     log.write(" ".join(sys.argv[1:]) + "\n")
-print("[0/1] Re-checking globbed directories...")
-print(os.environ.get("FAKE_NINJA_OUTPUT", "ninja: no work to do."))
+# What a real dry run prints with CONFIGURE_DEPENDS globs: the forced glob check and a CMake re-run.
+print("ninja explain: build/CMakeFiles/VerifyGlobs.cmake_force is dirty", file=sys.stderr)
+print("[0/2] Re-checking globbed directories...")
+print("ninja explain: build/CMakeFiles/cmake.verify_globs is dirty", file=sys.stderr)
+if os.environ.get("FAKE_NINJA_EXPLAIN"):
+    print("ninja explain: " + os.environ["FAKE_NINJA_EXPLAIN"], file=sys.stderr)
+print("[1/2] Re-running CMake...")
+print(os.environ.get("FAKE_NINJA_OUTPUT", ""))
 '''
 
 FAKE_SYSCTL = r'''#!/bin/sh
@@ -346,6 +352,11 @@ class GuardTests(unittest.TestCase):
         env = {"FAKE_NINJA_OUTPUT": "[1/2] Linking CXX shared library core/libs/libs/unpatched/libSceAgcDriver.prx"}
         result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", env=env)
         self.assertRefused(result, log, "build step(s) pending")
+
+    def test_a_cmake_rerun_counts_only_with_a_real_reason(self):
+        env = {"FAKE_NINJA_EXPLAIN": "output build.ninja older than most recent input /src/CMakeLists.txt (1 vs 2)"}
+        result, _, log = self.run_suite(self.PLAN, "agc_driver_ok", env=env)
+        self.assertRefused(result, log, "Re-running CMake")
 
     def test_stale_check_names_tests_canaries_and_the_prx(self):
         result, _, log = self.run_suite(self.PLAN, "agc_driver_ok")

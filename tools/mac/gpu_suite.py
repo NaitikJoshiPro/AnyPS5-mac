@@ -143,18 +143,35 @@ def dirty_paths(source):
     return [line[3:] for line in result.stdout.splitlines() if line.strip()]
 
 
+GLOB_CHECK = re.compile(r"VerifyGlobs\.cmake_force|cmake\.verify_globs")
+
+
 def stale_targets(build, targets):
-    """Edges `ninja -n` would run for the targets (empty when everything is up to date)."""
+    """Edges `ninja -n` would run for the targets (empty when everything is up to date).
+
+    With CONFIGURE_DEPENDS globs a dry run always lists "Re-checking globbed directories" and "Re-running CMake"
+    (the glob check is forced and cannot run in a dry run); the CMake step counts as stale only when `-d explain`
+    gives a reason other than that forced check (an edited CMakeLists.txt, a changed cache). New or removed source
+    files are caught by the clean-tree check."""
     if not targets:
         return []
     try:
-        result = subprocess.run(["ninja", "-C", str(build), "-n", *targets], capture_output=True, text=True)
+        result = subprocess.run(["ninja", "-C", str(build), "-n", "-d", "explain", *targets], capture_output=True, text=True)
     except OSError as error:
         raise Refused(f"cannot run ninja to check for stale binaries ({error})") from error
     if result.returncode != 0:
-        raise Refused("ninja -n failed: " + (result.stderr.strip() or result.stdout.strip()).splitlines()[-1][:300])
+        raise Refused("ninja -n failed: " + ((result.stderr.strip() or result.stdout.strip()).splitlines() or ["(no output)"])[-1][:300])
+    lines = (result.stdout + "\n" + result.stderr).splitlines()
+    reasons = [line for line in lines if line.startswith("ninja explain:") and not GLOB_CHECK.search(line)]
     steps = [line for line in result.stdout.splitlines() if re.match(r"^\[\d+/\d+\]", line)]
-    return [step for step in steps if "Re-checking globbed directories" not in step]
+    stale = []
+    for step in steps:
+        if "Re-checking globbed directories" in step:
+            continue
+        if "Re-running CMake" in step and not any("build.ninja" in reason for reason in reasons):
+            continue
+        stale.append(step)
+    return stale
 
 
 def load_average():
