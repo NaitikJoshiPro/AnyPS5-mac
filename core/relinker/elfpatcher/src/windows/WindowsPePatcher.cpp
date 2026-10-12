@@ -49,7 +49,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     if (originalPltGotVaddr != 0)
         image.GetRva(originalPltGotVaddr, 8);
     const WindowsRelocationBuilder relocationBuilder;
-    auto relocations = relocationBuilder.Apply(image, dynamicSection);
+    auto relocations = relocationBuilder.Apply(image, dynamicSection, originalHeaders);
     auto sections = image.BuildSections();
     std::array<PeDirectory, 16> directories{};
     auto nextRva = image.GetEndRva();

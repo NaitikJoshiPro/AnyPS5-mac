@@ -1,0 +1,11 @@
+# Tests expected to fail under aps5-fex on this Mac, one per line: <test>[ [qualifiers]]: <reason>
+# Qualifiers: the variant, "default" (MAXINST=500, multiblock) or "full" (MAXINST=1), and nasm2 or nasm3;
+# without them the entry always holds. A listed test that passes fails as XPASS, so fixed tests leave the list.
+
+# Expected values that depend on where the test's code is loaded.
+TwoByte/0F_8B_16.asm: the last load writes R15w only, so R15 keeps the upper bits of the code address (lea r15, [rel .data]); the expected value assumes FEX's load address 0x10000
+
+# Runner gaps found by the suite.
+FEX_bugs/CodeBufferOverflow.asm [default]: the block overflows FEX's temporary JIT buffer; FEX restarts compilation from the frontend's SIGSEGV handler on Thread->JITGuardPage (LinuxEmulation SignalDelegator.cpp:585), which aps5-fex's fault handler does not do
+Primary/Primary_8C.asm: mov es/ss/ds, 0x4142 makes FEX read GDT entry 0x828 without a bounds check; the runner's GDT has 32 entries (GuestThread::gdt), so the read leaves it (x86 raises #GP; FEX-Linux reads stray memory)
+Primary/Primary_8C_2.asm: mov es/ss/ds, 0x4142 (with REX.R) makes FEX read GDT entry 0x828 without a bounds check; the runner's GDT has 32 entries (GuestThread::gdt)

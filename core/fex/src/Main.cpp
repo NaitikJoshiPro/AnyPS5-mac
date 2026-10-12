@@ -1,5 +1,6 @@
 
 #include "Bridge.hpp"
+#include "CodeCache.hpp"
 #include "GuestCpu.hpp"
 #include "GuestProgram.hpp"
 
@@ -9,7 +10,9 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <sys/mman.h>
 #include <vector>
 
@@ -37,12 +40,45 @@ std::uint64_t CreateProcessStack(const std::vector<std::string>& arguments) {
     return top;
 }
 
+// aps5-fex --precompile <relinked executable> [--coverage <json>] [--threads <n>]: compiles the code found statically
+// in the executable and its guest modules into the disk cache (APS5_FEX_CACHE_DIR or the title's cache directory).
+int Precompile(int argc, char** argv) {
+    std::filesystem::path coverage;
+    unsigned threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+    std::filesystem::path elf;
+    for (int i = 2; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "--coverage" && i + 1 < argc) coverage = argv[++i];
+        else if (argument == "--threads" && i + 1 < argc) threads = static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (elf.empty()) elf = argument;
+        else throw std::runtime_error("--precompile: unexpected argument " + argument);
+    }
+    if (elf.empty()) throw std::runtime_error("--precompile needs an executable");
+    const auto executable = std::filesystem::absolute(elf);
+    if (!CodeCacheDirectory(executable)) throw std::runtime_error("--precompile: no cache directory (set APS5_FEX_CACHE_DIR)");
+    Coverage::Enable(); // precompile follows the compiled blocks to find return sites
+    Bridge bridge(executable.parent_path() / "libs");
+    GuestProgram program(executable, bridge);
+    GuestCpu cpu(bridge, program);
+    const std::size_t seeds = cpu.Precompile(threads, coverage);
+    std::fprintf(stderr, "[aps5-fex] precompiled %zu seeds into %s\n", seeds, CodeCacheDirectory(executable)->c_str());
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <relinked executable> [arguments...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <relinked executable> [arguments...]\n       %s --precompile <relinked executable> [--coverage <json>] [--threads <n>]\n", argv[0], argv[0]);
         return 2;
+    }
+    if (std::string(argv[1]) == "--precompile") {
+        try {
+            return Precompile(argc, argv);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[aps5-fex] %s\n", error.what());
+            return 1;
+        }
     }
     try {
         const auto executable = std::filesystem::absolute(argv[1]);

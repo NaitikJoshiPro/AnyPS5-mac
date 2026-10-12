@@ -1,0 +1,12 @@
+[submodule "External/fmt"]
+	path = External/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "External/xxhash"]
+	path = External/xxhash
+	url = https://github.com/Cyan4973/xxHash.git
+[submodule "External/range-v3"]
+	path = External/range-v3
+	url = https://github.com/ericniebler/range-v3.git
+[submodule "External/unordered_dense"]
+	path = External/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git

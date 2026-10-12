@@ -1,4 +1,5 @@
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestMachineState.hpp"
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstddef>
@@ -191,10 +192,25 @@ extern "C" int APS5_VABI sigsetjmp_nid_postfix(void* buffer, int saveMask) {
 }
 
 extern "C" [[noreturn]] void APS5_VABI siglongjmp_nid_postfix(void* buffer, int value) {
-    if (GuestControlWord() != Get<std::uint16_t>(buffer, SavedControlWord)) NotImplemented_nid_no_patch("siglongjmp to a different x87 control word");
+    const bool controlChanges = GuestControlWord() != Get<std::uint16_t>(buffer, SavedControlWord);
+    if (controlChanges && !LibcHasMachineState_nid_no_patch()) NotImplemented_nid_no_patch("siglongjmp to a different x87 control word");
     if (Get<std::int32_t>(buffer, SavedMaskFlag) != 0) {
         const auto mask = Get<GuestSignalSet>(buffer, SavedMask);
         _sigprocmask_nid_postfix(GuestSigSetmask, &mask, nullptr);
+    }
+    if (controlChanges) {
+        // The x87 control word is not among the registers the unwind hooks restore: resume the whole state.
+        GuestMachineState state{};
+        LibcGetMachineState_nid_no_patch(&state);
+        state.gregs[GuestMachine::Rax] = value != 0 ? static_cast<std::uint32_t>(value) : 1u;
+        state.gregs[GuestMachine::Rbx] = Get<std::uint64_t>(buffer, SavedRbx);
+        state.gregs[GuestMachine::Rsp] = Get<std::uint64_t>(buffer, SavedRsp) + 8;
+        state.gregs[GuestMachine::Rbp] = Get<std::uint64_t>(buffer, SavedRbp);
+        for (std::size_t index = 0; index < 4; ++index) state.gregs[GuestMachine::R12 + index] = Get<std::uint64_t>(buffer, SavedR12 + 8 * index);
+        state.rip = Get<std::uint64_t>(buffer, SavedRip);
+        const auto control = Get<std::uint16_t>(buffer, SavedControlWord);
+        std::memcpy(state.fxsave, &control, sizeof(control));
+        LibcSetMachineState_nid_no_patch(&state);
     }
     std::uintptr_t registers[Count];
     LibcCaptureRegisters_nid_no_patch(registers);

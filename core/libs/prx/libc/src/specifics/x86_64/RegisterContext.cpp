@@ -1,6 +1,8 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "prx/libc/include/GuestMachineState.hpp"
+
 extern "C" void LibcCaptureRegisters(std::uintptr_t*);
 extern "C" [[noreturn]] void LibcRestoreRegisters(const std::uintptr_t*);
 
@@ -152,6 +154,37 @@ void LibcCaptureRegisters(std::uintptr_t* registers) {
 
 bool LibcGuestBridged() {
     return bridgeCapture != nullptr;
+}
+
+namespace {
+void (*bridgeGetState)(GuestMachineState*) = nullptr;
+void (*bridgeSetState)(const GuestMachineState*) = nullptr;
+std::uint64_t bridgeMakecontextEntry = 0;
+}
+
+extern "C" void Aps5SetBridgeMachineState_nid_no_patch(void (*get)(GuestMachineState*), void (*set)(const GuestMachineState*),
+                                                       std::uint64_t makecontextEntry) {
+    bridgeGetState = get;
+    bridgeSetState = set;
+    bridgeMakecontextEntry = makecontextEntry;
+}
+
+extern "C" bool LibcHasMachineState_nid_no_patch() {
+    return bridgeGetState != nullptr && bridgeSetState != nullptr;
+}
+
+extern "C" void LibcGetMachineState_nid_no_patch(GuestMachineState* state) {
+    if (bridgeGetState == nullptr) std::abort();
+    bridgeGetState(state);
+}
+
+extern "C" [[noreturn]] void LibcSetMachineState_nid_no_patch(const GuestMachineState* state) {
+    if (bridgeSetState != nullptr) bridgeSetState(state);
+    std::abort();
+}
+
+extern "C" std::uint64_t LibcMakecontextEntry_nid_no_patch() {
+    return bridgeMakecontextEntry;
 }
 #else
 void LibcCaptureRegisters(std::uintptr_t*) { std::abort(); }

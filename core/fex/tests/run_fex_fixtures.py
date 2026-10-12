@@ -1,7 +1,7 @@
 """Relink the programs in fex_fixtures.py, and the C++ programs of the macOS fixtures when the tools
 in fex_toolchain.py are there, and run them with aps5-fex.
 
-    python3 run_fex_fixtures.py <relinker> <aps5-fex> <patched prx directory>
+    python3 run_fex_fixtures.py <relinker> <aps5-fex> <patched prx directory> [--only <fixture>...]
 
 Each program reports its result through its exit status and standard output."""
 import os
@@ -46,14 +46,14 @@ def current_umask():
 CHECKS = {"opening": created_with_mode}
 
 
-def compiled_executable(directory, sources, libraries, extra=()):
+def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
     """Builds input.elf from C and C++ sources whose imports come from the named stub libraries, or
-    from libc.prx when libraries is None."""
+    from libc.prx when libraries is None; with tpoff, its initial-exec TLS keeps TPOFF64 relocations."""
     objects = []
     imported, defined = set(), set()
     for source in sources:
         obj = directory / (pathlib.Path(source).stem + ".o")
-        fex_toolchain.compile(MACOS / source, obj, extra=(["-x", "c"] if source.endswith(".c") else []) + list(extra))
+        fex_toolchain.compile(MACOS / source, obj, pic=tpoff, extra=(["-x", "c"] if source.endswith(".c") else []) + list(extra))
         imported.update(fex_toolchain.symbols(obj, "-u"))
         defined.update(fex_toolchain.symbols(obj, "-g", "--defined-only"))
         objects.append(obj)
@@ -65,7 +65,7 @@ def compiled_executable(directory, sources, libraries, extra=()):
     for obj in objects:
         fex_toolchain.nidify(obj, obj.with_suffix(".nid.o"))
         renamed.append(obj.with_suffix(".nid.o"))
-    fex_toolchain.link_executable(renamed, stubs, directory / "input.elf")
+    (fex_toolchain.link_tpoff_executable if tpoff else fex_toolchain.link_executable)(renamed, stubs, directory / "input.elf")
     fex_toolchain.make_header_room(directory / "input.elf")
 
 
@@ -98,7 +98,38 @@ def compiled_modules(directory, modules, main, libraries):
     fex_toolchain.make_header_room(staged / "eboot.elf")
 
 
+def with_abi_library(directory, source, libraries, extra=()):
+    """Like compiled_executable, plus the test library libAps5BridgeAbi.prx staged beside the build's
+    libraries (directory/libs: links to each of them and to the test library)."""
+    compiled_executable(directory, [str(HERE / source)], {**libraries, "libAps5BridgeAbi.prx": ABI_EXPORTS}, extra)
+    staged = directory / "libs"
+    staged.mkdir()
+    for library in LIBRARIES.iterdir():
+        (staged / library.name).symlink_to(library)
+    (staged / "libAps5BridgeAbi.prx").symlink_to(RUNNER.parent / "abi-libs" / "libAps5BridgeAbi.prx")
+
+
+ABI_EXPORTS = ["Aps5AbiHfa", "Aps5AbiStack", "Aps5AbiMixed", "Aps5AbiLarge", "Aps5AbiLongDouble", "Aps5AbiInt128", "Aps5AbiPosition",
+               "Aps5AbiManyDoubles", "Aps5AbiCallInts", "Aps5AbiCallShaped", "Aps5AbiCallLarge", "Aps5AbiCallLongDouble",
+               "Aps5AbiStore", "Aps5AbiLoad", "Aps5AbiCallStored"]
+LIBRARIES = RUNNER = None
+
 COMPILED = {
+    "abi-registers": (lambda d: with_abi_library(d, "abi_registers.cpp", {"libc.prx": ["exit"]}), 43),
+    "abi-stack": (lambda d: with_abi_library(d, "abi_stack.cpp", {"libc.prx": ["exit"],
+                  "libSceAgc.prx": ["sceAgcCbReleaseMem", "sceAgcDcbDmaData"]}), 43),
+    "abi-memory": (lambda d: with_abi_library(d, "abi_memory.cpp", {"libc.prx": ["exit", "_ZSt17current_exceptionv"]}), 43),
+    "abi-long-double": (lambda d: with_abi_library(d, "abi_long_double.cpp", {"libc.prx": ["exit", "acosl", "atanl", "coshl", "cosl",
+                        "exp2l", "expl", "frexpl", "ldexpl", "log10l", "logl", "powl", "sinhl", "sinl", "tanhl", "tanl", "truncl",
+                        "strtold", "wcstold", "__signbitl"]}), 43),
+    "abi-callbacks": (lambda d: with_abi_library(d, "abi_callbacks.cpp", {"libc.prx": ["exit"]}), 43),
+    "context": (lambda d: compiled_executable(d, [str(HERE / "context.cpp")], {"libc.prx": ["exit"], "libkernel.prx": ["getcontext",
+                "setcontext", "sigsetjmp", "siglongjmp"], "libSceLibcInternal.prx": ["makecontext"]}), 43),
+    "context-exit": (lambda d: compiled_executable(d, [str(HERE / "context.cpp")], {"libc.prx": ["exit"], "libkernel.prx": ["getcontext",
+                     "setcontext", "sigsetjmp", "siglongjmp"], "libSceLibcInternal.prx": ["makecontext"]}, ["-DCONTEXT_EXIT"]), 0),
+    "raise": (lambda d: compiled_executable(d, [str(HERE / "raise.cpp")], {"libc.prx": ["exit"], "libkernel.prx": [
+              "sceKernelInstallExceptionHandler", "sceKernelRemoveExceptionHandler", "sceKernelRaiseException", "scePthreadSelf"]}), 43),
+    "abi-variadic": (lambda d: compiled_executable(d, [str(HERE / "abi_variadic.cpp")], {"libc.prx": ["exit", "snprintf", "swprintf"]}), 43),
     "exception": (lambda d: compiled_executable(d, ["exception.cpp"], None), 43),
     "c-cleanup": (lambda d: compiled_executable(d, ["c_cleanup.c", "c_cleanup_main.cpp"], None), 47),
     "threads": (lambda d: compiled_executable(d, ["threads.cpp"], {"libc.prx": ["exit"],
@@ -127,11 +158,24 @@ COMPILED = {
     "tls-modules": (lambda d: compiled_modules(d, [("tls_owner.cpp", "libowner.prx", []), ("tls_user.cpp", "libuser.prx", ["libowner.prx"])],
                     "tls_modules_main.cpp", {"libc.prx": ["exit", "__tls_get_addr"],
                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 47),
+    "tls-exec": (lambda d: compiled_executable(d, [str(HERE / "tls_exec.cpp")], {"libc.prx": ["exit"],
+                 "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, tpoff=True), 43),
+    "image-protect": (lambda d: compiled_executable(d, [str(HERE / "image_protect.cpp")], {"libc.prx": ["exit"],
+                      "libkernel.prx": ["sceKernelMprotect", "sceKernelQueryMemoryProtection"]}), 43),
+    "unaligned": (lambda d: compiled_executable(d, [str(HERE / "unaligned.cpp")], {"libc.prx": ["exit"],
+                  "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, ["-O2"]), 43),
+    "code-churn": (lambda d: compiled_executable(d, [str(HERE / "code_churn.cpp")], {"libc.prx": ["exit"],
+                   "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, ["-O2"]), 43),
+    "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
+                   "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }
 
 
 def main():
+    global LIBRARIES, RUNNER
     relinker, runner, libraries = (pathlib.Path(argument).resolve() for argument in sys.argv[1:4])
+    LIBRARIES, RUNNER = libraries, runner
+    only = set(sys.argv[sys.argv.index("--only") + 1:]) if "--only" in sys.argv else None
     failures = []
     cases = {name: (lambda d, name=name: (d / "input.elf").write_bytes(fex_fixtures.FIXTURES[name]()), status, output)
              for name, (status, output) in EXPECTED.items()}
@@ -139,6 +183,11 @@ def main():
         cases.update({name: (build, status, None) for name, (build, status) in COMPILED.items()})
     else:
         print("compiled programs skipped: clang, llvm-nm or an LLVM ELF linker is missing")
+    if only is not None:
+        unknown = only - cases.keys()
+        if unknown:
+            sys.exit(f"unknown fixtures: {', '.join(sorted(unknown))}")
+        cases = {name: case for name, case in cases.items() if name in only}
     for name, (build, status, output) in cases.items():
         with tempfile.TemporaryDirectory(prefix=f"aps5-fex-{name}-") as directory:
             directory = pathlib.Path(directory)
@@ -150,7 +199,8 @@ def main():
             if relinked.returncode != 0:
                 failures.append(f"{name}: relink failed: {relinked.stderr.strip()}")
                 continue
-            (directory / "libs").symlink_to(libraries, target_is_directory=True)
+            if not (directory / "libs").exists():
+                (directory / "libs").symlink_to(libraries, target_is_directory=True)
             executed = subprocess.run([str(runner), "eboot.elf"], cwd=directory, capture_output=True, text=True, timeout=60)
             if executed.returncode != status or (output is not None and executed.stdout != output):
                 failures.append(f"{name}: exit {executed.returncode}, expected {status}; output {executed.stdout!r}, "

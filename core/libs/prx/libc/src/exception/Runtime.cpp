@@ -7,6 +7,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "prx/libc/include/specifics/macos/GuestImages.hpp"
+#endif
 
 namespace LibcException {
 
@@ -343,10 +346,22 @@ bool APS5_VABI _ZSt18uncaught_exceptionv_nid_postfix() { return __cxa_uncaught_e
 int APS5_VABI _ZSt19uncaught_exceptionsv_nid_postfix() { return static_cast<int>(__cxa_uncaught_exceptions_nid_postfix()); }
 [[noreturn]] void APS5_VABI _ZSt9terminatev_nid_postfix() { LibcException::Terminate(); }
 using LibcTerminateHandler = void(*)();
-LibcTerminateHandler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(LibcTerminateHandler handler) {
-    return LibcException::terminateHandler.exchange(handler ? handler : std::abort);
+#if defined(__APPLE__) && defined(__aarch64__)
+[[noreturn]] void abort_nid_postfix(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+// The handlers libc installs itself are arm64 code, and the guest calls what set_terminate and
+// get_terminate return: on the runner it gets their x86 stubs (std::abort as libc's abort export).
+static LibcTerminateHandler GuestTerminateHandler(LibcTerminateHandler handler) {
+    const void* native = handler == std::abort ? reinterpret_cast<const void*>(&abort_nid_postfix)
+        : handler == LibcException::DefaultTerminate ? reinterpret_cast<const void*>(handler) : nullptr;
+    return native != nullptr ? reinterpret_cast<LibcTerminateHandler>(LibcGuestCallable_nid_no_patch(native, "terminate handler")) : handler;
 }
-LibcTerminateHandler APS5_VABI _ZSt13get_terminatev_nid_postfix() { return LibcException::terminateHandler.load(); }
+#else
+static LibcTerminateHandler GuestTerminateHandler(LibcTerminateHandler handler) { return handler; }
+#endif
+LibcTerminateHandler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(LibcTerminateHandler handler) {
+    return GuestTerminateHandler(LibcException::terminateHandler.exchange(handler ? handler : std::abort));
+}
+LibcTerminateHandler APS5_VABI _ZSt13get_terminatev_nid_postfix() { return GuestTerminateHandler(LibcException::terminateHandler.load()); }
 
 void APS5_VABI __cxa_increment_exception_refcount_nid_postfix(void* object) {
     if (object) LibcException::AllocationOf(LibcException::FromObject(object))->references.fetch_add(1, std::memory_order_relaxed);

@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Aps5Fex {
@@ -55,6 +56,12 @@ public:
     }
 
     std::optional<GuestSymbol> Export(const std::string& name) const;
+    // Absolute addresses of the exported non-TLS symbols.
+    std::vector<std::uint64_t> ExportAddresses() const;
+    // XXH3 of the file's bytes: names the module in the code cache, and changes with its content.
+    std::uint64_t FileId() const { return fileId; }
+    // [begin, end) of the executable (PF_X) segments, absolute.
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ExecutableRanges() const { return executableRanges; }
 
     void Relocate(const Resolver& resolve);
 
@@ -72,6 +79,8 @@ private:
     std::size_t size = 0;
     std::uint64_t entry = 0;
     std::uint64_t dynamic = 0;
+    std::uint64_t fileId = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> executableRanges;
     std::vector<std::string> needed;
     std::vector<unsigned char> programHeaders;
     std::unordered_map<std::string, Exported> exports;

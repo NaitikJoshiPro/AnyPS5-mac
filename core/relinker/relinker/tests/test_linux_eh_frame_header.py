@@ -96,11 +96,25 @@ def main():
             assert elf[offset:offset + size] == image[offset:offset + size], "eh_frame_hdr bytes changed"
             assert all(header[0] != PT_SCE_VERSION for header in headers), headers
 
-        result, elf = relink(relinker, directory, "full-slots", fixture(6))
+        image = fixture(6)
+        table_end = 64 + 6 * 56
+        image[table_end:table_end + 56] = bytes([0xa5]) * 56
+        result, elf = relink(relinker, directory, "full-slots", image)
         headers = program_headers(elf)
         assert all(header[0] != PT_GNU_EH_FRAME for header in headers), headers
         assert len(headers) == 6, headers
         assert "No free program header slot for PT_GNU_EH_FRAME" in result.stderr, result.stderr
+
+        # Zero padding after the table (up to the first segment's file data) gives it more slots.
+        result, elf = relink(relinker, directory, "zero-padding-slots", fixture(6))
+        headers = program_headers(elf)
+        assert [header for header in headers if header[0] == PT_GNU_EH_FRAME] == [EH_FRAME_HEADER], headers
+        assert len(headers) == 7, headers
+        assert "PT_GNU_EH_FRAME" not in result.stderr, result.stderr
+        image = fixture(2, with_frame=False)
+        image[176:232] = bytes(56)
+        result, elf = relink(relinker, directory, "zero-padding-no-sce-slots", image)
+        assert len(program_headers(elf)) == 6, program_headers(elf)
 
         image = fixture(6, with_frame=False)
         table_end = 64 + 6 * 56

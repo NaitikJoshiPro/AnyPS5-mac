@@ -576,10 +576,27 @@ if(BUILD_TESTING)
     target_include_directories(guest_user_context_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_user_context_tests PRIVATE libSceLibcInternal libkernel libc)
     configure_windows_unwind(guest_user_context_tests)
-    add_test(NAME guest_user_context COMMAND guest_user_context_tests)
-    add_test(NAME guest_user_context_exit COMMAND guest_user_context_tests exit-on-return)
-    # Exits 77 on arm64, where capturing and resuming a context needs the guest runner.
-    set_tests_properties(guest_user_context guest_user_context_exit PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+    # On arm64 the guest's registers live in the FEXCore runner: the host program checks the arguments (and exits
+    # 77), then the same operations run as guest programs under aps5-fex (core/fex/tests/context.cpp, raise.cpp).
+    set(APS5_GUEST_RUNNER_TESTS OFF)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" AND EXISTS ${CMAKE_SOURCE_DIR}/3rdparty/FEX/CMakeLists.txt
+       AND Python3_Interpreter_FOUND)
+        set(APS5_GUEST_RUNNER_TESTS ON)
+        set(APS5_GUEST_RUNNER_FIXTURES -- $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs)
+        set(APS5_GUEST_RUNNER_DRIVER ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/core/fex/tests/run_host_and_fixtures.py)
+    endif()
+    if(APS5_GUEST_RUNNER_TESTS)
+        add_test(NAME guest_user_context COMMAND ${APS5_GUEST_RUNNER_DRIVER} $<TARGET_FILE:guest_user_context_tests>
+            ${APS5_GUEST_RUNNER_FIXTURES} context)
+        add_test(NAME guest_user_context_exit COMMAND ${APS5_GUEST_RUNNER_DRIVER} $<TARGET_FILE:guest_user_context_tests> exit-on-return
+            ${APS5_GUEST_RUNNER_FIXTURES} context-exit)
+    else()
+        add_test(NAME guest_user_context COMMAND guest_user_context_tests)
+        add_test(NAME guest_user_context_exit COMMAND guest_user_context_tests exit-on-return)
+    endif()
+    # Exits 77 on arm64 without the guest runner, where capturing and resuming a context needs it.
+    set_tests_properties(guest_user_context guest_user_context_exit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     if(WIN32)
         target_compile_definitions(guest_user_context_tests PRIVATE _WIN32_WINNT=0x0602)
         set_tests_properties(guest_user_context guest_user_context_exit PROPERTIES ENVIRONMENT_MODIFICATION
@@ -663,9 +680,14 @@ if(BUILD_TESTING)
     target_include_directories(guest_raise_exception_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_raise_exception_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_raise_exception_tests)
-    add_test(NAME guest_raise_exception COMMAND guest_raise_exception_tests)
-    # Exits 77 on arm64, where delivering the exception needs the guest runner.
-    set_tests_properties(guest_raise_exception PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    if(APS5_GUEST_RUNNER_TESTS)
+        add_test(NAME guest_raise_exception COMMAND ${APS5_GUEST_RUNNER_DRIVER} $<TARGET_FILE:guest_raise_exception_tests>
+            ${APS5_GUEST_RUNNER_FIXTURES} raise)
+    else()
+        add_test(NAME guest_raise_exception COMMAND guest_raise_exception_tests)
+    endif()
+    # Exits 77 on arm64 without the guest runner, where delivering the exception needs it.
+    set_tests_properties(guest_raise_exception PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(guest_raise_exception PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")

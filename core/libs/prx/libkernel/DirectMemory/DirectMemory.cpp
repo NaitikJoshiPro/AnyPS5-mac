@@ -209,6 +209,18 @@ void* MapFixedNoReplace(void* addr, size_t len, int prot) {
 }
 #endif
 
+// macOS on arm64 keeps the low 4 GiB as __PAGEZERO, where nothing can be mapped; a guest's fixed mapping
+// there cannot be honoured (Linux and Windows map it).
+void ThrowBelowPageZero([[maybe_unused]] const void* addr, [[maybe_unused]] size_t len) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    constexpr std::uintptr_t PageZeroEnd = 0x100000000ull;
+    if (reinterpret_cast<std::uintptr_t>(addr) >= PageZeroEnd) return;
+    char message[160];
+    std::snprintf(message, sizeof(message), "fixed mapping %p+0x%zx is below 4 GiB, which macOS on arm64 reserves as __PAGEZERO", addr, len);
+    throw std::invalid_argument(message);
+#endif
+}
+
 void ValidateLength(size_t len) {
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) {
         // return SCE_KERNEL_ERROR_EINVAL;
@@ -242,7 +254,14 @@ int LinuxProtFromSce(int prot) {
     int result = PROT_NONE;
     if (prot & 0x113) result |= PROT_READ;
     if (prot & 0x222) result |= PROT_READ | PROT_WRITE;
+#if defined(__APPLE__) && defined(__aarch64__)
+    // Guest code is x86-64, which the translator reads and the CPU never runs. An executable host page
+    // would let a native call into guest code run x86 bytes as arm64 instead of faulting into the runner,
+    // and macOS refuses pages that are writable and executable outside MAP_JIT.
+    if (prot & 4) result |= PROT_READ;
+#else
     if (prot & 4) result |= PROT_READ | PROT_EXEC;
+#endif
     return result;
 }
 
@@ -633,7 +652,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     return true;
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 bool ArenaAvailable() { return GuestArena::GuestArenaAvailable_nid_postfix(); }
 
 void* ArenaCommit(void* addr, size_t len, int prot) {
@@ -647,14 +666,10 @@ void ArenaForget(void* addr, size_t len) {
 
 void Unmap(void* addr, size_t len) {
 #if defined(__linux__) || defined(__APPLE__)
-#ifdef __linux__
     if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
         GuestArena::GuestArenaReset_nid_postfix(addr, len);
     else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
     ArenaForget(addr, len);
-#else
-    if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
-#endif
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
     if (KernelArena::Get().Contains(addr, len)) munmap(addr, len);
@@ -702,15 +717,19 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
             }
         }
 #endif
-#if defined(__linux__)
-        if (ArenaAvailable() && !GuestArena::GuestArenaContains_nid_postfix(addr, len))
+#if defined(__linux__) || defined(__APPLE__)
+        if (ArenaAvailable() && !GuestArena::GuestArenaContains_nid_postfix(addr, len)) {
+            ThrowBelowPageZero(addr, len);
             throw std::invalid_argument("fixed mapping is outside the guest address space arena");
+        }
         if (ArenaAvailable()) {
             GuestArena::GuestArenaMarkUsed_nid_postfix(addr, len);
             if (void* placed = ArenaCommit(addr, len, prot); placed != MAP_FAILED) return placed;
             GuestArena::GuestArenaRelease_nid_postfix(addr, len);
             throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
         }
+#endif
+#if defined(__linux__)
         const int placement = (flags & GuestMapNoOverwrite) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
         void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | placement, -1, 0);
 #elif defined(__APPLE__)
@@ -720,13 +739,13 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
 #endif
         if (result == MAP_FAILED) {
             // return SCE_KERNEL_ERROR_ENOMEM;
+            ThrowBelowPageZero(addr, len);
             throw std::system_error(errno, std::generic_category(), "Fixed mmap failed");
         }
         return result;
     }
     if (addr) {
 #if defined(__linux__) || defined(__APPLE__)
-#ifdef __linux__
         if (ArenaAvailable()) {
             void* placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(
                 reinterpret_cast<std::uintptr_t>(addr), len, alignment);
@@ -734,7 +753,6 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
             ArenaForget(placed, len);
             throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
         }
-#endif
         return MapAtOrAbove(reinterpret_cast<std::uintptr_t>(addr), len, prot, alignment);
 #else
         return mmap_aligned(len, prot, alignment, reinterpret_cast<std::uintptr_t>(addr));
@@ -743,7 +761,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
 #endif
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     if (ArenaAvailable()) {
         void* placed = GuestArena::GuestArenaAllocate_nid_postfix(len, alignment);
         if (void* committed = ArenaCommit(placed, len, prot); committed != MAP_FAILED) return committed;

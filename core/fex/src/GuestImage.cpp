@@ -6,6 +6,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <sys/mman.h>
+#include <xxhash.h>
 
 namespace Aps5Fex {
 
@@ -62,6 +63,7 @@ struct Relocation {
 constexpr std::uint32_t PT_LOAD = 1;
 constexpr std::uint32_t PT_DYNAMIC = 2;
 constexpr std::uint32_t PT_TLS = 7;
+constexpr std::uint32_t PF_X = 1;
 constexpr std::int64_t DT_NULL = 0;
 constexpr std::int64_t DT_NEEDED = 1;
 constexpr std::int64_t DT_PLTRELSZ = 2;
@@ -106,6 +108,7 @@ GuestImage::GuestImage(const std::filesystem::path& path) : path(path) {
     if (header.programHeaderSize != sizeof(ProgramHeader) ||
         header.programHeaderOffset + std::uint64_t(header.programHeaderCount) * sizeof(ProgramHeader) > bytes.size())
         throw std::runtime_error(path.string() + " has malformed program headers");
+    fileId = XXH3_64bits(bytes.data(), bytes.size());
     std::vector<ProgramHeader> headers(header.programHeaderCount);
     std::memcpy(headers.data(), bytes.data() + header.programHeaderOffset, headers.size() * sizeof(ProgramHeader));
     static_assert(sizeof(ProgramHeader) == ProgramHeaderSize);
@@ -135,6 +138,7 @@ GuestImage::GuestImage(const std::filesystem::path& path) : path(path) {
             if (mprotect(reinterpret_cast<void*>(base + first), last - first, PROT_READ | PROT_WRITE) != 0)
                 throw std::runtime_error("cannot map a segment of " + path.string());
             std::memcpy(reinterpret_cast<void*>(base + segment.address), bytes.data() + segment.offset, segment.fileSize);
+            if ((segment.flags & PF_X) != 0) executableRanges.emplace_back(base + segment.address, base + segment.address + segment.memorySize);
         } else if (segment.type == PT_DYNAMIC) {
             dynamic = segment.address;
         } else if (segment.type == PT_TLS) {
@@ -180,6 +184,13 @@ std::optional<GuestSymbol> GuestImage::Export(const std::string& name) const {
     if (found == exports.end()) return std::nullopt;
     if (!found->second.tls) return GuestSymbol {found->second.value};
     return GuestSymbol {0, true, tlsModule, found->second.value, tlsOffset};
+}
+
+std::vector<std::uint64_t> GuestImage::ExportAddresses() const {
+    std::vector<std::uint64_t> addresses;
+    for (const auto& [name, exported] : exports)
+        if (!exported.tls) addresses.push_back(exported.value);
+    return addresses;
 }
 
 std::vector<std::uint64_t> GuestImage::Initializers() const {

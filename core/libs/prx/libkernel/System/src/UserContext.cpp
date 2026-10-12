@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestMachineState.hpp"
 #include "prx/libc/include/GuestStacks.hpp"
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -72,12 +73,43 @@ std::uint32_t HostMxcsrMask() {
     return mask;
 }
 #else
-// On arm64 the guest's x86-64 registers live in the translator (the FEXCore runner), not in host registers. Its
-// bridge hooks (libc RegisterContext.cpp) give the general registers and the MXCSR and x87 control words, but not
-// the FXSAVE state and RFLAGS a ucontext carries, so capturing or resuming a context needs the runner to provide them.
+// On arm64 the guest's x86-64 registers live in the translator (the FEXCore runner), not in host registers. The
+// runner hands libc hooks for the whole guest state (GuestMachineState.hpp); without them (a host process, no
+// runner) capturing or resuming a context is impossible.
 [[noreturn]] void NeedsRunner(const char* function) {
     throw std::runtime_error(std::string(function) + " needs the arm64 guest runner: the guest's x86-64 registers live in the "
-        "translator, whose bridge hooks do not expose the FXSAVE state and RFLAGS a ucontext holds");
+        "translator, which provides no machine state hooks here");
+}
+
+// FreeBSD's user code and stack selectors, which the x86-64 getcontext reads from %cs and %ss.
+constexpr std::uint64_t UserCodeSelector = 0x43;
+constexpr std::uint64_t UserStackSelector = 0x3b;
+
+RegisterFrame FrameFromMachine(const GuestMachineState& state) {
+    using namespace GuestMachine;
+    RegisterFrame frame{};
+    frame.rax = state.gregs[Rax];
+    frame.rbx = state.gregs[Rbx];
+    frame.rcx = state.gregs[Rcx];
+    frame.rdx = state.gregs[Rdx];
+    frame.rsi = state.gregs[Rsi];
+    frame.rdi = state.gregs[Rdi];
+    frame.rbp = state.gregs[Rbp];
+    frame.rsp = state.gregs[Rsp];
+    frame.r8 = state.gregs[R8];
+    frame.r9 = state.gregs[R9];
+    frame.r10 = state.gregs[R10];
+    frame.r11 = state.gregs[R11];
+    frame.r12 = state.gregs[R12];
+    frame.r13 = state.gregs[R13];
+    frame.r14 = state.gregs[R14];
+    frame.r15 = state.gregs[R15];
+    frame.rip = state.rip;
+    frame.rflags = state.rflags;
+    frame.cs = UserCodeSelector;
+    frame.ss = UserStackSelector;
+    std::memcpy(frame.fxsave, state.fxsave, sizeof(frame.fxsave));
+    return frame;
 }
 #endif
 
@@ -170,9 +202,15 @@ asm(".text\n"
 extern "C" {
 
 #if !defined(__x86_64__)
+int APS5_VABI Aps5GetcontextFinish_nid_no_patch(UserUcontext* context, const RegisterFrame* frame);
+
 int APS5_VABI getcontext_nid_postfix(UserUcontext* context) {
     if (context == nullptr) return Fail(GuestEinval);
-    NeedsRunner("getcontext");
+    if (!LibcHasMachineState_nid_no_patch()) NeedsRunner("getcontext");
+    GuestMachineState state{};
+    LibcGetMachineState_nid_no_patch(&state);
+    const RegisterFrame frame = FrameFromMachine(state);
+    return Aps5GetcontextFinish_nid_no_patch(context, &frame);
 }
 #endif
 
@@ -212,7 +250,21 @@ int APS5_VABI setcontext_nid_postfix(const UserUcontext* context) {
     const auto& machine = context->mcontext;
     if (machine.len != sizeof(UserMcontext) || (machine.flags & ~McontextFlagMask) != 0) return Fail(GuestEinval);
 #if !defined(__x86_64__)
-    NeedsRunner("setcontext");
+    if (!LibcHasMachineState_nid_no_patch()) NeedsRunner("setcontext");
+    GuestMachineState state{};
+    LibcGetMachineState_nid_no_patch(&state);
+    const std::uint64_t values[16] = {machine.rax, machine.rdx, machine.rcx, machine.rbx, machine.rsi, machine.rdi, machine.rbp, machine.rsp,
+                                      machine.r8,  machine.r9,  machine.r10, machine.r11, machine.r12, machine.r13, machine.r14, machine.r15};
+    std::memcpy(state.gregs, values, sizeof(values));
+    state.rip = machine.rip;
+    state.rflags = machine.rflags;
+    std::memcpy(state.fxsave, machine.fpstate, sizeof(state.fxsave));
+    std::uint32_t mxcsr = 0;
+    std::memcpy(&mxcsr, state.fxsave + GuestMachine::FxsaveMxcsr, sizeof(mxcsr));
+    mxcsr &= GuestMachine::MxcsrMask;
+    std::memcpy(state.fxsave + GuestMachine::FxsaveMxcsr, &mxcsr, sizeof(mxcsr));
+    sigprocmask_nid_postfix(GuestSigSetmask, context->sigmask, nullptr);
+    LibcSetMachineState_nid_no_patch(&state);
 #else
     RegisterFrame frame{};
     frame.rax = machine.rax;

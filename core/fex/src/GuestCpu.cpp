@@ -1,7 +1,11 @@
 #include "GuestCpu.hpp"
 
+#include "BareGuest.hpp"
 #include "Bridge.hpp"
+#include "CodeCache.hpp"
+#include "CodePool.hpp"
 #include "GuestProgram.hpp"
+#include "Options.hpp"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
@@ -11,19 +15,24 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
+#include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <csignal>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -36,35 +45,22 @@ namespace Aps5Fex {
 namespace {
 
 constexpr std::size_t PoolSize = std::size_t {1} << 30;
-std::uint8_t* poolCode = nullptr;
-std::atomic<std::size_t> poolUsed {0};
+CodePool* pool = nullptr;
 
 void CreateCodePool() {
-    mach_vm_address_t writable = 0;
-    mach_vm_address_t executable = 0;
-    if (mach_vm_allocate(mach_task_self(), &writable, PoolSize, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-        throw std::runtime_error("cannot allocate the JIT pool");
-    vm_prot_t current {};
-    vm_prot_t maximum {};
-    if (mach_vm_remap(mach_task_self(), &executable, PoolSize, 0, VM_FLAGS_ANYWHERE, mach_task_self(), writable, FALSE, &current, &maximum,
-                      VM_INHERIT_NONE) != KERN_SUCCESS ||
-        mprotect(reinterpret_cast<void*>(executable), PoolSize, PROT_READ | PROT_EXEC) != 0)
-        throw std::runtime_error("cannot map the JIT pool executable");
-    poolCode = reinterpret_cast<std::uint8_t*>(executable);
-    FEXCore::DualMap::WriteOffset = static_cast<std::int64_t>(writable) - static_cast<std::int64_t>(executable);
+    if (pool != nullptr) return;
+    pool = new CodePool(PoolSize); // lives as long as the process: FEX code may run until exit
+    FEXCore::DualMap::WriteOffset = pool->WriteOffset();
 }
 
+// FEXCore maps code buffers read-write-execute through these hooks; they come from the dual-mapped pool instead.
 void* PoolMmap(void* address, std::size_t length, int protection, int flags, int file, off_t offset) {
     if ((protection & PROT_EXEC) == 0 || address != nullptr) return ::mmap(address, length, protection, flags, file, offset);
-    const std::size_t aligned = (length + 0x3fff) & ~std::size_t {0x3fff};
-    const std::size_t start = poolUsed.fetch_add(aligned);
-    if (start + aligned > PoolSize) return MAP_FAILED;
-    return poolCode + start;
+    return pool->Allocate(length);
 }
 
 int PoolMunmap(void* address, std::size_t length) {
-    const auto* byte = static_cast<const std::uint8_t*>(address);
-    if (poolCode != nullptr && byte >= poolCode && byte < poolCode + PoolSize) return 0;
+    if (pool != nullptr && pool->Free(address, length)) return 0;
     return ::munmap(address, length);
 }
 
@@ -76,8 +72,7 @@ bool HasFeature(const char* name) {
 
 FEXCore::HostFeatures HostFeatures() {
     FEXCore::HostFeatures features {};
-    features.DCacheLineSize = 64;
-    features.ICacheLineSize = 64;
+    features.DCacheLineLog2 = 4; // 64-byte lines: DCacheSize() is 4 << DCacheLineLog2
     features.SupportsAES = HasFeature("FEAT_AES");
     features.SupportsCRC = HasFeature("FEAT_CRC32");
     features.SupportsSHA = HasFeature("FEAT_SHA1") && HasFeature("FEAT_SHA256");
@@ -96,6 +91,8 @@ FEXCore::HostFeatures HostFeatures() {
     features.SupportsECV = HasFeature("FEAT_ECV");
     features.SupportsWFXT = HasFeature("FEAT_WFxT");
     features.SupportsMOPS = HasFeature("FEAT_MOPS");
+    features.SupportsI8MM = HasFeature("FEAT_I8MM");
+    features.SupportsDotProd = HasFeature("FEAT_DotProd");
     features.SupportsAVX = true;
     features.SupportsAES256 = features.SupportsAES;
     return features;
@@ -133,22 +130,30 @@ bool IsGuestCode(std::uint64_t address) {
 
 class BridgeSyscalls final : public FEXCore::HLE::SyscallHandler {
 public:
-    explicit BridgeSyscalls(Bridge& bridge) : bridge(bridge) {
-        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
-    }
+    explicit BridgeSyscalls(Bridge& bridge) : bridge(bridge) {}
 
-    std::uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments* arguments) override {
-        return bridge.Call(frame->State, arguments->Argument[0], arguments->Argument[1]);
+    // FEX-2610 ends the block at `syscall` and runs this from the dispatcher: the guest registers are in
+    // frame->State, and execution continues at State.rip, which Bridge::Call advances past the instruction
+    // or redirects to a resumed guest frame.
+    void HandleSyscall(FEXCore::Core::CpuStateFrame* frame) override {
+        auto& state = frame->State;
+        const std::uint64_t result =
+            bridge.Call(state, state.gregs[FEXCore::X86State::REG_RAX], state.gregs[FEXCore::X86State::REG_RDI]);
+        state.gregs[FEXCore::X86State::REG_RAX] = result;
     }
 
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
+        if (modules != nullptr)
+            if (const auto range = modules->ExecutableRange(address)) return *range;
         if (const auto range = GuestCodeRange(address)) return {range->first, range->second - range->first, false};
         return {address & ~std::uint64_t {0x3fff}, 0x4000, false};
     }
 
-    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, std::uint64_t) override {
-        return std::nullopt;
+    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
+        return modules == nullptr ? std::nullopt : modules->Section(address);
     }
+
+    const GuestModules* modules = nullptr;
 
 private:
     Bridge& bridge;
@@ -170,6 +175,8 @@ struct GuestCpu::State {
     BridgeSyscalls syscalls;
     CallbackReturns returns;
     fextl::unique_ptr<FEXCore::Context::Context> context;
+    std::unique_ptr<GuestModules> modules;
+    std::filesystem::path coverage; // APS5_FEX_COVERAGE: written at exit
 };
 
 namespace {
@@ -208,11 +215,13 @@ public:
             this->stackSize = stackSize;
             rsp = reinterpret_cast<std::uint64_t>(stack) + stackSize - Page;
         }
-        const std::uint64_t fs = reinterpret_cast<std::uint64_t>(CreateThreadPointer(*guestCode.tls, &tls));
+        const std::uint64_t fs = guestCode.tls == nullptr ? 0 : reinterpret_cast<std::uint64_t>(CreateThreadPointer(*guestCode.tls, &tls));
         {
             std::lock_guard lock(threadsMutex);
-            thread = guestCode.context->CreateThread(rip, rsp);
+            thread = guestCode.context->CreateThread();
         }
+        thread->CurrentFrame->State.rip = rip;
+        thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = rsp;
         callRet = mmap(nullptr, ThreadState::CALLRET_STACK_SIZE + 2 * Page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (callRet == MAP_FAILED) throw std::runtime_error("cannot allocate the call-return stack");
         thread->CallRetStackBase = static_cast<std::uint8_t*>(callRet) + Page;
@@ -220,7 +229,7 @@ public:
         auto& guest = thread->CurrentFrame->State;
         guest.callret_sp = reinterpret_cast<std::uint64_t>(thread->CallRetStackBase) + ThreadState::CALLRET_DEFAULT_OFFSET;
         guest.callret_sp_base = reinterpret_cast<std::uint64_t>(thread->CallRetStackBase);
-        thread->CurrentFrame->Pointers.ThunkCallbackRet = guestCode.bridge->CallbackReturn();
+        thread->CurrentFrame->Pointers.ThunkCallbackRet = guestCode.bridge == nullptr ? 0 : guestCode.bridge->CallbackReturn();
 
         guest.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt;
         guest.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt;
@@ -273,6 +282,7 @@ thread_local AdoptedThread adoptedThread;
 
 ThreadState* CurrentThread() {
     if (currentThread == nullptr) {
+        ApplyThreadQos();
         adoptedThread.thread = std::make_unique<GuestThread>(0, 0, ThreadStackSize);
         currentThread = adoptedThread.thread->Thread();
     }
@@ -313,6 +323,7 @@ void CallGuest(ThreadState* thread, std::uint64_t target, Aps5GuestCallFrame* fr
     state.gregs[REG_R8] = frame->gpr[4];
     state.gregs[REG_R9] = frame->gpr[5];
     std::memcpy(state.xmm.sse.data, frame->vector, sizeof(frame->vector));
+    if (guestDepth == 0 && ClearCodeOnGuestEntry()) thread->CTX->ClearCodeCache(thread);
     ++guestDepth;
     thread->CTX->HandleCallback(thread, target);
     --guestDepth;
@@ -344,11 +355,53 @@ std::uint64_t Aps5Fex::CallGuestFunction(std::uint64_t target, const std::uint64
     return frame.gpr[0];
 }
 
+bool Aps5Fex::IsGuestCodeAddress(std::uint64_t address) {
+    return IsGuestCode(address);
+}
+
+// Like CallGuest, with the registers and stack set by the caller (setup) and the results read by it
+// (finish), for calls whose arguments or result positional mapping places wrongly (GuestCall.cpp).
+void Aps5Fex::CallGuestWith(std::uint64_t target, GuestStateHook setup, GuestStateHook finish, void* context) {
+    ThreadState* thread = CurrentThread();
+    auto& state = thread->CurrentFrame->State;
+    const std::uint64_t rip = state.rip;
+    std::uint64_t gregs[16];
+    std::memcpy(gregs, state.gregs, sizeof(gregs));
+    std::uint64_t xmm[16][2];
+    std::memcpy(xmm, state.xmm.sse.data, sizeof(xmm));
+    setup(state, context);
+    ++guestDepth;
+    thread->CTX->HandleCallback(thread, target);
+    --guestDepth;
+    finish(state, context);
+    std::memcpy(state.gregs, gregs, sizeof(gregs));
+    std::memcpy(state.xmm.sse.data, xmm, sizeof(xmm));
+    state.rip = rip;
+}
+
 namespace Aps5Fex {
 
 namespace {
 
 struct sigaction previousBus {}, previousSegv {};
+FEXCore::ArchHelpers::Arm64::UnalignedHandlerType unalignedHandler = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier;
+
+// The M3 raises SIGBUS (BUS_ADRALN) when an ordered access (LDAPR/LDAPUR/STLR/STLUR) or an atomic crosses a
+// 16-byte boundary. FEX emulates the access or backpatches it to a plain access plus barrier; the backpatch writes
+// through the code pool's writable alias (FEX Arm64.cpp).
+bool HandleUnaligned(int signal, siginfo_t* info, __darwin_mcontext64* machine) {
+    if (signal != SIGBUS || info->si_code != BUS_ADRALN || currentThread == nullptr) return false;
+    const std::uint64_t pc = arm_thread_state64_get_pc(machine->__ss);
+    if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) return false;
+    // __x[0..28], __fp, __lr, __sp and __pc are contiguous: FEX indexes the GPRs as x0..x31.
+    static_assert(offsetof(__darwin_arm_thread_state64, __x) + 29 * 8 == offsetof(__darwin_arm_thread_state64, __fp));
+    static_assert(offsetof(__darwin_arm_thread_state64, __fp) + 8 == offsetof(__darwin_arm_thread_state64, __lr));
+    static_assert(offsetof(__darwin_arm_thread_state64, __lr) + 8 == offsetof(__darwin_arm_thread_state64, __sp));
+    const auto result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(currentThread, unalignedHandler, pc, machine->__ss.__x);
+    if (!result) return false;
+    arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(pc + *result));
+    return true;
+}
 
 void OnFault(int signal, siginfo_t* info, void* context) {
     auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
@@ -358,6 +411,7 @@ void OnFault(int signal, siginfo_t* info, void* context) {
         arm_thread_state64_set_pc_fptr(machine->__ss, &Aps5GuestCallEntry);
         return;
     }
+    if (HandleUnaligned(signal, info, machine)) return;
     const struct sigaction& previous = signal == SIGBUS ? previousBus : previousSegv;
     if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
         previous.sa_sigaction(signal, info, context);
@@ -381,9 +435,58 @@ void InstallFaultHandler() {
         if ((previous->sa_flags & SA_SIGINFO) != 0 && previous->sa_sigaction == OnFault) *previous = {};
 }
 
+// FEXCore's own helper threads (the disk cache writer) are created through the frontend.
+class HostThread final : public FEXCore::Threads::Thread {
+public:
+    HostThread(FEXCore::Threads::ThreadFunc function, void* argument, FEXCore::Threads::Flags flags, const char* name)
+        : start {function, argument, flags.LowPriority, name != nullptr ? name : ""} {
+        if (pthread_create(&thread, nullptr, Entry, &start) != 0) throw std::runtime_error("cannot create a FEXCore thread");
+        running = true;
+    }
+    ~HostThread() override {
+        if (running) pthread_detach(thread);
+    }
+    bool joinable() override { return running; }
+    bool join(void** result) override {
+        if (!running) return false;
+        running = false;
+        return pthread_join(thread, result) == 0;
+    }
+    bool detach() override {
+        if (!running) return false;
+        running = false;
+        return pthread_detach(thread) == 0;
+    }
+    bool IsSelf() override { return running && pthread_equal(thread, pthread_self()); }
+
+private:
+    struct Start {
+        FEXCore::Threads::ThreadFunc function;
+        void* argument;
+        bool lowPriority;
+        std::string name;
+    };
+    static void* Entry(void* data) {
+        const auto* start = static_cast<const Start*>(data);
+        if (!start->name.empty()) pthread_setname_np(start->name.c_str());
+        if (start->lowPriority) pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        return start->function(start->argument);
+    }
+
+    Start start;
+    pthread_t thread {};
+    bool running = false;
+};
+
+fextl::unique_ptr<FEXCore::Threads::Thread> CreateHostThread(FEXCore::Threads::ThreadFunc function, void* argument,
+                                                            FEXCore::Threads::Flags flags, const char* name) {
+    return fextl::make_unique<HostThread>(function, argument, flags, name);
 }
 
-GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
+void CleanupAfterFork() {}
+
+void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::string>>& config) {
+    FEXCore::Threads::Thread::SetInternalPointers({CreateHostThread, CleanupAfterFork});
     LogMan::Msg::InstallHandler(LogMessage);
     LogMan::Throw::InstallHandler(LogAssertion);
     CreateCodePool();
@@ -393,18 +496,127 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     FEXCore::Config::Load();
     FEXCore::Config::ReloadMetaLayer();
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+    // A locked access that crosses 16 bytes is emulated in the SIGBUS handler with two CASes, which tear under
+    // contention unless such accesses share a lock (x86 makes them atomic). Only that slow path takes the lock.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1");
+    for (const auto& [option, value] : config)
+        FEXCore::Config::Set(option, value);
+    LoadOptions();
+    FEX_CONFIG_OPT(halfBarrierTso, HALFBARRIERTSOENABLED);
+    unalignedHandler = halfBarrierTso() ? FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier
+                                        : FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic;
+}
 
-    state.reset(new State {BridgeSyscalls(bridge), CallbackReturns(bridge), FEXCore::Context::Context::CreateNewContext(HostFeatures())});
+}
+
+namespace {
+
+struct ExitFlush {
+    FEXCore::Context::Context* context;
+    const GuestModules* modules;
+    std::filesystem::path coverage;
+};
+std::optional<ExitFlush> exitFlush;
+
+// The guest ends the process with exit(): queued disk-cache writes must reach the file first.
+void FlushAtExit() {
+    if (!exitFlush) return;
+    exitFlush->context->FlushDiskCache();
+    if (!exitFlush->coverage.empty()) Coverage::Write(exitFlush->coverage, "run", *exitFlush->modules, nullptr);
+}
+
+bool atExitRegistered = false;
+
+}
+
+GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
+    std::vector<std::pair<FEXCore::Config::ConfigOption, std::string>> config;
+    if (const auto cache = CodeCacheDirectory(program.Executable().Path())) {
+        std::filesystem::create_directories(*cache);
+        config.emplace_back(FEXCore::Config::CONFIG_DISKCACHE, "1");
+        // FEX appends the file names to this path as is.
+        config.emplace_back(FEXCore::Config::CONFIG_DISKCACHEPATH, cache->string() + "/");
+    }
+    PrepareFex(config);
+
+    // The disk cache is set up when the context is created, from the configuration above.
+    state.reset(new State {BridgeSyscalls(bridge), CallbackReturns(bridge), FEXCore::Context::Context::CreateNewContext(HostFeatures()),
+                           std::make_unique<GuestModules>(program), {}});
+    state->syscalls.modules = state->modules.get();
+    if (const char* coverage = std::getenv("APS5_FEX_COVERAGE"); coverage != nullptr && *coverage != 0) {
+        state->coverage = coverage;
+        Coverage::Enable();
+    }
+    if (Coverage::Enabled()) state->context->SetCompiledBlockObserver(Coverage::Observe);
     state->context->SetSyscallHandler(&state->syscalls);
     state->context->SetSignalDelegator(&state->returns);
+    state->context->SetThunkHandler(Bridge::Thunks());
     state->context->EnableExitOnHLT();
     if (!state->context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
+    if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
+    exitFlush = ExitFlush {state->context.get(), state->modules.get(), state->coverage};
 }
 
 GuestCpu::~GuestCpu() {
+    if (exitFlush && exitFlush->context == state->context.get()) exitFlush.reset();
+    state->context->FlushDiskCache();
     guestCode = {};
+}
+
+std::size_t GuestCpu::Precompile(unsigned threads, const std::filesystem::path& coverage) {
+    if (!Coverage::Enabled()) throw std::runtime_error("Precompile needs the compiled-block observer (Coverage::Enable before GuestCpu)");
+    std::vector<AotSeeds> seeds;
+    std::vector<std::uint64_t> addresses;
+    for (const auto& module : state->modules->Modules()) {
+        seeds.push_back(FindAotSeeds(module.seedImage));
+        addresses.insert(addresses.end(), seeds.back().addresses.begin(), seeds.back().addresses.end());
+    }
+    const auto compile = [&](const std::vector<std::uint64_t>& batch) {
+        std::atomic<std::size_t> next {0};
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < std::max(1u, threads); ++t) {
+            workers.emplace_back([&] {
+                ApplyThreadQos();
+                GuestThread thread(0, 0, 0);
+                currentThread = thread.Thread();
+                for (std::size_t i = next++; i < batch.size(); i = next++) state->context->CompileRIP(thread.Thread(), batch[i]);
+                currentThread = nullptr;
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    };
+    compile(addresses);
+    // A block ends at a call: the code after it, the return site, starts where the compiled bytes stop. Inside a
+    // function's FDE range, seed the first byte of every gap that follows compiled code, and repeat.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> functions;
+    for (const auto& found : seeds) functions.insert(functions.end(), found.fdeRanges.begin(), found.fdeRanges.end());
+    std::sort(functions.begin(), functions.end());
+    std::vector<std::uint64_t> tried(addresses.begin(), addresses.end());
+    std::sort(tried.begin(), tried.end());
+    constexpr int MaxPasses = 16;
+    for (int pass = 0; pass < MaxPasses && !functions.empty(); ++pass) {
+        const auto compiled = Coverage::CompiledRanges();
+        std::vector<std::uint64_t> batch;
+        for (const auto& [begin, end] : compiled) {
+            const auto function = std::upper_bound(functions.begin(), functions.end(), std::pair {end, ~std::uint64_t {0}});
+            if (function == functions.begin()) continue;
+            const auto& [low, high] = *std::prev(function);
+            if (end <= low || end >= high || std::binary_search(tried.begin(), tried.end(), end)) continue;
+            batch.push_back(end);
+        }
+        if (batch.empty()) break;
+        std::sort(batch.begin(), batch.end());
+        batch.erase(std::unique(batch.begin(), batch.end()), batch.end());
+        compile(batch);
+        tried.insert(tried.end(), batch.begin(), batch.end());
+        std::sort(tried.begin(), tried.end());
+        addresses.insert(addresses.end(), batch.begin(), batch.end());
+    }
+    state->context->FlushDiskCache();
+    if (!coverage.empty()) Coverage::Write(coverage, "precompile", *state->modules, &seeds);
+    return addresses.size();
 }
 
 namespace {
@@ -439,6 +651,7 @@ void GuestCpu::Start(Bridge& bridge, std::uint64_t start, std::uint64_t block, s
 }
 
 std::uint64_t GuestCpu::Run(std::uint64_t rip, std::uint64_t rsp, const std::vector<std::uint64_t>& initializers) {
+    ApplyThreadQos();
     GuestThread main(rip, rsp, 0);
     currentThread = main.Thread();
     for (const std::uint64_t initializer : initializers) {
@@ -448,6 +661,89 @@ std::uint64_t GuestCpu::Run(std::uint64_t rip, std::uint64_t rsp, const std::vec
     state->context->ExecuteThread(currentThread);
     currentThread = nullptr;
     return main.Thread()->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX];
+}
+
+namespace {
+
+class BareSyscalls final : public FEXCore::HLE::SyscallHandler {
+public:
+    BareSyscalls(FEXCore::Context::Context& context, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& executable)
+        : context(context), executable(executable) {}
+
+    void HandleSyscall(FEXCore::Core::CpuStateFrame* frame) override {
+        frame->State.rip += 2;
+        if (count++ == 0) first = frame->State.gregs[FEXCore::X86State::REG_RAX];
+        constexpr std::uint64_t LinuxNoSyscall = 38;
+        frame->State.gregs[FEXCore::X86State::REG_RAX] = -LinuxNoSyscall;
+    }
+
+    void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState*, std::uint64_t start, std::uint64_t length) override {
+        std::lock_guard lock(context.GetCodeInvalidationMutex());
+        context.InvalidateCodeBuffersCodeRange(start, length);
+        if (currentThread != nullptr) context.InvalidateThreadCachedCodeRange(currentThread, start, length);
+    }
+
+    FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, std::uint64_t address) override {
+        for (const auto& [begin, end] : executable)
+            if (address >= begin && address < end) return {begin, end - begin, true};
+        return {address, 0, false};
+    }
+
+    std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, std::uint64_t) override {
+        return std::nullopt;
+    }
+
+    std::uint32_t count = 0;
+    std::uint64_t first = 0;
+
+private:
+    FEXCore::Context::Context& context;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> executable;
+};
+
+FEXCore::Context::Context* bareContext = nullptr;
+
+}
+
+FEXCore::HostFeatures RunnerHostFeatures() {
+    return HostFeatures();
+}
+
+void RunBareGuest(const BareGuest& guest, BareGuestResult& result) {
+    PrepareFex(guest.config);
+    auto context = FEXCore::Context::Context::CreateNewContext(HostFeatures());
+    BareSyscalls syscalls(*context, guest.executable);
+    FEXCore::SignalDelegator signals;
+    context->SetSyscallHandler(&syscalls);
+    context->SetSignalDelegator(&signals);
+    context->EnableExitOnHLT();
+    if (!context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
+    guestCode = {{}, nullptr, nullptr, context.get()};
+    bareContext = context.get();
+    InstallFaultHandler();
+    {
+        GuestThread thread(guest.rip, guest.rsp, 0);
+        currentThread = thread.Thread();
+        context->ExecuteThread(currentThread);
+        std::memcpy(&result.state, &currentThread->CurrentFrame->State, sizeof(result.state));
+        __uint128_t low[CPUState::NUM_XMMS];
+        __uint128_t high[CPUState::NUM_XMMS];
+        context->ReconstructXMMRegisters(currentThread, low, high);
+        for (std::size_t index = 0; index < CPUState::NUM_XMMS; ++index) {
+            std::memcpy(&result.state.xmm.avx.data[index][0], &low[index], sizeof(low[index]));
+            std::memcpy(&result.state.xmm.avx.data[index][2], &high[index], sizeof(high[index]));
+        }
+        currentThread = nullptr;
+    }
+    bareContext = nullptr;
+    guestCode = {};
+    result.syscalls = syscalls.count;
+    result.firstSyscall = syscalls.first;
+}
+
+std::uint64_t BareGuestRip(std::uint64_t hostPc) {
+    if (bareContext == nullptr || currentThread == nullptr) return 0;
+    return bareContext->RestoreRIPFromHostPC(currentThread, hostPc);
 }
 
 }

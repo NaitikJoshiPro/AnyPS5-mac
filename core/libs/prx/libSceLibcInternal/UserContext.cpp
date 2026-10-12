@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestMachineState.hpp"
 #include "prx/libc/include/GuestStacks.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libc/include/VarArgsAbi.hpp"
@@ -26,6 +27,13 @@ extern "C" {
 
 [[noreturn]] void APS5_VABI Aps5MakecontextStart_nid_no_patch(UserUcontext* context, ContextFunction function, const std::uint64_t* arguments) {
     function(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]);
+    if (context->link == nullptr) LibcExit_nid_no_patch(0);
+    setcontext_nid_postfix(context->link);
+    std::abort();
+}
+
+// Where a made context goes when its function returns (the arm64 runner's makecontext entry calls it).
+[[noreturn]] void APS5_VABI Aps5MakecontextFinish_nid_no_patch(UserUcontext* context) {
     if (context->link == nullptr) LibcExit_nid_no_patch(0);
     setcontext_nid_postfix(context->link);
     std::abort();
@@ -61,6 +69,11 @@ void APS5_VABI makecontext_nid_postfix(UserUcontext* context, void (APS5_VABI* s
     machine.rbx = reinterpret_cast<std::uint64_t>(stack);
     machine.rsp = reinterpret_cast<std::uint64_t>(stack);
     machine.rip = reinterpret_cast<std::uint64_t>(&Aps5MakecontextStart_nid_no_patch);
+#if defined(__APPLE__) && defined(__aarch64__)
+    // The guest cannot run Aps5MakecontextStart (arm64 code): the runner's guest-code entry calls the function,
+    // then Aps5MakecontextFinish. Without a runner the context keeps the host entry (only the host tests see it).
+    if (const std::uint64_t entry = LibcMakecontextEntry_nid_no_patch(); entry != 0) machine.rip = entry;
+#endif
     GuestStacks::GuestStackRegister_nid_no_patch(context->stackPointer, context->stackSize);
 }
 

@@ -7,7 +7,10 @@ namespace Elfpatcher::Windows {
 
 class WindowsRelocationBuilder {
 public:
-    PeRelocations Apply(WindowsLoadImage& image, const Domain::SysVDynamicSection& dynamicSection) const;
+    // headers: the source program headers, for the executable's PT_TLS block, which the Windows and
+    // macOS images place directly below the guest thread pointer.
+    PeRelocations Apply(WindowsLoadImage& image, const Domain::SysVDynamicSection& dynamicSection,
+                        const std::vector<Domain::ProgramHeader>& headers) const;
     std::vector<std::uint8_t> BuildBaseRelocations(const std::vector<std::uint32_t>& targets) const;
 };
 
