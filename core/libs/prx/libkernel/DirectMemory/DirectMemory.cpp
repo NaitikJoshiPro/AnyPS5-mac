@@ -397,7 +397,7 @@ struct DirectMapping {
 
 std::map<std::uintptr_t, DirectMapping> g_directMappings;
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 struct PhysicalSpan {
     std::uint64_t end;
     std::vector<std::uintptr_t> bases;
@@ -418,7 +418,7 @@ void SplitPhysicalSpan(std::uint64_t at) {
 std::map<std::uintptr_t, DirectMapping>::iterator InsertMapping(std::uintptr_t base, DirectMapping mapping) {
     const auto [inserted, added] = g_directMappings.emplace(base, std::move(mapping));
     if (!added) throw std::runtime_error("direct mapping inserted over a live one");
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     const auto first = inserted->second.phys;
     const auto last = first + (inserted->second.end - base);
     SplitPhysicalSpan(first);
@@ -435,7 +435,7 @@ std::map<std::uintptr_t, DirectMapping>::iterator InsertMapping(std::uintptr_t b
 }
 
 std::map<std::uintptr_t, DirectMapping>::iterator RemoveMapping(std::map<std::uintptr_t, DirectMapping>::iterator mapping) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     const auto base = mapping->first;
     const auto first = mapping->second.phys;
     const auto last = first + (mapping->second.end - base);
