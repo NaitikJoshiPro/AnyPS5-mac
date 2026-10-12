@@ -31,3 +31,19 @@
 [submodule "3rdparty/libjpeg-turbo"]
 	path = 3rdparty/libjpeg-turbo
 	url = https://github.com/libjpeg-turbo/libjpeg-turbo.git
+[submodule "3rdparty/FEX/External/fmt"]
+	path = 3rdparty/FEX/External/fmt
+	url = https://github.com/fmtlib/fmt.git
+	shallow = true
+[submodule "3rdparty/FEX/External/xxhash"]
+	path = 3rdparty/FEX/External/xxhash
+	url = https://github.com/Cyan4973/xxHash.git
+	shallow = true
+[submodule "3rdparty/FEX/External/range-v3"]
+	path = 3rdparty/FEX/External/range-v3
+	url = https://github.com/ericniebler/range-v3.git
+	shallow = true
+[submodule "3rdparty/FEX/External/unordered_dense"]
+	path = 3rdparty/FEX/External/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git
+	shallow = true
