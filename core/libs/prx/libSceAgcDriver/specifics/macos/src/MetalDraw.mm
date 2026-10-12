@@ -393,7 +393,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (fragmentReflection != nullptr && fragmentReflection->stage != Abi::Stage::Fragment) Fail("the pixel stage's MSL is not a fragment function");
     if (vertexReflection.workgroupMemoryStrideDwords != 0u || (fragmentReflection != nullptr && fragmentReflection->workgroupMemoryStrideDwords != 0u)) Fail("device-memory LDS in a draw stage");
     if (graphics.samples > 1u) Fail("multisampled draws (" + std::to_string(graphics.samples) + " samples)");
-    if (graphics.conservativeRasterization != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) Fail("conservative rasterization (Apple GPUs have none)");
+    if (graphics.conservativeRasterization != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) Fail("conservative rasterization requires VK_EXT_conservative_rasterization, which has no Metal counterpart (the Metal API has no conservative rasterization)");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
     // The draws to record: direct, or the indirect records read on the CPU (through the checked
@@ -819,7 +819,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         for (auto& fetch : fetches) {
             auto record = fetch.record;
             if (fetch.end > fetch.begin) {
-                record.address = state.Wrap(fetch.begin, fetch.end - fetch.begin);
+                record.address = state.WrapOrCopy(fetch.begin, fetch.end - fetch.begin, stream, false);
                 state.KeepWrapped(fetch.begin, fetch.end - fetch.begin);
             }
             records[fetch.location] = record;
@@ -889,7 +889,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
     } else if (draw.indexed) {
         if (indexBegin % 4u == 0u) {
-            indexAddress = state.Wrap(indexBegin, indexBytes);
+            indexAddress = state.WrapOrCopy(indexBegin, indexBytes, stream, false);
             state.KeepWrapped(indexBegin, indexBytes);
         } else {
             state.SettleRange(indexBegin, indexBytes);

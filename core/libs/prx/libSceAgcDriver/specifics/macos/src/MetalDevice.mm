@@ -65,6 +65,8 @@ constexpr std::uint64_t ArenaGranule = 1u << 20u;
 // as upstream splits with vkCmdDispatchBase.
 constexpr std::uint32_t GroupLimit = 65535u;
 constexpr std::uint64_t MaxSplitChunks = 1u << 16u;
+// The largest read-only range copied into upload memory when it cannot be wrapped (WrapOrCopy).
+constexpr std::uint64_t MaxCopiedBytes = std::uint64_t{64} << 20u;
 
 // The Vulkan stage and access masks of upstream's barriers (the command stream maps the stages).
 constexpr VkPipelineStageFlags AnyStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT;
@@ -119,6 +121,22 @@ GuestBufferRange DecodeBuffer(std::span<const std::uint32_t> words) {
     return {base, stride == 0u ? records : records * stride};
 }
 
+// Whether every page of [pageBegin, pageEnd) is mapped readable (executable pages included).
+bool Readable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
+    mach_vm_address_t cursor = pageBegin;
+    while (cursor < pageEnd) {
+        mach_vm_address_t region = cursor;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info {};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || region > cursor) return false;
+        if ((info.protection & VM_PROT_READ) == 0) return false;
+        cursor = region + size;
+    }
+    return true;
+}
+
 // Why [pageBegin, pageEnd) cannot be wrapped in place, empty when it can: every page must be
 // mapped, readable and not executable (code-signed pages fault when wrapped).
 std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
@@ -133,7 +151,7 @@ std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
             return "guest memory at " + Hex(cursor) + " is not mapped";
         }
         if ((info.protection & VM_PROT_EXECUTE) != 0 || (info.protection & VM_PROT_READ) == 0) {
-            return "guest memory at " + Hex(cursor) + " is executable or unreadable and cannot be wrapped (copy fallback: work package D3)";
+            return "guest memory at " + Hex(cursor) + " is executable or unreadable and cannot be wrapped (ranges a command only reads are copied instead)";
         }
         cursor = region + size;
     }
@@ -221,6 +239,21 @@ std::uint64_t VulkanDevice::State::Wrap(std::uint64_t address, std::uint64_t byt
     const auto pageEnd = (address + std::max<std::uint64_t>(bytes, 1u) + HostPage - 1u) & ~(HostPage - 1u);
     const auto reason = Unwrappable(pageBegin, pageEnd);
     throw std::runtime_error("Metal device: " + (reason.empty() ? "newBufferWithBytesNoCopy refused guest memory at " + Hex(pageBegin) : reason));
+}
+
+// Guest memory a command only reads that cannot be wrapped in place (executable pages: constant
+// data in __TEXT, the guest's code) is copied into the stream's upload memory when the command is
+// recorded (D3's copy fallback; such pages do not change). Written ranges must be wrapped: a copy
+// would lose the GPU's stores, so they throw as Wrap does.
+std::uint64_t VulkanDevice::State::WrapOrCopy(std::uint64_t address, std::uint64_t bytes, Graphics::Metal::CommandStream& stream, bool written) {
+    if (const auto gpu = TryWrap(address, bytes); gpu != 0u) return gpu;
+    const auto pageBegin = address & ~(HostPage - 1u);
+    const auto pageEnd = (address + std::max<std::uint64_t>(bytes, 1u) + HostPage - 1u) & ~(HostPage - 1u);
+    if (written || bytes > MaxCopiedBytes || !Readable(pageBegin, pageEnd)) {
+        const auto reason = Unwrappable(pageBegin, pageEnd);
+        throw std::runtime_error("Metal device: " + (reason.empty() ? "newBufferWithBytesNoCopy refused guest memory at " + Hex(pageBegin) : reason) + (written ? " (the command writes it: a copy would lose the stores)" : bytes > MaxCopiedBytes ? " (too large to copy: " + std::to_string(bytes) + " bytes)" : ""));
+    }
+    return stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(address), bytes), 16u).address;
 }
 
 id<MTLBuffer> VulkanDevice::State::WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const {
@@ -976,6 +1009,8 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
 }
 
 std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t) {
+    // As upstream: an incompatible runtime ABI is refused before anything is prepared.
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     // The pipeline starts building on the cache's workers; Dispatch waits for it.
     if (state->pipelines != nullptr && state->recorder != nullptr && !shader.msl.empty() && shader.msl.Reflection().stage == Abi::Stage::Kernel) state->pipelines->PrepareCompute(shader);
     return nullptr;
@@ -1022,7 +1057,7 @@ std::vector<Bda::Range> VulkanDevice::State::AddressExtras(const ShaderRecompile
                 const auto aligned = guest.base & ~std::uint64_t{3u};
                 const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                extras.push_back({aligned, aligned + bytes, Wrap(aligned, bytes), Bda::Read | (written ? Bda::Write : 0u), 0u});
+                extras.push_back({aligned, aligned + bytes, WrapOrCopy(aligned, bytes, stream, written), Bda::Read | (written ? Bda::Write : 0u), 0u});
             }
         } else if (binding.role == ShaderRecompiler::DescriptorRole::Gds) {
             const auto gds = Pm4::GdsAddress();
@@ -1138,7 +1173,8 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
                 const auto aligned = guest.base & ~std::uint64_t{3u};
                 const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
                 if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: a guest buffer exceeds 4 GiB");
-                entries[element] = {Wrap(aligned, bytes), static_cast<std::uint32_t>(bytes), 0u};
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                entries[element] = {WrapOrCopy(aligned, bytes, stream, written), static_cast<std::uint32_t>(bytes), 0u};
                 KeepWrapped(aligned, bytes);
                 const auto position = static_cast<std::size_t>(shader.memoryOffsetDword) * 4u + element;
                 if (position < push.size()) push[position] = std::byte{0};

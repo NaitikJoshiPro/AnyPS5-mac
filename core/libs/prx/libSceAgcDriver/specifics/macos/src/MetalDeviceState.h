@@ -189,6 +189,9 @@ struct VulkanDevice::State {
     void AttachPresentation(const PresentationWindow& window);
 
     std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
+    // Wrap, or for a range the command only reads that cannot be wrapped (executable pages), a copy in
+    // the stream's upload memory made now (D3's copy fallback).
+    std::uint64_t WrapOrCopy(std::uint64_t address, std::uint64_t bytes, Graphics::Metal::CommandStream& stream, bool written);
     // Wrap without throwing: 0 when the range cannot be wrapped (unmapped, executable, unreadable).
     std::uint64_t TryWrap(std::uint64_t address, std::uint64_t bytes);
     // The host import holding [address, address + bytes) (D3, GuestBufferMemory.mm), nil if none.
