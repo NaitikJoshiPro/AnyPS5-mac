@@ -580,6 +580,7 @@ def main():
         wait_until_idle(args.busy_wait)
     except Refused as error:
         refusal = str(error)
+    git_start = git_state(guards.get("source", REPO))
     prx_path = build / PRX
     prx_before = sha256(prx_path)
     before = executable_mtimes(build, order, registered)
@@ -645,7 +646,7 @@ def main():
     not_run = [name for name in runnable if name not in {case[0] for case in cases}]
     meta = {
         "started": started_wall, "finished": finished_wall, "seconds": time.monotonic() - started, "batches": len(cases),
-        "git": git_state(guards.get("source", REPO)), "build": os.path.relpath(build, REPO), "environment": extra,
+        "git": git_start, "build": os.path.relpath(build, REPO), "environment": extra,
         "rebuilt": rebuilt, "prx": {"path": PRX, "sha256": prx_before}, "guards": guards, "canaries": canary_results,
         "stopped": stopped, "not_run": not_run, "timeout_cap": MAX_TIMEOUT, "pause": args.pause, "quarantine_rerun": rerun,
     }
