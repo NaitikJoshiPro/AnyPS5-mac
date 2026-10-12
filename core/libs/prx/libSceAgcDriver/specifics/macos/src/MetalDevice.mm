@@ -508,6 +508,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
         // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
         state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityFloat64));
+        // half arithmetic rounds to nearest even and keeps f16 denormals on Apple GPUs (probe_float_b2),
+        // so packed f16 add/mul run natively (FPAdd16x2/FPMul16x2, MslAluMath.cpp).
+        for (const auto capability : {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve}) state->capabilities.push_back(static_cast<std::uint32_t>(capability));
         std::ranges::sort(state->capabilities);
         state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
         if (compileOnly) return;
