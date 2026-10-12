@@ -52,6 +52,18 @@ int Parent(const char* self) {
     const char* made = mkdtemp(pattern);
     if (made == nullptr) return Fail("cannot create a temporary directory");
     const std::filesystem::path directory(made);
+    if (ShaderValidation()) {
+        PipelineCache cache(device, directory);
+        std::vector<std::uint32_t> results;
+        const auto failure = BuildWorkload(device, cache, &results);
+        const auto statistics = cache.Statistics();
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+        if (!failure.empty()) return Fail(failure);
+        if (!statistics.archivePath.empty() || statistics.archiveDisabled.empty()) return Fail("the archive must be disabled under MTL_SHADER_VALIDATION");
+        std::printf("PASS: agc_metal_pipeline_cache (shader validation: archive disabled, workload correct)\n");
+        return 0;
+    }
     std::string first;
     std::string second;
     const int firstStatus = RunChild(self, "--child-first", directory, &first);

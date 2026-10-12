@@ -14,6 +14,7 @@
 //                                    when the shader cache is disabled)
 //   APS5_NO_PIPELINE_CACHE=1         no archive (memory cache only)
 //   APS5_PROFILE_PIPELINES=1         one line per compiled pipeline and a summary at destruction
+//   MTL_SHADER_VALIDATION=1          no archive (instrumented binaries do not reload on 27.0.1)
 // Objective-C++ only.
 
 #import <Foundation/Foundation.h>
@@ -55,6 +56,8 @@ struct PipelineCacheStatistics {
     bool archiveLoaded = false;
     std::uint64_t archiveSaves = 0;
     std::string archivePath;
+    // Why there is no archive although a directory was given (empty: there is one, or none asked).
+    std::string archiveDisabled;
 };
 
 // One shader function of a pipeline: an emitted MSL library, the values of the function constants

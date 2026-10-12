@@ -45,6 +45,12 @@ int PipelineCacheOnly() {
             std::error_code error;
             std::filesystem::remove_all(directory, error);
             if (!failure.empty()) return Fail(failure);
+            if (ShaderValidation()) {
+                if (!after.archivePath.empty() || after.archiveDisabled.empty() || after.pipelinesCompiled != WorkloadPipelines) return Fail("the archive must be disabled under MTL_SHADER_VALIDATION");
+                if (first != second) return Fail("the two caches' pipelines computed different results");
+                std::printf("PASS: agc_pipeline_cache (shader validation: archive disabled, workload correct)\n");
+                return 0;
+            }
             if (before.pipelinesCompiled != WorkloadPipelines) return Fail("the first cache compiled " + std::to_string(before.pipelinesCompiled) + " pipelines");
             if (!after.archiveLoaded || after.pipelinesCompiled != 0u || after.archiveHits != WorkloadPipelines) {
                 return Fail("the second cache compiled " + std::to_string(after.pipelinesCompiled) + " pipelines with " + std::to_string(after.archiveHits) + " archive hits");

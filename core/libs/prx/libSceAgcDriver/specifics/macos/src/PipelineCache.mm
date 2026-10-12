@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <system_error>
 
@@ -39,6 +40,15 @@ std::string FileSafe(std::string text) {
         if (!safe) character = '_';
     }
     return text;
+}
+
+// Archives serialized while Metal shader validation instruments the pipelines do not load again
+// ("deployment target for architecture applegpu_g15g found in archive is not compatible with
+// current OS", macOS 27.0.1), and archive lookups would hand out uninstrumented pipelines: no
+// archive under MTL_SHADER_VALIDATION.
+bool ShaderValidation() {
+    const char* value = std::getenv("MTL_SHADER_VALIDATION");
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 }
 
 std::filesystem::path DefaultDirectory() {
@@ -102,6 +112,11 @@ PipelineFunction PipelineFunction::From(const ShaderRecompiler::RecompileResult&
 PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directory) : device(device) {
     if (device == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no Metal device");
     if (directory.empty()) directory = DefaultDirectory();
+    if (ShaderValidation()) {
+        if (!directory.empty() && Profile()) std::fprintf(stderr, "[metal-pipelines] no archive under MTL_SHADER_VALIDATION\n");
+        directory.clear();
+        statistics.archiveDisabled = "MTL_SHADER_VALIDATION";
+    }
     if (!directory.empty()) {
         archivePath = directory / FileSafe(std::string(device.name.UTF8String) + "-" + OsBuild() + ".mtl4archive");
         statistics.archivePath = archivePath.string();

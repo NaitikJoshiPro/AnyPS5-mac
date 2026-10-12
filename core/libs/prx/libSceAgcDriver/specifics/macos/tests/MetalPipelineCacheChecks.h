@@ -10,6 +10,7 @@
 
 #include "../src/MetalPipelineCache.h"
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,13 @@ inline int Fail(const std::string& message) {
 }
 
 inline constexpr std::uint64_t WorkloadPipelines = 3;
+
+// Metal shader validation disables the archive (MetalPipelineCache.h): the tests then check that
+// instead of the reuse.
+inline bool ShaderValidation() {
+    const char* value = std::getenv("MTL_SHADER_VALIDATION");
+    return value != nullptr && *value != '\0' && std::string(value) != "0";
+}
 
 inline Metal::PipelineFunction ComputeFunction(std::uint32_t multiplier) {
     static const auto shader = std::make_shared<const ShaderRecompiler::MslShader>(ShaderRecompiler::MslShader{
