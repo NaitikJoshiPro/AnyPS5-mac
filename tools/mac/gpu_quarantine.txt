@@ -6,3 +6,4 @@
 # agc_driver_f16_denormal_flush | kernel panic 2026-10-12 20:20 IST (IOGPUFamily data abort at NULL+0x10 while the test process was terminating; macOS 27.0.1, M3) | metal-gpu-quarantine
 # released 2026-10-13 after a supervised rerun under validation (passed, 0.2 s; .mac-work/logs/gpu-suite/20261012T193150Z-agc_driver_copied_writer_copy): cause was a CPU deadlock on a strong BDA-table lease, fixed in 4633c51d2:
 # agc_driver_copied_writer_copy | timeout (30 s hang, no GPU fault) 2026-10-13 00:47 after DRV 1b7067f7b routed registered memory through host imports; suspected CPU deadlock (pin waiter / leases) | metal-gpu-quarantine
+agc_driver_look_back_scan | GPU batch did not finish within 20000 ms (recorder timeout, machine recovered) in .mac-work/logs/gpu-suite/shd-final2 at db6d57ea (passed under validation at 46b3059b in shd-r5); cross-workgroup spin on 64-bit atomics (B3 lock table) suspected | metal-gpu-quarantine
