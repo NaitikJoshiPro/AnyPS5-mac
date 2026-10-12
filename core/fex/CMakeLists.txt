@@ -27,6 +27,7 @@ ExternalProject_Add(fexcore
         -DCMAKE_BUILD_TYPE=Release
         -DTUNE_CPU=none
         -DCMAKE_DISABLE_FIND_PACKAGE_fmt=TRUE
+        -DCMAKE_DISABLE_FIND_PACKAGE_xxhash=TRUE
         -DBUILD_TESTING=OFF
         -DBUILD_THUNKS=OFF
         -DBUILD_FEXCONFIG=OFF
@@ -35,7 +36,7 @@ ExternalProject_Add(fexcore
         -DENABLE_ASSERTIONS=OFF
         -DENABLE_CCACHE=OFF
         -DENABLE_LTO=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target FEXCore FEXCore_Base JemallocLibs --parallel ${APS5_FEX_JOBS}
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target FEXCore FEXCore_Base JemallocLibs xxhash --parallel ${APS5_FEX_JOBS}
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
