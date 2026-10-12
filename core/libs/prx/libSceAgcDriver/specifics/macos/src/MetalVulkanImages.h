@@ -70,6 +70,19 @@ void CmdBlitImage(VkCommandBuffer commands, VkImage source, VkImageLayout source
 // A compute kernel writes the clear value through a view of the image's format class.
 void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, const VkClearColorValue* color, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges);
 void CmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions);
+void CmdUpdateBuffer(VkCommandBuffer commands, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, const void* data);
+
+// Descriptor sets do not exist on Metal: the twins keep their bookkeeping, the handles are tokens,
+// and the writes a ShaderResources collects become MslAbi descriptor-table entries instead
+// (ShaderResources::WriteTableEntries). Binding a set records nothing.
+VkResult CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo* info, const VkAllocationCallbacks* allocator, VkDescriptorSetLayout* layout);
+void DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout layout, const VkAllocationCallbacks* allocator);
+VkResult CreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo* info, const VkAllocationCallbacks* allocator, VkDescriptorPool* pool);
+void DestroyDescriptorPool(VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks* allocator);
+VkResult ResetDescriptorPool(VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags flags);
+VkResult AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets);
+void UpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies);
+void CmdBindDescriptorSets(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, std::uint32_t dynamicOffsetCount, const std::uint32_t* dynamicOffsets);
 // A render pass that loads the clear value (depth images, multisampled images).
 void CmdClearDepthStencilImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges);
 

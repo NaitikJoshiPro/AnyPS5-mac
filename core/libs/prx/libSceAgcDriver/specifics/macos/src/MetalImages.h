@@ -35,6 +35,11 @@
 
 namespace AgcDriver::Graphics {
 class Recorder;
+class ShaderResources;
+class TextureDetiler;
+class PlaceholderImages;
+class SamplerCache;
+struct Context;
 }
 
 namespace AgcDriver::Graphics::Metal {
@@ -131,7 +136,7 @@ public:
     // and writes them back when the batch completes.
     void Commit(Recorder& recorder);
 
-    bool Empty() const { return surfaces.empty() && samplers.empty(); }
+    bool Empty() const { return resources == nullptr && surfaces.empty() && samplers.empty(); }
 
 private:
     std::shared_ptr<GuestSurface> surface(std::span<const std::uint32_t> words, bool storage, bool atomic, std::uint32_t mip);
@@ -141,6 +146,11 @@ private:
     std::function<void(std::uint64_t, std::uint64_t)> settle;
     std::vector<std::shared_ptr<GuestSurface>> surfaces;
     std::vector<id<MTLSamplerState>> samplers;
+    // The upstream build (ShaderResources twin, MetalImagesOnly) once the cache is attached to the
+    // device's Context: the image and sampler entries come from it, and the pending/live storage
+    // registries, the texture caches and the resource cache are upstream's (Texture.mm,
+    // ShaderResources.mm). Null: the bring-up path above (no cache attached).
+    std::shared_ptr<ShaderResources> resources;
     // Storage surfaces and the levels the dispatch may write (written back at completion).
     std::map<GuestSurface*, std::set<std::uint32_t>> writtenLevels;
     // Prepare's adjusted sampler words per sampler element (empty: not prepared).
@@ -166,6 +176,13 @@ public:
     id<MTLSamplerState> Sampler(std::span<const std::uint32_t> words, bool compare, bool unnormalized, bool integerBorder);
     // A 1x1 (one layer) zero texture of an image heap's type (RuntimeAbi binding 1-56).
     id<MTLTexture> Placeholder(std::uint32_t heap);
+
+    // Attaches the device's Context (once it is complete): image bindings then build upstream's
+    // ShaderResources over a copy of it that carries the cache's detiler, placeholder images and
+    // sampler cache (D4/D5 twins). Teardown clears the texture and resource caches of the device.
+    void Attach(const Context& deviceContext);
+    // The Context image builds use (null before Attach).
+    const Context* ImageContext() const { return imageContext.get(); }
 
     // The image cache of a device (the one constructed with it), or null: the textures the
     // Vulkan-shaped twins make (MetalVulkanImages.mm) are tracked by it.
@@ -195,6 +212,10 @@ private:
     std::map<std::array<std::uint32_t, 5>, id<MTLSamplerState>> samplerCache;
     std::map<std::uint32_t, id<MTLTexture>> placeholders;
     std::map<void*, std::uint32_t> residentCounts;
+    std::unique_ptr<Context> imageContext;
+    std::unique_ptr<TextureDetiler> detiler;
+    std::unique_ptr<PlaceholderImages> placeholderImages;
+    std::unique_ptr<SamplerCache> upstreamSamplers;
     Statistics statistics;
     bool tornDown = false;
 };

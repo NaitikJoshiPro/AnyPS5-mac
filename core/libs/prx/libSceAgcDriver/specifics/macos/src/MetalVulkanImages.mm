@@ -9,6 +9,8 @@
 #include <vector>
 
 #include <algorithm>
+#include <atomic>
+#include <span>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -634,6 +636,48 @@ void ClearByRenderPass(VkCommandBuffer commands, id<MTLTexture> texture, const V
 void CmdClearDepthStencilImage(VkCommandBuffer commands, VkImage image, VkImageLayout, const VkClearDepthStencilValue* value, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges) {
     ClearByRenderPass(commands, TextureOfImage(image), ranges, rangeCount, nullptr, value);
 }
+
+void CmdUpdateBuffer(VkCommandBuffer commands, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, const void* data) {
+    Stream(commands).UpdateBuffer(BufferOf(buffer), offset, std::span<const std::byte>(static_cast<const std::byte*>(data), bytes));
+}
+
+namespace {
+
+// Distinct non-null tokens for the descriptor objects (never dereferenced).
+template <typename Handle>
+Handle Token() {
+    static std::atomic<std::uintptr_t> next{0x1000u};
+    return reinterpret_cast<Handle>(next.fetch_add(16u, std::memory_order_relaxed));
+}
+
+}
+
+VkResult CreateDescriptorSetLayout(VkDevice, const VkDescriptorSetLayoutCreateInfo*, const VkAllocationCallbacks*, VkDescriptorSetLayout* layout) {
+    *layout = Token<VkDescriptorSetLayout>();
+    return VK_SUCCESS;
+}
+
+void DestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, const VkAllocationCallbacks*) {}
+
+VkResult CreateDescriptorPool(VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*, VkDescriptorPool* pool) {
+    *pool = Token<VkDescriptorPool>();
+    return VK_SUCCESS;
+}
+
+void DestroyDescriptorPool(VkDevice, VkDescriptorPool, const VkAllocationCallbacks*) {}
+
+VkResult ResetDescriptorPool(VkDevice, VkDescriptorPool, VkDescriptorPoolResetFlags) {
+    return VK_SUCCESS;
+}
+
+VkResult AllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
+    for (std::uint32_t index = 0; index < info->descriptorSetCount; ++index) sets[index] = Token<VkDescriptorSet>();
+    return VK_SUCCESS;
+}
+
+void UpdateDescriptorSets(VkDevice, std::uint32_t, const VkWriteDescriptorSet*, std::uint32_t, const VkCopyDescriptorSet*) {}
+
+void CmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t, std::uint32_t, const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {}
 
 void CmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
     auto& stream = Stream(commands);
