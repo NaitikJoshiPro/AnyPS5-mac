@@ -138,17 +138,23 @@ std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
     return {};
 }
 
-// The MSL version MetalBackend emits (MslAbi::LanguageMajor/LanguageMinor).
-
 std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
     return shader.msl.Reflection().workgroupMemoryStrideDwords;
 }
 
 }
 
+// Registered guest memory is reached through its host import, so every GPU access to it (dispatch
+// V#s, BDA table, labels, fills, copies) goes through one MTLBuffer: two no-copy buffers over the
+// same pages have different GPU addresses, and ordering stores through one against loads through
+// the other was seen to fail (agc_driver_copied_writer_copy). Other memory gets page wrappers.
 std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t bytes) {
     const auto end = address + std::max<std::uint64_t>(bytes, 1u);
     if (end < address) return 0;
+    if (context.hostImportAlignment != 0u) {
+        std::uint64_t offset = 0;
+        if (id<MTLBuffer> import = ImportOf(address, bytes, &offset)) return import.gpuAddress + offset;
+    }
     for (const auto& wrapper : wrappers) {
         if (address >= wrapper.begin && end <= wrapper.end) return wrapper.buffer.gpuAddress + (address - wrapper.begin);
     }
