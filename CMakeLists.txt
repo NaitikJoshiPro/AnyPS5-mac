@@ -116,6 +116,8 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_check_no_x86.py)
             set_tests_properties(check_no_x86_tool PROPERTIES TIMEOUT 120 ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
         endif()
+        add_test(NAME unself COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_unself.py)
     endif()
 endif()
 

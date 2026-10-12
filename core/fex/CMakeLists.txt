@@ -58,5 +58,9 @@ if(BUILD_TESTING)
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs)
         add_test(NAME fex_bridge_tables COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bridge_tables.py
             ${CMAKE_CURRENT_SOURCE_DIR}/src/Bridge.cpp ${CMAKE_SOURCE_DIR}/core/libs)
+        add_test(NAME fex_licence COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mac/check_fex_licence.py
+            ${CMAKE_SOURCE_DIR})
+        add_test(NAME fex_licence_checker COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tools/tests/test_check_fex_licence.py)
     endif()
 endif()

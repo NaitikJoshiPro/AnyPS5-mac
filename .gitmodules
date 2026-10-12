@@ -34,5 +34,4 @@
 [submodule "3rdparty/FEX"]
 	path = 3rdparty/FEX
 	url = https://github.com/arvindfroi/FEX.git
-	branch = anyps5-macos
 	shallow = true
