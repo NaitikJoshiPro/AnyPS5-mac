@@ -58,6 +58,13 @@ struct MslB5Storage {
 // The invocation's scratch (private segment) of the half being emitted, zero-initialised.
 [[nodiscard]] MslB5Storage MslB5Scratch(MslEmitterState& state);
 
+// Package B3 (MslMemory.cpp): the workgroup's LDS, declared once: `threadgroup uint aps5_lds[N]`
+// (plus the lock dword when SpirvRequirements::ldsLock), or the workgroup's slice of the device
+// arena (`device uint* aps5_lds`) when it exceeds threadgroup memory. MslB5Lds forwards here.
+[[nodiscard]] MslB5Storage MslLdsStorage(MslEmitterState& state);
+// An `atomic_uint*` expression for LDS dword `index` in the LDS's address space.
+[[nodiscard]] std::string MslLdsAtomicPointer(MslEmitterState& state, std::string_view index);
+
 // 32-bit atomic operations shared by buffer (MUBUF) and flat/global atomics; the values are the
 // `op` codes of aps5_atomic_next in the RuntimeBuffer chunk.
 enum class MslAtomicOp : std::uint32_t {
@@ -83,6 +90,13 @@ enum class MslAtomicOp : std::uint32_t {
 // expression) and yields the old value: native atomics where Metal has them, else the CAS loop of
 // the RuntimeBuffer chunk. `comparator` is used by the compare-exchange forms only.
 [[nodiscard]] std::string MslAtomic32Expression(MslAtomicOp op, std::string_view object, std::string_view value, std::string_view comparator);
+// Package B3: a 64-bit atomic read-modify-write of the 8-byte aligned device address `address` (a
+// ulong expression already checked and translated by the caller), emitted at the current position
+// where every invocation of the SIMD group that reaches the caller's `if` runs it. Apple GPUs have no
+// 64-bit device atomics beyond min/max, so the update runs under a lock word of the driver's lock
+// table (DriverData.atomicLocks). `op` codes as MslAtomicOp (comparator: compare-exchange forms).
+// Returns the name of a ulong local holding the old value.
+[[nodiscard]] std::string MslDeviceAtomic64(MslEmitterState& state, const IrValue& instruction, MslAtomicOp op, std::string_view address, std::string_view value, std::string_view comparator);
 // The device-scope fence that follows every buffer and flat/global atomic
 // (EmitDeviceAtomicMemoryBarrier; APS5_NO_ATOMIC_BARRIER=1 drops it). Empty when disabled.
 [[nodiscard]] std::string MslAtomicFence();

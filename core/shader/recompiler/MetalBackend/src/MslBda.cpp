@@ -459,12 +459,7 @@ std::uint32_t MslUsedDwords(const IrValue& instruction, std::uint32_t dwords) {
 }
 
 MslB5Storage MslB5Lds(MslEmitterState& state) {
-    if (state.workgroup == nullptr) state.Fail("LDS through the shared aperture needs a workgroup stage (work package B5)");
-    if (state.LdsInDeviceMemory()) state.Fail("flat accesses to device-memory LDS are not implemented in the MSL backend yet (work packages B3/B5)");
-    const auto dwords = state.workgroup->ldsSizeDwords;
-    if (dwords == 0u) return {};
-    if (state.prologue.find(" aps5_lds[") == std::string::npos) state.AddPrologue("threadgroup uint aps5_lds[" + std::to_string(dwords + (state.requirements.ldsLock ? 1u : 0u)) + "];");
-    return {"aps5_lds", dwords};
+    return MslLdsStorage(state);
 }
 
 MslB5Storage MslB5Scratch(MslEmitterState& state) {

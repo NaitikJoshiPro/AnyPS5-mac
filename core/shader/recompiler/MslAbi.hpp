@@ -42,9 +42,10 @@ namespace ShaderRecompiler::MslAbi {
 
 inline constexpr std::uint32_t Version = 1u;
 
-// Metal Shading Language version the backend emits (MTLLanguageVersion4_0, macOS 26 and later).
+// Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
+// acquire/release orders of the mem_flags fences).
 inline constexpr std::uint32_t LanguageMajor = 4u;
-inline constexpr std::uint32_t LanguageMinor = 0u;
+inline constexpr std::uint32_t LanguageMinor = 1u;
 
 // Name of the stage function in every emitted library.
 inline constexpr const char* EntryPoint = "aps5_main";

@@ -412,7 +412,6 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     static const bool survey = std::getenv("APS5_MSL_SURVEY") != nullptr;
     state.survey = survey;
     if (stage != IrShaderStage::Compute) state.Fail("only compute shaders are implemented in the MSL backend so far");
-    if (program.Info().sharedMemoryBytes != 0u) state.Fail("device-memory LDS is not implemented in the MSL backend yet");
     state.waveLdsScope = MslWaveLdsScope(state);
     EmitMslFunctionBody(state);
     const auto entry = EmitMslEntryPoint(state);
