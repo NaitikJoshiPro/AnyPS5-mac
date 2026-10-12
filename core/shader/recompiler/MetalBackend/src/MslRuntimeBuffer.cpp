@@ -114,8 +114,8 @@ StaticDescriptor Descriptor(MslEmitterState& state, const IrValue& instruction) 
     descriptor.records = state.Value(handle->Argument(2));
     const auto addThreadId = "(extract_bits(" + descriptor.word3 + ", 23u, 1u) != 0u)";
     if (state.program.Resources().stage != IrShaderStage::Compute) state.Fail(instruction, "buffer access outside compute is not implemented in the MSL backend yet");
-    if (state.laneCount != 1u) state.Fail(instruction, "buffer access of wave64 programs on 32-wide SIMD groups is not implemented in the MSL backend yet");
-    const auto lane = state.hostSubgroupSize < state.program.WaveSize() ? "(" + state.Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " & " + std::to_string(state.program.WaveSize() - 1u) + "u)" : state.Builtin(MslBuiltin::ThreadIndexInSimdgroup);
+    // The guest lane of the half being emitted (B1 core helper; laneCount 2 adds 32 in half 1).
+    const auto lane = state.GuestLane();
     descriptor.index = "(" + state.Arg(instruction, 1u) + " + (" + addThreadId + " ? " + lane + " : 0u))";
     const auto element = state.DescriptorElement(DescriptorBindingKind::Buffers, memory.resource);
     descriptor.buffer = state.TableBuffer(DescriptorBindingKind::Buffers, element);
