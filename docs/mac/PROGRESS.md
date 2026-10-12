@@ -31,3 +31,10 @@ Append-only. Read the tail on every start or resume. Each entry: date, milestone
 ## 2026-10-12: network outage, agents resumed
 - A DNS/API outage killed all four agents and their sub-agents mid-task. State at the time: (A) M0: 16 files fixed but uncommitted in the main worktree, plus `tools/mac/check_no_x86.py` and its test; (B) M1 prep: 3 commits on `mac-native-m1prep` (`986586b8` FEX branch tracking removed, `cf215cc4` FEX licence guard test, `e47605dc` `tools/unself.py`); was relinking DOOM; (C) M2 architect: worktree and `build-metal` configured, `MslAbi.hpp` uncommitted, plus temporary copies of A's WIP fixes (to be dropped when A's commits land); (D) homebrew search: ccleste excluded (unlicensed assets), checking ProsperoPuzzles and Homebrew UI Lab.
 - All four resumed with context intact (SendMessage); each told to resume or re-launch its own sub-agents.
+
+## 2026-10-12: Xcode and sudo setup (user-authorised)
+- The user supplied their sudo password to end password prompts. It is not stored anywhere (repo, logs, memory, agent prompts); it was used once for:
+  - `DevToolsSecurity -enable` (debugger attach no longer raises the "Developer Tools Access" dialog);
+  - Xcode 27.0 (27A266a) at `/Applications/Xcode.app`: licence accepted, `-runFirstLaunch` OK. `xcode-select` still points at the Command Line Tools on purpose (switching mid-build would swap compilers under live build dirs); use `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun <tool>` for Xcode tools. The Metal toolchain (`metal`, `metallib`) is a separate component: `xcodebuild -downloadComponent MetalToolchain` running;
+  - `/etc/sudoers.d/anyps5-powermetrics` (0440 root:wheel, `visudo -c` OK): `naitikjoshi ALL=(root) NOPASSWD: /usr/bin/powermetrics` only. Verified: `sudo -n /usr/bin/powermetrics --samplers cpu_power -i 200 -n 1` → CPU 1167 mW, combined 1244 mW (idle-ish).
+- **Cleanup at project end:** delete `/etc/sudoers.d/anyps5-powermetrics`, optionally `DevToolsSecurity -disable`; the user will rotate the password.

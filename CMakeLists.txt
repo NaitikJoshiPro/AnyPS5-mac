@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_HOST_APPLE AND NOT ANYPS5_RELINKER_ONLY)
-    set(CMAKE_OSX_ARCHITECTURES x86_64 CACHE STRING "Architectures built on macOS")
+    set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "Architecture built on macOS: arm64 (native), or x86_64 (runs under Rosetta)")
     set(CMAKE_APPLE_SILICON_PROCESSOR ${CMAKE_OSX_ARCHITECTURES} CACHE STRING "Host processor CMake reports on Apple silicon")
+    # tools/mac/check_no_x86.py reads compile_commands.json to show that no x86 code is left on the arm64 build path.
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Write compile_commands.json")
 endif()
 project(Relinker CXX)
 
