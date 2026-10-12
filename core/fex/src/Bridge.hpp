@@ -13,8 +13,13 @@
 
 struct mach_header_64;
 
+namespace FEXCore {
+class ThunkHandler;
+}
+
 namespace FEXCore::Core {
 struct CPUState;
+struct CpuStateFrame;
 }
 
 namespace Aps5Fex {
@@ -53,6 +58,10 @@ public:
 
     std::uint64_t Call(FEXCore::Core::CPUState& state, std::uint64_t number, std::uint64_t block);
 
+    // The handler that names the fast trampolines' host function for FEXCore (Context::SetThunkHandler).
+    static FEXCore::ThunkHandler* Thunks();
+    void ThunkCall(FEXCore::Core::CpuStateFrame* frame, std::uint64_t block);
+
 private:
     enum class Variadic : std::uint8_t {
         None,
@@ -69,7 +78,15 @@ private:
         bool x87Result;
         const BridgeSignature* signature = nullptr;
         bool shaped = false;
+        bool callbacks = false;
+        bool callbackResult = false;
+        // Guest stack slots and whether vector registers carry arguments (all of them without a signature).
+        std::uint8_t stackSlots = 10;
+        bool vectors = true;
     };
+
+    std::uint64_t NativeCallable(std::uint64_t value, const BridgeSignature* callback);
+    std::uint64_t GuestCallable(std::uint64_t value);
 
     static bool IsShaped(const BridgeSignature* signature);
     static bool GuestX87Result(const BridgeSignature* signature);

@@ -122,6 +122,7 @@ COMPILED = {
     "abi-long-double": (lambda d: with_abi_library(d, "abi_long_double.cpp", {"libc.prx": ["exit", "acosl", "atanl", "coshl", "cosl",
                         "exp2l", "expl", "frexpl", "ldexpl", "log10l", "logl", "powl", "sinhl", "sinl", "tanhl", "tanl", "truncl",
                         "strtold", "wcstold", "__signbitl"]}), 43),
+    "abi-callbacks": (lambda d: with_abi_library(d, "abi_callbacks.cpp", {"libc.prx": ["exit"]}), 43),
     "abi-variadic": (lambda d: compiled_executable(d, [str(HERE / "abi_variadic.cpp")], {"libc.prx": ["exit", "snprintf", "swprintf"]}), 43),
     "exception": (lambda d: compiled_executable(d, ["exception.cpp"], None), 43),
     "c-cleanup": (lambda d: compiled_executable(d, ["c_cleanup.c", "c_cleanup_main.cpp"], None), 47),

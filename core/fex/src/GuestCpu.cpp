@@ -355,6 +355,30 @@ std::uint64_t Aps5Fex::CallGuestFunction(std::uint64_t target, const std::uint64
     return frame.gpr[0];
 }
 
+bool Aps5Fex::IsGuestCodeAddress(std::uint64_t address) {
+    return IsGuestCode(address);
+}
+
+// Like CallGuest, with the registers and stack set by the caller (setup) and the results read by it
+// (finish), for calls whose arguments or result positional mapping places wrongly (GuestCall.cpp).
+void Aps5Fex::CallGuestWith(std::uint64_t target, GuestStateHook setup, GuestStateHook finish, void* context) {
+    ThreadState* thread = CurrentThread();
+    auto& state = thread->CurrentFrame->State;
+    const std::uint64_t rip = state.rip;
+    std::uint64_t gregs[16];
+    std::memcpy(gregs, state.gregs, sizeof(gregs));
+    std::uint64_t xmm[16][2];
+    std::memcpy(xmm, state.xmm.sse.data, sizeof(xmm));
+    setup(state, context);
+    ++guestDepth;
+    thread->CTX->HandleCallback(thread, target);
+    --guestDepth;
+    finish(state, context);
+    std::memcpy(state.gregs, gregs, sizeof(gregs));
+    std::memcpy(state.xmm.sse.data, xmm, sizeof(xmm));
+    state.rip = rip;
+}
+
 namespace Aps5Fex {
 
 namespace {

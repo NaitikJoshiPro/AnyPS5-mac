@@ -1,11 +1,15 @@
 #include "Bridge.hpp"
 
 #include "BridgeSignatures.hpp"
+#include "GuestCall.hpp"
 #include "GuestCpu.hpp"
 #include "GuestImage.hpp"
 #include "X87Convert.hpp"
 
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Core/Thunks.h>
+#include <FEXCore/IR/IR.h>
 #include <FEXCore/Core/X86Enums.h>
 
 #include <algorithm>
@@ -41,6 +45,7 @@ struct Aps5NativeResult {
 static_assert(offsetof(Aps5NativeResult, vector) == 16);
 
 extern "C" void Aps5NativeCall(const void* target, const Aps5NativeArguments* arguments, Aps5NativeResult* result);
+extern "C" void Aps5BridgeThunkEntry(void* block);
 
 namespace Aps5Fex {
 
@@ -100,6 +105,7 @@ struct GuestFrame {
     std::memcpy(frame.registers, registers, sizeof(frame.registers));
     throw frame;
 }
+
 
 std::vector<std::uint64_t> tlsOffsets;
 
@@ -221,6 +227,52 @@ constexpr auto TrampolineCall = Join(SubRspBlock, StoreRdi, StoreRsi, StoreRdx, 
 constexpr auto TrampolineReturn = Join(LoadRax, LoadRdx, LoadXmm0, LoadXmm1, AddRspBlock, Return);
 constexpr auto X87TrampolineReturn = Join(LoadSt0, AddRspBlock, Return);
 
+// The fast trampolines call the bridge from JIT code through FEX's thunk instruction (0f 3f and a 32-byte
+// name, OpDispatchBuilder::ThunkOp): FEXCore spills its static registers, calls the host function the
+// ThunkHandler names with rdi (the block), refills them and returns to the address on the guest stack.
+// No dispatcher exit and no block lookups, unlike `syscall`. The function number goes to the block's
+// spare slot.
+constexpr Bytes7 StoreEaxNumber {0x89, 0x84, 0x24, 0xb0, 0x00, 0x00, 0x00};
+constexpr std::size_t NumberSlot = 0xb0;
+constexpr std::uint8_t CallRelative = 0xe8;
+constexpr std::array<std::uint8_t, 2> ThunkInstruction {0x0f, 0x3f};
+constexpr std::array<std::uint8_t, 32> ThunkName {'a', 'p', 's', '5', '-', 'f', 'e', 'x', ' ', 'b', 'r', 'i', 'd', 'g', 'e', ' ',
+                                                  'c', 'a', 'l', 'l', ' ', 't', 'h', 'u', 'n', 'k', ' ', 'v', '1', '.', '0', 0};
+constexpr auto FastTrampolineCall = Join(SubRspBlock, StoreRdi, StoreRsi, StoreRdx, StoreRcx, StoreR8, StoreR9, StoreXmm0, StoreXmm1,
+                                         StoreXmm2, StoreXmm3, StoreXmm4, StoreXmm5, StoreXmm6, StoreXmm7, StoreEaxNumber, MoveRspToRdi);
+constexpr std::size_t FastCallBytes = 5;
+constexpr auto FastThunk = Join(ThunkInstruction, ThunkName);
+
+// Writes the fast trampoline at code: the saves, `call` to the thunk instruction after the return
+// sequence, the return sequence, the thunk instruction. Returns its size.
+template <std::size_t ReturnSize>
+std::size_t WriteFastTrampoline(std::uint8_t* code, const std::array<std::uint8_t, ReturnSize>& ret) {
+    std::size_t at = 0;
+    std::memcpy(code, FastTrampolineCall.data(), FastTrampolineCall.size());
+    at += FastTrampolineCall.size();
+    const auto relative = static_cast<std::int32_t>(ReturnSize);
+    code[at] = CallRelative;
+    std::memcpy(code + at + 1, &relative, sizeof(relative));
+    at += FastCallBytes;
+    std::memcpy(code + at, ret.data(), ReturnSize);
+    at += ReturnSize;
+    std::memcpy(code + at, FastThunk.data(), FastThunk.size());
+    return at + FastThunk.size();
+}
+
+Bridge* fastBridge = nullptr;
+
+class FastBridgeThunks final : public FEXCore::ThunkHandler {
+public:
+    FEXCore::ThunkedFunction* LookupThunk(const FEXCore::IR::SHA256Sum& name) override {
+        static_assert(sizeof(name) == ThunkName.size());
+        if (std::memcmp(&name, ThunkName.data(), ThunkName.size()) != 0) return nullptr;
+        return reinterpret_cast<FEXCore::ThunkedFunction*>(&Aps5BridgeThunkEntry);
+    }
+};
+
+FastBridgeThunks fastThunks;
+
 constexpr std::uint8_t MoveToEax = 0xb8;
 constexpr std::uint8_t JumpRelative = 0xe9;
 
@@ -238,10 +290,44 @@ Bridge::Bridge(std::filesystem::path libraries) : directory(std::move(libraries)
     std::memset(stubs, 0xcc, FirstStubOffset);
     stubs[0] = 0x0f;
     stubs[1] = 0x3e;
-    std::memcpy(stubs + TrampolineOffset, TrampolineCall.data(), TrampolineCall.size());
-    std::memcpy(stubs + TrampolineOffset + TrampolineCall.size(), TrampolineReturn.data(), TrampolineReturn.size());
-    std::memcpy(stubs + X87TrampolineOffset, TrampolineCall.data(), TrampolineCall.size());
-    std::memcpy(stubs + X87TrampolineOffset + TrampolineCall.size(), X87TrampolineReturn.data(), X87TrampolineReturn.size());
+    // APS5_FEX_BRIDGE_SYSCALL=1 keeps the older path through `syscall` and the dispatcher (for comparison).
+    const char* viaSyscall = std::getenv("APS5_FEX_BRIDGE_SYSCALL");
+    if (viaSyscall != nullptr && std::strcmp(viaSyscall, "0") != 0) {
+        std::memcpy(stubs + TrampolineOffset, TrampolineCall.data(), TrampolineCall.size());
+        std::memcpy(stubs + TrampolineOffset + TrampolineCall.size(), TrampolineReturn.data(), TrampolineReturn.size());
+        std::memcpy(stubs + X87TrampolineOffset, TrampolineCall.data(), TrampolineCall.size());
+        std::memcpy(stubs + X87TrampolineOffset + TrampolineCall.size(), X87TrampolineReturn.data(), X87TrampolineReturn.size());
+    } else {
+        static_assert(TrampolineOffset + FastTrampolineCall.size() + FastCallBytes + TrampolineReturn.size() + FastThunk.size() <=
+                      X87TrampolineOffset);
+        static_assert(X87TrampolineOffset + FastTrampolineCall.size() + FastCallBytes + X87TrampolineReturn.size() + FastThunk.size() <=
+                      FirstStubOffset);
+        WriteFastTrampoline(stubs + TrampolineOffset, TrampolineReturn);
+        WriteFastTrampoline(stubs + X87TrampolineOffset, X87TrampolineReturn);
+    }
+    fastBridge = this;
+}
+
+FEXCore::ThunkHandler* Bridge::Thunks() {
+    return &fastThunks;
+}
+
+// The fast trampolines' host side: block holds the guest's argument registers and the function number,
+// frame is FEXCore's state (x28 in JIT code, Aps5BridgeThunkEntry passes it on).
+void Bridge::ThunkCall(FEXCore::Core::CpuStateFrame* frame, std::uint64_t block) {
+    auto& state = frame->State;
+    std::uint32_t number = 0;
+    std::memcpy(&number, reinterpret_cast<const void*>(block + NumberSlot), sizeof(number));
+    if (number < FirstStub || number - FirstStub >= stubCount.load(std::memory_order_acquire)) {
+        std::fprintf(stderr, "[aps5-fex] the bridge got function number %#x\n", number);
+        std::abort();
+    }
+    if (!Invoke(state, functions[number - FirstStub], block)) return;
+    // A native function resumed a guest frame. FEXCore continues at the address it pops from the guest
+    // stack after the call: put the frame's rip there, below its stack pointer.
+    const std::uint64_t rsp = state.gregs[REG_RSP] - 8;
+    std::memcpy(reinterpret_cast<void*>(rsp), &state.rip, sizeof(state.rip));
+    state.gregs[REG_RSP] = rsp;
 }
 
 Bridge::~Bridge() {
@@ -321,7 +407,24 @@ std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic v
         static_cast<std::uint8_t>(jump >> 16), static_cast<std::uint8_t>(jump >> 24)};
     std::memset(stub, 0xcc, StubBytes);
     std::memcpy(stub, code, sizeof(code));
-    functions.push_back({address, name, variadic, fixed, x87Result, signature, IsShaped(signature)});
+    Function function {address, name, variadic, fixed, x87Result, signature, IsShaped(signature)};
+    if (signature != nullptr && variadic == Variadic::None) {
+        std::size_t stackBytes = 0;
+        bool vectors = false;
+        for (std::size_t value = 1; value <= signature->parameterCount; ++value)
+            for (const BridgePiece& piece : BridgeGuestPieces(*signature, value)) {
+                if (piece.place == BridgePlace::Stack) stackBytes = std::max<std::size_t>(stackBytes, piece.at + piece.size);
+                vectors |= piece.place == BridgePlace::Vector;
+            }
+        function.stackSlots = static_cast<std::uint8_t>(std::min<std::size_t>((stackBytes + 7) / 8, 2 + StackArgumentSlots));
+        function.vectors = vectors;
+    }
+    if (signature != nullptr) {
+        for (const BridgeValue& parameter : BridgeParameters(*signature))
+            function.callbacks |= parameter.kind == BridgeKind::Function && IsShaped(BridgeCallback(parameter));
+        function.callbackResult = BridgeResult(*signature).kind == BridgeKind::Function;
+    }
+    functions.push_back(std::move(function));
     stubCount.store(functions.size(), std::memory_order_release);
     return reinterpret_cast<std::uint64_t>(stub);
 }
@@ -565,7 +668,7 @@ bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, st
     std::optional<ShapedFrame> shapedStorage;
     Aps5NativeArguments positional;
     Aps5NativeResult positionalResult {};
-    std::uint64_t slots[2 + StackArgumentSlots];
+    std::uint64_t slots[2 + StackArgumentSlots] {};
     VaList list {static_cast<std::uint32_t>(8 * function.fixed), 48, guestStack, registers};
     std::uint64_t variadicSlots[6 + StackArgumentSlots];
     std::uint64_t hidden = 0;
@@ -577,16 +680,17 @@ bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, st
         arguments = &shaped->arguments;
         result = &shaped->result;
     } else {
-        std::memcpy(slots, guestStack, ReadableBytes(guestStack, sizeof(slots)));
+        // With a signature, only the guest stack slots and vector registers the export reads.
+        if (function.stackSlots != 0) std::memcpy(slots, guestStack, ReadableBytes(guestStack, 8 * function.stackSlots));
         const std::uint64_t* stack = slots;
         positional = {
             {registers[0], registers[1], registers[2], registers[3], registers[4], registers[5], stack[0], stack[1]},
             {},
             stack + 2,
-            StackArgumentSlots,
+            function.stackSlots > 2 ? function.stackSlots - 2u : 0u,
             0,
         };
-        std::memcpy(positional.vector, reinterpret_cast<const void*>(block + BlockVectors), sizeof(positional.vector));
+        if (function.vectors) std::memcpy(positional.vector, reinterpret_cast<const void*>(block + BlockVectors), sizeof(positional.vector));
         switch (function.variadic) {
         case Variadic::None: break;
         case Variadic::GuestList: setBridgeVaList(&list); break;
@@ -601,6 +705,29 @@ bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, st
             std::abort();
         }
     }
+    if (function.callbacks) {
+        // Function pointers whose calls positional mapping gets wrong (floats past the registers, hidden
+        // results, long double...): guest functions become thunks that marshal from the callback's shape,
+        // import stubs the native functions behind them. Other function pointers stay as they are: a
+        // library may hand them back to the guest to run (a fiber's entry becomes its rip), and native
+        // calls to them work positionally through the fault path or CallProgram.
+        const auto parameters = BridgeParameters(*function.signature);
+        for (std::size_t index = 0; index < parameters.size(); ++index) {
+            if (parameters[index].kind != BridgeKind::Function || !IsShaped(BridgeCallback(parameters[index]))) continue;
+            const auto host = BridgeHostPieces(*function.signature, index + 1);
+            if (host.size() != 1 || host[0].size != 8) continue;
+            std::uint8_t* place = nullptr;
+            if (host[0].place == BridgePlace::Gpr)
+                place = reinterpret_cast<std::uint8_t*>(shaped != nullptr ? &shaped->arguments.gpr[host[0].reg] : &positional.gpr[host[0].reg]);
+            else if (host[0].place == BridgePlace::Stack && shaped != nullptr)
+                place = shaped->hostStack + host[0].at;
+            if (place == nullptr) continue;
+            std::uint64_t pointer = 0;
+            std::memcpy(&pointer, place, 8);
+            pointer = NativeCallable(pointer, BridgeCallback(parameters[index]));
+            std::memcpy(place, &pointer, 8);
+        }
+    }
     const GuestCall call {&state, block, currentCall};
     currentCall = &call;
     try {
@@ -610,6 +737,7 @@ bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, st
         if (function.variadic == Variadic::GuestList) setBridgeVaList(nullptr);
         for (std::size_t i = 0; i < 16; ++i) state.gregs[DwarfRegisters[i]] = frame.registers[i];
         state.rip = frame.registers[16];
+        if (const std::uint64_t guest = GuestBehindThunk(state.rip)) state.rip = guest;
         return true;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[aps5-fex] %s: %s\n", function.name.c_str(), error.what());
@@ -624,15 +752,38 @@ bool Bridge::Invoke(FEXCore::Core::CPUState& state, const Function& function, st
             std::fprintf(stderr, "[aps5-fex] %s: %s\n", function.name.c_str(), error.what());
             std::abort();
         }
+        if (function.callbackResult) registers[0] = GuestCallable(registers[0]);
         if (trace)
             std::fprintf(stderr, "[aps5-fex] %s returned %#llx:%#llx\n", function.name.c_str(), static_cast<unsigned long long>(registers[0]),
                          static_cast<unsigned long long>(registers[1]));
         return false;
     }
-    registers[0] = result->gpr[0];
+    registers[0] = function.callbackResult ? GuestCallable(result->gpr[0]) : result->gpr[0];
     registers[1] = result->gpr[1];
     std::memcpy(reinterpret_cast<void*>(block + BlockVectors), result->vector, 2 * sizeof(result->vector[0]));
     return false;
+}
+
+std::uint64_t Bridge::NativeCallable(std::uint64_t value, const BridgeSignature* callback) {
+    if (value == 0) return 0;
+    if (OwnsStub(value)) {
+        const std::uint64_t offset = value - StubBase();
+        if (offset >= FirstStubOffset && (offset - FirstStubOffset) % StubBytes == 0) {
+            const std::size_t index = (offset - FirstStubOffset) / StubBytes;
+            if (index < stubCount.load(std::memory_order_acquire) && functions[index].address != nullptr)
+                return reinterpret_cast<std::uint64_t>(functions[index].address);
+        }
+        return value;
+    }
+    if (IsGuestCodeAddress(value)) return GuestThunkFor(value, callback);
+    return value;
+}
+
+std::uint64_t Bridge::GuestCallable(std::uint64_t value) {
+    if (value == 0 || OwnsStub(value) || IsGuestCodeAddress(value)) return value;
+    if (const std::uint64_t guest = GuestBehindThunk(value)) return guest;
+    if (const std::uint64_t stub = StubFor(reinterpret_cast<void*>(value), "function pointer")) return stub;
+    return value;
 }
 
 std::uint64_t Bridge::Call(FEXCore::Core::CPUState& state, std::uint64_t number, std::uint64_t block) {
@@ -648,4 +799,8 @@ std::uint64_t Bridge::Call(FEXCore::Core::CPUState& state, std::uint64_t number,
     return reinterpret_cast<const std::uint64_t*>(block)[0];
 }
 
+}
+
+extern "C" void Aps5BridgeThunkCall(std::uint64_t block, FEXCore::Core::CpuStateFrame* frame) {
+    Aps5Fex::fastBridge->ThunkCall(frame, block);
 }

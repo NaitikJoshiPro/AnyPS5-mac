@@ -6,12 +6,20 @@
 #include <memory>
 #include <vector>
 
+namespace FEXCore::Core {
+struct CPUState;
+}
+
 namespace Aps5Fex {
 
 class Bridge;
 class GuestProgram;
 
 std::uint64_t CallGuestFunction(std::uint64_t target, const std::uint64_t* arguments);
+bool IsGuestCodeAddress(std::uint64_t address);
+
+using GuestStateHook = void (*)(FEXCore::Core::CPUState& state, void* context);
+void CallGuestWith(std::uint64_t target, GuestStateHook setup, GuestStateHook finish, void* context);
 
 class GuestCpu {
 public:
