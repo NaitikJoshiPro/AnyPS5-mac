@@ -366,6 +366,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     auto& state = *this;
     auto& cache = Draws();
     auto& recorder = *state.recorder;
+    // A batch over its kept-byte budget is submitted first (upstream's Draw does the same).
+    recorder.BoundKeptBytes();
     const auto& vertexResult = *vertex.program;
     const auto& vertexReflection = vertexResult.msl.Reflection();
     const auto* fragmentResult = fragment != nullptr ? fragment->program : nullptr;
@@ -745,6 +747,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
                 texture = [buffer newTextureWithDescriptor:descriptor offset:offset bytesPerRow:pitch];
                 if (texture == nil) Fail("cannot alias a linear color target");
+                state.KeepWrapped(attachment.begin, attachment.end - attachment.begin);
                 textures.push_back(texture);
             }
             width = std::min<std::uint32_t>(width, target.extent.width);
@@ -812,7 +815,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         std::vector<Abi::VertexFetchRecord> records(highest + 1u);
         for (auto& fetch : fetches) {
             auto record = fetch.record;
-            if (fetch.end > fetch.begin) record.address = state.Wrap(fetch.begin, fetch.end - fetch.begin);
+            if (fetch.end > fetch.begin) {
+                record.address = state.Wrap(fetch.begin, fetch.end - fetch.begin);
+                state.KeepWrapped(fetch.begin, fetch.end - fetch.begin);
+            }
             records[fetch.location] = record;
         }
         fetchAddress = stream.Write(std::as_bytes(std::span(records)), 16u).address;
@@ -881,6 +887,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     } else if (draw.indexed) {
         if (indexBegin % 4u == 0u) {
             indexAddress = state.Wrap(indexBegin, indexBytes);
+            state.KeepWrapped(indexBegin, indexBytes);
         } else {
             state.SettleRange(indexBegin, indexBytes);
             const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(indexBegin), indexBytes), 16u);

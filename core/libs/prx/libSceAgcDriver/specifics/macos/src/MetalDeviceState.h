@@ -195,6 +195,8 @@ struct VulkanDevice::State {
     id<MTLBuffer> ImportOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const;
     // The wrapper holding [address, address + bytes) and the offset of `address` in it (after Wrap).
     id<MTLBuffer> WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const;
+    // Charges the page wrapper holding a range (unregistered memory) to the open batch's kept bytes.
+    void KeepWrapped(std::uint64_t address, std::uint64_t bytes);
     // Drops the wrappers (and the cached BDA table) once the recorder is idle.
     void DropWrappersIfIdle();
     // The device-memory LDS arena for `groups` workgroups of `strideDwords` each.

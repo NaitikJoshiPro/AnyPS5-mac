@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -231,6 +232,15 @@ id<MTLBuffer> VulkanDevice::State::WrapperOf(std::uint64_t address, std::uint64_
         }
     }
     return nil;
+}
+
+// Guest memory a command reads through a page wrapper (unregistered memory) stays pinned and
+// resident while the batch is in flight: its pages count against the batch's kept-byte budget
+// (Recorder::BoundKeptBytes), where upstream counts the copies it makes of such memory.
+void VulkanDevice::State::KeepWrapped(std::uint64_t address, std::uint64_t bytes) {
+    std::uint64_t offset = 0;
+    if (context.hostImportAlignment != 0u && ImportOf(address, bytes, &offset) != nil) return;
+    if (id<MTLBuffer> wrapper = WrapperOf(address, bytes, &offset)) recorder->KeepBytes((__bridge const void*)wrapper, wrapper.length);
 }
 
 void VulkanDevice::State::DropWrappersIfIdle() {
@@ -557,7 +567,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
             state->compiler = state->pipelines->Compiler();
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
-            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod}) {
+            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
             // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
@@ -725,7 +735,8 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
 }
 
 void VulkanDevice::StoreIdleResults(bool) {
-    // Pending storage-image results are D4's (StorageTexture); the device has none yet.
+    // Pending storage-image results of the upstream image path (D4's Texture twin), as upstream.
+    if (Graphics::StorageTexture::AnyPending()) Graphics::StorageTexture::FlushAllPending("idle");
 }
 
 bool VulkanDevice::CanWaitUnlocked() const {
@@ -1128,6 +1139,7 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
                 const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
                 if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: a guest buffer exceeds 4 GiB");
                 entries[element] = {Wrap(aligned, bytes), static_cast<std::uint32_t>(bytes), 0u};
+                KeepWrapped(aligned, bytes);
                 const auto position = static_cast<std::size_t>(shader.memoryOffsetDword) * 4u + element;
                 if (position < push.size()) push[position] = std::byte{0};
             }
@@ -1234,6 +1246,8 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         if (chunks > MaxSplitChunks) throw std::runtime_error("Metal device: a dispatch of " + std::to_string(x) + "x" + std::to_string(y) + "x" + std::to_string(z) + " workgroups needs more than " + std::to_string(MaxSplitChunks) + " chunks");
     }
     auto& recorder = *this->recorder;
+    // A batch over its kept-byte budget is submitted first (upstream's dispatch does the same).
+    recorder.BoundKeptBytes();
     // The arena is sized for the whole grid (an indirect dispatch with an arena reads its counts on
     // the CPU first, so the grid is direct here); growing it waits for idle, before the open batch
     // is taken below.
