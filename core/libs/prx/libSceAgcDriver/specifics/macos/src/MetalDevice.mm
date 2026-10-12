@@ -34,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -322,6 +323,16 @@ void VulkanDevice::State::Sync() {
     if (!recorder->Idle()) Recorder::CountSync(0, __builtin_return_address(0));
     recorder->Sync();
     DropWrappersIfIdle();
+    RaisePendingFault();
+}
+
+void VulkanDevice::State::RaisePendingFault() {
+    std::exception_ptr fault;
+    {
+        std::lock_guard lock(faultMutex);
+        fault = std::exchange(pendingFault, nullptr);
+    }
+    if (fault != nullptr) std::rethrow_exception(fault);
 }
 
 // The BdaAbi fault buffer after a batch with dispatches completed: GPU stores through BDA addresses
@@ -658,6 +669,7 @@ void VulkanDevice::ReapRecorded(std::uint64_t serial) {
     Recorder::AnnounceSyncSite(__builtin_return_address(0));
     state->recorder->FinishUpTo(serial);
     state->DropWrappersIfIdle();
+    state->RaisePendingFault();
 }
 
 void VulkanDevice::ReapRecorded() {
@@ -1081,14 +1093,15 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     if (!writes.empty()) recorder.NotePendingWrites(writes);
     // Faults and written pages of this batch's dispatches (one shared record) when it completes.
     recorder.OnComplete([this] {
-        if (!tearingDown) {
-            CheckFaults();
-            return;
-        }
         try {
             CheckFaults();
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "[metal] %s\n", error.what());
+            if (tearingDown) {
+                std::fprintf(stderr, "[metal] %s\n", error.what());
+                return;
+            }
+            std::lock_guard lock(faultMutex);
+            if (pendingFault == nullptr) pendingFault = std::current_exception();
         }
     });
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", reads.size(), writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);

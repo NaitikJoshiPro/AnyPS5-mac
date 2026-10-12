@@ -13,6 +13,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -107,6 +108,11 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Recorder> recorder;
     // The device is being destroyed: completion actions log faults instead of throwing.
     bool tearingDown = false;
+    // A fault record a batch's completion found (the recorder runs completions on whichever thread
+    // reaps and swallows their exceptions): raised by the next Sync()/ReapRecorded.
+    std::mutex faultMutex;
+    std::exception_ptr pendingFault;
+    void RaisePendingFault();
     // Teardown() ran (from ~VulkanDevice or from the exit handler, whichever came first).
     bool tornDown = false;
     // Releases everything in the order the GPU driver needs (D19.5): waits for every submitted
