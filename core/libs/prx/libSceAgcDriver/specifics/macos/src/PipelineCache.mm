@@ -60,8 +60,8 @@ std::filesystem::path DefaultDirectory() {
 }
 
 MTLLanguageVersion Language(const ShaderRecompiler::MslShader&) {
-    // MslAbi::LanguageMajor/Minor: 4.0 today (MSL 4.1 comes with a Version bump).
-    return MTLLanguageVersion4_0;
+    // The MSL version the backend emits (MslAbi::LanguageMajor/Minor), as MetalDevice.mm's ShaderLanguage().
+    return static_cast<MTLLanguageVersion>((ShaderRecompiler::MslAbi::LanguageMajor << 16u) | ShaderRecompiler::MslAbi::LanguageMinor);
 }
 
 void AppendColor(std::string& key, const ColorAttachmentState& color) {
@@ -166,7 +166,7 @@ PipelineCache::~PipelineCache() {
 }
 
 id<MTLLibrary> PipelineCache::Library(const ShaderRecompiler::MslShader& shader, const std::vector<std::pair<std::string, std::string>>& macros) {
-    std::string key = shader.source;
+    std::string key = "msl" + std::to_string(ShaderRecompiler::MslAbi::LanguageMajor) + "." + std::to_string(ShaderRecompiler::MslAbi::LanguageMinor) + "\n" + shader.source;
     for (const auto& [name, value] : macros) key += "\n#" + name + "=" + value;
     {
         std::lock_guard lock(mutex);
