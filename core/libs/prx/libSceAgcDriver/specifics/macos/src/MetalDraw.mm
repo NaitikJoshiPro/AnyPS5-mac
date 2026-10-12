@@ -228,6 +228,9 @@ struct DrawCache {
     Graphics::Metal::ImageCache* images = nullptr;
     id<MTL4ArgumentTable> vertexArguments = nil;
     id<MTL4ArgumentTable> fragmentArguments = nil;
+    // MslAbi v4: the buffer of primitive-ordered fragment functions' raster order group (contents
+    // ignored), made on first use, resident through the device's residency set.
+    id<MTLBuffer> rasterOrder = nil;
 
     // The depth/stencil surface of one draw (DepthSurface.mm's registry holds the surfaces: GPU-only,
     // cleared at creation and after HTILE fast clears, never written back to guest memory).
@@ -284,7 +287,7 @@ Metal::DrawCache& VulkanDevice::State::Draws() {
         cache->device = state.device;
         cache->images = state.images.get();
         MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
-        table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::VertexFetch) + 1u;
+        table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
         NSError* error = nil;
         cache->vertexArguments = [state.device newArgumentTableWithDescriptor:table error:&error];
         cache->fragmentArguments = [state.device newArgumentTableWithDescriptor:table error:&error];
@@ -978,6 +981,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
     [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
     [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
+    std::uint64_t rasterOrderAddress = driverAddress;
+    if (fragmentReflection != nullptr && fragmentReflection->rasterOrder) {
+        if (cache.rasterOrder == nil) {
+            cache.rasterOrder = [state.device newBufferWithLength:Abi::RasterOrderBytes options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
+            if (cache.rasterOrder == nil) Fail("cannot allocate the raster order buffer");
+            [state.residency addAllocation:cache.rasterOrder];
+            [state.residency commit];
+        }
+        rasterOrderAddress = cache.rasterOrder.gpuAddress;
+    }
+    [cache.fragmentArguments setAddress:rasterOrderAddress atIndex:Abi::Index(Abi::BufferIndex::RasterOrder)];
     [encoder setArgumentTable:cache.vertexArguments atStages:MTLRenderStageVertex];
     [encoder setArgumentTable:cache.fragmentArguments atStages:MTLRenderStageFragment];
 
