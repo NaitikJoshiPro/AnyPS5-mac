@@ -72,10 +72,13 @@ static inline uint aps5_buffer_read(Aps5Buffer buffer, uint byteOffset, uint mis
     return (value >> ((byte & 3u) << 3u)) & ((1u << bits) - 1u);
 }
 
+// A masked store as one compare-exchange (AtomicUpdate): two lanes storing the same byte must leave
+// one lane's value, not the OR of both (a separate clear and set would).
 static inline void aps5_update_bits(device uint* word, uint mask, uint value) {
     device atomic_uint* bits = reinterpret_cast<device atomic_uint*>(word);
-    atomic_fetch_and_explicit(bits, ~mask, memory_order_relaxed);
-    atomic_fetch_or_explicit(bits, value & mask, memory_order_relaxed);
+    uint observed = atomic_load_explicit(bits, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(bits, &observed, (observed & ~mask) | (value & mask), memory_order_relaxed, memory_order_relaxed)) {
+    }
 }
 
 static inline void aps5_buffer_write(Aps5Buffer buffer, uint byteOffset, uint misalignment, uint byte, uint value, uint bits, bool glc) {

@@ -475,7 +475,10 @@ std::string FloatCompare(MslEmitterState& state, const IrValue& instruction) {
     const bool exact = state.target.keepF32Denormals;
     const auto call = [&](std::string_view function) { return std::string(function) + "(" + a + ", " + b + ")"; };
     const auto native = [&](std::string_view operation) { return "(" + a + " " + std::string(operation) + " " + b + ")"; };
-    const auto orderedNotEqual = "(" + a + " < " + b + " || " + a + " > " + b + ")";
+    // Ordered not-equal on NaN bits: the Metal compiler folds `a < b || a > b` into a compare that
+    // is true for NaN operands (v_cmp_lg_f32 of 0 and NaN measured 1 on the M3).
+    state.RequirePrelude(MslPreludeChunk::Alu);
+    const auto orderedNotEqual = "(aps5_f32_ordered(" + a + ", " + b + ") && " + a + " != " + b + ")";
     switch (instruction.Opcode()) {
     case IrOpcode::FPOrdEqual32: return exact ? call("aps5_feq") : native("==");
     case IrOpcode::FPOrdNotEqual32: return exact ? call("aps5_fne") : orderedNotEqual;

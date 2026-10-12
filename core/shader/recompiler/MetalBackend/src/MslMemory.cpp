@@ -201,7 +201,7 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bit
     const auto shared = SharedOf(state, instruction);
     const auto address = ByteAddress(state, instruction);
     if (bits < 32u) {
-        // Neighbouring lanes write the other bytes of the dword: clear and set the field atomically.
+        // Neighbouring lanes write the other bytes of the dword: one compare-exchange per field.
         const auto index = state.Temporary("aps5_di");
         const auto shift = state.Temporary("aps5_ds");
         const auto mask = bits == 8u ? std::string("0xffu") : std::string("0xffffu");
@@ -209,8 +209,10 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bit
         state.Line("const uint " + shift + " = (" + address + " & 3u) << 3u;");
         state.Line("if (" + index + " < " + shared.length + ") {");
         state.Indent();
-        state.Line("atomic_fetch_and_explicit(" + AtomicPointer(shared, index) + ", ~(" + mask + " << " + shift + "), memory_order_relaxed);");
-        state.Line("atomic_fetch_or_explicit(" + AtomicPointer(shared, index) + ", (uint(" + state.Arg(instruction, instruction.ArgumentCount() - 2u) + ") & " + mask + ") << " + shift + ", memory_order_relaxed);");
+        const auto old = state.Temporary("aps5_dw");
+        const auto field = "((uint(" + state.Arg(instruction, instruction.ArgumentCount() - 2u) + ") & " + mask + ") << " + shift + ")";
+        state.Line("uint " + old + " = atomic_load_explicit(" + AtomicPointer(shared, index) + ", memory_order_relaxed);");
+        state.Line("while (!atomic_compare_exchange_weak_explicit(" + AtomicPointer(shared, index) + ", &" + old + ", (" + old + " & ~(" + mask + " << " + shift + ")) | " + field + ", memory_order_relaxed, memory_order_relaxed)) {}");
         state.Outdent();
         state.Line("}");
     } else if (components == 1u) {

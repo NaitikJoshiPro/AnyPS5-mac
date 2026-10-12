@@ -327,8 +327,17 @@ struct Aps5BdaMemory {
 // atomics, scratch is the invocation's own.
 static inline void aps5_aperture_merge(threadgroup uint* word, uint mask, uint value) {
     threadgroup atomic_uint* bits = reinterpret_cast<threadgroup atomic_uint*>(word);
-    atomic_fetch_and_explicit(bits, ~mask, memory_order_relaxed);
-    atomic_fetch_or_explicit(bits, value & mask, memory_order_relaxed);
+    uint observed = atomic_load_explicit(bits, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(bits, &observed, (observed & ~mask) | (value & mask), memory_order_relaxed, memory_order_relaxed)) {
+    }
+}
+
+// Device-memory LDS (the WorkgroupMemory arena).
+static inline void aps5_aperture_merge(device uint* word, uint mask, uint value) {
+    device atomic_uint* bits = reinterpret_cast<device atomic_uint*>(word);
+    uint observed = atomic_load_explicit(bits, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(bits, &observed, (observed & ~mask) | (value & mask), memory_order_relaxed, memory_order_relaxed)) {
+    }
 }
 
 static inline void aps5_aperture_merge(thread uint* word, uint mask, uint value) {
