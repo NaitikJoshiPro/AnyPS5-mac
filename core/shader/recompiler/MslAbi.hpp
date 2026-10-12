@@ -40,7 +40,7 @@
 
 namespace ShaderRecompiler::MslAbi {
 
-inline constexpr std::uint32_t Version = 2u;
+inline constexpr std::uint32_t Version = 3u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -57,7 +57,10 @@ enum class BufferIndex : std::uint32_t {
     PushData = 1u,
     WorkgroupMemory = 2u,
     DriverData = 3u,
-    Count = 4u
+    // Version 3: vertex functions only, the VertexFetchRecord array indexed by Vulkan location
+    // (Reflection::vertexFetchLocations), for vertex pulling.
+    VertexFetch = 4u,
+    Count = 5u
 };
 
 inline constexpr std::uint32_t Index(BufferIndex index) {
@@ -160,6 +163,34 @@ struct DriverData {
     std::uint64_t atomicLocks;
 };
 
+// Version 3: one vertex attribute location as the vertex function pulls it (MSL Aps5VertexFetch).
+// address = the V# base (0 for a null V#, with bytes 0: reads give zeros), stride = the V# stride,
+// bytes = the readable bytes from address (VertexBufferExtent, ZeroStrideAvailableBytes for stride 0),
+// word3 = V# dword 3 (dst_sel and format), rate = the attribute's fetchIndex (0 per vertex,
+// 1 per instance), components = its format component count.
+struct VertexFetchRecord {
+    std::uint64_t address;
+    std::uint32_t stride;
+    std::uint32_t bytes;
+    std::uint32_t word3;
+    std::uint32_t rate;
+    std::uint32_t components;
+    std::uint32_t reserved;
+};
+
+static_assert(std::is_standard_layout_v<VertexFetchRecord> && sizeof(VertexFetchRecord) == 32u && offsetof(VertexFetchRecord, stride) == 8u);
+
+// Version 3: preprocessor macros the driver sets when it compiles a render pipeline's libraries
+// (MTLCompileOptions.preprocessorMacros):
+// - fragment: the vertex function's written user(locnN) locations (Reflection::outputLocations),
+//   decimal, bits 0-31 and 32-63; a fragment input whose location is not written reads its default;
+inline constexpr const char* VertexOutputsMacro = "APS5_VERTEX_OUTPUTS";
+inline constexpr const char* VertexOutputsHighMacro = "APS5_VERTEX_OUTPUTS_HI";
+// - vertex: 1 when the draw is a rect list expanded to 6 host vertices per rect;
+inline constexpr const char* RectListMacro = "APS5_RECT_LIST";
+// - vertex: 1 when the guest clip space has z in [-w, w] (the function remaps z = (z + w) / 2).
+inline constexpr const char* DepthNegativeOneToOneMacro = "APS5_DEPTH_NEGATIVE_ONE_TO_ONE";
+
 // Size of the lock table DriverData::atomicLocks points at (1024 lock words).
 inline constexpr std::uint32_t AtomicLockTableBytes = 4096u;
 
@@ -192,6 +223,21 @@ struct Reflection {
     TableLayout table;
     // [[function_constant]] ids the function declares; the driver supplies values for these only.
     std::vector<std::uint32_t> functionConstants;
+    // Version 3, vertex functions: user(locnN) outputs written (bit N), locations pulled through
+    // BufferIndex::VertexFetch (bit N).
+    std::uint64_t outputLocations = 0;
+    std::uint32_t vertexFetchLocations = 0;
+    // Version 3, fragment functions: color(n) outputs written (bit n); depth, stencil and sample
+    // mask exports; a dual-source second colour (color(0), index(1)); per-sample shading (reads
+    // sample_id); [[early_fragment_tests]]; the function can discard.
+    std::uint32_t colorOutputs = 0;
+    bool exportsDepth = false;
+    bool exportsStencil = false;
+    bool exportsSampleMask = false;
+    bool dualSource = false;
+    bool perSample = false;
+    bool earlyFragmentTests = false;
+    bool usesDiscard = false;
 
     bool operator==(const Reflection& other) const = default;
 };

@@ -322,6 +322,16 @@ void encodeMsl(Writer& writer, const SharedMsl& msl) {
     });
     writer.Value(reflection.table.bytes);
     writer.Values(std::span<const std::uint32_t>(reflection.functionConstants));
+    writer.Value(reflection.outputLocations);
+    writer.Value(reflection.vertexFetchLocations);
+    writer.Value(reflection.colorOutputs);
+    writer.Value(reflection.exportsDepth);
+    writer.Value(reflection.exportsStencil);
+    writer.Value(reflection.exportsSampleMask);
+    writer.Value(reflection.dualSource);
+    writer.Value(reflection.perSample);
+    writer.Value(reflection.earlyFragmentTests);
+    writer.Value(reflection.usesDiscard);
 }
 
 void decodeMsl(Reader& reader, SharedMsl& msl) {
@@ -348,6 +358,16 @@ void decodeMsl(Reader& reader, SharedMsl& msl) {
     });
     reader.Value(reflection.table.bytes);
     reader.Values(reflection.functionConstants);
+    reader.Value(reflection.outputLocations);
+    reader.Value(reflection.vertexFetchLocations);
+    reader.Value(reflection.colorOutputs);
+    reader.Value(reflection.exportsDepth);
+    reader.Value(reflection.exportsStencil);
+    reader.Value(reflection.exportsSampleMask);
+    reader.Value(reflection.dualSource);
+    reader.Value(reflection.perSample);
+    reader.Value(reflection.earlyFragmentTests);
+    reader.Value(reflection.usesDiscard);
     msl = SharedMsl(std::move(shader));
 }
 
