@@ -145,6 +145,18 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvEmitterHelpers.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvMemoryInstructions.cpp
 
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslEmitter.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslEntryPoint.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslFlowEmitter.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslPrelude.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslAluMath.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslFloat64.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslWave.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslMemory.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslRuntimeBuffer.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslImage.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslStageIo.cpp
+
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DummyShaders.cpp
     )
 
@@ -157,6 +169,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/include
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/include
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/include
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/include
             ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
             ${ANYPS5_GLSLANG_INCLUDE_DIRS}
     )

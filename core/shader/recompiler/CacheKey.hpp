@@ -243,6 +243,7 @@ private:
         append(key, value.float64DenormPreserve);
         append(key, value.registrationModules);
         append(key, value.registrationWordLimit);
+        append(key, static_cast<std::uint32_t>(value.backend));
     }
 };
 

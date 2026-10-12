@@ -10,6 +10,7 @@
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include "MetalBackend/MslEmitter.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
 #include <list>
@@ -408,7 +409,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     shaderInfoCollector.Collect(program, inputInfo);
 
     constexpr BindingAllocator bindingAllocator;
-    bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
+    const bool msl = request.target.backend == ShaderBackend::Msl;
+    bool registration = !msl && request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
     auto bindings = bindingAllocator.Allocate(program, request.layout, registration);
 
     SpirvTargetOptions targetOptions {};
@@ -427,13 +429,22 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
-    result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
-    if (registration && result.spirv.size() > request.target.registrationWordLimit) {
-        registration = false;
-        program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false);
-        targetOptions.registrationModules = false;
+    if (msl) {
+        MslTargetOptions mslOptions;
+        mslOptions.subgroupSize = request.target.subgroupSize;
+        mslOptions.bdaAbiVersion = request.target.bdaAbiVersion;
+        mslOptions.maxThreadgroupMemoryBytes = request.target.maxWorkgroupSharedMemoryBytes;
+        constexpr MslEmitter mslEmitter;
+        result.msl = SharedMsl(mslEmitter.Emit(program, inputInfo, bindings, mslOptions));
+    } else {
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        if (registration && result.spirv.size() > request.target.registrationWordLimit) {
+            registration = false;
+            program.Metadata().bindingLayoutComplete = false;
+            bindings = bindingAllocator.Allocate(program, request.layout, false);
+            targetOptions.registrationModules = false;
+            result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        }
     }
     result.registrationModule = registration;
 
@@ -477,10 +488,10 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         }
     }
 
-    const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
+    const bool embedded = !msl && !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+    if (!msl) result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
     if (embedded) {
         std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> classes{};
         for (std::uint32_t kind = 1u; kind < 3u; ++kind) {
@@ -502,11 +513,30 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 struct SpecializedModule {
     std::uint64_t specializationId = 0;
     SharedSpirv spirv;
+    // The Metal form keeps its source: the constants become function constants at pipeline creation.
+    SharedMsl msl;
+    std::vector<PipelineSpecializationConstant> functionConstants;
     std::vector<std::uint32_t> bindings;
     bool pushData = false;
 };
 
+std::shared_ptr<const SpecializedModule> buildMslModule(const CompiledShaderArtifact& artifact, std::span<const PipelineSpecializationConstant> constants) {
+    const auto& reflection = artifact.msl.Reflection();
+    auto module = std::make_shared<SpecializedModule>();
+    std::set<std::uint32_t> supplied;
+    for (const auto& constant : constants) {
+        if (!supplied.insert(constant.id).second) throw std::runtime_error("duplicate prepared specialization ID");
+        if (std::find(reflection.functionConstants.begin(), reflection.functionConstants.end(), constant.id) != reflection.functionConstants.end()) module->functionConstants.push_back(constant);
+    }
+    for (const auto& range : reflection.table.ranges) module->bindings.push_back(RuntimeAbi::BindingNumber(reflection.group, range.binding));
+    module->msl = artifact.msl;
+    module->pushData = reflection.usesPushData;
+    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    return module;
+}
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    if (!artifact.msl.empty()) return buildMslModule(artifact, constants);
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
@@ -834,9 +864,12 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto& module = entry->module;
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
+        result.msl = module->msl;
+        result.specialization = module->functionConstants;
         bindingPlan = &entry->bindings;
     } else {
         result.spirv = artifact.spirv;
+        result.msl = artifact.msl;
     }
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));

@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "MslAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include <array>
 #include <cstddef>
@@ -10,6 +11,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <string_view>
 #include <vector>
@@ -212,6 +215,12 @@ struct TessellationTargetLimits {
     std::uint32_t maxEvaluationOutputComponents;
 };
 
+// The form the device consumes: SPIR-V for Vulkan, Metal Shading Language source for Metal.
+enum class ShaderBackend : std::uint32_t {
+    Spirv,
+    Msl
+};
+
 struct SpirvTarget {
     std::uint32_t vulkanVersion;
     std::uint32_t spirvVersion;
@@ -232,6 +241,7 @@ struct SpirvTarget {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
+    ShaderBackend backend = ShaderBackend::Spirv;
 };
 
 struct BindingLayout {
@@ -453,6 +463,34 @@ private:
     std::shared_ptr<std::vector<std::uint32_t>> words;
 };
 
+// MetalBackend output: one library's source with its stage function MslAbi::EntryPoint, and what
+// it declares. Shared like SharedSpirv: cached results and every result materialized from them
+// point at one immutable shader.
+struct MslShader {
+    std::string source;
+    MslAbi::Reflection reflection;
+
+    bool operator==(const MslShader& other) const = default;
+};
+
+class SharedMsl {
+public:
+    SharedMsl() = default;
+    explicit SharedMsl(MslShader shader) : shader(std::make_shared<const MslShader>(std::move(shader))) {}
+
+    [[nodiscard]] bool empty() const { return shader == nullptr; }
+    [[nodiscard]] const MslShader& Shader() const {
+        if (shader == nullptr) throw std::runtime_error("the shader has no Metal Shading Language form");
+        return *shader;
+    }
+    [[nodiscard]] const std::string& Source() const { return Shader().source; }
+    [[nodiscard]] const MslAbi::Reflection& Reflection() const { return Shader().reflection; }
+    friend bool operator==(const SharedMsl& left, const SharedMsl& right) { return left.shader == right.shader || (left.shader != nullptr && right.shader != nullptr && *left.shader == *right.shader); }
+
+private:
+    std::shared_ptr<const MslShader> shader;
+};
+
 struct VertexInput {
     std::uint32_t location;
     std::uint32_t components;
@@ -473,6 +511,7 @@ struct VertexInputPatch {
 struct CompiledShaderArtifact {
     std::vector<VertexInputPatch> vertexInputPatches;
     SharedSpirv spirv;
+    SharedMsl msl;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t shaderDataDwords = 0;
     std::uint32_t imageMetadataDword = 0;
