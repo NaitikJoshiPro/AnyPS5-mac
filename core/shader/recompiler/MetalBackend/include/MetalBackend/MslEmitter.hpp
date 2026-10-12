@@ -14,6 +14,9 @@ struct MslTargetOptions {
     std::uint32_t subgroupSize = 32u;
     std::uint32_t bdaAbiVersion = 0u;
     std::uint32_t maxThreadgroupMemoryBytes = 32768u;
+    // FLOAT_MODE keeps f32 denormals (FP_DENORM_32 == 3). Apple GPUs flush f32 denormals in every float
+    // operation, so the ALU emits exact (slower) f32 arithmetic in this mode (MslAluMath.cpp, B2).
+    bool keepF32Denormals = false;
 };
 
 // IR -> Metal Shading Language, the MetalBackend counterpart of SpirvEmitter (same inputs, same
