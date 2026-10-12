@@ -68,47 +68,32 @@ struct VulkanDevice::State {
     id<MTLDevice> device = nil;
     id<MTL4CommandQueue> queue = nil;
     id<MTL4Compiler> compiler = nil;
-    id<MTLSharedEvent> event = nil;
+    // Long-lived resources the device's own commands use (guest-memory wrappers, the LDS arena, the
+    // fault buffer), attached to the queue.
     id<MTLResidencySet> residency = nil;
+    // The argument table of the device's dispatches (bindings are snapshotted per dispatch).
     id<MTL4ArgumentTable> arguments = nil;
-    // Transient upload ring (descriptor tables, push data, DriverData, BDA tables, label bytes),
-    // linear, reset whenever the device is idle.
-    id<MTLBuffer> ring = nil;
     // The BdaAbi fault buffer: fault record + written-page record, shared by every dispatch, checked
-    // and reset whenever the device goes idle (CheckFaults).
+    // and reset when a batch with a dispatch completes (CheckFaults).
     id<MTLBuffer> faults = nil;
     // Device-memory LDS arena (MslAbi::BufferIndex::WorkgroupMemory), grown in 1 MiB granules
     // while idle; its lock dwords start at zero.
     id<MTLBuffer> workgroupArena = nil;
-    std::size_t ringUsed = 0;
-    // Upload buffers of the command being built that did not fit the ring (Commit hands them to
-    // its batch).
-    std::vector<id<MTLBuffer>> uploads;
-    std::uint64_t submitted = 0;
     std::vector<std::uint32_t> capabilities;
     std::vector<std::string_view> extensions;
 
-    // A committed command buffer: its event value, its allocator, what it keeps alive (command
-    // buffers retain nothing in Metal 4: upload buffers beyond the ring, the registry lease of its
-    // BDA page table) and the completion actions run when it retires.
-    struct Batch {
-        std::uint64_t value;
-        id<MTL4CommandAllocator> allocator;
-        std::vector<id<MTLBuffer>> uploads;
-        GuestAllocations::Lease lease;
-        std::vector<std::function<void()>> completions;
-    };
-    std::deque<Batch> inflight;
-    std::vector<id<MTL4CommandAllocator>> freeAllocators;
-    // Command buffer errors reported by commit feedback, which may arrive after the device is gone.
-    struct Errors {
-        std::mutex mutex;
-        std::vector<std::string> messages;
-    };
-    std::shared_ptr<Errors> errors = std::make_shared<Errors>();
+    // D2's recorder (specifics/macos/src/Recorder.mm): every command of the device records into its
+    // open batch (a MTL4 command buffer), which it submits, waits for and completes; its pending
+    // writes back the GuestMemory flush hook, its label table WAIT_REG_MEM. The Context carries the
+    // Metal device and queue in its Vulkan-typed fields (D-M2-3) for the twins of D2-D6.
+    Graphics::Context context {};
+    std::unique_ptr<Graphics::Recorder> recorder;
+    // The device is being destroyed: completion actions log faults instead of throwing.
+    bool tearingDown = false;
 
-    // Guest memory wrapped in place (newBufferWithBytesNoCopy over 16 KiB pages), dropped whenever
-    // the device is idle; `wrapperEpoch` counts the drops (cached GPU addresses expire with it).
+    // Guest memory wrapped in place (newBufferWithBytesNoCopy over 16 KiB pages), dropped only when
+    // the recorder is idle (batches read them, and Metal 4 command buffers retain nothing);
+    // `wrapperEpoch` counts the drops (cached GPU addresses expire with it).
     struct Wrapper {
         std::uint64_t begin;
         std::uint64_t end;
@@ -123,58 +108,37 @@ struct VulkanDevice::State {
         std::uint64_t generation = ~std::uint64_t{0};
         std::uint64_t wrapperEpoch = ~std::uint64_t{0};
         std::vector<std::byte> bytes;
-        GuestAllocations::Lease lease;
+        std::shared_ptr<const GuestAllocations::Lease> lease;
+        // The writable ranges (a dispatch binding the table may store anywhere in them).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
     } addressTable;
 
     std::mutex pipelinesMutex;
     std::unordered_map<std::string, id<MTLLibrary>> libraries;
     std::unordered_map<std::string, id<MTLComputePipelineState>> computePipelines;
-    // The driver's own kernels (fills, copies), compiled on first use.
-    id<MTLLibrary> helpers = nil;
-    std::unordered_map<std::string, id<MTLComputePipelineState>> helperPipelines;
 
-    // An open command buffer with its compute encoder, ordered after all earlier work on the queue.
-    struct Encoding {
-        id<MTL4CommandAllocator> allocator = nil;
-        id<MTL4CommandBuffer> commands = nil;
-        id<MTL4ComputeCommandEncoder> encoder = nil;
-    };
-
-    // Upload memory for the command being built: its GPU address, CPU pointer, buffer and offset.
-    struct Upload {
-        std::uint64_t address;
-        void* host;
-        id<MTLBuffer> buffer;
-        std::uint64_t offset;
-    };
-    Upload Stage(std::size_t bytes, std::size_t alignment);
-    std::uint64_t Allocate(std::size_t bytes, std::size_t alignment, void** host);
-    // Makes room for `bytes` of ring allocations before anything of a command is wrapped or
-    // allocated (a full ring waits for idle, which drops wrappers).
-    void Reserve(std::size_t bytes);
     std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
     // Wrap without throwing: 0 when the range cannot be wrapped (unmapped, executable, unreadable).
     std::uint64_t TryWrap(std::uint64_t address, std::uint64_t bytes);
     // The wrapper holding [address, address + bytes) and the offset of `address` in it (after Wrap).
     id<MTLBuffer> WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const;
+    // Drops the wrappers (and the cached BDA table) once the recorder is idle.
+    void DropWrappersIfIdle();
     id<MTLLibrary> Library(const ShaderRecompiler::MslShader& shader);
     id<MTLComputePipelineState> ComputePipeline(const ShaderRecompiler::RecompileResult& shader);
-    id<MTLComputePipelineState> HelperPipeline(const char* name);
     // The device-memory LDS arena for `groups` workgroups of `strideDwords` each.
     id<MTLBuffer> WorkgroupArena(std::uint64_t groups, std::uint32_t strideDwords);
-    // The BDA page table for a dispatch: its GPU address and size; `lease` receives the registry
-    // lease the table's wrappers rely on (kept by the batch).
-    std::uint64_t BuildAddressTable(std::uint32_t* bytes, GuestAllocations::Lease* lease);
+    // The BDA page table bytes for a dispatch; `lease` receives the registry lease its wrappers
+    // rely on (kept by the batch).
+    const std::vector<std::byte>& AddressTableBytes(std::shared_ptr<const GuestAllocations::Lease>* lease);
     // Compute dispatches (MetalDevice.mm): the checks every dispatch makes, and the recording of
     // one grid (split over the group limit) or, with `indirect` (a guest address), of a dispatch
     // whose counts the GPU reads.
     void RequireDispatchable(const ShaderRecompiler::RecompileResult& shader) const;
     void RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect);
-    Encoding Begin();
-    // Ends the encoding and commits it; returns the event value that signals its completion.
-    std::uint64_t Commit(Encoding& encoding, Batch batch);
-    void Retire(bool wait);
+    // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).
+    void Sync();
     void CheckFaults();
 };
 

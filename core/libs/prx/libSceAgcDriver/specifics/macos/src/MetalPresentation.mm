@@ -56,8 +56,8 @@ void VulkanDevice::QueuePresent() {
 }
 
 void VulkanDevice::FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const {
-    submissions = state->submitted;
-    unsignaled = state->inflight.size();
+    submissions = state->recorder != nullptr ? state->recorder->Submissions() : 0u;
+    unsignaled = state->recorder != nullptr ? state->recorder->InFlightBatches() : 0u;
 }
 
 VulkanDevice::PresentStatistics VulkanDevice::PresentCounts() {

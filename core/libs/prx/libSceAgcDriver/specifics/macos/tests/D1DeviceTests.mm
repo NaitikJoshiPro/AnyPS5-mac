@@ -11,6 +11,7 @@
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -351,7 +352,7 @@ void CheckIndirect(AgcDriver::VulkanDevice& device) {
     const auto outcome = device.DispatchIndirect(CounterKernel(counter), reinterpret_cast<std::uintptr_t>(arguments.data()));
     device.WaitIdle();
     Require(outcome.cpuReason == 0, "indirect: the arguments were read on the CPU (reason " + std::to_string(outcome.cpuReason) + ")");
-    Require(counter[0] == 24u && counter[1] == 3u && counter[2] == 2u, "indirect: ran " + std::to_string(counter[0]) + " workgroups, expected the 4x3x2 an earlier dispatch wrote");
+    Require(counter[0] == 24u && counter[1] == 3u && counter[2] == 2u, "indirect: ran " + std::to_string(counter[0]) + " workgroups, expected the 4x3x2 an earlier dispatch wrote (the arguments hold " + std::to_string(arguments[0]) + "x" + std::to_string(arguments[1]) + "x" + std::to_string(arguments[2]) + ")");
     alignas(16384) static std::array<std::uint32_t, 64> output {};
     output.fill(0u);
     const auto lds = Kernel("if (local == 0u) atomic_fetch_add_explicit(reinterpret_cast<device atomic_uint*>(out(0)), 1u, memory_order_relaxed);", {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(output.data(), sizeof(output))}}, {32, 1, 1}, 11u);
@@ -378,14 +379,25 @@ void CheckSubmission(AgcDriver::VulkanDevice& device) {
     const std::array<std::uint32_t, 4> uniform {0x05050505u, 0x05050505u, 0x05050505u, 0x05050505u};
     Require(device.FillBuffer(reinterpret_cast<std::uintptr_t>(&memory[192]), 64, uniform), "fills: the uniform fill was refused");
     Require(!device.FillBuffer(reinterpret_cast<std::uintptr_t>(&memory[1]), 64, uniform), "fills: a misaligned fill was accepted");
-    bool completed = false;
-    Require(device.AfterRecordedWork([&] { completed = true; }, false), "completions: an action behind recorded work was not deferred");
     const auto copy = device.CopyBuffer(reinterpret_cast<std::uintptr_t>(&memory[512]), reinterpret_cast<std::uintptr_t>(&memory[64]), 256, 0, 1u << 20u, 0, 0, 0, [](std::span<const std::byte>, std::uint64_t) {});
     Require(copy.path == 1, "copies: a copy behind recorded work took path " + std::to_string(copy.path));
     const auto oddCopy = device.CopyBuffer(reinterpret_cast<std::uintptr_t>(&memory[700]) + 1u, reinterpret_cast<std::uintptr_t>(&memory[64]) + 3u, 9, 0, 1u << 20u, 0, 0, 0, [](std::span<const std::byte>, std::uint64_t) {});
     Require(oddCopy.path == 1, "copies: an unaligned copy took path " + std::to_string(oddCopy.path));
+    // A CPU read through GuestMemory waits for the GPU stores into its range (the recorder's
+    // flush hook over the pending writes the device noted), without WaitIdle.
+    std::array<std::uint32_t, 4> read {};
+    AgcDriver::GuestMemory::Read(reinterpret_cast<std::uintptr_t>(&memory[512]), std::as_writable_bytes(std::span(read)), 4);
+    Require(read == pattern, "flush hook: a GuestMemory read did not wait for the GPU copy into it (" + Hex(read[0]) + ")");
+    // A completion action (an EOP interrupt) runs when the work recorded before it completed.
+    Require(device.FillBuffer(reinterpret_cast<std::uintptr_t>(&memory[960]), 64, pattern), "fills: the fill before the completion was refused");
+    bool completed = false;
+    std::uint32_t seenAtCompletion = 0;
+    Require(device.AfterRecordedWork([&] {
+        completed = true;
+        seenAtCompletion = memory[960];
+    }, false), "completions: an action behind recorded work was not deferred");
     device.WaitIdle();
-    Require(completed, "completions: the action did not run when its work retired");
+    Require(completed && seenAtCompletion == pattern[0], "completions: the action did not run after the work before it (" + Hex(seenAtCompletion) + ")");
     Require(memory[8] == label[0] && memory[9] == label[1] && memory[7] == 0x11111111u && memory[10] == 0x11111111u, "labels: the label did not land after the dispatch (" + Hex(memory[8]) + ")");
     for (std::uint32_t index = 0; index < 64u; ++index) Require(memory[64u + index] == pattern[index % 4u], "fills: dword " + std::to_string(index) + " of the pattern fill is " + Hex(memory[64u + index]));
     for (std::uint32_t index = 0; index < 16u; ++index) Require(memory[192u + index] == 0x05050505u, "fills: the uniform fill is wrong");
@@ -399,7 +411,7 @@ void CheckSubmission(AgcDriver::VulkanDevice& device) {
     Require(cpuCopy.path == 0 && std::memcmp(&memory[800], &memory[64], 64) == 0, "copies: an idle small copy took path " + std::to_string(cpuCopy.path));
     const auto bigCopy = device.CopyBuffer(reinterpret_cast<std::uintptr_t>(&memory[800]), reinterpret_cast<std::uintptr_t>(&memory[64]), 64, 0, 32, 0, 0, 0, [](std::span<const std::byte>, std::uint64_t) {});
     Require(bigCopy.path == 8, "copies: a copy over gpuMax took path " + std::to_string(bigCopy.path));
-    std::puts("submission: GPU labels, pattern and uniform fills, aligned and unaligned copies and completions ordered after recorded work");
+    std::puts("submission: GPU labels, pattern and uniform fills, aligned and unaligned copies, flush-hook reads and completions ordered after recorded work");
 }
 
 void CheckProfile(AgcDriver::VulkanDevice& device) {

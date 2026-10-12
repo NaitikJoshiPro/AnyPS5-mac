@@ -3,17 +3,19 @@
 // docs/mac/M2_DESIGN.md): device setup, the Metal shader target, compute dispatches (direct, split,
 // indirect) of MetalBackend shaders over wrapped guest memory with every MslAbi binding the compute
 // path has (guest buffers, GDS, BDA page table, fault buffer, flattened SRT, shader data, the
-// device-memory LDS arena), GPU labels, fills and copies, completion actions and the
-// synchronization the PM4 core needs.
-// Command model: one MTL4 command queue, a MTLSharedEvent timeline, every command buffer ordered
-// after all earlier work by a queue barrier (bring-up policy) and committed at once; D2's recorder
-// replaces the immediate commits with batches.
+// device-memory LDS arena), GPU labels, fills and copies, and the submission the PM4 core drives.
+// Every command records into D2's recorder (specifics/macos/src/Recorder.mm), as upstream
+// VulkanDevice.cpp records into the Vulkan one: batches are MTL4 command buffers on the device's
+// queue, waits and completions are the recorder's, and its pending writes and label table serve
+// the GuestMemory flush hook and WAIT_REG_MEM.
 
 #include "MetalDeviceState.h"
+#include "MetalCommandStream.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -24,9 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -48,13 +48,9 @@ namespace {
 
 namespace Abi = ShaderRecompiler::MslAbi;
 namespace Bda = ShaderRecompiler::BdaAbi;
+using Graphics::Recorder;
 
 constexpr std::uint64_t HostPage = 16384u;
-constexpr std::size_t RingBytes = 8u << 20u;
-// Ring room a command needs at its start; less waits for idle and starts the ring over (a larger
-// single allocation gets a buffer of its own).
-constexpr std::size_t RingHeadroom = 1u << 20u;
-constexpr std::uint64_t WaitTimeoutMs = 20000u;
 constexpr std::uint64_t ArenaGranule = 1u << 20u;
 // Workgroups per grid dimension the device reports (WorkGroupCountLimit). Metal ran 2^24
 // threadgroups in x and 2^20 in y and z on the M3 (no limit is documented); dispatches beyond this
@@ -62,6 +58,12 @@ constexpr std::uint64_t ArenaGranule = 1u << 20u;
 // as upstream splits with vkCmdDispatchBase.
 constexpr std::uint32_t GroupLimit = 65535u;
 constexpr std::uint64_t MaxSplitChunks = 1u << 16u;
+
+// The Vulkan stage and access masks of upstream's barriers (the command stream maps the stages).
+constexpr VkPipelineStageFlags AnyStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+constexpr VkAccessFlags ShaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+constexpr VkAccessFlags DispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+constexpr VkAccessFlags TransferredAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
 
 std::uint64_t NextSerial() {
     static std::atomic<std::uint64_t> serials{0};
@@ -76,6 +78,19 @@ std::uint32_t LoopGuardLimit() {
         return parsed == 0u ? 0xffffffffu : parsed;
     }();
     return limit;
+}
+
+// Debug aid (APS5_NO_OPPORTUNISTIC_REAP=1), as upstream: no reap of finished batches before a
+// label, fill, copy or dispatch decision.
+bool OpportunisticReap() {
+    static const bool enabled = std::getenv("APS5_NO_OPPORTUNISTIC_REAP") == nullptr;
+    return enabled;
+}
+
+// APS5_METAL_TRACE=1: one stderr line per command the device records (debug aid).
+bool Trace() {
+    static const bool trace = std::getenv("APS5_METAL_TRACE") != nullptr;
+    return trace;
 }
 
 std::string Hex(std::uint64_t value) {
@@ -124,59 +139,10 @@ MTLLanguageVersion ShaderLanguage() {
     return Abi::LanguageMinor >= 1u ? MTLLanguageVersion4_1 : MTLLanguageVersion4_0;
 }
 
-// The driver's own kernels. Their arguments are a constant block at the push data slot.
-constexpr const char* HelperSource = R"(#include <metal_stdlib>
-using namespace metal;
-
-struct Aps5FillArguments {
-    ulong address;
-    uint count;
-    uint reserved;
-    uint4 pattern;
-};
-
-// Stores a 16-byte pattern `count` times from `address` (16-byte aligned).
-kernel void aps5_fill16(constant Aps5FillArguments& arguments [[buffer(1)]], uint index [[thread_position_in_grid]]) {
-    if (index < arguments.count) reinterpret_cast<device uint4*>(arguments.address)[index] = arguments.pattern;
-}
-)";
-
-struct FillArguments {
-    std::uint64_t address;
-    std::uint32_t count;
-    std::uint32_t reserved;
-    std::array<std::uint32_t, 4> pattern;
-};
-
-static_assert(sizeof(FillArguments) == 32u);
-
+std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
+    return shader.msl.Reflection().workgroupMemoryStrideDwords;
 }
 
-VulkanDevice::State::Upload VulkanDevice::State::Stage(std::size_t bytes, std::size_t alignment) {
-    const auto offset = (ringUsed + alignment - 1u) & ~(alignment - 1u);
-    if (offset + bytes <= RingBytes) {
-        ringUsed = offset + bytes;
-        return {ring.gpuAddress + offset, static_cast<std::byte*>(ring.contents) + offset, ring, offset};
-    }
-    // A buffer of its own, kept by the batch of the command being built (Commit).
-    id<MTLBuffer> buffer = [device newBufferWithLength:std::max<std::size_t>(bytes, 16u) options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-    if (buffer == nil) throw std::runtime_error("Metal device: cannot allocate " + std::to_string(bytes) + " bytes of upload memory");
-    [residency addAllocation:buffer];
-    [residency commit];
-    uploads.push_back(buffer);
-    return {buffer.gpuAddress, buffer.contents, buffer, 0u};
-}
-
-std::uint64_t VulkanDevice::State::Allocate(std::size_t bytes, std::size_t alignment, void** host) {
-    const auto upload = Stage(bytes, alignment);
-    *host = upload.host;
-    return upload.address;
-}
-
-void VulkanDevice::State::Reserve(std::size_t bytes) {
-    if (RingBytes - ringUsed >= std::max(bytes, RingHeadroom)) return;
-    if (!inflight.empty()) Retire(true);
-    ringUsed = 0;
 }
 
 std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t bytes) {
@@ -215,6 +181,16 @@ id<MTLBuffer> VulkanDevice::State::WrapperOf(std::uint64_t address, std::uint64_
         }
     }
     return nil;
+}
+
+void VulkanDevice::State::DropWrappersIfIdle() {
+    if (recorder == nullptr || !recorder->Idle() || wrappers.empty()) return;
+    for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
+    [residency commit];
+    wrappers.clear();
+    ++wrapperEpoch;
+    // The cached BDA table points into the dropped wrappers and its lease pins the registry.
+    addressTable = {};
 }
 
 id<MTLLibrary> VulkanDevice::State::Library(const ShaderRecompiler::MslShader& shader) {
@@ -271,30 +247,6 @@ id<MTLComputePipelineState> VulkanDevice::State::ComputePipeline(const ShaderRec
     return pipeline;
 }
 
-id<MTLComputePipelineState> VulkanDevice::State::HelperPipeline(const char* name) {
-    std::lock_guard lock(pipelinesMutex);
-    if (const auto found = helperPipelines.find(name); found != helperPipelines.end()) return found->second;
-    NSError* error = nil;
-    if (helpers == nil) {
-        MTLCompileOptions* options = [MTLCompileOptions new];
-        options.languageVersion = MTLLanguageVersion4_0;
-        MTL4LibraryDescriptor* descriptor = [MTL4LibraryDescriptor new];
-        descriptor.source = @(HelperSource);
-        descriptor.options = options;
-        helpers = [compiler newLibraryWithDescriptor:descriptor error:&error];
-        if (helpers == nil) throw std::runtime_error("Metal device: the driver's helper kernels did not compile: " + Describe(error));
-    }
-    MTL4LibraryFunctionDescriptor* function = [MTL4LibraryFunctionDescriptor new];
-    function.name = @(name);
-    function.library = helpers;
-    MTL4ComputePipelineDescriptor* descriptor = [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = function;
-    id<MTLComputePipelineState> pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
-    if (pipeline == nil) throw std::runtime_error(std::string("Metal device: helper pipeline ") + name + " creation failed: " + Describe(error));
-    helperPipelines.emplace(name, pipeline);
-    return pipeline;
-}
-
 id<MTLBuffer> VulkanDevice::State::WorkgroupArena(std::uint64_t groups, std::uint32_t strideDwords) {
     const auto groupBytes = static_cast<std::uint64_t>(strideDwords) * 4u;
     const auto limit = static_cast<std::uint64_t>(device.maxBufferLength);
@@ -303,8 +255,8 @@ id<MTLBuffer> VulkanDevice::State::WorkgroupArena(std::uint64_t groups, std::uin
     }
     const auto bytes = std::max<std::uint64_t>(groups, 1u) * groupBytes;
     if (workgroupArena != nil && workgroupArena.length >= bytes) return workgroupArena;
-    // Grown only while idle: in-flight dispatches still index the old arena.
-    if (!inflight.empty()) Retire(true);
+    // Grown only while idle: recorded and in-flight dispatches still index the old arena.
+    if (!recorder->Idle()) Sync();
     const auto size = std::min<std::uint64_t>((bytes + ArenaGranule - 1u) / ArenaGranule * ArenaGranule, limit);
     id<MTLBuffer> arena = [device newBufferWithLength:size options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
     if (arena == nil) throw std::runtime_error("Metal device: cannot allocate " + std::to_string(size) + " bytes of device-memory LDS");
@@ -317,146 +269,57 @@ id<MTLBuffer> VulkanDevice::State::WorkgroupArena(std::uint64_t groups, std::uin
     return arena;
 }
 
-std::uint64_t VulkanDevice::State::BuildAddressTable(std::uint32_t* tableBytes, GuestAllocations::Lease* lease) {
+const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared_ptr<const GuestAllocations::Lease>* lease) {
     // The registry generation is read before the lease: a mutation bumps it before it releases the
     // registry, so an unchanged generation means the lease is the one a build would make now.
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (addressTable.generation != generation || addressTable.wrapperEpoch != wrapperEpoch) {
-        auto acquired = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        auto acquired = std::make_shared<GuestAllocations::Lease>(GuestAllocations::GuestAllocationsAcquire_nid_postfix());
         std::vector<Bda::Range> ranges;
-        ranges.reserve(acquired.size());
+        ranges.reserve(acquired->size());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
-        for (const auto& range : acquired) {
+        for (const auto& range : *acquired) {
             const auto gpu = TryWrap(range->address, range->bytes);
             if (gpu == 0) {
                 ++skipped;
                 continue;
             }
             const auto permissions = Bda::Read | (range->writable ? Bda::Write : 0u);
-            if ((permissions & Bda::Write) != 0u && range->address + range->bytes > Bda::WrittenAddressLimit) {
-                throw std::runtime_error("Metal device: a writable BDA range ends past the addresses the written-page record can hold");
+            if ((permissions & Bda::Write) != 0u) {
+                if (range->address + range->bytes > Bda::WrittenAddressLimit) throw std::runtime_error("Metal device: a writable BDA range ends past the addresses the written-page record can hold");
+                writable.push_back({range->address, range->address + range->bytes});
             }
             ranges.push_back({range->address, range->address + range->bytes, gpu, permissions, 0u});
         }
         if (skipped != 0u && addressTable.skipped != skipped) {
-            std::fprintf(stderr, "[metal] BDA page table: %zu of %zu guest allocations cannot be wrapped in place and are left out (mirrors: work package D3)\n", skipped, acquired.size());
+            std::fprintf(stderr, "[metal] BDA page table: %zu of %zu guest allocations cannot be wrapped in place and are left out (mirrors: work package D3)\n", skipped, acquired->size());
         }
         // TryWrap may have created wrappers but never drops any, so the epoch is still current.
         const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
         addressTable.bytes.resize(sizeof(header) + ranges.size() * sizeof(Bda::Range));
         std::memcpy(addressTable.bytes.data(), &header, sizeof(header));
         if (!ranges.empty()) std::memcpy(addressTable.bytes.data() + sizeof(header), ranges.data(), ranges.size() * sizeof(Bda::Range));
+        if (addressTable.bytes.size() > 0xffffffffu) throw std::runtime_error("Metal device: the BDA page table exceeds 4 GiB");
         addressTable.generation = generation;
         addressTable.wrapperEpoch = wrapperEpoch;
         addressTable.lease = std::move(acquired);
+        addressTable.writable = std::move(writable);
         addressTable.skipped = skipped;
     }
-    if (addressTable.bytes.size() > 0xffffffffu) throw std::runtime_error("Metal device: the BDA page table exceeds 4 GiB");
-    void* host = nullptr;
-    const auto address = Allocate(addressTable.bytes.size(), 16u, &host);
-    std::memcpy(host, addressTable.bytes.data(), addressTable.bytes.size());
-    *tableBytes = static_cast<std::uint32_t>(addressTable.bytes.size());
     *lease = addressTable.lease;
-    return address;
+    return addressTable.bytes;
 }
 
-VulkanDevice::State::Encoding VulkanDevice::State::Begin() {
-    Encoding encoding;
-    if (!freeAllocators.empty()) {
-        encoding.allocator = freeAllocators.back();
-        freeAllocators.pop_back();
-    } else {
-        encoding.allocator = [device newCommandAllocator];
-    }
-    encoding.commands = [device newCommandBuffer];
-    if (encoding.allocator == nil || encoding.commands == nil) throw std::runtime_error("Metal device: cannot create a command buffer");
-    [encoding.commands beginCommandBufferWithAllocator:encoding.allocator];
-    encoding.encoder = [encoding.commands computeCommandEncoder];
-    // Bring-up ordering: everything committed before, any stage, completes before this encoder.
-    [encoding.encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
-    [encoding.encoder setArgumentTable:arguments];
-    return encoding;
+void VulkanDevice::State::Sync() {
+    if (recorder == nullptr) return;
+    if (!recorder->Idle()) Recorder::CountSync(0, __builtin_return_address(0));
+    recorder->Sync();
+    DropWrappersIfIdle();
 }
 
-std::uint64_t VulkanDevice::State::Commit(Encoding& encoding, Batch batch) {
-    [encoding.encoder endEncoding];
-    [encoding.commands endCommandBuffer];
-    MTL4CommitOptions* options = [MTL4CommitOptions new];
-    std::shared_ptr<Errors> sink = errors;
-    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-        if (feedback.error == nil) return;
-        std::lock_guard lock(sink->mutex);
-        sink->messages.push_back(Describe(feedback.error));
-    }];
-    id<MTL4CommandBuffer> list[1] = {encoding.commands};
-    [queue commit:list count:1 options:options];
-    [queue signalEvent:event value:++submitted];
-    batch.value = submitted;
-    batch.allocator = encoding.allocator;
-    batch.uploads = std::move(uploads);
-    uploads.clear();
-    inflight.push_back(std::move(batch));
-    encoding = {};
-    return submitted;
-}
-
-void VulkanDevice::State::Retire(bool wait) {
-    if (queue == nil) return;
-    if (wait && submitted != 0u && ![event waitUntilSignaledValue:submitted timeoutMS:WaitTimeoutMs]) {
-        throw std::runtime_error("Metal device: the GPU did not finish within " + std::to_string(WaitTimeoutMs) + " ms");
-    }
-    const auto done = event.signaledValue;
-    std::vector<std::function<void()>> actions;
-    bool released = false;
-    while (!inflight.empty() && inflight.front().value <= done) {
-        auto& batch = inflight.front();
-        [batch.allocator reset];
-        freeAllocators.push_back(batch.allocator);
-        for (auto& action : batch.completions) actions.push_back(std::move(action));
-        for (id<MTLBuffer> buffer : batch.uploads) {
-            [residency removeAllocation:buffer];
-            released = true;
-        }
-        inflight.pop_front();
-    }
-    std::string fault;
-    if (inflight.empty()) {
-        ringUsed = 0;
-        for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
-        released = released || !wrappers.empty();
-        if (!wrappers.empty()) ++wrapperEpoch;
-        wrappers.clear();
-        // The cached BDA table points into the dropped wrappers and its lease pins the registry.
-        addressTable = {};
-        try {
-            CheckFaults();
-        } catch (const std::exception& error) {
-            fault = error.what();
-        }
-    }
-    if (released) [residency commit];
-    // Completion actions (EOP interrupts, deferred stores) run in batch order, after the batch's
-    // GPU stores are visible; a failure in one does not drop the others.
-    std::string actionFailure;
-    for (auto& action : actions) {
-        try {
-            action();
-        } catch (const std::exception& error) {
-            if (actionFailure.empty()) actionFailure = error.what();
-        }
-    }
-    std::vector<std::string> failures;
-    {
-        std::lock_guard lock(errors->mutex);
-        failures.swap(errors->messages);
-    }
-    if (!failures.empty()) throw std::runtime_error("Metal device: command buffer failed: " + failures.front());
-    if (!fault.empty()) throw std::runtime_error(fault);
-    if (!actionFailure.empty()) throw std::runtime_error("Metal device: a completion action failed: " + actionFailure);
-}
-
-// The BdaAbi fault buffer after the GPU went idle: GPU stores through BDA addresses are reported
-// to the write tracker (written-page record), then a published fault record is raised.
+// The BdaAbi fault buffer after a batch with dispatches completed: GPU stores through BDA addresses
+// are reported to the write tracker (written-page record), then a published fault record is raised.
 void VulkanDevice::State::CheckFaults() {
     auto* words = static_cast<std::uint32_t*>(faults.contents);
     if (words[Bda::WrittenOverflowWord] != 0u) {
@@ -515,16 +378,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
         if (compileOnly) return;
         state->queue = [state->device newMTL4CommandQueue];
-        state->event = [state->device newSharedEvent];
         MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
         residency.initialCapacity = 64;
         state->residency = [state->device newResidencySetWithDescriptor:residency error:&error];
-        if (state->queue == nil || state->event == nil || state->residency == nil) throw std::runtime_error("Metal device: queue setup failed: " + Describe(error));
-        state->ring = [state->device newBufferWithLength:RingBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+        if (state->queue == nil || state->residency == nil) throw std::runtime_error("Metal device: queue setup failed: " + Describe(error));
         state->faults = [state->device newBufferWithLength:Bda::FaultBufferBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-        if (state->ring == nil || state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the upload ring or the fault buffer");
+        if (state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the fault buffer");
         std::memset(state->faults.contents, 0, state->faults.length);
-        [state->residency addAllocation:state->ring];
         [state->residency addAllocation:state->faults];
         [state->residency commit];
         [state->queue addResidencySet:state->residency];
@@ -532,15 +392,45 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
         state->arguments = [state->device newArgumentTableWithDescriptor:table error:&error];
         if (state->arguments == nil) throw std::runtime_error("Metal device: argument table setup failed: " + Describe(error));
+
+        // The Context of the D2-D6 twins (D2's integration steps, docs/mac/M2_DESIGN.md §9 D2).
+        auto& context = state->context;
+        context.device = Graphics::Metal::DeviceHandle(state->device);
+        context.queue = Graphics::Metal::QueueHandle(state->queue);
+        context.bufferDeviceAddress = true;
+        const auto bufferLength = static_cast<std::uint64_t>(state->device.maxBufferLength);
+        context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
+        context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
+        context.limits.maxPushConstantsSize = Abi::PushDataBytes;
+        context.limits.maxBoundDescriptorSets = 4u;
+        context.limits.minStorageBufferOffsetAlignment = 4u;
+        context.limits.nonCoherentAtomSize = 1u;
+        const auto threads = state->device.maxThreadsPerThreadgroup;
+        context.limits.maxComputeWorkGroupCount[0] = context.limits.maxComputeWorkGroupCount[1] = context.limits.maxComputeWorkGroupCount[2] = GroupLimit;
+        context.limits.maxComputeWorkGroupSize[0] = static_cast<std::uint32_t>(threads.width);
+        context.limits.maxComputeWorkGroupSize[1] = static_cast<std::uint32_t>(threads.height);
+        context.limits.maxComputeWorkGroupSize[2] = static_cast<std::uint32_t>(threads.depth);
+        context.limits.maxComputeWorkGroupInvocations = 1024u;
+        context.limits.maxComputeSharedMemorySize = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
+        context.subgroup.subgroupSize = 32u;
+        context.bufferPool = std::make_shared<Graphics::BufferPool>(context);
+        state->recorder = std::make_unique<Graphics::Recorder>(context, true);
+        context.recorder = state->recorder.get();
+        state->recorder->Activate();
     }
 }
 
 VulkanDevice::~VulkanDevice() {
+    if (state == nullptr) return;
+    state->tearingDown = true;
     try {
-        if (state != nullptr) state->Retire(true);
+        state->Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[metal] %s\n", error.what());
     }
+    // The recorder's teardown frees what its batches kept; the wrappers go after it.
+    state->recorder.reset();
+    state->context.recorder = nullptr;
 }
 
 ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePipelineCapture&, std::span<const std::byte>) {
@@ -576,14 +466,15 @@ ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t) const {
 }
 
 VkDevice VulkanDevice::Device() const {
-    return VK_NULL_HANDLE;
+    return state->context.device;
 }
 
 void VulkanDevice::WaitIdle() {
-    state->Retire(true);
+    state->Sync();
 }
 
 void VulkanDevice::PrepareForReplacement() {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::PrepareForReplacement");
     WaitIdle();
 }
 
@@ -592,115 +483,150 @@ bool VulkanDevice::ImportGuestMemory(const GuestAllocations::Mapped&, std::uint6
 }
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
-    if (reapFirst) state->Retire(false);
+    if (state->recorder == nullptr) return;
+    if (reapFirst && OpportunisticReap()) {
+        state->recorder->Reap();
+        state->DropWrappersIfIdle();
+    }
+    state->recorder->Submit();
 }
 
-void VulkanDevice::StoreIdleResults(bool reapFirst) {
-    if (reapFirst) state->Retire(false);
+void VulkanDevice::StoreIdleResults(bool) {
+    // Pending storage-image results are D4's (StorageTexture); the device has none yet.
 }
 
 bool VulkanDevice::CanWaitUnlocked() const {
-    return true;
+    return state->recorder != nullptr && state->recorder->HasTimeline();
 }
 
 std::uint64_t VulkanDevice::SubmitAndEpoch() {
-    return state->inflight.empty() ? 0u : state->submitted;
+    if (state->recorder == nullptr) return 0;
+    if (OpportunisticReap()) {
+        state->recorder->Reap();
+        state->DropWrappersIfIdle();
+    }
+    return state->recorder->SubmitAndEpoch();
 }
 
 void VulkanDevice::WaitRecorded(std::uint64_t serial) {
-    if (serial != 0u && ![state->event waitUntilSignaledValue:serial timeoutMS:WaitTimeoutMs]) throw std::runtime_error("Metal device: the GPU did not finish within the timeout");
+    if (state->recorder != nullptr) state->recorder->WaitSerial(serial);
 }
 
-void VulkanDevice::ReapRecorded(std::uint64_t) {
-    state->Retire(false);
+void VulkanDevice::ReapRecorded(std::uint64_t serial) {
+    if (state->recorder == nullptr) return;
+    Recorder::AnnounceSyncSite(__builtin_return_address(0));
+    state->recorder->FinishUpTo(serial);
+    state->DropWrappersIfIdle();
 }
 
 void VulkanDevice::ReapRecorded() {
-    state->Retire(false);
+    if (state->recorder == nullptr) return;
+    state->recorder->Reap();
+    state->DropWrappersIfIdle();
 }
 
-// The store is a copy from the upload ring into the wrapped label memory in a command buffer of its
-// own, ordered after everything committed before it; the CPU writes the label (1) when nothing is
-// in flight. Without D2's recorder there is no pending-label table: waiters poll memory.
-int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t, std::uint32_t, bool reapFirst) {
-    if (state->queue == nil || bytes.empty() || bytes.size() > 65536u || address % 4u != 0u || bytes.size() % 4u != 0u) return 4;
-    @autoreleasepool {
-        if (reapFirst) state->Retire(false);
-        if (state->inflight.empty()) return 1;
-        state->Reserve(bytes.size());
-        if (state->inflight.empty()) return 1;
-        if (state->TryWrap(address, bytes.size()) == 0u) return 3;
-        std::uint64_t destinationOffset = 0;
-        id<MTLBuffer> destination = state->WrapperOf(address, bytes.size(), &destinationOffset);
-        const auto source = state->Stage(bytes.size(), 16u);
-        std::memcpy(source.host, bytes.data(), bytes.size());
-        auto encoding = state->Begin();
-        [encoding.encoder copyFromBuffer:source.buffer sourceOffset:source.offset toBuffer:destination destinationOffset:destinationOffset size:bytes.size()];
-        state->Commit(encoding, {});
+// Upstream's rule: a store behind the recorded work (into the wrapped guest memory, through the
+// recorder's store runs and label table), or the CPU's when nothing is recorded (1). The device has
+// no copied writers (every guest buffer is wrapped in place), so no label waits behind a write-back
+// completion (5).
+int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    if (state->recorder == nullptr || bytes.empty() || bytes.size() > 65536u || address % 4u != 0u || bytes.size() % 4u != 0u) return 4;
+    auto& recorder = *state->recorder;
+    static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) {
+        recorder.Reap();
+        state->DropWrappersIfIdle();
     }
+    if (recorder.Idle()) return 1;
+    @autoreleasepool {
+        if (state->TryWrap(address, bytes.size()) == 0u) return 3;
+        std::uint64_t offset = 0;
+        id<MTLBuffer> wrapper = state->WrapperOf(address, bytes.size(), &offset);
+        recorder.RecordStore(Graphics::Metal::BufferHandle(wrapper), offset, bytes, address);
+    }
+    recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
+    if (Trace()) std::fprintf(stderr, "[metal] label 0x%llx+0x%zx stamp %llu queue %u\n", static_cast<unsigned long long>(address), bytes.size(), static_cast<unsigned long long>(stamp), queue);
+    static const bool submitNow = std::getenv("APS5_LABEL_SUBMIT_NOW") != nullptr;
+    if (submitNow) recorder.Submit();
     return 0;
 }
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
-    if (state->queue == nil) return false;
-    if (reapFirst) state->Retire(false);
-    if (state->inflight.empty()) return false;
-    state->inflight.back().completions.push_back(std::move(action));
-    return true;
+    if (state->recorder == nullptr) return false;
+    if (reapFirst && OpportunisticReap()) {
+        state->recorder->Reap();
+        state->DropWrappersIfIdle();
+    }
+    return state->recorder->AfterRecordedWork(std::move(action));
 }
 
-std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint64_t, std::size_t, std::uint64_t, Graphics::Recorder::LabelRefusal*) const {
-    return std::nullopt;
+std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal) const {
+    if (state->recorder == nullptr) return std::nullopt;
+    return state->recorder->PendingLabel(address, bytes, afterStamp, refusal);
 }
 
-bool VulkanDevice::OpenWriteOverlaps(std::uint64_t, std::size_t) const {
-    return false;
+bool VulkanDevice::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    return state->recorder != nullptr && state->recorder->OpenWriteOverlaps(address, bytes);
 }
 
-bool VulkanDevice::RecordedWritesSettled(std::uint64_t, std::size_t) const {
-    return state->inflight.empty();
+bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const {
+    if (state->recorder == nullptr) return true;
+    const auto& recorder = *state->recorder;
+    if (!recorder.PendingWriteSettled(address, bytes)) return false;
+    return Recorder::PendingCompletionLabels() == 0 || !recorder.CompletionLabelIn(address, bytes);
 }
 
-bool VulkanDevice::StoresPendingOver(std::uint64_t, std::size_t) const {
-    return !state->inflight.empty();
+bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) const {
+    return state->recorder != nullptr && (state->recorder->PendingWriteOverlaps(address, bytes) || state->recorder->PendingLabelIn(address, bytes));
 }
 
-// A uniform byte pattern is a fillBuffer; any other 16-byte pattern runs the aps5_fill16 kernel.
+// Upstream's rule over the recorder: earlier recorded stores into the range are ordered before the
+// fill by its barrier; a completion label pending over the range is waited for (it lands by a CPU
+// store at reap). A dword-uniform pattern is the stream's fill, any other the fill kernel.
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
-    if (state->queue == nil || bytes == 0u || bytes % 16u != 0u || address % 16u != 0u) return false;
+    if (state->recorder == nullptr || bytes == 0u || bytes % 16u != 0u || address % 16u != 0u) return false;
+    auto& recorder = *state->recorder;
+    if (OpportunisticReap()) {
+        recorder.Reap();
+        state->DropWrappersIfIdle();
+    }
     @autoreleasepool {
-        state->Retire(false);
-        state->Reserve(sizeof(FillArguments));
-        const auto gpu = state->TryWrap(address, bytes);
-        if (gpu == 0u) return false;
-        std::array<std::byte, 16> patternBytes {};
-        std::memcpy(patternBytes.data(), pattern.data(), patternBytes.size());
-        const bool uniform = std::all_of(patternBytes.begin(), patternBytes.end(), [&](std::byte value) { return value == patternBytes[0]; });
-        id<MTLComputePipelineState> pipeline = uniform ? nil : state->HelperPipeline("aps5_fill16");
-        std::uint64_t argumentsAddress = 0;
-        if (!uniform) {
-            if (bytes / 16u > 0xffffffffu) throw std::runtime_error("Metal device: a fill of " + std::to_string(bytes) + " bytes exceeds the fill kernel's range");
-            const FillArguments arguments {gpu, static_cast<std::uint32_t>(bytes / 16u), 0u, {pattern[0], pattern[1], pattern[2], pattern[3]}};
-            void* host = nullptr;
-            argumentsAddress = state->Allocate(sizeof(arguments), 16u, &host);
-            std::memcpy(host, &arguments, sizeof(arguments));
+        if (state->TryWrap(address, bytes) == 0u) return false;
+        static const bool alwaysSync = std::getenv("APS5_FILL_SYNC") != nullptr;
+        if (recorder.PendingWriteOverlaps(address, bytes) && (alwaysSync || (Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes)))) {
+            Recorder::CountSync(4);
+            recorder.SyncThrough(address, bytes);
         }
+        recorder.FlushKeyStoresOverlapping(address, bytes);
+        recorder.FlushStoresOverlapping(address, bytes);
         std::uint64_t offset = 0;
         id<MTLBuffer> wrapper = state->WrapperOf(address, bytes, &offset);
-        auto encoding = state->Begin();
-        if (uniform) {
-            [encoding.encoder fillBuffer:wrapper range:NSMakeRange(offset, bytes) value:static_cast<std::uint8_t>(patternBytes[0])];
+        VkAccessFlags covered = 0;
+        auto& stream = recorder.Stream(&covered);
+        if ((covered & VK_ACCESS_TRANSFER_WRITE_BIT) != 0u && Recorder::MergeBarriers()) {
+            Recorder::CountMerged(Recorder::CommandClass::Fill);
         } else {
-            [encoding.encoder setComputePipelineState:pipeline];
-            [state->arguments setAddress:argumentsAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
-            const auto count = bytes / 16u;
-            const auto width = std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 256u);
-            [encoding.encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(width, count), 1, 1)];
+            stream.PipelineBarrier(AnyStage, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::Fill);
         }
-        state->Commit(encoding, {});
+        const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
+        if (uniform) {
+            stream.FillBuffer(wrapper, offset, bytes, pattern[0]);
+        } else {
+            stream.FillPattern(wrapper, offset, bytes, pattern);
+        }
+        stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, AnyStage);
+        Recorder::CountBarriers(Recorder::CommandClass::Fill);
+        recorder.MarkCovered(TransferredAccess);
+        if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) {
+            recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
+        } else {
+            recorder.NotePendingWrite(address, bytes);
+        }
     }
     GuestMemory::MarkWritten(address, bytes);
+    if (Trace()) std::fprintf(stderr, "[metal] fill 0x%llx+0x%zx pattern %08x %08x %08x %08x\n", static_cast<unsigned long long>(address), bytes, pattern[0], pattern[1], pattern[2], pattern[3]);
     return true;
 }
 
@@ -708,36 +634,88 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t) {
     return false;
 }
 
-// Path 0 (CPU copy) only while nothing is in flight: without D2's recorder the device cannot tell
-// which ranges in-flight work reads or writes. Path 1 records a copy between the two wrappers,
-// ordered after everything committed before it.
+// Upstream's rule over the recorder (VulkanDevice.cpp CopyBuffer) without the parts other
+// packages own (storage images D4, unit shadows D3, copied writers D5): path 0 copies on the CPU
+// when neither range has an unsettled recorded write, a pending label or an in-place reader;
+// path 1 records a copy between the wrappers behind the recorded work.
 VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t, std::uint64_t, std::uint32_t, const CopyWriterNote& noteWriter) {
     CopyOutcome outcome {2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
-    if (state->queue == nil || bytes == 0u) return outcome;
+    if (state->recorder == nullptr || bytes == 0u) return outcome;
+    auto& recorder = *state->recorder;
+    const auto completionStoreOverlaps = [&](std::uint64_t address) { return Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes); };
+    bool settledBySignal = false;
+    const auto refusal = [&]() -> int {
+        settledBySignal = false;
+        if (bytes > cpuMax) return CopyOutcome::Size;
+        if (recorder.PendingWriteOverlaps(source, bytes)) {
+            if (!recorder.PendingWriteSettled(source, bytes)) return CopyOutcome::SourcePending;
+            if (completionStoreOverlaps(source) || recorder.PendingLabelIn(source, bytes)) return CopyOutcome::SourceUnsettled;
+            settledBySignal = true;
+        }
+        if (recorder.PendingWriteOverlaps(destination, bytes)) {
+            static const bool strict = std::getenv("APS5_COPY_DESTINATION_STRICT") != nullptr;
+            if (strict || !recorder.PendingWriteSettled(destination, bytes)) return CopyOutcome::DestinationPending;
+            if (completionStoreOverlaps(destination)) return CopyOutcome::DestinationUnsettled;
+        }
+        if (recorder.PendingLabelIn(destination, bytes)) return CopyOutcome::Label;
+        if (Recorder::ReadTracking() ? recorder.PendingReadOverlaps(destination, bytes) : !recorder.Idle()) return CopyOutcome::Reader;
+        return CopyOutcome::None;
+    };
+    outcome.reason = refusal();
+    if (outcome.reason == CopyOutcome::None) {
+        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
+        outcome.path = 0;
+        outcome.sourceSettledBySignal = settledBySignal;
+        return outcome;
+    }
+    if (bytes > gpuMax) {
+        outcome.path = 8;
+        return outcome;
+    }
     @autoreleasepool {
-        state->Retire(false);
-        if (bytes <= cpuMax && state->inflight.empty()) {
-            GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
-            outcome.path = 0;
-            return outcome;
-        }
-        outcome.reason = bytes > cpuMax ? CopyOutcome::Size : CopyOutcome::SourcePending;
-        if (bytes > gpuMax) {
-            outcome.path = 8;
-            return outcome;
-        }
-        state->Reserve(0);
         if (state->TryWrap(destination, bytes) == 0u || state->TryWrap(source, bytes) == 0u) return outcome;
+        const bool waitSource = recorder.PendingWriteOverlaps(source, bytes) && completionStoreOverlaps(source);
+        const bool waitDestination = recorder.PendingWriteOverlaps(destination, bytes) && completionStoreOverlaps(destination);
+        if (waitSource || waitDestination) {
+            outcome.synced = true;
+            const auto start = std::chrono::steady_clock::now();
+            if (waitSource) {
+                Recorder::CountSync(4);
+                recorder.SyncThrough(source, bytes);
+            }
+            if (waitDestination) {
+                Recorder::CountSync(4);
+                recorder.SyncThrough(destination, bytes);
+            }
+            outcome.syncMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+        recorder.FlushKeyStoresOverlapping(source, bytes);
+        recorder.FlushKeyStoresOverlapping(destination, bytes);
+        recorder.FlushStoresOverlapping(source, bytes);
+        recorder.FlushStoresOverlapping(destination, bytes);
         std::uint64_t destinationOffset = 0;
         std::uint64_t sourceOffset = 0;
         id<MTLBuffer> destinationBuffer = state->WrapperOf(destination, bytes, &destinationOffset);
         id<MTLBuffer> sourceBuffer = state->WrapperOf(source, bytes, &sourceOffset);
-        auto encoding = state->Begin();
-        [encoding.encoder copyFromBuffer:sourceBuffer sourceOffset:sourceOffset toBuffer:destinationBuffer destinationOffset:destinationOffset size:bytes];
-        state->Commit(encoding, {});
+        VkAccessFlags covered = 0;
+        auto& stream = recorder.Stream(&covered);
+        constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        if ((covered & transferAccess) == transferAccess && Recorder::MergeBarriers()) {
+            Recorder::CountMerged(Recorder::CommandClass::Copy);
+        } else {
+            stream.PipelineBarrier(AnyStage, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::Copy);
+        }
+        stream.CopyBuffer(sourceBuffer, sourceOffset, destinationBuffer, destinationOffset, bytes);
+        stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, AnyStage);
+        Recorder::CountBarriers(Recorder::CommandClass::Copy);
+        recorder.MarkCovered(TransferredAccess);
+        recorder.NotePendingRead(source, bytes, Recorder::ReadKind::CopySource);
     }
     GuestMemory::MarkWritten(destination, bytes);
     noteWriter({}, 0);
+    recorder.NotePendingWrite(destination, bytes);
+    if (Trace()) std::fprintf(stderr, "[metal] copy 0x%llx <- 0x%llx +0x%zx\n", static_cast<unsigned long long>(destination), static_cast<unsigned long long>(source), bytes);
     outcome.path = 1;
     return outcome;
 }
@@ -759,16 +737,8 @@ std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch&)
     return zero;
 }
 
-namespace {
-
-std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
-    return shader.msl.Reflection().workgroupMemoryStrideDwords;
-}
-
-}
-
 void VulkanDevice::State::RequireDispatchable(const ShaderRecompiler::RecompileResult& shader) const {
-    if (queue == nil) throw std::runtime_error("Metal device: a compile-only device cannot dispatch");
+    if (recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot dispatch");
     if (shader.msl.empty()) throw std::runtime_error("Metal device: the shader has no MSL form (recompile it for the device's Target(), whose backend is Msl)");
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     const auto& reflection = shader.msl.Reflection();
@@ -776,7 +746,7 @@ void VulkanDevice::State::RequireDispatchable(const ShaderRecompiler::RecompileR
     if (reflection.stage != Abi::Stage::Kernel) throw std::runtime_error("Metal device: Dispatch needs a kernel");
 }
 
-// Records one compute dispatch of `shader` in a command buffer of its own (see the binding
+// Records one compute dispatch of `shader` into the recorder's open batch (see the binding
 // contract in MslAbi.hpp):
 // - DescriptorTable: guest buffers (wrapped V# ranges), Gds (the 64 KiB global data share, guest
 //   memory at Pm4::GdsAddress()), BdaPagetable (BdaAbi::Header + Range[] of every readable guest
@@ -789,52 +759,77 @@ void VulkanDevice::State::RequireDispatchable(const ShaderRecompiler::RecompileR
 //   one the LDS lock, zero before first use); otherwise the DriverData record (never read).
 // - DriverData: workgroupBase (the chunk's first workgroup of a split dispatch, else 0),
 //   loopGuardLimit, faultBuffer (the fault buffer's GPU address).
-void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t gridX, std::uint32_t gridY, std::uint32_t gridZ, std::uint64_t indirectArguments) {
-    struct {
-        std::uint32_t x, y, z;
-        std::uint64_t indirect;
-    } const grid {gridX, gridY, gridZ, indirectArguments};
-    auto& state = *this;
+// Barriers as upstream: a leading one (unless the last command's trailing barrier covered shader
+// access) and a trailing one; the written V# ranges, GDS and every writable range of a bound BDA
+// table are noted as pending writes, the bound V# ranges as in-place reads.
+void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirectArguments) {
     const auto& reflection = shader.msl.Reflection();
     const auto stride = WorkgroupStride(shader);
-    const bool split = grid.indirect == 0u && (grid.x > GroupLimit || grid.y > GroupLimit || grid.z > GroupLimit);
-    std::uint64_t chunks = 1;
+    const bool split = indirectArguments == 0u && (x > GroupLimit || y > GroupLimit || z > GroupLimit);
     if (split) {
         if (stride != 0u) {
-            throw std::runtime_error("Metal device: workgroup count " + std::to_string(grid.x) + "x" + std::to_string(grid.y) + "x" + std::to_string(grid.z) + " exceeds the device limits " + std::to_string(GroupLimit) + " per dimension and a split aliases the device-memory LDS slots, whose base is computed from threadgroups_per_grid of a single chunk");
+            throw std::runtime_error("Metal device: workgroup count " + std::to_string(x) + "x" + std::to_string(y) + "x" + std::to_string(z) + " exceeds the device limits " + std::to_string(GroupLimit) + " per dimension and a split aliases the device-memory LDS slots, whose base is computed from threadgroups_per_grid of a single chunk");
         }
-        for (const std::uint64_t count : {grid.x, grid.y, grid.z}) chunks *= (count + GroupLimit - 1u) / GroupLimit;
-        if (chunks > MaxSplitChunks) throw std::runtime_error("Metal device: a dispatch of " + std::to_string(grid.x) + "x" + std::to_string(grid.y) + "x" + std::to_string(grid.z) + " workgroups needs more than " + std::to_string(MaxSplitChunks) + " chunks");
+        std::uint64_t chunks = 1;
+        for (const std::uint64_t count : {x, y, z}) chunks *= (count + GroupLimit - 1u) / GroupLimit;
+        if (chunks > MaxSplitChunks) throw std::runtime_error("Metal device: a dispatch of " + std::to_string(x) + "x" + std::to_string(y) + "x" + std::to_string(z) + " workgroups needs more than " + std::to_string(MaxSplitChunks) + " chunks");
     }
-    // Ring room before anything is wrapped: a full ring waits for idle, which drops wrappers.
-    std::size_t upload = reflection.table.bytes + Abi::PushDataBytes + chunks * sizeof(Abi::DriverData) + 64u;
-    for (const auto& binding : shader.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) upload += binding.guestDescriptor.size() * sizeof(std::uint32_t) + 16u;
-    }
-    state.Reserve(upload);
+    auto& recorder = *this->recorder;
     // The arena is sized for the whole grid (an indirect dispatch with an arena reads its counts on
-    // the CPU first, so `grid` is direct here).
-    id<MTLBuffer> arena = stride != 0u ? state.WorkgroupArena(static_cast<std::uint64_t>(grid.x) * grid.y * grid.z, stride) : nil;
-    id<MTLComputePipelineState> pipeline = state.ComputePipeline(shader);
-    // Wrapped after the ring check, which may wait for idle and drop wrappers.
-    const auto indirect = grid.indirect != 0u ? state.Wrap(grid.indirect, 12u) : 0u;
+    // the CPU first, so the grid is direct here); growing it waits for idle, before the open batch
+    // is taken below.
+    id<MTLBuffer> arena = stride != 0u ? WorkgroupArena(static_cast<std::uint64_t>(x) * y * z, stride) : nil;
+    id<MTLComputePipelineState> pipeline = ComputePipeline(shader);
     const auto& threads = reflection.threadsPerThreadgroup;
     if (static_cast<NSUInteger>(threads[0]) * threads[1] * threads[2] > pipeline.maxTotalThreadsPerThreadgroup) {
         throw std::runtime_error("Metal device: the workgroup of " + std::to_string(threads[0] * threads[1] * threads[2]) + " threads exceeds the pipeline's maximum threadgroup size " + std::to_string(pipeline.maxTotalThreadsPerThreadgroup));
     }
 
+    // Guest ranges first (queued label and key stores into them must precede the dispatch).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    bool addressBased = false;
+    for (const auto& binding : shader.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            const auto elements = std::min<std::size_t>(binding.count, binding.guestDescriptor.size() / 4u);
+            for (std::uint32_t element = 0; element < elements; ++element) {
+                const auto guest = DecodeBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u));
+                if (guest.base == 0u || guest.bytes == 0u) continue;
+                const auto aligned = guest.base & ~std::uint64_t{3u};
+                const auto end = aligned + ((guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u});
+                reads.push_back({aligned, end});
+                // An element the recompiler did not classify counts as written.
+                if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) writes.push_back({aligned, end});
+            }
+        } else if (binding.role == ShaderRecompiler::DescriptorRole::Gds) {
+            const auto gds = Pm4::GdsAddress();
+            reads.push_back({gds, gds + Pm4::GdsBytes});
+            writes.push_back({gds, gds + Pm4::GdsBytes});
+        } else if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) {
+            addressBased = true;
+        }
+    }
+    if (indirectArguments != 0u) reads.push_back({indirectArguments, indirectArguments + 12u});
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        const auto overlaps = [&](const auto& ranges) { return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; }); };
+        return overlaps(reads) || overlaps(writes);
+    };
+    if (recorder.HasQueuedKeyStores() && (addressBased || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
+    if (recorder.HasQueuedStores() && (addressBased || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+
+    VkAccessFlags covered = 0;
+    auto& stream = recorder.Stream(&covered);
     std::array<std::byte, Abi::PushDataBytes> push {};
     if (!shader.pushConstants.empty()) {
         if (shader.pushConstants.size() > push.size()) throw std::runtime_error("Metal device: push constants exceed the push data block");
         std::memcpy(push.data(), shader.pushConstants.data(), shader.pushConstants.size());
     }
-    Batch batch {};
     std::uint64_t tableAddress = 0;
     if (reflection.table.bytes != 0u) {
-        void* host = nullptr;
-        tableAddress = state.Allocate(reflection.table.bytes, 16u, &host);
-        std::memset(host, 0, reflection.table.bytes);
-        auto* table = static_cast<std::byte*>(host);
+        const auto upload = stream.Allocate(reflection.table.bytes, 16u);
+        tableAddress = upload.address;
+        std::memset(upload.host, 0, reflection.table.bytes);
+        auto* table = upload.host;
         for (const auto& binding : shader.bindings) {
             const auto group = binding.binding / static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
             const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
@@ -851,7 +846,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
                     const auto aligned = guest.base & ~std::uint64_t{3u};
                     const auto bytes = (guest.base - aligned + guest.bytes + 3u) & ~std::uint64_t{3u};
                     if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: a guest buffer exceeds 4 GiB");
-                    entries[element] = {state.Wrap(aligned, bytes), static_cast<std::uint32_t>(bytes), 0u};
+                    entries[element] = {Wrap(aligned, bytes), static_cast<std::uint32_t>(bytes), 0u};
                     const auto position = static_cast<std::size_t>(shader.memoryOffsetDword) * 4u + element;
                     if (position < shader.pushConstants.size()) push[position] = std::byte{0};
                 }
@@ -859,26 +854,27 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
             case ShaderRecompiler::DescriptorRole::ShaderData:
             case ShaderRecompiler::DescriptorRole::FlattenedSrt: {
                 const auto bytes = binding.guestDescriptor.size() * sizeof(std::uint32_t);
-                void* data = nullptr;
-                const auto address = state.Allocate(std::max<std::size_t>(bytes, 4u), 16u, &data);
-                if (bytes != 0u) std::memcpy(data, binding.guestDescriptor.data(), bytes);
-                entries[0] = {address, static_cast<std::uint32_t>(bytes), 0u};
+                const auto data = stream.Allocate(std::max<std::size_t>(bytes, 4u), 16u);
+                if (bytes != 0u) std::memcpy(data.host, binding.guestDescriptor.data(), bytes);
+                entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
                 break;
             }
             case ShaderRecompiler::DescriptorRole::Gds: {
                 if (binding.count != 1u || !binding.guestDescriptor.empty()) throw std::runtime_error("Metal device: invalid GDS descriptor contract");
-                const auto gds = Pm4::GdsAddress();
-                entries[0] = {state.Wrap(gds, Pm4::GdsBytes), static_cast<std::uint32_t>(Pm4::GdsBytes), 0u};
+                entries[0] = {Wrap(Pm4::GdsAddress(), Pm4::GdsBytes), static_cast<std::uint32_t>(Pm4::GdsBytes), 0u};
                 break;
             }
             case ShaderRecompiler::DescriptorRole::BdaPagetable: {
-                std::uint32_t bytes = 0;
-                const auto address = state.BuildAddressTable(&bytes, &batch.lease);
-                entries[0] = {address, bytes, 0u};
+                std::shared_ptr<const GuestAllocations::Lease> lease;
+                const auto& bytes = AddressTableBytes(&lease);
+                const auto data = stream.Write(std::span<const std::byte>(bytes), 16u);
+                entries[0] = {data.address, static_cast<std::uint32_t>(bytes.size()), 0u};
+                recorder.Keep(std::const_pointer_cast<GuestAllocations::Lease>(lease));
+                writes.insert(writes.end(), addressTable.writable.begin(), addressTable.writable.end());
                 break;
             }
             case ShaderRecompiler::DescriptorRole::FaultBuffer:
-                entries[0] = {state.faults.gpuAddress, static_cast<std::uint32_t>(state.faults.length), 0u};
+                entries[0] = {faults.gpuAddress, static_cast<std::uint32_t>(faults.length), 0u};
                 break;
             case ShaderRecompiler::DescriptorRole::GuestImages:
             case ShaderRecompiler::DescriptorRole::GuestSamplers:
@@ -886,49 +882,74 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
             }
         }
     }
-    void* pushHost = nullptr;
-    const auto pushAddress = state.Allocate(push.size(), 16u, &pushHost);
-    std::memcpy(pushHost, push.data(), push.size());
+    const auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     std::vector<std::uint64_t> driverAddresses;
     std::vector<MTLSize> chunkGroups;
     const auto addChunk = [&](std::uint32_t xBase, std::uint32_t yBase, std::uint32_t zBase, MTLSize groups) {
         Abi::DriverData driver {};
         driver.workgroupBase = {xBase, yBase, zBase};
         driver.loopGuardLimit = LoopGuardLimit();
-        driver.faultBuffer = state.faults.gpuAddress;
-        void* host = nullptr;
-        driverAddresses.push_back(state.Allocate(sizeof(driver), 16u, &host));
-        std::memcpy(host, &driver, sizeof(driver));
+        driver.faultBuffer = faults.gpuAddress;
+        driverAddresses.push_back(stream.Write(std::as_bytes(std::span(&driver, 1)), 16u).address);
         chunkGroups.push_back(groups);
     };
     if (split) {
-        for (std::uint64_t zBase = 0; zBase < grid.z; zBase += GroupLimit) {
-            for (std::uint64_t yBase = 0; yBase < grid.y; yBase += GroupLimit) {
-                for (std::uint64_t xBase = 0; xBase < grid.x; xBase += GroupLimit) {
-                    addChunk(static_cast<std::uint32_t>(xBase), static_cast<std::uint32_t>(yBase), static_cast<std::uint32_t>(zBase), MTLSizeMake(std::min<std::uint64_t>(GroupLimit, grid.x - xBase), std::min<std::uint64_t>(GroupLimit, grid.y - yBase), std::min<std::uint64_t>(GroupLimit, grid.z - zBase)));
+        for (std::uint64_t zBase = 0; zBase < z; zBase += GroupLimit) {
+            for (std::uint64_t yBase = 0; yBase < y; yBase += GroupLimit) {
+                for (std::uint64_t xBase = 0; xBase < x; xBase += GroupLimit) {
+                    addChunk(static_cast<std::uint32_t>(xBase), static_cast<std::uint32_t>(yBase), static_cast<std::uint32_t>(zBase), MTLSizeMake(std::min<std::uint64_t>(GroupLimit, x - xBase), std::min<std::uint64_t>(GroupLimit, y - yBase), std::min<std::uint64_t>(GroupLimit, z - zBase)));
                 }
             }
         }
     } else {
-        addChunk(0u, 0u, 0u, MTLSizeMake(grid.x, grid.y, grid.z));
+        addChunk(0u, 0u, 0u, MTLSizeMake(x, y, z));
     }
 
-    auto encoding = state.Begin();
-    [encoding.encoder setComputePipelineState:pipeline];
-    [state.arguments setAddress:tableAddress != 0u ? tableAddress : driverAddresses.front() atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
-    [state.arguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
-    [state.arguments setAddress:arena != nil ? arena.gpuAddress : driverAddresses.front() atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
+    if ((covered & ShaderAccess) == ShaderAccess && Recorder::MergeBarriers()) {
+        Recorder::CountMerged(Recorder::CommandClass::DispatchLeading);
+    } else {
+        stream.PipelineBarrier(AnyStage, indirectArguments != 0u ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::DispatchLeading);
+    }
+    auto encoder = stream.Compute();
     const auto threadsPerGroup = MTLSizeMake(threads[0], threads[1], threads[2]);
     for (std::size_t chunk = 0; chunk < driverAddresses.size(); ++chunk) {
-        // Argument table bindings are snapshotted per dispatch, so each chunk sees its own base.
-        [state.arguments setAddress:driverAddresses[chunk] atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+        if (chunk != 0u) stream.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        // The stream's helper kernels bind their own table: set ours for every dispatch (bindings
+        // are snapshotted per dispatch, so each chunk sees its own DriverData).
+        [encoder setComputePipelineState:pipeline];
+        [encoder setArgumentTable:this->arguments];
+        [this->arguments setAddress:tableAddress != 0u ? tableAddress : driverAddresses.front() atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
+        [this->arguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
+        [this->arguments setAddress:arena != nil ? arena.gpuAddress : driverAddresses.front() atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
+        [this->arguments setAddress:driverAddresses[chunk] atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
         if (indirect != 0u) {
-            [encoding.encoder dispatchThreadgroupsWithIndirectBuffer:indirect threadsPerThreadgroup:threadsPerGroup];
+            [encoder dispatchThreadgroupsWithIndirectBuffer:indirect threadsPerThreadgroup:threadsPerGroup];
         } else {
-            [encoding.encoder dispatchThreadgroups:chunkGroups[chunk] threadsPerThreadgroup:threadsPerGroup];
+            [encoder dispatchThreadgroups:chunkGroups[chunk] threadsPerThreadgroup:threadsPerGroup];
         }
+        stream.CountCommand();
     }
-    state.Commit(encoding, std::move(batch));
+    stream.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, AnyStage);
+    Recorder::CountBarriers(Recorder::CommandClass::DispatchTrailing);
+    recorder.MarkCovered(DispatchedAccess);
+    if (indirectArguments != 0u) recorder.NotePendingRead(indirectArguments, 12u, Recorder::ReadKind::Indirect);
+    if (!reads.empty()) recorder.NotePendingReads(reads, Recorder::ReadKind::DispatchElement);
+    if (!writes.empty()) recorder.NotePendingWrites(writes);
+    // Faults and written pages of this batch's dispatches (one shared record) when it completes.
+    recorder.OnComplete([this] {
+        if (!tearingDown) {
+            CheckFaults();
+            return;
+        }
+        try {
+            CheckFaults();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[metal] %s\n", error.what());
+        }
+    });
+    if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", reads.size(), writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
 }
 
 void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
@@ -936,24 +957,32 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
     state->RequireDispatchable(shader);
     if (x == 0u || y == 0u || z == 0u) return;
     @autoreleasepool {
-        state->Retire(false);
         state->RecordCompute(shader, x, y, z, 0u);
     }
 }
 
-// DISPATCH_INDIRECT: the GPU reads the three group counts from guest memory (wrapped in place)
-// behind everything committed before, so a dispatch or label writing them earlier is seen.
-// cpuReason (the counts are read on the CPU after the device went idle, then dispatched directly):
-// 8 the shader uses the device-memory LDS arena, sized from the counts; 3 the arguments cannot be
-// wrapped (unmapped, executable or misaligned memory).
+// DISPATCH_INDIRECT as upstream decides it (decideIndirect): the GPU reads the three group counts
+// from the wrapped guest memory behind the recorded work (cpuReason 0), so a dispatch or label
+// writing them earlier is seen; otherwise the counts are read on the CPU (GuestMemory::Read, whose
+// flush hook waits for the batch that writes them) and dispatched directly: 8 the shader uses the
+// device-memory LDS arena, sized from the counts; 2 a label is pending over the counts; 3 they
+// cannot be wrapped (unmapped, executable or misaligned memory).
 VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
     state->RequireDispatchable(shader);
     IndirectOutcome outcome {0, 0.0};
+    auto& recorder = *state->recorder;
     @autoreleasepool {
-        state->Retire(false);
+        const auto labelPending = [&] {
+            for (std::uint64_t dword = arguments; dword < arguments + 12u; dword += 4u) {
+                if (recorder.PendingLabel(dword, 4, 0).has_value()) return true;
+            }
+            return false;
+        };
         if (WorkgroupStride(shader) != 0u || shader.workgroupMemoryDwords != 0u) {
             outcome.cpuReason = 8;
+        } else if (labelPending()) {
+            outcome.cpuReason = 2;
         } else if (arguments % 4u != 0u || state->TryWrap(arguments, 12u) == 0u) {
             outcome.cpuReason = 3;
         }
@@ -962,7 +991,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
             return outcome;
         }
         const auto start = std::chrono::steady_clock::now();
-        state->Retire(true);
         std::array<std::uint32_t, 3> groups {};
         GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4u);
         outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -998,7 +1026,8 @@ void VulkanDevice::NoteRecipe(RecipeEvent, RecipeKind) {
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
-    Unimplemented("the Vulkan Graphics::Context", "Vulkan-only test hook");
+    if (state->recorder == nullptr) Unimplemented("the Graphics::Context of a compile-only device", "work package D1");
+    return state->context;
 }
 
 }
