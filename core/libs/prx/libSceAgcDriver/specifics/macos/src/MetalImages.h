@@ -121,7 +121,9 @@ public:
     // depend on (the images paired with each sampler): ANISO_OVERRIDE samplers of single-level
     // images lose their anisotropy, FORCE_DEGAMMA samplers require sRGB images (as
     // ShaderResources::applyAnisoOverride / RequireDegammaFormat).
-    void Prepare(std::span<const ShaderRecompiler::DescriptorBinding> bindings);
+    // Also validates the bindless table metadata in the shader data against the bound heaps
+    // (ShaderResources.cpp ValidateRuntimeResources).
+    void Prepare(const ShaderRecompiler::RecompileResult& shader);
     // `entries`: the binding's first min(binding.count, range.count) table entries.
     void Write(const ShaderRecompiler::DescriptorBinding& binding, std::span<std::uint64_t> entries);
     // After the dispatch is recorded into the recorder's open batch: keeps the textures alive with

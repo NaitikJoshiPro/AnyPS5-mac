@@ -466,7 +466,41 @@ std::uint64_t ImageBindings::view(GuestSurface& surface, std::uint32_t heapNumbe
     return ResourceId(view);
 }
 
-void ImageBindings::Prepare(std::span<const ShaderRecompiler::DescriptorBinding> bindings) {
+void ImageBindings::Prepare(const ShaderRecompiler::RecompileResult& shader) {
+    const std::span<const ShaderRecompiler::DescriptorBinding> bindings(shader.bindings);
+    if (shader.runtimeImageCount != 0u) {
+        constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+        std::array<const ShaderRecompiler::DescriptorBinding*, bindingCount> heaps{};
+        const ShaderRecompiler::DescriptorBinding* shaderData = nullptr;
+        for (const auto& binding : bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) shaderData = &binding;
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
+            auto& heap = heaps[binding.binding % bindingCount];
+            if (heap != nullptr) FailD5("duplicate runtime image binding");
+            heap = &binding;
+        }
+        std::vector<std::uint32_t> pushWords;
+        std::span<const std::uint32_t> words;
+        if (shaderData != nullptr) {
+            words = shaderData->guestDescriptor;
+        } else {
+            pushWords.resize(shader.pushConstants.size() / 4u);
+            std::memcpy(pushWords.data(), shader.pushConstants.data(), pushWords.size() * 4u);
+            words = pushWords;
+        }
+        constexpr auto metadataWords = sizeof(ShaderRecompiler::RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t);
+        if (shader.imageMetadataDword > words.size() || shader.runtimeImageCount > (words.size() - shader.imageMetadataDword) / metadataWords) FailD5("runtime image metadata exceeds shader data");
+        for (const auto index : shader.runtimeImageResources) {
+            if (index >= shader.runtimeImageCount) FailD5("runtime image resource exceeds its compact layout");
+            const auto offset = shader.imageMetadataDword + index * metadataWords;
+            const auto kind = words[offset];
+            const auto first = words[offset + 1u];
+            const auto count = words[offset + 2u];
+            if (count == 0u) FailD5("runtime image metadata has no descriptor elements");
+            if (kind >= heaps.size() || heaps[kind] == nullptr) FailD5("runtime metadata references an unbound image heap");
+            if (!(first < heaps[kind]->count && count <= heaps[kind]->count - first)) FailD5("runtime metadata exceeds its bound heap");
+        }
+    }
     const ShaderRecompiler::DescriptorBinding* samplerBinding = nullptr;
     for (const auto& binding : bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) samplerBinding = &binding;
