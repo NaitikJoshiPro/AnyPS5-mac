@@ -130,11 +130,11 @@ asm(".text\n"
     "    movq %rcx, 0(%rsp)\n"
     "    ret\n");
 #elif defined(__APPLE__) && defined(__aarch64__)
-// The guest's registers live in the arm64 runner: sigsetjmp and siglongjmp reach them through its bridge hooks, as
-// setjmp and longjmp do (libc JumpBuffer.cpp), and fill the guest's sigjmp_buf as the x86-64 code above does.
-extern "C" void LibcCaptureRegisters(std::uintptr_t* registers);
-extern "C" [[noreturn]] void LibcRestoreRegisters(const std::uintptr_t* registers);
-extern "C" void LibcGuestControl(std::uint32_t* mxcsr, std::uint16_t* fcw);
+// The guest's registers live in the arm64 runner: sigsetjmp and siglongjmp reach them through its bridge hooks, which
+// libc exports for them (JumpBuffer.cpp), and fill the guest's sigjmp_buf as the x86-64 code above does.
+extern "C" void LibcCaptureRegisters_nid_no_patch(std::uintptr_t* registers);
+extern "C" [[noreturn]] void LibcRestoreRegisters_nid_no_patch(const std::uintptr_t* registers);
+extern "C" void LibcGuestControl_nid_no_patch(std::uint32_t* mxcsr, std::uint16_t* fcw);
 extern "C" int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet);
 
 namespace {
@@ -166,7 +166,7 @@ template<class T> T Get(const void* buffer, std::size_t offset) {
 std::uint16_t GuestControlWord() {
     std::uint32_t mxcsr = 0;
     std::uint16_t fcw = 0;
-    LibcGuestControl(&mxcsr, &fcw);
+    LibcGuestControl_nid_no_patch(&mxcsr, &fcw);
     return fcw;
 }
 }
@@ -179,7 +179,7 @@ extern "C" int APS5_VABI sigsetjmp_nid_postfix(void* buffer, int saveMask) {
         Put(buffer, SavedMask, mask);
     }
     std::uintptr_t registers[Count];
-    LibcCaptureRegisters(registers);
+    LibcCaptureRegisters_nid_no_patch(registers);
     // The hooks describe the caller after the return, with the return address popped.
     Put<std::uint64_t>(buffer, SavedRip, registers[Rip]);
     Put<std::uint64_t>(buffer, SavedRbx, registers[Rbx]);
@@ -197,14 +197,14 @@ extern "C" [[noreturn]] void APS5_VABI siglongjmp_nid_postfix(void* buffer, int 
         _sigprocmask_nid_postfix(GuestSigSetmask, &mask, nullptr);
     }
     std::uintptr_t registers[Count];
-    LibcCaptureRegisters(registers);
+    LibcCaptureRegisters_nid_no_patch(registers);
     registers[Rax] = value != 0 ? static_cast<std::uint32_t>(value) : 1u;
     registers[Rbx] = Get<std::uint64_t>(buffer, SavedRbx);
     registers[Rsp] = Get<std::uint64_t>(buffer, SavedRsp) + 8;
     registers[Rbp] = Get<std::uint64_t>(buffer, SavedRbp);
     for (std::size_t index = 0; index < 4; ++index) registers[R12 + index] = Get<std::uint64_t>(buffer, SavedR12 + 8 * index);
     registers[Rip] = Get<std::uint64_t>(buffer, SavedRip);
-    LibcRestoreRegisters(registers);
+    LibcRestoreRegisters_nid_no_patch(registers);
 }
 #else
 extern "C" int APS5_VABI sigsetjmp_nid_postfix(void*, int) {
