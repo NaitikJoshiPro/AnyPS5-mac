@@ -532,6 +532,34 @@ void PipelineCache::PrepareRender(const RenderPipelineRequest& request) {
     });
 }
 
+id<MTLDepthStencilState> PipelineCache::DepthStencil(const DepthStencilRequest& request) {
+    std::lock_guard lock(mutex);
+    for (const auto& [known, state] : depthStencilStates) {
+        if (known == request) return state;
+    }
+    MTLDepthStencilDescriptor* descriptor = [MTLDepthStencilDescriptor new];
+    descriptor.depthCompareFunction = request.depthCompare;
+    descriptor.depthWriteEnabled = request.depthWrite;
+    if (request.stencil) {
+        const auto face = [](const StencilFaceState& state) {
+            MTLStencilDescriptor* stencil = [MTLStencilDescriptor new];
+            stencil.stencilCompareFunction = state.compare;
+            stencil.stencilFailureOperation = state.fail;
+            stencil.depthFailureOperation = state.depthFail;
+            stencil.depthStencilPassOperation = state.pass;
+            stencil.readMask = state.readMask;
+            stencil.writeMask = state.writeMask;
+            return stencil;
+        };
+        descriptor.frontFaceStencil = face(request.front);
+        descriptor.backFaceStencil = face(request.back);
+    }
+    id<MTLDepthStencilState> state = [device newDepthStencilStateWithDescriptor:descriptor];
+    if (state == nil) throw std::runtime_error("Metal pipeline cache (work package D5): Metal refused a depth-stencil state");
+    depthStencilStates.emplace_back(request, state);
+    return state;
+}
+
 void PipelineCache::submit(std::function<void()> task) {
     {
         std::lock_guard lock(queueMutex);

@@ -160,6 +160,14 @@ int Background() {
             if (std::strstr(error.what(), "MSL compile failed") == nullptr) return Fail(std::string("unexpected failure text: ") + error.what());
         }
     }
+    // Depth-stencil states: equal requests share one state, different ones do not.
+    DepthStencilRequest less;
+    less.depthCompare = MTLCompareFunctionLess;
+    less.depthWrite = true;
+    DepthStencilRequest stencil = less;
+    stencil.stencil = true;
+    stencil.front.pass = MTLStencilOperationReplace;
+    if (cache.DepthStencil(less) == nil || cache.DepthStencil(less) != cache.DepthStencil(less) || cache.DepthStencil(stencil) == cache.DepthStencil(less)) return Fail("depth-stencil state cache");
     std::printf("PASS: agc_metal_pipeline_cache_background\n");
     return 0;
 }

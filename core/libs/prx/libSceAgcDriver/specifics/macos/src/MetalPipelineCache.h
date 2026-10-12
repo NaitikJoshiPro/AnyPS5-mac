@@ -101,6 +101,27 @@ struct RenderPipelineRequest {
     // Vertex amplification and raster order groups are not used by M2.
 };
 
+// A depth-stencil state (MTLDepthStencilDescriptor): no depth test is compare Always without
+// writes; no stencil test is `stencil` false.
+struct StencilFaceState {
+    MTLCompareFunction compare = MTLCompareFunctionAlways;
+    MTLStencilOperation fail = MTLStencilOperationKeep;
+    MTLStencilOperation depthFail = MTLStencilOperationKeep;
+    MTLStencilOperation pass = MTLStencilOperationKeep;
+    std::uint32_t readMask = 0xffu;
+    std::uint32_t writeMask = 0xffu;
+    bool operator==(const StencilFaceState&) const = default;
+};
+
+struct DepthStencilRequest {
+    MTLCompareFunction depthCompare = MTLCompareFunctionAlways;
+    bool depthWrite = false;
+    bool stencil = false;
+    StencilFaceState front;
+    StencilFaceState back;
+    bool operator==(const DepthStencilRequest&) const = default;
+};
+
 class PipelineCache {
 public:
     // `directory`: where the archive lives (empty: the default from the environment, see above).
@@ -123,6 +144,8 @@ public:
     void PrepareCompute(const ShaderRecompiler::RecompileResult& shader);
 
     id<MTLRenderPipelineState> Render(const RenderPipelineRequest& request);
+    // The depth-stencil state of a request, made once per distinct request (thread-safe).
+    id<MTLDepthStencilState> DepthStencil(const DepthStencilRequest& request);
     void PrepareRender(const RenderPipelineRequest& request);
 
     // Writes the archive when pipelines were compiled since the last save (atomically renamed).
@@ -157,6 +180,7 @@ private:
     mutable std::mutex mutex;
     std::unordered_map<std::string, id<MTLLibrary>> libraries;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries;
+    std::vector<std::pair<DepthStencilRequest, id<MTLDepthStencilState>>> depthStencilStates;
     // Pipelines served by the archive this run: the serializer only captures pipelines its compiler
     // builds, so before a save they are rebuilt through the compiler (archive-accelerated) to keep
     // the new archive a superset of the old one.
