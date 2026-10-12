@@ -482,3 +482,5 @@ agc_storage_upload_failure G7
 agc_storage_upload_lifetime G7
 agc_unchanged_cpu_stamps G7
 agc_unit_shadow G7
+agc_metal_draw_targets G3
+agc_metal_draw_primitives G3

@@ -478,12 +478,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // per-face depth bias (as upstream's secondChannel and backFaces pipelines).
     Graphics::Metal::RenderPipelineRequest request;
     request.vertex = Graphics::Metal::PipelineFunction::From(vertexResult);
-    if (graphics.rectList) request.vertex.macros.push_back({"APS5_RECT_LIST", "1"});
-    if (graphics.negativeOneToOne) request.vertex.macros.push_back({"APS5_DEPTH_NEGATIVE_ONE_TO_ONE", "1"});
+    if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
+    if (graphics.negativeOneToOne) request.vertex.macros.push_back({Abi::DepthNegativeOneToOneMacro, "1"});
     if (fragmentResult != nullptr) {
         auto function = Graphics::Metal::PipelineFunction::From(*fragmentResult);
-        function.macros.push_back({"APS5_VERTEX_OUTPUTS", std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations)) + "u"});
-        function.macros.push_back({"APS5_VERTEX_OUTPUTS_HI", std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations >> 32u)) + "u"});
+        function.macros.push_back({Abi::VertexOutputsMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations)) + "u"});
+        function.macros.push_back({Abi::VertexOutputsHighMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations >> 32u)) + "u"});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
