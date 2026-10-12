@@ -104,3 +104,12 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 ## 2026-10-12 ~22:50: paused at the user's request
 - M2 restart agent stopped while bucketing failures per package (its work up to then is committed on `mac-native-metal`: `c666cccdd`…`6273496cb`: merge of mac-native, D19 guards in gpu_suite, teardown hygiene + tests, f16 test released from quarantine with validation evidence). Last validated run (canaries passed): G2 0/43, G3 0/32, G4 14/39, G6 10/24, G7 17/49 (total 41/187 excluding G1). No GPU/build processes left running.
 - **Resume:** finish the per-package failure buckets + refreshed work list in M2_DESIGN.md (restart agent's step 5), G1 count, then fan out the M2 packages (textures D4/B4, pipelines D5, draws B6/D6, presentation, atomics/LDS B3, guest memory D3, D1 recorder integration, PR #4030).
+
+## 2026-10-13: M2 resumed (wave R)
+- User said continue. Disk 8.58 GB / 100 GB. Metal Toolchain download still pending (offline `metal` unavailable; runtime compile gate in use).
+- Instead of a separate bucketing pass, each package agent baselines and buckets its own group. Agents (Agent tool, worktree `.mac-work/wt/metal`, shared `build-metal` under buildlock):
+  - **DRV**: D1 recorder integration and D3 guest memory/BDA page table → G4, plus the driver side of G1/G7.
+  - **SHD**: B2/B3/B5 and the MSL 4.1 switch → G1, G6.
+  - **TEX**: D4/B4/D5 textures, images, pipelines and the pipeline cache → G2.
+  - B6/D6 (draws, presentation → G3/G5) start once TEX's render pipelines land.
+- Protocol (coord/m2.md): agents commit their own files before every gpu_suite run, because D19 refuses while the tree is dirty.
