@@ -225,8 +225,9 @@ ImageCache* ImageCache::For(id<MTLDevice> device) {
     if (device == nil) return nullptr;
     auto& registry = Caches();
     std::lock_guard lock(registry.mutex);
-    for (const auto& [key, cache] : registry.caches) {
-        if (key == (__bridge void*)device) return cache;
+    // The newest cache of the device (a test may keep an older, queue-less one alive).
+    for (auto entry = registry.caches.rbegin(); entry != registry.caches.rend(); ++entry) {
+        if (entry->first == (__bridge void*)device) return entry->second;
     }
     return nullptr;
 }
