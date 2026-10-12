@@ -46,7 +46,7 @@ std::vector<const char*> windowExtensions(SDL_Window* window) {
     // macOS presents through Metal (the window's CAMetalLayer): no Vulkan instance extensions.
     (void)window;
     return {};
-#endif
+#else
     return OnMainThread([&] {
         unsigned extensionCount = 0;
         if (!SDL_Vulkan_GetInstanceExtensions(window, &extensionCount, nullptr)) throw std::runtime_error(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
@@ -55,17 +55,21 @@ std::vector<const char*> windowExtensions(SDL_Window* window) {
         extensions.resize(extensionCount);
         return extensions;
     });
+#endif
 }
 
 VkSurfaceKHR createWindowSurface(void* context, VkInstance instance) {
 #ifdef __APPLE__
+    (void)context;
+    (void)instance;
     throw std::runtime_error("VideoOut: the macOS device presents through the window's Metal layer, not a Vulkan surface");
-#endif
+#else
     return OnMainThread([&] {
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface)) throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
         return surface;
     });
+#endif
 }
 
 void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* height) {

@@ -233,7 +233,6 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
         presenter->layer.framebufferOnly = YES;
         presenter->layer.maximumDrawableCount = 3;
         presenter->layer.displaySyncEnabled = YES;
-        if (width != 0u && height != 0u) presenter->layer.drawableSize = CGSizeMake(width, height);
         [CATransaction commit];
         // Metal 4: drawables are resident through the layer's own residency set on the queue.
         [queue addResidencySet:presenter->layer.residencySet];
@@ -278,27 +277,15 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
         presenter->height = 0;
         return;
     }
-    if (presenter->getDrawableSize != nullptr) {
-        std::uint32_t drawableWidth = 0;
-        std::uint32_t drawableHeight = 0;
-        presenter->getDrawableSize(presenter->window, &drawableWidth, &drawableHeight);
-        if (drawableWidth != 0u && drawableHeight != 0u) {
-            width = drawableWidth;
-            height = drawableHeight;
-        }
-    }
+    // The arguments are the window's drawable size (Driver::Present asks for it every frame).
     if (width == presenter->width && height == presenter->height && (presenter->layer != nil || presenter->offscreen[0] != nil)) return;
     RetirePresents(0);
     presenter->drawable = nil;
     presenter->target = nil;
     presenter->width = width;
     presenter->height = height;
-    if (presenter->layer != nil) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        presenter->layer.drawableSize = CGSizeMake(width, height);
-        [CATransaction commit];
-    }
+    // SDL's Metal view owns the layer's drawableSize and contentsScale (it updates them on resizes
+    // and backing-scale changes); the presenter only follows the size.
     presenter->MakeOffscreen();
 }
 

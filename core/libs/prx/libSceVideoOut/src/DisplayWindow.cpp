@@ -157,6 +157,13 @@ void DisplayWindow::UpdateTitle() {
         fpsStart = now;
         fpsFrames = 0;
     }
+#ifdef __APPLE__
+    // macOS: a title change is an AppKit call on the main thread (the presenter waits for it):
+    // once a second is enough for the FPS readout.
+    static std::uint64_t lastTitle = 0;
+    if (lastTitle != 0 && now - lastTitle < frequency) return;
+    lastTitle = now;
+#endif
     char text[160];
     std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
     SDL_SetWindowTitle(window, text);
