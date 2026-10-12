@@ -22,7 +22,8 @@ bool VulkanDevice::PrimitiveListRestart() const {
 }
 
 bool VulkanDevice::SamplerFilterMinmax() const {
-    return false;
+    // MTLSamplerDescriptor.reductionMode (min/max filtering) exists on macOS 26+ (D5's samplers).
+    return true;
 }
 
 bool VulkanDevice::ConservativeRasterization() const {

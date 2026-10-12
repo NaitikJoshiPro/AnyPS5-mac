@@ -533,7 +533,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
             state->compiler = state->pipelines->Compiler();
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
-            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
+            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
             // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
@@ -624,6 +624,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // on Apple10 (vertex_value); Apple7+ has [[barycentric_coord]] alone (DeviceProfile, B6).
     ShaderRecompiler::SpirvTarget target {0u, 0u, 32u, Bda::Version, state->capabilities, state->extensions, false, {static_cast<std::uint32_t>(threads.width), static_cast<std::uint32_t>(threads.height), static_cast<std::uint32_t>(threads.depth)}, 1024u, threadgroupMemory, {}, {}};
     target.backend = ShaderRecompiler::ShaderBackend::Msl;
+    // Formats whose sRGB decode the image path does in the texture view (D4, MetalImages.h).
+    target.srgbDecodeFormats = Graphics::Metal::SrgbDecodeFormats();
     return target;
 }
 
@@ -1038,6 +1040,8 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
             this->recorder->SyncThrough(address, bytes);
         }
     });
+    // Pairs samplers with images (ANISO_OVERRIDE, FORCE_DEGAMMA) and checks bindless metadata.
+    imageBindings.Prepare(shader);
     std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> imageEntries;
     if (reflection.table.bytes != 0u) {
         for (const auto& binding : shader.bindings) {
