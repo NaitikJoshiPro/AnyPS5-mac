@@ -100,3 +100,7 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Disk 8.01 GB.
 - **Next:** M2, gated on the user's OK of the GPU safety proposal (GPU frozen since the panic).
 - SuperTuxKart relinks now (`36a74c44d` executable TLS relocations TPOFF64/DTPOFF64/DTPMOD64 → Linux `.rela.dyn`, applied by the runner's variant II layout; static resolution on Windows/macOS outputs; test `executable_tls_relocations`, fixture `tls-exec`; `5dc07a7e6` grow the program header table into unused zero padding). Relinker tests 103/103, fex fixtures 35/35. Not run (needs GPU).
+
+## 2026-10-12 ~22:50: paused at the user's request
+- M2 restart agent stopped while bucketing failures per package (its work up to then is committed on `mac-native-metal`: `c666cccdd`…`6273496cb`: merge of mac-native, D19 guards in gpu_suite, teardown hygiene + tests, f16 test released from quarantine with validation evidence). Last validated run (canaries passed): G2 0/43, G3 0/32, G4 14/39, G6 10/24, G7 17/49 (total 41/187 excluding G1). No GPU/build processes left running.
+- **Resume:** finish the per-package failure buckets + refreshed work list in M2_DESIGN.md (restart agent's step 5), G1 count, then fan out the M2 packages (textures D4/B4, pipelines D5, draws B6/D6, presentation, atomics/LDS B3, guest memory D3, D1 recorder integration, PR #4030).
