@@ -1695,7 +1695,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
 void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags, VkAccessFlags) const {
     // macOS: the access masks have no Metal counterpart (every barrier makes its writes visible to
     // the device); host stages vanish (a completed command buffer's writes reach the CPU).
-    Metal::Stream(commands).Barrier(sourceStage, destinationStage);
+    Metal::Stream(commands).PipelineBarrier(sourceStage, destinationStage);
 }
 
 void Recorder::flushPendingStore() {

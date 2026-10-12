@@ -129,7 +129,9 @@ public:
     id<MTLDevice> Device() const;
     id<MTL4CommandBuffer> CommandBuffer() const { return commandBuffer; }
 
-    // The open compute encoder, opening one (after its queue barrier) when none is.
+    // The open compute encoder, opening one (after its queue barrier) when none is. Debug aid:
+    // APS5_METAL_SERIAL_COMMANDS=1 records a full encoder barrier at every call that returns an
+    // already open encoder (every command then runs after the one before).
     id<MTL4ComputeCommandEncoder> Compute();
     // Ends the open encoder and begins a render pass (after its queue barrier).
     id<MTL4RenderCommandEncoder> BeginRender(MTL4RenderPassDescriptor* descriptor);
@@ -146,7 +148,9 @@ public:
     // the next encoder's queue barrier orders the work; with no encoder open the next encoder's
     // queue barrier already does.
     void Barrier(MTLStages after = MTLStageAll, MTLStages before = MTLStageAll);
-    void Barrier(VkPipelineStageFlags after, VkPipelineStageFlags before) { Barrier(StagesOf(after), StagesOf(before)); }
+    // The same for a Vulkan pipeline barrier's stage masks (a distinct name: Vulkan stage constants
+    // convert to both mask types).
+    void PipelineBarrier(VkPipelineStageFlags source, VkPipelineStageFlags destination) { Barrier(StagesOf(source), StagesOf(destination)); }
 
     // Inline data: `bytes` of upload memory (aligned) the CPU fills now and the GPU reads when the
     // stream executes.

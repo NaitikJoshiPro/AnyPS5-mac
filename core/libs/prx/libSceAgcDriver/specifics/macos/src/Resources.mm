@@ -115,7 +115,7 @@ void CopyBuffer(const Context&, VkCommandBuffer commands, VkBuffer source, VkDev
 }
 
 void RecordMemoryBarrier(const Context&, VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags, VkAccessFlags) {
-    Metal::Stream(commands).Barrier(sourceStage, destinationStage);
+    Metal::Stream(commands).PipelineBarrier(sourceStage, destinationStage);
 }
 
 void FillDeviceFunctions(const Context&, DeviceFunctions& functions) {

@@ -5,6 +5,7 @@
 #include "RecorderKernels.h"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <utility>
@@ -123,8 +124,22 @@ id<MTLDevice> CommandStream::Device() const {
     return arena->Device();
 }
 
+namespace {
+
+// Debug aid: APS5_METAL_SERIAL_COMMANDS=1 puts a full encoder barrier before every command recorded
+// into an open compute encoder (each Compute() call), so a missing barrier can be bisected.
+bool SerialCommands() {
+    static const bool serial = std::getenv("APS5_METAL_SERIAL_COMMANDS") != nullptr;
+    return serial;
+}
+
+}
+
 id<MTL4ComputeCommandEncoder> CommandStream::Compute() {
-    if (compute != nil) return compute;
+    if (compute != nil) {
+        if (SerialCommands()) Barrier(MTLStageAll, MTLStageAll);
+        return compute;
+    }
     if (!recording) Fail("a compute encoder was requested from a stream that is not recording");
     EndEncoder();
     compute = [commandBuffer computeCommandEncoder];
