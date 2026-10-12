@@ -78,7 +78,13 @@ VkSurfaceKHR createWindowSurface(void* context, VkInstance instance) {
 }
 
 void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* height) {
+#ifdef __APPLE__
+    // macOS: read on the calling thread (the minimized flag and the Metal layer's drawable size are
+    // plain reads; a main-thread hop per frame would wait out any window drag).
+    const auto query = [&] {
+#else
     OnMainThread([&] {
+#endif
         if ((SDL_GetWindowFlags(static_cast<SDL_Window*>(context)) & SDL_WINDOW_MINIMIZED) != 0) {
             *width = 0;
             *height = 0;
@@ -93,7 +99,12 @@ void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* heig
 #endif
         *width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
         *height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
+#ifdef __APPLE__
+    };
+    query();
+#else
     });
+#endif
 }
 
 #ifdef __APPLE__
@@ -550,7 +561,13 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             req.gpuComplete = true;
         }
     } else {
+#ifdef __APPLE__
+        // macOS: no main-thread hop once the window exists (Ensure then only records the aspect).
+        if (window.Handle() != nullptr) window.Ensure(req.width, req.height);
+        else OnMainThread([&] { window.Ensure(req.width, req.height); });
+#else
         OnMainThread([&] { window.Ensure(req.width, req.height); });
+#endif
         const auto extensions = windowExtensions(window.Handle());
         const auto target = presentationWindow(window.Handle(), extensions, req.width, req.height, req.timing);
         timing.Mark("window_prepare");
@@ -570,7 +587,14 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
         }
         timing.Mark("present");
+#ifdef __APPLE__
+        // macOS: the title update is queued, not waited for (the window outlives it: Destroy runs
+        // on the same serial main queue).
+        if (pthread_main_np() == 0) dispatch_async_f(dispatch_get_main_queue(), &window, [](void* context) { static_cast<DisplayWindow*>(context)->UpdateTitle(); });
+        else window.UpdateTitle();
+#else
         OnMainThread([&] { window.UpdateTitle(); });
+#endif
         timing.Mark("window_title");
     }
     std::lock_guard lock(req.cfg->mutex);
