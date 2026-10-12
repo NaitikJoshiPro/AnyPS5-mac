@@ -117,6 +117,17 @@ struct Aps5BufferMemory {
     void write(uint byte, uint value, uint bits, thread bool& stop) const {
         aps5_buffer_write(buffer, byteOffset, misalignment, byte, value, bits, glc);
     }
+
+    // A coherent (GLC) dwordx2 at an 8-byte aligned address is one 64-bit load, so it never sees half
+    // of a 64-bit atomic (which commits with one 64-bit atomic_max/min, see the Atomics64 chunk).
+    uint2 read2(uint byte, thread bool& stop) const {
+        const ulong address = buffer.address + ulong(byteOffset) + ulong(byte);
+        const uint index = (byte >> 2u) + (byteOffset >> 2u);
+        if (glc && misalignment == 0u && (address & 7ul) == 0ul && index + 1u < (buffer.bytes >> 2u)) {
+            return as_type<uint2>(*reinterpret_cast<coherent(device) device const ulong*>(address));
+        }
+        return uint2(read(byte, 32u, stop), read(byte + 4u, 32u, stop));
+    }
 };
 
 // A dword of the flattened SRT (ReadConst); zero past its end.
@@ -760,6 +771,20 @@ void Load(MslEmitterState& state, const IrValue& instruction, std::uint32_t comp
         if (descriptor.gpu) MslB5StopIf(state, stop);
         state.Outdent();
         state.Line("}");
+    } else if (components == 2u && memory.coherent && memory.dataBits == 32u) {
+        // GLC dwordx2: one 64-bit load when both dwords are in bounds (a 64-bit atomic's value whole).
+        const auto first = state.Temporary("aps5_a");
+        const auto second = state.Temporary("aps5_a");
+        state.Line("const Aps5BufferAccess " + first + " = " + AccessExpression(state, instruction, descriptor, 0u, 4u) + ";");
+        state.Line("const Aps5BufferAccess " + second + " = " + AccessExpression(state, instruction, descriptor, 4u, 4u) + ";");
+        state.Line("if (" + first + ".inBounds && " + second + ".inBounds && " + second + ".byte == " + first + ".byte + 4u) " + result + " = " + descriptor.memory + ".read2(" + first + ".byte, " + stop + ");");
+        state.Line("else {");
+        state.Indent();
+        state.Line("if (" + first + ".inBounds) " + result + "[0] = " + descriptor.memory + ".read(" + first + ".byte, 32u, " + stop + ");");
+        state.Line("if (" + second + ".inBounds) " + result + "[1] = " + descriptor.memory + ".read(" + second + ".byte, 32u, " + stop + ");");
+        state.Outdent();
+        state.Line("}");
+        if (descriptor.gpu) MslB5StopIf(state, stop);
     } else {
         for (std::uint32_t component = 0; component < components; ++component) {
             const auto access = state.Temporary("aps5_a");

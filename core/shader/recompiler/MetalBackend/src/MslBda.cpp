@@ -310,6 +310,12 @@ struct Aps5BdaMemory {
         return aps5_bda_read_small(bda, address, bits, pc, stops, stop);
     }
 
+    // A coherent dwordx2 (Aps5BufferMemory::read2): dword by dword through the page table.
+    uint2 read2(uint byte, thread bool& stop) const {
+        const uint low = read(byte, 32u, stop);
+        return uint2(low, stop ? 0u : read(byte + 4u, 32u, stop));
+    }
+
     void write(uint byte, uint value, uint bits, thread bool& stop) const {
         bool overflow = false;
         const ulong address = aps5_bda_add(bda, base, ulong(byte), false, pc, overflow);

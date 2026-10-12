@@ -557,11 +557,13 @@ std::string MslDeviceAtomic64(MslEmitterState& state, const IrValue& instruction
     state.Line("if (atomic_compare_exchange_weak_explicit(" + lock + ", &" + expected + ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
     state.Indent();
     state.Line(Fence(lockSpace.flags, "memory_order_acquire", lockSpace.scope));
-    state.Line(result + " = ulong(" + words + "[0]) | (ulong(" + words + "[1]) << 32u);");
+    state.Line(result + " = *reinterpret_cast<coherent(device) device const ulong*>(" + words + ");");
     const auto updated = state.Temporary("aps5_n64");
     state.Line("const ulong " + updated + " = aps5_atomic64_next(" + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + result + ", ulong(" + std::string(value) + "), ulong(" + std::string(comparator.empty() ? "0ul" : comparator) + "));");
-    state.Line(words + "[0] = uint(" + updated + ");");
-    state.Line(words + "[1] = uint(" + updated + " >> 32u);");
+    // Commit the new value with one 64-bit atomic (max when it grows, min when it shrinks: the lock
+    // holder knows the old value), so 64-bit loads elsewhere never see half of it.
+    state.Line("if (" + updated + " > " + result + ") atomic_max_explicit(reinterpret_cast<device atomic_ulong*>(" + words + "), " + updated + ", memory_order_relaxed);");
+    state.Line("else if (" + updated + " < " + result + ") atomic_min_explicit(reinterpret_cast<device atomic_ulong*>(" + words + "), " + updated + ", memory_order_relaxed);");
     state.Line(Fence(lockSpace.flags, "memory_order_release", lockSpace.scope));
     state.Line("atomic_store_explicit(" + lock + ", 0u, memory_order_relaxed);");
     state.Line(done + " = true;");
