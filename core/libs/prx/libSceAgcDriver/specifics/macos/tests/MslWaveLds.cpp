@@ -75,6 +75,14 @@ alignas(256) constexpr std::array<std::uint32_t, 69> LdsBeyondCode{
     0x80012c1e, 0xe0781020, 0x8001301e, 0xbf8c0000, 0xbf810000,
 };
 
+// Constants of tests/execution/DsAppendConsume.cpp its code embeds.
+constexpr std::uint32_t AppendStart = 1000;
+constexpr std::uint32_t ConsumeStart = 2000;
+constexpr std::uint32_t MaskedAppendStart = 3000;
+constexpr std::uint32_t MaskedConsumeStart = 4000;
+constexpr std::uint32_t BaseShiftedStart = 5000;
+constexpr std::uint32_t UntouchedAppend = 0x5eed0001u;
+constexpr std::uint32_t UntouchedConsume = 0x5eed0002u;
 // tests/execution/DsAppendConsume.cpp (Code).
 alignas(256) constexpr std::array<std::uint32_t, 98> AppendConsumeCode{
     0x34060084, 0x7e100280, 0x7e0802ff, AppendStart, 0x7e0a02ff, ConsumeStart, 0x7e0c02ff, MaskedAppendStart,
@@ -253,7 +261,7 @@ int main() {
             const Program within {"lds_within_device_limit", LdsBeyondCode, 64u, 32u, 1024u, 8u};
             const auto small = Recompile(within);
             Require(small.msl.Reflection().workgroupMemoryStrideDwords == 0u, "lds_within_device_limit: LDS that fits threadgroup memory must not use the arena");
-            Has(within, std::string(small.msl.Source()), "threadgroup uint aps5_lds[1024];");
+            Has(within, std::string(small.msl.Source()), "threadgroup uint aps5_lds[1025];");
         }
         // ds_append / ds_consume: one atomic per wave on the counter, broadcast to the wave.
         {
