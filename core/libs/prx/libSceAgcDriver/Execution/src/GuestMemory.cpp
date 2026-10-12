@@ -11,7 +11,6 @@
 #include <atomic>
 #include <algorithm>
 #include <bit>
-#include <emmintrin.h>
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +22,11 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1904,6 +1908,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         std::size_t firstChanged = size;
         std::size_t lastChanged = 0;
         std::size_t at = 0;
+#if defined(__x86_64__) || defined(_M_X64)
         for (; at + 16 <= size; at += 16) {
             const auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current.data() + at));
             const auto same = _mm_cmpeq_epi8(bytes, _mm_loadu_si128(reinterpret_cast<const __m128i*>(original.data() + at)));
@@ -1916,6 +1921,30 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
             lastChanged = std::max(lastChanged, at + 32 - static_cast<std::size_t>(std::countl_zero(changed)));
         }
         _mm_sfence();
+#elif defined(__aarch64__)
+        for (; at + 16 <= size; at += 16) {
+            const auto bytes = vld1q_u8(reinterpret_cast<const std::uint8_t*>(current.data() + at));
+            const auto same = vceqq_u8(bytes, vld1q_u8(reinterpret_cast<const std::uint8_t*>(original.data() + at)));
+            // Four bits per byte, byte i in bits 4i..4i+3: 0xf where the byte is unchanged.
+            const auto equal = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(same), 4)), 0);
+            if (equal == ~std::uint64_t{0}) continue;
+            const auto changed = ~equal;
+            if (equal == 0) {
+                vst1q_u8(reinterpret_cast<std::uint8_t*>(destination + at), bytes);
+            } else {
+                // Only the changed bytes, as MASKMOVDQU stores them: a 16-byte store would also rewrite the
+                // unchanged ones and could undo a guest write that lands on them meanwhile.
+                for (auto pending = changed; pending != 0;) {
+                    const auto nibble = static_cast<unsigned>(std::countr_zero(pending)) & ~3u;
+                    const auto index = at + nibble / 4;
+                    destination[index] = current[index];
+                    pending &= ~(std::uint64_t{0xf} << nibble);
+                }
+            }
+            firstChanged = std::min(firstChanged, at + static_cast<std::size_t>(std::countr_zero(changed)) / 4);
+            lastChanged = std::max(lastChanged, at + (64 - static_cast<std::size_t>(std::countl_zero(changed))) / 4);
+        }
+#endif
         for (; at < size; ++at) {
             if (current[at] == original[at]) continue;
             destination[at] = current[at];
