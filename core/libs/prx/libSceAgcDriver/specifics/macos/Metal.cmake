@@ -71,3 +71,10 @@ foreach(agcMetalTarget IN LISTS agcMetalTargets)
         target_link_libraries(${agcMetalTarget} PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Foundation")
     endif()
 endforeach()
+
+# libSceAudioIn/libSceAudioOut/libSceVideoOut take SDL from the driver on macOS (one SDL per process, see
+# libSceAudioOut/CMakeLists.txt). The Vulkan driver pulls SDL's core in through SDL_Init; the Metal driver does
+# not call SDL yet (presentation is D6), so keep SDL_Init (and through it the audio/video subsystems) linked.
+if(TARGET libSceAgcDriver)
+    target_link_options(libSceAgcDriver PRIVATE "LINKER:-u,_SDL_Init")
+endif()
