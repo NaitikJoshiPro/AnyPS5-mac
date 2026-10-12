@@ -249,6 +249,7 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader
+            MslAbi::Index
             GetPreparedArtifact
             MaterializeShader
             RegistrationResult
