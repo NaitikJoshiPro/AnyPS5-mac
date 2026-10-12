@@ -11,7 +11,7 @@
 #if defined(__linux__)
 #include <sys/syscall.h>
 #elif defined(__APPLE__)
-#include <signal.h>
+#include <pthread.h>
 #endif
 #include <unistd.h>
 #include <variant>
@@ -163,10 +163,13 @@ public:
 #if defined(__linux__)
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &*OriginalMask, sizeof(*OriginalMask));
 #elif defined(__APPLE__)
-    sigset_t NewMask, OldMask;
-    sigfillset(&NewMask);
-    sigprocmask(SIG_SETMASK, &NewMask, &OldMask);
-    (void)Mask;
+    // Darwin's sigset_t is a 32-bit mask with signal N at bit N-1, the same
+    // layout as the low half of Linux's mask. Per-thread, like rt_sigprocmask.
+    static_assert(sizeof(sigset_t) == sizeof(uint32_t));
+    sigset_t NewMask = static_cast<sigset_t>(Mask);
+    sigset_t OldMask {};
+    pthread_sigmask(SIG_SETMASK, &NewMask, &OldMask);
+    *OriginalMask = OldMask;
 #endif
   }
 
@@ -183,9 +186,8 @@ public:
 #if defined(__linux__)
       ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &OriginalMask, nullptr, sizeof(*OriginalMask));
 #elif defined(__APPLE__)
-      sigset_t OldMask;
-      sigfillset(&OldMask); // Restore all (simplified)
-      sigprocmask(SIG_SETMASK, &OldMask, nullptr);
+      sigset_t OldMask = static_cast<sigset_t>(*OriginalMask);
+      pthread_sigmask(SIG_SETMASK, &OldMask, nullptr);
 #endif
     }
   }
