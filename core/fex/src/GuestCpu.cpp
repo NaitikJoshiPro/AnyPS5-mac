@@ -97,6 +97,8 @@ FEXCore::HostFeatures HostFeatures() {
     features.SupportsECV = HasFeature("FEAT_ECV");
     features.SupportsWFXT = HasFeature("FEAT_WFxT");
     features.SupportsMOPS = HasFeature("FEAT_MOPS");
+    features.SupportsI8MM = HasFeature("FEAT_I8MM");
+    features.SupportsDotProd = HasFeature("FEAT_DotProd");
     features.SupportsAVX = true;
     features.SupportsAES256 = features.SupportsAES;
     return features;

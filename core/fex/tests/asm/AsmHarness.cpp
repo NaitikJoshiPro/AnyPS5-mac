@@ -163,6 +163,8 @@ std::optional<std::string> MissingFeature(const TestConfig& config) {
     const std::pair<std::string_view, bool> checked[] = {
         {"AVX", host.SupportsAVX}, {"RAND", host.SupportsRAND}, {"SHA", host.SupportsSHA}, {"CLZERO", host.SupportsCLZERO},
         {"AES256", host.SupportsAES256}, {"AFP", host.SupportsAFP},
+        // FEX advertises AVX-VNNI only with AVX and I8MM or DotProd (CPUID.cpp).
+        {"AVX_VNNI", host.SupportsAVX && (host.SupportsI8MM || host.SupportsDotProd)},
     };
     constexpr std::string_view emulated[] = {"3DNOW", "SSE4A", "BMI1", "BMI2", "CLWB", "LINUX", "SSSE3", "SSE4.1", "SSE4.2", "AES",
                                              "PCLMUL", "MOVBE", "ADX", "XSAVE", "RDPID", "CLFLOPT", "FSGSBASE", "EMMI"};
