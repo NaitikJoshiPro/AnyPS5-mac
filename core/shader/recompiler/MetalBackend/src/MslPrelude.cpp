@@ -22,7 +22,9 @@ struct Aps5DriverData {
 
 )";
 
-// BdaAbi::Fault: claim the record (Empty -> Writing), fill it, publish it (Ready).
+// BdaAbi::Fault: claim the record (Empty -> Writing), fill it, publish it (Ready). The publishing
+// fence is seq_cst: MSL 4.0 has only memory_order_relaxed and memory_order_seq_cst (release and
+// acquire need MSL 4.1's mem_flags overloads), and the fault path is rare.
 constexpr std::string_view FaultRecordText = R"(static void aps5_record_fault(ulong faultBuffer, uint reason, ulong address, uint bytes, uint stage, uint instruction) {
     if (faultBuffer == 0ul) return;
     device atomic_uint* state = reinterpret_cast<device atomic_uint*>(faultBuffer);
@@ -35,7 +37,7 @@ constexpr std::string_view FaultRecordText = R"(static void aps5_record_fault(ul
     words[4] = bytes;
     words[5] = stage;
     words[6] = instruction;
-    atomic_thread_fence(mem_flags::mem_device, memory_order_release, thread_scope_device);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     atomic_store_explicit(state, 2u, memory_order_relaxed);
 }
 
