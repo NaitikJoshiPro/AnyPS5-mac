@@ -176,6 +176,41 @@ All other calls the runner uses are unchanged.
 - **Dependencies:** none. Run it on the pin first as the R baseline. **Overlap:** R (GuestCpu.cpp API), `core/fex/CMakeLists.txt` with C, D and H.
 - **Later (M4):** `unittests/InstructionCountCI` (101 files, 7,677 entries) is a code-size regression oracle. Its expected disassembly needs a Darwin baseline because the pin doesn't use x18 on Apple.
 
+**Results (2026-10-12, pin `cad0c096`, commits `ace93c10`, `0dade124`, `161f7c8a`):**
+- **Built as designed, with these corrections:**
+  - Δ is `0x100_0000_0000`, not `0x10_0000_0000`: macOS 27 reserves a 384 GiB guard region at `0x10_0000_0000`-`0x70_0000_0000` (`vmmap`: "Guard"), the GPU carveout at `0x73_ec00_0000`-`0x79_ec00_0000` and malloc regions in between; `mach_vm_allocate(FIXED)` there returns `KERN_NO_SPACE` even in an empty process. A small `__PAGEZERO` (`-pagezero_size`) is no way out: the kernel kills such an arm64 binary at exec (exit 137).
+  - The shared setup is `RunBareGuest` in R/GuestCpu.cpp (declared in R/BareGuest.hpp): `PrepareFex` (log handlers, pool, allocator hooks, config, `APS5_FEX_CONFIG`) is shared with `GuestCpu`'s constructor; a bare `SyscallHandler` and `GuestThread` without TLS or bridge. `aps5-fex` is `Main.cpp` over the static library `aps5-fex-runtime`, which the harness links too.
+  - The harness forks per test so crashes count as failures and known failures invert them; it captures the child's output and prints the verdict first (CTest truncates passed-test output).
+  - Relocation is a source-order dataflow over `nasm -E` output: movs whose constant becomes a pointer, followed through copies, arithmetic, push/pop, `cmp`/`sub` with another moved pointer, and unscaled bases whose sum is an address (`SIBScaleTranspose`). 1,024 tests are rewritten. Expectations accept `V + Δ` within 1 MiB of a mapped range and the moved code address through nasm listings (`cmpxchg8b`, `cmpxchg16b`).
+  - Tests that cannot be moved: the 13 predicted, plus the three `5_FF_05*` far jumps through `lea edi, [rel label]` (a 32-bit code address).
+- **Suite (`ctest -L fex_asm`, both variants, 4,444 tests + prepare, about 15 s on 8 cores after a 70-100 s first prepare):** default (MAXINST=500, multiblock, TSO on as in the runner) 2,121 pass, 73 known failures, 28 skips, 0 unexpected; full (MAXINST=1) 2,122 / 72 / 28 / 0. Baseline: `T/asm/baseline-cad0c096.txt`; `T/asm/asm_suite.py compare <junit> <baseline>` checks a rerun.
+- **Skips (28):** 18 `Disabled_Tests_macos` (16 unmovable, `TwoByte/0F_02.asm` needs the Linux `time` syscall, `Secondary/07_XX_04.asm` with nasm 3), 5 FEX `Disabled_Tests`, 3 CLZERO (the runner's host features leave it out), 2 RDRAND/RDSEED (no FEAT_RNG on M3).
+- **Known failures (73): FEX's own `FEX_bugs/32bit_syscall.asm` (`Known_Failures_jit`) and 72 runner gaps, none in FEXCore's x86 semantics:**
+  - 69 SIGBUS (`BUS_ADRALN`) on atomics or TSO-ordered accesses that cross a 16-byte granule (fault offsets 9-15). The plain ones pass with `FEX_TSOENABLED=0`; lock-prefixed ones fault either way. Package B's handler should turn them into passes (XPASS then asks to delete the list entries).
+  - `FEX_bugs/CodeBufferOverflow.asm` (default variant only): FEXCore restarts a block that outgrows its temporary JIT buffer from the frontend's SIGSEGV handler on `Thread->JITGuardPage` (FEX `Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp:585`, `UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, ...)`); `OnFault` does not.
+  - `Primary/Primary_8C.asm`, `Primary_8C_2.asm`: `mov es, ax` with 0x4142 makes FEXCore read GDT entry 0x828; `GuestThread::gdt` has 32 entries on the stack.
+- **Found and fixed in the bare guest only** (the runner still lacks them, TechnicalDebt): the pinned FEX ends a block at `syscall` and resumes at the stored RIP, so a handler must advance RIP by 2 (`Bridge::Call` does); FEXCore leaves `InvalidateGuestCodeRange` to the frontend, so with `SMCChecks=full` a changed block loops forever and with the default MTRACK self-modifying code is never seen.
+- **nasm 3.02 vs 2.16.03** (built from source in `.mac-work/tools/`, sha256 from Homebrew's 2.16.03 formula): 26 tests assemble to different bytes (prefix order such as `66 F3 A5` for `F3 66 A5`, `cdqe` for `movsxd rax, eax`, dropped no-op REX.W on `pinsrw`/`pextrw`/`crc32`, swapped `xchg` operands). Only `smsw r64/r16` changes meaning (nasm 3 drops REX.W and 0x66). With nasm 2.16.03 the default variant gives 2,122 pass, 73 known failures, 27 skips. `-DAPS5_FEX_ASM_NASM=<nasm>` selects the assembler; the baseline uses nasm 3.02.
+- **Coverage, default variant** (`asm_suite.py classes`; a test counts for every class among its instructions other than mov/lea/push/pop/xor/jmp/call/ret/nop/hlt):
+
+| Class | Tests | Pass | Known failures | Skips | Pass rate of run tests |
+|---|---|---|---|---|---|
+| integer | 831 | 762 | 65 | 4 | 92.1% |
+| flags (pushf/lahf/setcc/cmovcc/jcc/adc/sbb/rcl/rcr readers) | 417 | 400 | 15 | 2 | 96.4% |
+| string ops | 99 | 98 | 1 | 0 | 99.0% |
+| atomics (lock, cmpxchg8b/16b) | 90 | 45 | 45 | 0 | 50.0% |
+| x87 | 388 | 381 | 7 | 0 | 98.2% |
+| MMX / 3DNow! | 145 / 28 | 144 / 28 | 1 / 0 | 0 | 99.3% / 100% |
+| SSE / SSE2 / SSE3 / SSSE3 | 312 / 368 / 37 / 54 | 308 / 364 / 37 / 54 | 4 / 4 / 0 / 0 | 0 | 98.7% / 98.9% / 100% / 100% |
+| SSE4.1 / SSE4.2 / SSE4a | 105 / 37 / 12 | all pass | 0 | 0 | 100% |
+| AES / PCLMUL / SHA | 31 | 31 | 0 | 0 | 100% |
+| AVX / AVX2 | 702 / 258 | all pass | 0 | 0 | 100% |
+| FMA / F16C | 21 / 11 | all pass | 0 | 0 | 100% |
+| BMI1 / BMI2 / LZCNT, POPCNT | 13 / 11 / 7 | 13 / 11 / 5 | 0 / 0 / 2 | 0 | 100% / 100% / 71.4% |
+| MOVBE | 3 | 3 | 0 | 0 | 100% |
+| system (cpuid, rdtsc, xsave, fxsave, rdrand, ...) | 86 | 73 | 8 | 5 | 90.1% |
+| all | 2,222 | 2,121 | 73 | 28 | 96.7% |
+
 ### B. SIGBUS handler for unaligned ordered accesses
 **Problem:** the M3 raises SIGBUS (BUS_ADRALN) when an LDAPR/LDAPUR/STLR/STLUR or atomic crosses a 16-byte boundary. `OnFault` (R/GuestCpu.cpp:353-371) handles only native→guest calls (:356-359) and passes everything else on, so the process dies.
 
