@@ -46,6 +46,12 @@ using CustomIREntrypointHandler = std::function<void(uintptr_t Entrypoint, IR::I
 
 using ExitHandler = std::function<void(Core::InternalThreadState* Thread)>;
 
+// Where the host code for a guest block came from: compiled now, or loaded from the disk cache.
+enum class CompiledBlockOrigin : uint8_t { JIT, DiskCache };
+// Told of every block the lookup cache gains outside the L1/L2 hit path: the entry RIP and the guest bytes the block
+// covers as (begin, size) pairs. Runs on the compiling thread.
+using CompiledBlockObserver = void (*)(uint64_t EntryRIP, const uint64_t* Ranges, size_t RangeCount, CompiledBlockOrigin Origin);
+
 class Context {
 public:
   virtual ~Context() = default;
@@ -134,6 +140,9 @@ public:
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) = 0;
 
   virtual void InitDiskCache() = 0;
+  // Waits for the disk cache's queued writes to reach the file.
+  FEX_DEFAULT_VISIBILITY virtual void FlushDiskCache() = 0;
+  FEX_DEFAULT_VISIBILITY virtual void SetCompiledBlockObserver(CompiledBlockObserver Observer) = 0;
 
   virtual AbstractCodeCache& GetCodeCache() = 0;
   virtual void SetCodeMapWriter(fextl::unique_ptr<CodeMapWriter>) = 0;

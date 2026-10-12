@@ -929,6 +929,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
 
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+        if (BlockObserver) {
+          BlockObserver(GuestRIP, Hit->GuestRanges.data(), Hit->GuestRanges.size() / 2, CompiledBlockOrigin::DiskCache);
+        }
         Thread->FrontendDecoder->DelayedDisownBuffer();
 
         Thread->FrontendDecoder->ValidateDisownedOrFree();
@@ -1028,6 +1031,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     if (CodeMapWriter && Region && Region->FileStartVA != 0) {
       CodeMapWriter->AppendBlock(*Region, GuestRIP);
     }
+  }
+
+  if (BlockObserver && NeedsAddGuestCodeRanges) {
+    fextl::vector<uint64_t> Ranges;
+    for (const auto& Block : Thread->FrontendDecoder->GetDecodedBlockInfo()->Blocks) {
+      Ranges.push_back(Block.Entry);
+      Ranges.push_back(Block.Size);
+    }
+    BlockObserver(GuestRIP, Ranges.data(), Ranges.size() / 2, CompiledBlockOrigin::JIT);
   }
 
   // Insert to lookup cache

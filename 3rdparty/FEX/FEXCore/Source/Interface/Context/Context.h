@@ -206,6 +206,13 @@ public:
   FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) override;
 
   virtual void InitDiskCache() override {}
+  void FlushDiskCache() override {
+    DiskCache.Flush();
+  }
+  void SetCompiledBlockObserver(CompiledBlockObserver Observer) override {
+    BlockObserver = Observer;
+  }
+  CompiledBlockObserver BlockObserver {};
 
   CodeCache& GetCodeCache() override {
     return CodeCache;

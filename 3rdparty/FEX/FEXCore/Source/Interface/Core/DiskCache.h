@@ -119,6 +119,8 @@ namespace DiskCache {
     std::span<const uint64_t> GuestPages;
     std::span<uint64_t> EntryPointRIPs;
     std::span<const uint32_t> EntryPointHostOffsets;
+    // Guest bytes the block covers, as (begin, size) pairs.
+    fextl::vector<uint64_t> GuestRanges;
 
     // the spans above point to memory owned by the Blob vec, so it's important this can't be copied
     CodeHitData() = default;
@@ -207,6 +209,11 @@ namespace DiskCache {
     }
     bool IsValidating() const {
       return Validation;
+    }
+    void Flush() {
+      if (Writer) {
+        Writer->WaitIdle();
+      }
     }
 
   private:

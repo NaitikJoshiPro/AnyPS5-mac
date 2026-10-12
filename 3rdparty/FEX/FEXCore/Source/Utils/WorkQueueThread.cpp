@@ -28,6 +28,11 @@ void WorkQueueThread::QueueWork(fextl::unique_ptr<WorkItem> Work) {
   CV.notify_one();
 }
 
+void WorkQueueThread::WaitIdle() {
+  std::unique_lock lk {Mutex};
+  IdleCV.wait(lk, [this] { return Queue.empty() && !Running; });
+}
+
 void WorkQueueThread::ThreadProc() {
   while (true) {
     fextl::unique_ptr<WorkItem> Work;
@@ -44,9 +49,16 @@ void WorkQueueThread::ThreadProc() {
 
       Work = std::move(Queue.front());
       Queue.pop_front();
+      Running = true;
     }
 
     Work->Run();
+    Work.reset();
+    {
+      std::unique_lock lk {Mutex};
+      Running = false;
+    }
+    IdleCV.notify_all();
     // Work is destroyed here
   }
 }

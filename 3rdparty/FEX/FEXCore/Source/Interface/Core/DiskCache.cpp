@@ -770,6 +770,13 @@ namespace DiskCache {
 
     // this seems to be a full hit, pull from disk and check the entry is big enough to have everything (except GuestCode)
     CodeHitData HitData;
+    for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+      HitData.GuestRanges.push_back(GuestRIP + Entry.GuestExtents[i]);
+      HitData.GuestRanges.push_back(Entry.GuestExtents[i + 1]);
+    }
+    if (Entry.GuestExtents.empty()) {
+      HitData.GuestRanges = {GuestRIP, Entry.GuestSize};
+    }
     uint32_t EntrySizeWithoutGuestCode = Entry.Size - Entry.GuestSize;
     HitData.Blob.resize(GuestPages.size() * sizeof(uint64_t) + EntrySizeWithoutGuestCode);
     memcpy(HitData.Blob.data(), GuestPages.data(), GuestPages.size() * sizeof(uint64_t));

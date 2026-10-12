@@ -23,6 +23,9 @@ public:
 
   void QueueWork(fextl::unique_ptr<WorkItem> Work);
 
+  // Blocks until every queued item has run.
+  void WaitIdle();
+
 private:
   // static function for the ::Thread to refer to
   static void* ThreadEntry(void* Self) {
@@ -33,6 +36,8 @@ private:
 
   std::mutex Mutex;
   std::condition_variable CV;
+  std::condition_variable IdleCV;
+  bool Running = false;
   fextl::deque<fextl::unique_ptr<WorkItem>> Queue;
   bool Stop = false;
 
