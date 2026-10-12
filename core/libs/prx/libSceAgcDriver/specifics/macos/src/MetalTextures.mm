@@ -285,11 +285,11 @@ ImageCache::~ImageCache() {
 
 void ImageCache::Attach(const Context& deviceContext, bool force) {
     if (imageContext != nullptr) return;
-    // Bring-up switch while the twins reach the bring-up path's G2 count: the upstream image path
-    // (Texture/ShaderResources twins) only with APS5_METAL_UPSTREAM_IMAGES=1.
+    // The upstream image path (Texture/ShaderResources twins) is the default; APS5_METAL_UPSTREAM_IMAGES=0
+    // keeps the bring-up path until the default is verified on G1/G2/G4, then the bring-up path goes.
     static const bool upstream = [] {
         const char* value = std::getenv("APS5_METAL_UPSTREAM_IMAGES");
-        return value != nullptr && std::strcmp(value, "1") == 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     if (!upstream && !force) return;
     imageContext = std::make_unique<Context>(deviceContext);
