@@ -6,10 +6,14 @@
 //                                   written back, cull mode and front-face winding as Vulkan)
 //   agc_metal_draw_tests primitives (agc_metal_draw_primitives: depth surfaces and the depth test,
 //                                   indexed triangle fans, CPU-read indirect draws, instancing)
+//   agc_metal_draw_tests offscreen  (agc_metal_offscreen_frames: headless presentation, a window
+//                                   without a Metal layer: pixels scaled aspect-fit over black,
+//                                   clears, slots retired; read back via APS5_METAL_PRESENT_READBACK)
 #include "../src/MetalDeviceState.h"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -314,13 +318,55 @@ void CheckPrimitives(AgcDriver::VulkanDevice& device) {
     std::puts("primitives: depth test, indexed fan, CPU indirect, instancing passed");
 }
 
+// Headless presentation: a 32x16 source with four colored quadrants presented into a 64x48
+// offscreen target is scaled 2x and centered vertically (8 black rows above and below).
+void CheckOffscreen(AgcDriver::VulkanDevice& device) {
+    Require(device.Presentable() && device.Window() != nullptr, "a window without a Metal layer is not presentable headless");
+    constexpr std::uint32_t Width = 32u;
+    constexpr std::uint32_t Height = 16u;
+    constexpr std::array<std::uint32_t, 4> quadrants {0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu};
+    std::vector<std::byte> pixels(Width * Height * 4u);
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            const auto color = quadrants[(y >= Height / 2u ? 2u : 0u) + (x >= Width / 2u ? 1u : 0u)];
+            std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * Width + x) * 4u, &color, 4u);
+        }
+    }
+    device.PresentPixels(Width, Height, pixels);
+    device.WaitIdle();
+    auto frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(frame.frames == 1u && frame.width == 64u && frame.height == 48u, "the headless present read back " + std::to_string(frame.frames) + " frames of " + std::to_string(frame.width) + "x" + std::to_string(frame.height));
+    const auto at = [&](std::uint32_t x, std::uint32_t y) {
+        std::uint32_t value;
+        std::memcpy(&value, frame.pixels.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4u, 4u);
+        return value;
+    };
+    Require(at(32u, 2u) == 0xff000000u && at(32u, 45u) == 0xff000000u, "the letterbox rows are not opaque black");
+    Require(at(8u, 14u) == quadrants[0] && at(56u, 14u) == quadrants[1] && at(8u, 34u) == quadrants[2] && at(56u, 34u) == quadrants[3], "the scaled quadrants are wrong (" + std::to_string(at(8u, 14u)) + " " + std::to_string(at(56u, 14u)) + " " + std::to_string(at(8u, 34u)) + " " + std::to_string(at(56u, 34u)) + ")");
+    // A clear-only present; the slot retires through FinishPresent.
+    Require(device.PresentClear(Width, Height, true), "a headless clear was not presented");
+    device.FinishPresent();
+    device.QueuePresent();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(frame.frames == 2u && at(8u, 14u) == 0xff000000u && at(56u, 34u) == 0xff000000u, "the clear-only present did not clear the target");
+    Require(AgcDriver::VulkanDevice::PresentCounts().presents >= 2u, "presents were not counted");
+    std::puts("offscreen: aspect-fit scaling, letterbox, clear, slot retirement passed");
+}
+
+void NoDrawableSize(void*, std::uint32_t* width, std::uint32_t* height) {
+    *width = 64u;
+    *height = 48u;
+}
+
 }
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "targets";
     std::unique_ptr<AgcDriver::VulkanDevice> device;
+    static int windowToken = 0;
+    AgcDriver::PresentationWindow window {&windowToken, {}, nullptr, &NoDrawableSize, 64u, 48u, nullptr};
     try {
-        device = std::make_unique<AgcDriver::VulkanDevice>();
+        device = mode == "offscreen" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
     } catch (const std::exception& error) {
         std::printf("skipped, no usable Metal device: %s\n", error.what());
         return Skipped;
@@ -330,6 +376,8 @@ int main(int argc, char** argv) {
             CheckTargets(*device);
         } else if (mode == "primitives") {
             CheckPrimitives(*device);
+        } else if (mode == "offscreen") {
+            CheckOffscreen(*device);
         } else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;

@@ -21,6 +21,14 @@ public:
     void DrawableSize(std::uint32_t& width, std::uint32_t& height) const;
     void UpdateTitle();
     void ToggleFullscreen();
+#ifdef __APPLE__
+    // The window's CAMetalLayer (an SDL Metal view made on first use and destroyed with the window),
+    // null when the video driver has no Metal view (offscreen). Main thread only.
+    static void* MetalLayer(SDL_Window* window);
+    // The drawable size in pixels: the Metal view's, else the window's size.
+    static void MetalDrawableSize(SDL_Window* window, int* width, int* height);
+    static constexpr const char* MetalViewKey = "aps5.metal.view";
+#endif
 
 private:
     void create(std::uint32_t sourceWidth, std::uint32_t sourceHeight);

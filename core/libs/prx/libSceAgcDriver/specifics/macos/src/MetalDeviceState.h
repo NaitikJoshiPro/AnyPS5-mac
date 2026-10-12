@@ -37,8 +37,19 @@ namespace AgcDriver {
 
 namespace Metal {
 
-// D6's per-device draw objects (MetalDraw.mm).
+// D6's per-device draw objects (MetalDraw.mm) and presentation state (MetalPresentation.mm).
 struct DrawCache;
+struct Presenter;
+
+// The last frame a headless present copied back (APS5_METAL_PRESENT_READBACK=1, for tests):
+// BGRA8 rows of the presentation target, `frames` counts the copies so far.
+struct PresentedFrame {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::vector<std::byte> pixels;
+    std::uint64_t frames = 0;
+};
+PresentedFrame LastPresentedFrame();
 
 [[noreturn]] inline void Unimplemented(const char* what, const char* package) {
     throw std::runtime_error(std::string("Metal device: ") + what + " is not implemented yet (" + package + ", docs/mac/M2_DESIGN.md)");
@@ -172,6 +183,10 @@ struct VulkanDevice::State {
     // Destroyed in Teardown after the recorder is idle, before `images` (whose residency set holds
     // their textures).
     std::shared_ptr<Metal::DrawCache> draws;
+    // D6's presentation (null without a window): the window's CAMetalLayer or headless targets,
+    // the scaler, the present slots. Destroyed in Teardown with `draws`.
+    std::shared_ptr<Metal::Presenter> presenter;
+    void AttachPresentation(const PresentationWindow& window);
 
     std::uint64_t Wrap(std::uint64_t address, std::uint64_t bytes);
     // Wrap without throwing: 0 when the range cannot be wrapped (unmapped, executable, unreadable).

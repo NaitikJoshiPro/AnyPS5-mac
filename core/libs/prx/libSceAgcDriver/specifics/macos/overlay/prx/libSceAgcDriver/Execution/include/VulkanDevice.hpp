@@ -307,6 +307,9 @@ public:
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
+    // Records and submits one frame into the next present slot (MetalPresentation.mm): `pixels`
+    // (BGRA8, width x height) drawn aspect-fit over a clear, or the clear alone when empty.
+    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels);
     // Vulkan-only test hook (tests/execution/PipelineOptimizedReadback.cpp); throws on Metal.
     Graphics::Context graphicsContext() const;
     // The Metal state (MTLDevice, queue, compiler, pipelines, guest-memory wrappers, in-flight

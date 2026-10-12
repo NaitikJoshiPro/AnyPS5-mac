@@ -5,6 +5,9 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
+#ifdef __APPLE__
+#include "SDL_metal.h"
+#endif
 #include <cstdio>
 #include <span>
 #include <stdexcept>
@@ -60,7 +63,13 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
     const auto title = GetAppTitle_nid_postfix();
     AgcDriverLockVulkanLoader_nid_postfix();
+#ifdef __APPLE__
+    // macOS: a plain window; MetalLayer() adds the Metal view (SDL recreates the window with
+    // SDL_WINDOW_METAL when its video driver has Metal; the offscreen driver has none: headless).
+    window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, static_cast<int>(initialSize.width), static_cast<int>(initialSize.height), SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+#else
     window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, static_cast<int>(initialSize.width), static_cast<int>(initialSize.height), SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+#endif
     AgcDriverUnlockVulkanLoader_nid_postfix();
     require(window != nullptr, SDL_GetError());
     SDL_SetWindowMinimumSize(window, static_cast<int>(DisplayWindowMinimumWidth), static_cast<int>(DisplayWindowMinimumHeight));
@@ -76,6 +85,10 @@ void DisplayWindow::updateAspectRatio(std::uint32_t sourceWidth, std::uint32_t s
 void DisplayWindow::Destroy() noexcept {
     if (window == nullptr) return;
     removeSubclass();
+#ifdef __APPLE__
+    if (auto* view = static_cast<SDL_MetalView>(SDL_GetWindowData(window, MetalViewKey))) SDL_Metal_DestroyView(view);
+    SDL_SetWindowData(window, MetalViewKey, nullptr);
+#endif
     SDL_DestroyWindow(window);
     window = nullptr;
 }
@@ -98,10 +111,35 @@ void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) co
     }
     int drawableWidth = 0;
     int drawableHeight = 0;
+#ifdef __APPLE__
+    MetalDrawableSize(window, &drawableWidth, &drawableHeight);
+#else
     SDL_Vulkan_GetDrawableSize(window, &drawableWidth, &drawableHeight);
+#endif
     width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
     height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
 }
+
+#ifdef __APPLE__
+void* DisplayWindow::MetalLayer(SDL_Window* window) {
+    if (window == nullptr) return nullptr;
+    auto view = static_cast<SDL_MetalView>(SDL_GetWindowData(window, MetalViewKey));
+    if (view == nullptr) {
+        view = SDL_Metal_CreateView(window);
+        if (view == nullptr) return nullptr;
+        SDL_SetWindowData(window, MetalViewKey, view);
+    }
+    return SDL_Metal_GetLayer(view);
+}
+
+void DisplayWindow::MetalDrawableSize(SDL_Window* window, int* width, int* height) {
+    if (SDL_GetWindowData(window, MetalViewKey) != nullptr) {
+        SDL_Metal_GetDrawableSize(window, width, height);
+        return;
+    }
+    SDL_GetWindowSize(window, width, height);
+}
+#endif
 
 void DisplayWindow::UpdateTitle() {
     require(window != nullptr, "window must exist before updating title");

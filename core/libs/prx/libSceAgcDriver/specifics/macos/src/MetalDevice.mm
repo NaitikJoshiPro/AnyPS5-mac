@@ -516,6 +516,7 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         // D6's draw objects (depth surfaces, tiled targets) release their textures from the
         // image cache's residency set before the cache goes.
         draws.reset();
+        presenter.reset();
         if (images != nullptr) images->Teardown();
         images.reset();
         // The pipeline cache after the recorder: joins its background workers, saves the archive.
@@ -548,7 +549,6 @@ VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {
 
 VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial(NextSerial()) {
     try {
-        if (window != nullptr) Unimplemented("presentation to a window", "work package D6");
         @autoreleasepool {
             state->device = SelectDevice();
             if (state->device == nil) throw std::runtime_error("Metal device: no Metal device");
@@ -619,6 +619,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             Graphics::PrepareImportWatch(context);
             // The image cache's Graphics twins (Texture/ShaderResources, D4/D5) take the complete Context.
             state->images->Attach(state->context);
+            // Presentation (D6): the window's Metal layer, or headless targets when it has none.
+            if (window != nullptr) state->AttachPresentation(*window);
         }
     } catch (...) {
         // A half-built device releases what it attached (residency sets on the queue) before unwinding.

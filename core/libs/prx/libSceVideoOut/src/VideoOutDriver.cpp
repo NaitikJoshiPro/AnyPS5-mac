@@ -11,6 +11,9 @@
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
+#ifdef __APPLE__
+#include "SDL_metal.h"
+#endif
 #include "prx/libSceVideoOut/include/MainThread.hpp"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
@@ -39,6 +42,11 @@ void require(bool condition, const char* reason) {
 }
 
 std::vector<const char*> windowExtensions(SDL_Window* window) {
+#ifdef __APPLE__
+    // macOS presents through Metal (the window's CAMetalLayer): no Vulkan instance extensions.
+    (void)window;
+    return {};
+#endif
     return OnMainThread([&] {
         unsigned extensionCount = 0;
         if (!SDL_Vulkan_GetInstanceExtensions(window, &extensionCount, nullptr)) throw std::runtime_error(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
@@ -50,6 +58,9 @@ std::vector<const char*> windowExtensions(SDL_Window* window) {
 }
 
 VkSurfaceKHR createWindowSurface(void* context, VkInstance instance) {
+#ifdef __APPLE__
+    throw std::runtime_error("VideoOut: the macOS device presents through the window's Metal layer, not a Vulkan surface");
+#endif
     return OnMainThread([&] {
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface)) throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
@@ -66,10 +77,30 @@ void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* heig
         }
         int drawableWidth = 0;
         int drawableHeight = 0;
+#ifdef __APPLE__
+        DisplayWindow::MetalDrawableSize(static_cast<SDL_Window*>(context), &drawableWidth, &drawableHeight);
+#else
         SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(context), &drawableWidth, &drawableHeight);
+#endif
         *width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
         *height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
     });
+}
+
+#ifdef __APPLE__
+// The window's CAMetalLayer (made on first use, kept with the window), null when the video driver
+// has no Metal view (SDL's offscreen driver): the device then presents headless.
+void* windowMetalLayer(void* context) {
+    return OnMainThread([&] { return DisplayWindow::MetalLayer(static_cast<SDL_Window*>(context)); });
+}
+#endif
+
+AgcDriver::PresentationWindow presentationWindow(SDL_Window* window, std::span<const char* const> extensions, std::uint32_t width, std::uint32_t height, std::shared_ptr<AgcDriver::FrameTiming> timing) {
+    AgcDriver::PresentationWindow target{window, extensions, &createWindowSurface, &windowDrawableSize, width, height, std::move(timing)};
+#ifdef __APPLE__
+    target.metalLayer = &windowMetalLayer;
+#endif
+    return target;
 }
 
 void checkConfig(const VideoOutConfig& cfg) {
@@ -512,7 +543,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     } else {
         OnMainThread([&] { window.Ensure(req.width, req.height); });
         const auto extensions = windowExtensions(window.Handle());
-        const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
+        const auto target = presentationWindow(window.Handle(), extensions, req.width, req.height, req.timing);
         timing.Mark("window_prepare");
         const auto gpuReady = [](void* context) {
             auto& request = *static_cast<FlipRequest*>(context);
@@ -566,7 +597,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
     try {
         OnMainThread([&] { window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT); });
         const auto extensions = windowExtensions(window.Handle());
-        AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
+        AgcDriverAttachWindow_nid_postfix(presentationWindow(window.Handle(), extensions, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr));
     } catch (...) {
         OnMainThread([&] { window.Destroy(); });
         started.set_exception(std::current_exception());
