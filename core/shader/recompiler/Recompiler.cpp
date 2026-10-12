@@ -434,6 +434,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         mslOptions.subgroupSize = request.target.subgroupSize;
         mslOptions.bdaAbiVersion = request.target.bdaAbiVersion;
         mslOptions.maxThreadgroupMemoryBytes = request.target.maxWorkgroupSharedMemoryBytes;
+        mslOptions.keepF32Denormals = request.context.floatMode.has_value() && ((request.context.floatMode->floatMode >> 4u) & 3u) == 3u;
         constexpr MslEmitter mslEmitter;
         result.msl = SharedMsl(mslEmitter.Emit(program, inputInfo, bindings, mslOptions));
     } else {
@@ -1129,9 +1130,48 @@ std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& req
     return materializeMemoized(*capture.source, request, capture.snapshot, memoHit);
 }
 
+void dumpRequest(const RecompileRequest& request) {
+    static const char* const directory = std::getenv("APS5_DUMP_REQUESTS");
+    if (directory == nullptr || *directory == '\0') return;
+    static std::mutex dumpedMutex;
+    static std::set<std::uint64_t> dumped;
+    static std::atomic<std::uint64_t> sequence{0};
+    std::string text;
+    try {
+        text = RequestSerializer{}.Serialize(request);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[shader] APS5_DUMP_REQUESTS: the request cannot be serialized: %s\n", error.what());
+        return;
+    }
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const char value : text) hash = (hash ^ static_cast<std::uint8_t>(value)) * 0x100000001b3ull;
+    hash = (hash ^ static_cast<std::uint8_t>(request.target.backend)) * 0x100000001b3ull;
+    {
+        std::lock_guard lock(dumpedMutex);
+        if (!dumped.insert(hash).second) return;
+    }
+    char name[40];
+    std::snprintf(name, sizeof(name), "/%016llx.%s.req", static_cast<unsigned long long>(hash), request.target.backend == ShaderBackend::Msl ? "msl" : "spirv");
+    const std::string path = std::string(directory) + name;
+    if (std::FILE* existing = std::fopen(path.c_str(), "rb")) {
+        std::fclose(existing);
+        return;
+    }
+    const auto stamp = static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string temporary = path + "." + std::to_string(stamp) + "." + std::to_string(sequence.fetch_add(1)) + ".tmp";
+    std::FILE* file = std::fopen(temporary.c_str(), "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "[shader] APS5_DUMP_REQUESTS: cannot write %s\n", temporary.c_str());
+        return;
+    }
+    const bool written = std::fwrite(text.data(), 1, text.size(), file) == text.size();
+    if (std::fclose(file) != 0 || !written || std::rename(temporary.c_str(), path.c_str()) != 0) std::remove(temporary.c_str());
+}
+
 template <typename Impl>
 auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltype(impl()) {
     try {
+        dumpRequest(request);
         return impl();
     } catch (const std::exception& e) {
         constexpr auto requestSerializer = RequestSerializer{};
