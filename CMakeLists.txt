@@ -120,7 +120,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_check_skips_macos.py)
         add_test(NAME gpu_suite_tool COMMAND ${Python3_EXECUTABLE} -I
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_gpu_suite.py)
-        set_tests_properties(check_skips_macos gpu_suite_tool PROPERTIES TIMEOUT 120)
+        add_test(NAME port_ledger_tool COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_port_ledger.py)
+        set_tests_properties(check_skips_macos gpu_suite_tool port_ledger_tool PROPERTIES TIMEOUT 120)
     endif()
 endif()
 
