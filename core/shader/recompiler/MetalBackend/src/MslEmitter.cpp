@@ -408,7 +408,9 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     state.hostSubgroupSize = target.subgroupSize;
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
-    if (state.laneCount == 2u) state.waveUniform = WaveUniformValues(program);
+    // Wave-uniform values: computed once for both lane halves at laneCount 2; at any lane count the
+    // stores whose address is wave-uniform keep only the highest active lane's data (MslBufferShared).
+    if (stage == IrShaderStage::Compute) state.waveUniform = WaveUniformValues(program);
     static const bool survey = std::getenv("APS5_MSL_SURVEY") != nullptr;
     state.survey = survey;
     if (stage != IrShaderStage::Compute) state.Fail("only compute shaders are implemented in the MSL backend so far");

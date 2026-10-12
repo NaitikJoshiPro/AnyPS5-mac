@@ -101,6 +101,12 @@ enum class MslAtomicOp : std::uint32_t {
 // table (DriverData.atomicLocks). `op` codes as MslAtomicOp (comparator: compare-exchange forms).
 // Returns the name of a ulong local holding the old value.
 [[nodiscard]] std::string MslDeviceAtomic64(MslEmitterState& state, const IrValue& instruction, MslAtomicOp op, std::string_view address, std::string_view value, std::string_view comparator);
+// Stores of several lanes to one address keep the highest lane's data on RDNA; Apple GPUs pick an
+// unspecified lane. When arguments [first, last] (the address operands) of `instruction` are
+// wave-uniform, every active lane stores to the same place: this emits, at the current position
+// (outside any per-lane `if`), the ballot of the instruction's EXEC argument and returns the
+// condition "this lane is the highest active one" to AND into the store's guard; empty otherwise.
+[[nodiscard]] std::string MslUniformStoreLane(MslEmitterState& state, const IrValue& instruction, std::size_t first, std::size_t last);
 // The device-scope fence that follows every buffer and flat/global atomic
 // (EmitDeviceAtomicMemoryBarrier; APS5_NO_ATOMIC_BARRIER=1 drops it). Empty when disabled.
 [[nodiscard]] std::string MslAtomicFence();

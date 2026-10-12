@@ -196,7 +196,8 @@ void Load(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits
 }
 
 void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits, std::uint32_t components) {
-    state.Line("if (" + Active(state, instruction) + ") {");
+    const auto lane = MslUniformStoreLane(state, instruction, 0u, 0u);
+    state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
     const auto shared = SharedOf(state, instruction);
     const auto address = ByteAddress(state, instruction);
@@ -578,6 +579,19 @@ std::string MslDeviceAtomic64(MslEmitterState& state, const IrValue& instruction
     state.Outdent();
     state.Line("}");
     return result;
+}
+
+std::string MslUniformStoreLane(MslEmitterState& state, const IrValue& instruction, std::size_t first, std::size_t last) {
+    if (state.program.WaveSize() > state.hostSubgroupSize && state.laneCount == 1u) return {};
+    for (std::size_t index = first; index <= last && index < instruction.ArgumentCount(); ++index) {
+        const IrValue* argument = instruction.Argument(index)->Resolve();
+        if (!argument->HasImmediate() && !state.waveUniform.contains(argument)) return {};
+    }
+    const auto ballot = state.Temporary("aps5_sb");
+    state.Line("const uint2 " + ballot + " = " + state.WaveBallot(instruction.Argument(instruction.ArgumentCount() - 1u)) + ";");
+    const auto highest = state.Temporary("aps5_hl");
+    state.Line("const uint " + highest + " = " + ballot + ".y != 0u ? 63u - clz(" + ballot + ".y) : 31u - clz(" + ballot + ".x);");
+    return "(" + state.GuestLane() + " == " + highest + ")";
 }
 
 bool EmitMslMemoryInstruction(MslEmitterState& state, const IrValue& instruction) {

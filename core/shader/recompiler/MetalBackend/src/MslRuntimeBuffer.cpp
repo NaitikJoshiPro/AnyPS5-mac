@@ -779,7 +779,8 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t com
     if (memory.kind != ResourceKind::Buffer) state.Fail(instruction, "must access a buffer resource");
     state.RequirePrelude(MslPreludeChunk::RuntimeBuffer);
     const auto data = state.Arg(instruction, instruction.ArgumentCount() - 2u);
-    state.Line("if (" + ActiveArgument(state, instruction) + ") {");
+    const auto lane = MslUniformStoreLane(state, instruction, 0u, 3u);
+    state.Line("if (" + ActiveArgument(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
     const auto descriptor = MakeDescriptor(state, instruction, false);
     const auto stop = state.Temporary("aps5_st");

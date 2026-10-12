@@ -242,7 +242,8 @@ void StoreAddress(MslEmitterState& state, const IrValue& instruction, std::uint3
         return;
     }
     if (memory.kind != ResourceKind::Flat && memory.kind != ResourceKind::Global) state.Fail(instruction, "must write a scratch or physical address resource");
-    state.Line("if (" + Active(state, instruction) + ") {");
+    const auto lane = MslUniformStoreLane(state, instruction, 0u, 2u);
+    state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
     const auto access = Prepare(state, instruction, memory);
     const auto address = GuestAddress(state, instruction, memory, access);
@@ -262,7 +263,8 @@ void StoreAddress(MslEmitterState& state, const IrValue& instruction, std::uint3
 void StoreAddressWide(MslEmitterState& state, const IrValue& instruction, std::uint32_t components) {
     const auto& memory = state.Memory(instruction);
     if (memory.kind != ResourceKind::Flat && memory.kind != ResourceKind::Global) state.Fail(instruction, "must write a physical address resource");
-    state.Line("if (" + Active(state, instruction) + ") {");
+    const auto lane = MslUniformStoreLane(state, instruction, 0u, 2u);
+    state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
     const auto access = Prepare(state, instruction, memory);
     const auto base = GuestAddressBase(state, instruction, memory, access);
