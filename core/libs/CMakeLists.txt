@@ -11,7 +11,7 @@ endif()
 
 # The guest unwinder steps through the runtime's own frames, and on macOS it reads them from DWARF
 # (__eh_frame); ld64 otherwise folds that into compact unwind info and drops it.
-if(APPLE)
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     add_link_options(LINKER:-no_compact_unwind)
 endif()
 
@@ -90,13 +90,23 @@ set_target_properties(libc PROPERTIES
         INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
 )
 
+if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+    set(APS5_MACHO_UNSIGN codesign --remove-signature)
+    set(APS5_MACHO_SIGN codesign --force --sign -)
+else()
+    set(APS5_MACHO_UNSIGN ${CMAKE_COMMAND} -E true)
+    set(APS5_MACHO_SIGN ${CMAKE_COMMAND} -E true)
+endif()
+
 set(LIBC_UNPATCHED ${UNPATCHED_DIR}/libc.prx)
 set(LIBC_PATCHED ${PATCHED_DIR}/libc.prx)
 
 add_custom_command(
         OUTPUT ${LIBC_PATCHED}
         COMMAND ${CMAKE_COMMAND} -E copy ${LIBC_UNPATCHED} ${LIBC_PATCHED}
+        COMMAND ${APS5_MACHO_UNSIGN} ${LIBC_PATCHED}
         COMMAND $<TARGET_FILE:nid_patcher> libc ${LIBC_PATCHED}
+        COMMAND ${APS5_MACHO_SIGN} ${LIBC_PATCHED}
         DEPENDS nid_patcher libc ${LIBC_UNPATCHED}
         COMMENT "Patching NIDs for libc"
 )
@@ -152,7 +162,9 @@ foreach(LIB_DIR ${LIBS_DIRS})
         add_custom_command(
                 OUTPUT ${PATCHED_FILE}
                 COMMAND ${CMAKE_COMMAND} -E copy ${UNPATCHED_FILE} ${PATCHED_FILE}
+                COMMAND ${APS5_MACHO_UNSIGN} ${PATCHED_FILE}
                 COMMAND $<TARGET_FILE:nid_patcher> ${LIB_NAME} --preserve-exports "${LIBC_UNPATCHED}" "${PATCHED_FILE}"
+                COMMAND ${APS5_MACHO_SIGN} ${PATCHED_FILE}
                 DEPENDS nid_patcher ${LIB_NAME} ${UNPATCHED_FILE} ${LIBC_UNPATCHED}
                 COMMENT "Patching NIDs for ${LIB_NAME}"
         )

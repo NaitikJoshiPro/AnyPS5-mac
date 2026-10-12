@@ -109,7 +109,57 @@ asm(
 "movq 64(%r10),%r8\nmovq 72(%r10),%r9\nmovq 96(%r10),%r12\n"
 "movq 104(%r10),%r13\nmovq 112(%r10),%r14\nmovq 120(%r10),%r15\njmp *%r11\n"
 );
+#elif defined(__APPLE__) && defined(__aarch64__)
+namespace {
+void (*bridgeCapture)(std::uintptr_t*) = nullptr;
+void (*bridgeRestore)(const std::uintptr_t*) = nullptr;
+void (*bridgeControl)(std::uint32_t*, std::uint16_t*) = nullptr;
+std::uint64_t (*bridgeGuestCall)(std::uint64_t, const std::uint64_t*) = nullptr;
+}
+
+extern "C" void Aps5SetBridgeGuestCall_nid_no_patch(std::uint64_t (*call)(std::uint64_t target, const std::uint64_t* arguments)) {
+    bridgeGuestCall = call;
+}
+
+std::uint64_t LibcCallGuest(const void* function, const std::uint64_t* arguments) {
+    if (bridgeGuestCall == nullptr) std::abort();
+    return bridgeGuestCall(reinterpret_cast<std::uint64_t>(function), arguments);
+}
+
+extern "C" void Aps5SetBridgeControl_nid_no_patch(void (*control)(std::uint32_t* mxcsr, std::uint16_t* fcw)) {
+    bridgeControl = control;
+}
+
+extern "C" void LibcGuestControl(std::uint32_t* mxcsr, std::uint16_t* fcw) {
+    if (bridgeControl == nullptr) std::abort();
+    bridgeControl(mxcsr, fcw);
+}
+
+extern "C" void Aps5SetBridgeUnwind_nid_no_patch(void (*capture)(std::uintptr_t*), void (*restore)(const std::uintptr_t*)) {
+    bridgeCapture = capture;
+    bridgeRestore = restore;
+}
+
+void LibcCaptureRegisters(std::uintptr_t* registers) {
+    if (bridgeCapture == nullptr) std::abort();
+    bridgeCapture(registers);
+}
+
+[[noreturn]] void LibcRestoreRegisters(const std::uintptr_t* registers) {
+    if (bridgeRestore != nullptr) bridgeRestore(registers);
+    std::abort();
+}
+
+bool LibcGuestBridged() {
+    return bridgeCapture != nullptr;
+}
 #else
 void LibcCaptureRegisters(std::uintptr_t*) { std::abort(); }
 [[noreturn]] void LibcRestoreRegisters(const std::uintptr_t*) { std::abort(); }
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__)
+constexpr bool LibcCapturesCaller = true;
+#else
+constexpr bool LibcCapturesCaller = false;
 #endif

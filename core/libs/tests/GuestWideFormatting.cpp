@@ -1,5 +1,6 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -11,19 +12,9 @@ extern "C" int APS5_VABI snwprintf_s_nid_postfix(char16_t*, std::size_t, const c
 extern "C" int APS5_VABI swprintf_nid_postfix(char16_t*, std::size_t, const char16_t*, ...);
 
 static int APS5_VABI Format(char16_t* buffer, std::size_t size, const char16_t* format, ...) {
-#ifdef _WIN32
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
-#else
-    std::va_list args;
-    va_start(args, format);
-#endif
+    APS5_VA_BEGIN(format);
     const int result = vswprintf_nid_postfix(buffer, size, format, reinterpret_cast<VaList*>(args));
-#ifdef _WIN32
-    __builtin_sysv_va_end(args);
-#else
-    va_end(args);
-#endif
+    APS5_VA_END();
     return result;
 }
 

@@ -1,5 +1,6 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/ProgramCall.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <array>
 #include <cstdint>
@@ -104,7 +105,7 @@ void finalize() {
         if (heapFinalized || heapFailure) return;
         finalizeCallback = heapFinalize;
     }
-    if (finalizeCallback != nullptr) finalizeCallback();
+    if (finalizeCallback != nullptr) CallProgram(finalizeCallback);
     std::lock_guard lock(heapMutex);
     heapFinalized = true;
 }
@@ -148,7 +149,7 @@ void ApplicationHeapInitialize_nid_no_patch(const void* processParameters) {
             std::memcpy(api.data(), static_cast<const std::byte*>(replacement) + 0x20, sizeof(api));
             ApplicationHeapRegister_nid_no_patch(api.data());
             const auto initialize = read<Initialize>(replacement, 0x10);
-            if (initialize != nullptr) initialize();
+            if (initialize != nullptr) CallProgram(initialize);
             {
                 std::lock_guard lock(heapMutex);
                 heapFinalize = read<Initialize>(replacement, 0x18);
@@ -165,14 +166,14 @@ void ApplicationHeapInitialize_nid_no_patch(const void* processParameters) {
 void* ApplicationHeapAllocate_nid_no_patch(std::size_t bytes) {
     const auto allocate = callback<Allocate>(0);
     CallbackScope scope;
-    return requireAllocation(allocate(bytes));
+    return requireAllocation(CallProgram(allocate, bytes));
 }
 
 void ApplicationHeapFree_nid_no_patch(void* pointer) {
     if (pointer == nullptr) return;
     const auto free = callback<Free>(1);
     CallbackScope scope;
-    free(pointer);
+    CallProgram(free, pointer);
 }
 
 void* ApplicationHeapReallocate_nid_no_patch(void* pointer, std::size_t bytes) {
@@ -182,14 +183,14 @@ void* ApplicationHeapReallocate_nid_no_patch(void* pointer, std::size_t bytes) {
     }
     const auto reallocate = callback<Reallocate>(3);
     CallbackScope scope;
-    return requireAllocation(reallocate(pointer, bytes));
+    return requireAllocation(CallProgram(reallocate, pointer, bytes));
 }
 
 void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes) {
     requireAlignment(alignment);
     const auto align = callback<Align>(4);
     CallbackScope scope;
-    void* pointer = requireAllocation(align(alignment, bytes));
+    void* pointer = requireAllocation(CallProgram(align, alignment, bytes));
     if (reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");
     return pointer;
 }
@@ -210,7 +211,7 @@ void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std:
         else realign = defaultRealign;
     }
     CallbackScope scope;
-    void* result = requireAllocation(realign(pointer, bytes, alignment));
+    void* result = requireAllocation(CallProgram(realign, pointer, bytes, alignment));
     if (reinterpret_cast<std::uintptr_t>(result) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");
     return result;
 }
@@ -219,7 +220,7 @@ void* ApplicationHeapCalloc_nid_no_patch(std::size_t count, std::size_t bytes) {
     if (bytes != 0 && count > std::numeric_limits<std::size_t>::max() / bytes) throw std::length_error("application heap: calloc size overflow");
     const auto calloc = callback<Calloc>(2);
     CallbackScope scope;
-    return requireAllocation(calloc(count, bytes));
+    return requireAllocation(CallProgram(calloc, count, bytes));
 }
 
 int ApplicationHeapPosixAlign_nid_no_patch(void** pointer, std::size_t alignment, std::size_t bytes) {
@@ -229,7 +230,7 @@ int ApplicationHeapPosixAlign_nid_no_patch(void** pointer, std::size_t alignment
     const auto align = callback<PosixAlign>(6);
     CallbackScope scope;
     void* result = nullptr;
-    const int error = align(&result, alignment, bytes);
+    const int error = CallProgram(align, &result, alignment, bytes);
     if (error != 0) return error;
     requireAllocation(result);
     if (reinterpret_cast<std::uintptr_t>(result) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");

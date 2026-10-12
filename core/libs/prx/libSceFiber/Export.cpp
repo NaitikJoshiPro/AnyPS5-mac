@@ -11,7 +11,9 @@
 #include <thread>
 #include <stdexcept>
 #include <string>
+#if defined(__x86_64__)
 #include <xmmintrin.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -43,6 +45,15 @@ enum class FiberState : std::uint32_t {
     Suspended = 4,
 };
 
+#if defined(__APPLE__) && defined(__aarch64__)
+struct GuestContext {
+    std::uint64_t rbx, rbp, rsp, r12, r13, r14, r15, rip;
+    std::uint64_t* transfer;
+    std::uint32_t mxcsr;
+    std::uint16_t fcw;
+};
+#endif
+
 struct Fiber {
     std::uint64_t magic;
     std::atomic<FiberState> state;
@@ -54,6 +65,9 @@ struct Fiber {
     void* savedStack;
     char name[FIBER_MAX_NAME_LENGTH + 1];
     bool contextSizeCheck;
+#if defined(__APPLE__) && defined(__aarch64__)
+    GuestContext guest;
+#endif
 };
 static_assert(sizeof(Fiber) <= FIBER_OBJECT_SIZE, "guest reserves 0x100 bytes for SceFiber");
 
@@ -74,6 +88,9 @@ struct ThreadFiberState {
     StackBounds threadBounds{};
     std::uint64_t transfer = 0;
     Fiber* pendingSuspend = nullptr;
+#if defined(__APPLE__) && defined(__aarch64__)
+    GuestContext threadGuest{};
+#endif
 };
 
 static thread_local ThreadFiberState g_thread;
@@ -201,6 +218,7 @@ static void UnpinStack(const void* context, std::uint64_t bytes) {
 extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void* load);
 extern "C" void Aps5FiberTrampoline_nid_no_patch();
 
+#if defined(__x86_64__)
 asm(".text\n"
     APS5_ASM_FUNCTION("Aps5FiberSwitchStack_nid_no_patch") R"(
     push %rbp
@@ -231,6 +249,17 @@ asm(".text\n"
     call )" APS5_ASM_SYMBOL("Aps5FiberMain_nid_no_patch") R"(
     ud2
 )" APS5_ASM_FUNCTION_END("Aps5FiberTrampoline_nid_no_patch"));
+#else
+extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void* load) {
+    (void)save;
+    (void)load;
+    NotImplemented_nid_no_patch(__func__);
+}
+
+extern "C" void Aps5FiberTrampoline_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+#endif
 
 struct InitialFrame {
     std::uint32_t mxcsr;
@@ -269,13 +298,22 @@ extern "C" [[noreturn]] void Aps5FiberMain_nid_no_patch(Fiber* fiber) {
 }
 
 static void PrepareInitialStack(Fiber* fiber) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    fiber->guest = {};
+    return;
+#endif
     const auto top = reinterpret_cast<std::uintptr_t>(fiber->context + fiber->contextSize) & ~static_cast<std::uintptr_t>(15);
     auto* frame = reinterpret_cast<InitialFrame*>(top - 256);
     std::memset(frame, 0, sizeof(*frame));
+#if defined(__x86_64__)
     frame->mxcsr = _mm_getcsr();
     std::uint16_t control = 0;
     asm volatile("fnstcw %0" : "=m"(control));
     frame->fpuControl = control;
+#else
+    frame->mxcsr = 0x1F80;
+    frame->fpuControl = 0x037F;
+#endif
     frame->r12 = reinterpret_cast<std::uint64_t>(fiber);
     frame->returnAddress = reinterpret_cast<std::uint64_t>(&Aps5FiberTrampoline_nid_no_patch);
     fiber->savedStack = frame;
@@ -311,6 +349,78 @@ static void Resume(Fiber* target, void** save, std::uint64_t argOnRun) {
     SetBounds(FiberBounds(target));
     Aps5FiberSwitchStack_nid_no_patch(save, target->savedStack);
 }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+namespace {
+
+void (*bridgeCapture)(std::uintptr_t*) = nullptr;
+void (*bridgeResume)(const std::uintptr_t*) = nullptr;
+void (*bridgeControl)(std::uint32_t*, std::uint16_t*) = nullptr;
+std::uint64_t entryReturned = 0;
+
+enum GuestRegister { Rax = 0, Rbx = 3, Rsi = 4, Rdi = 5, Rbp = 6, Rsp = 7, R12 = 12, R13 = 13, R14 = 14, R15 = 15, Rip = 16, GuestRegisters = 17 };
+
+void RequireBridge() {
+    if (bridgeCapture == nullptr || bridgeResume == nullptr || bridgeControl == nullptr) NotImplemented_nid_no_patch("sceFiber without FEXCore");
+}
+
+void Save(GuestContext& context, std::uint64_t* transfer) {
+    RequireBridge();
+    std::uintptr_t registers[GuestRegisters];
+    bridgeCapture(registers);
+    context = {registers[Rbx], registers[Rbp], registers[Rsp], registers[R12], registers[R13], registers[R14], registers[R15], registers[Rip],
+               transfer, 0, 0};
+    bridgeControl(&context.mxcsr, &context.fcw);
+}
+
+[[noreturn]] void Continue(const GuestContext& context, std::uint64_t transfer) {
+    std::uint32_t mxcsr = 0;
+    std::uint16_t fcw = 0;
+    bridgeControl(&mxcsr, &fcw);
+    if (mxcsr != context.mxcsr || fcw != context.fcw) NotImplemented_nid_no_patch("sceFiber switching to a different MXCSR or x87 control word");
+    if (context.transfer) *context.transfer = transfer;
+    std::uintptr_t registers[GuestRegisters];
+    bridgeCapture(registers);
+    registers[Rax] = SCE_OK;
+    registers[Rbx] = context.rbx;
+    registers[Rbp] = context.rbp;
+    registers[Rsp] = context.rsp;
+    registers[R12] = context.r12;
+    registers[R13] = context.r13;
+    registers[R14] = context.r14;
+    registers[R15] = context.r15;
+    registers[Rip] = context.rip;
+    bridgeResume(registers);
+    std::abort();
+}
+
+[[noreturn]] void Enter(Fiber* target, std::uint64_t argOnRun) {
+    ThreadState().current = target;
+    ThreadState().transfer = argOnRun;
+    if (target->guest.rip != 0) Continue(target->guest, argOnRun);
+    std::uintptr_t registers[GuestRegisters];
+    bridgeCapture(registers);
+    const auto top = reinterpret_cast<std::uintptr_t>(target->context + target->contextSize) & ~static_cast<std::uintptr_t>(15);
+    const auto stack = top - 16;
+    std::memcpy(reinterpret_cast<void*>(stack), &entryReturned, sizeof(entryReturned));
+    registers[Rsp] = stack;
+    registers[Rip] = reinterpret_cast<std::uintptr_t>(target->entry);
+    registers[Rdi] = target->argOnInitialize;
+    registers[Rsi] = argOnRun;
+    bridgeResume(registers);
+    std::abort();
+}
+
+}
+
+extern "C" void Aps5SetFiberBridge_nid_no_patch(void (*capture)(std::uintptr_t*), void (*resume)(const std::uintptr_t*),
+                                                 void (*control)(std::uint32_t*, std::uint16_t*), std::uint64_t returned) {
+    bridgeCapture = capture;
+    bridgeResume = resume;
+    bridgeControl = control;
+    entryReturned = returned;
+}
+#endif
 
 extern "C" {
 
@@ -358,6 +468,11 @@ int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_r
     if (!fiber) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     if (ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
     if (!AcquireForResume(fiber)) return SCE_FIBER_ERROR_STATE;
+#if defined(__APPLE__) && defined(__aarch64__)
+    Save(ThreadState().threadGuest, arg_on_return);
+    ThreadState().threadFramePointer = ThreadState().threadGuest.rbp;
+    Enter(fiber, arg_on_run);
+#endif
     ThreadState().threadFramePointer = reinterpret_cast<std::uint64_t>(static_cast<void**>(__builtin_frame_address(0))[0]);
     ThreadState().threadBounds = CurrentBounds();
     Resume(fiber, &ThreadState().threadStack, arg_on_run);
@@ -383,6 +498,11 @@ int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint6
         }
         std::fprintf(stderr, "[fiber] switch %s -> %s from %p %p %p %p %p %p\n", self->name, target->name, chain[0], chain[1], chain[2], chain[3], chain[4], chain[5]);
     }
+#if defined(__APPLE__) && defined(__aarch64__)
+    Save(self->guest, arg_on_run_out);
+    self->state.store(FiberState::Suspended, std::memory_order_release);
+    Enter(target, arg_on_run);
+#endif
     self->state.store(FiberState::Suspending, std::memory_order_relaxed);
     ThreadState().pendingSuspend = self;
     Resume(target, &self->savedStack, arg_on_run);
@@ -395,6 +515,13 @@ int32_t APS5_VABI sceFiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_o
     auto* self = ThreadState().current;
     if (!self) return SCE_FIBER_ERROR_PERMISSION;
     if (TraceFibers()) std::fprintf(stderr, "[fiber] return %s from %p\n", self->name, __builtin_return_address(0));
+#if defined(__APPLE__) && defined(__aarch64__)
+    Save(self->guest, arg_on_run);
+    self->state.store(FiberState::Suspended, std::memory_order_release);
+    ThreadState().current = nullptr;
+    ThreadState().transfer = arg_on_return;
+    Continue(ThreadState().threadGuest, arg_on_return);
+#endif
     self->state.store(FiberState::Suspending, std::memory_order_relaxed);
     ThreadState().pendingSuspend = self;
     ThreadState().current = nullptr;

@@ -18,6 +18,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 using AgcDriver::DisplayBuffer;
@@ -121,6 +122,16 @@ GuestTextureResource Surface(std::uint32_t width, std::uint32_t height, std::uin
     return surface;
 }
 
+std::size_t HostPageSize() {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+#else
+    return static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
 std::uint8_t* ReserveKeys(std::size_t writable, std::size_t reserved) {
 #ifdef _WIN32
     auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, reserved, MEM_RESERVE, PAGE_NOACCESS));
@@ -199,12 +210,20 @@ void RetileTests() {
     Expect(message.empty() && keys == DccKeys::Uncompressed, "the driver's store over a 1920x1080 render DCC, retiled, does not present: " + message + " (display keys over the first " + std::to_string(driverKeys) + ": " + Describe(Histogram(std::span(display).first(driverKeys))) + ")");
 
     constexpr std::size_t reserved = 65536;
-    constexpr std::size_t writable = 0x9000;
+    const std::size_t page = HostPageSize();
+    const std::size_t extent = AgcDriver::Graphics::DccKeyCount(surface, surfaceBytes);
+    const std::size_t coveringDriverKeys = (driverKeys / page + 1) * page;
+    const bool pageEndsBetween = coveringDriverKeys < extent;
+    const std::size_t writable = pageEndsBetween ? coveringDriverKeys : extent - page;
     auto* small = ReserveKeys(writable, reserved);
     Expect(small != nullptr, "cannot reserve metadata with an inaccessible tail");
     if (small == nullptr) return;
     const auto stored = Rejection([&] { AgcDriver::Graphics::MarkDccUncompressed(reinterpret_cast<std::uint64_t>(small), surfaceBytes, AgcDriver::Graphics::DccKeyCount(surface, surfaceBytes)); });
     Expect(stored.find("not writable over the 0xc000 key bytes") != std::string::npos && small[0] == 0x00, "a key store over metadata smaller than the console's extent did not throw: " + stored);
+    if (!pageEndsBetween) {
+        ReleaseKeys(small, reserved);
+        return;
+    }
     const auto unaligned = Rejection([&] { AgcDriver::Graphics::MarkDccUncompressed(reinterpret_cast<std::uint64_t>(small), surfaceBytes, AgcDriver::Graphics::DccKeyCount(Surface(width, height, reinterpret_cast<std::uint64_t>(small), false), surfaceBytes)); });
     Expect(unaligned.empty() && std::all_of(small, small + driverKeys, [](std::uint8_t key) { return key == 0xff; }) && small[driverKeys] == 0x00, "an unaligned DCC key store over metadata smaller than the console's extent did not cover one key per 256 bytes: " + unaligned);
     ReleaseKeys(small, reserved);

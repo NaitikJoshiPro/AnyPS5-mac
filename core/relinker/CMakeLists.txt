@@ -413,7 +413,7 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_registry.py $<TARGET_FILE:relinker>)
         add_test(NAME macos_output COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_output.py $<TARGET_FILE:relinker>)
-        if(APPLE AND NOT ANYPS5_RELINKER_ONLY)
+        if(APPLE AND NOT ANYPS5_RELINKER_ONLY AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
             # Runs the relinked programs, so it needs the patched libraries: build the libs target first.
             add_test(NAME macos_fixtures COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/macos/run_macos_fixtures.py $<TARGET_FILE:relinker> ${CMAKE_BINARY_DIR}/core/libs/libs)

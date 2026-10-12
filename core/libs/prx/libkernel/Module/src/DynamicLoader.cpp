@@ -31,10 +31,15 @@ void Error(const char* message) {
     std::snprintf(loaderError.data(), loaderError.size(), "%s", message);
     pendingError = true;
 }
+#if defined(__APPLE__) && defined(__aarch64__)
+void* (*guestOpen)(const char* path) = nullptr;
+void* (*guestSymbol)(void* image, const char* name) = nullptr;
+#endif
 struct Module {
     void* native = nullptr;
     bool owned = true;
     bool global = false;
+    bool guest = false;
     ~Module() {
         if (owned && native) {
 #ifdef _WIN32
@@ -50,6 +55,9 @@ std::map<std::uintptr_t, std::shared_ptr<Module>> modules;
 std::uintptr_t nextHandle = 0x20000000;
 std::map<const void*, std::uintptr_t> imageIds;
 void* Symbol(Module& module, const char* name) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (module.guest) return guestSymbol(module.native, name);
+#endif
 #ifdef _WIN32
     return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module.native), name));
 #else
@@ -108,6 +116,12 @@ void* FindSymbol(Module& module, const char* name) {
 }
 
 extern "C" {
+#if defined(__APPLE__) && defined(__aarch64__)
+void Aps5SetGuestLoader_nid_no_patch(void* (*open)(const char*), void* (*symbol)(void*, const char*)) {
+    guestOpen = open;
+    guestSymbol = symbol;
+}
+#endif
 char* APS5_VABI dlerror_nid_postfix() {
     if (!pendingError) return nullptr;
     pendingError = false;
@@ -168,6 +182,16 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
         const auto resolved = path ? RelinkedModulePath(ResolvePath_nid_no_patch(path)).string() : std::string{};
         const int nativeFlags = ((flags & 3) == 1 ? RTLD_LAZY : RTLD_NOW) |
             ((flags & 0x100) ? RTLD_GLOBAL : RTLD_LOCAL);
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (path && guestOpen) {
+            if (void* image = guestOpen(resolved.c_str())) {
+                module->native = image;
+                module->guest = true;
+                module->owned = false;
+            }
+        }
+        if (!module->guest)
+#endif
         module->native = ::dlopen(path ? resolved.c_str() : nullptr, nativeFlags);
         if (!module->native) { Error(::dlerror()); return nullptr; }
 #endif

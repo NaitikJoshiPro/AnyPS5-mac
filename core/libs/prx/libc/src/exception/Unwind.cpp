@@ -40,6 +40,11 @@ _Unwind_Reason_Code CallPersonality(Word personality, _Unwind_Action actions, _U
         return __gxx_personality_v0_nid_postfix(1, actions, exception->exception_class, exception, context);
     if (personality == reinterpret_cast<Word>(__gcc_personality_v0_nid_postfix) || personality == reinterpret_cast<Word>(__gcc_personality_v0))
         return __gcc_personality_v0_nid_postfix(1, actions, exception->exception_class, exception, context);
+#if defined(__APPLE__) && defined(__aarch64__)
+    using Personality = _Unwind_Reason_Code (*)(int, _Unwind_Action, std::uint64_t, _Unwind_Exception*, _Unwind_Context*);
+    if (personality != 0 && LibcGuestBridged())
+        return reinterpret_cast<Personality>(personality)(1, actions, exception->exception_class, exception, context);
+#endif
     return (actions & _UA_SEARCH_PHASE) ? _URC_FATAL_PHASE1_ERROR : _URC_FATAL_PHASE2_ERROR;
 }
 struct Lookup { Word pc; const Byte* fde {}; Word text {}; Word data {}; };
@@ -486,7 +491,7 @@ extern "C" {
 _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Exception* exception) {
     _Unwind_Context start;
     LibcCaptureRegisters(start.registers);
-    if (!LibcUnwind::Step(start)) return _URC_FATAL_PHASE1_ERROR;
+    if (!LibcCapturesCaller && !LibcUnwind::Step(start)) return _URC_FATAL_PHASE1_ERROR;
     auto context = start;
     exception->private_1 = 0;
     for (unsigned depth = 0; depth < 65536; ++depth) {
@@ -516,7 +521,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Excepti
 #endif
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
-    if (!LibcUnwind::Step(context)) std::abort();
+    if (!LibcCapturesCaller && !LibcUnwind::Step(context)) std::abort();
     LibcUnwind::PhaseTwo(context, exception);
     std::abort();
 }
@@ -551,7 +556,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception
     if (!stop) return _URC_FATAL_PHASE2_ERROR;
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
-    if (!LibcUnwind::Step(context)) return _URC_FATAL_PHASE2_ERROR;
+    if (!LibcCapturesCaller && !LibcUnwind::Step(context)) return _URC_FATAL_PHASE2_ERROR;
     exception->private_1 = reinterpret_cast<std::uintptr_t>(stop);
     exception->private_2 = reinterpret_cast<std::uintptr_t>(argument);
     return LibcUnwind::PhaseTwo(context, exception);
@@ -560,7 +565,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception
 _Unwind_Reason_Code APS5_VABI _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn trace, void* argument) {
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
-    if (!LibcUnwind::Step(context)) return _URC_END_OF_STACK;
+    if (!LibcCapturesCaller && !LibcUnwind::Step(context)) return _URC_END_OF_STACK;
     for (unsigned depth = 0; depth < 65536; ++depth) {
         LibcUnwind::Frame frame; LibcUnwind::Rules rules;
         if (!LibcUnwind::GetRules(context, frame, rules)) return _URC_END_OF_STACK;

@@ -2,7 +2,7 @@ add_library(libSceFiber SHARED EXCLUDE_FROM_ALL Export.cpp)
 target_include_directories(libSceFiber PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceFiber)
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     add_test_executable(fiber_tests ${LIBS_INCLUDE_DIR}/tests/Fiber.cpp)
     target_include_directories(fiber_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(fiber_tests PRIVATE libSceFiber libc)

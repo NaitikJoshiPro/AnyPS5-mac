@@ -1,6 +1,8 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -9,13 +11,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
-
-// clang only has the explicit System V va_list builtins on targets whose default ABI is not System V.
-#if defined(__clang__) && !defined(_WIN32)
-#define __builtin_sysv_va_list va_list
-#define __builtin_sysv_va_start va_start
-#define __builtin_sysv_va_end va_end
-#endif
 
 extern "C" {
 int APS5_VABI snprintf_nid_postfix(char*, size_t, const char*, ...);
@@ -36,44 +31,40 @@ static void Require(bool condition) {
 }
 
 static int APS5_VABI FormatList(char* buffer, size_t size, const char* format, ...) {
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
+    APS5_VA_BEGIN(format);
     VaList list;
     std::memcpy(&list, args, sizeof(list));
     const VaList original = list;
     const int result = vsnprintf_nid_postfix(buffer, size, format, &list);
     Require(std::memcmp(&list, &original, sizeof(list)) == 0);
-    __builtin_sysv_va_end(args);
+    APS5_VA_END();
     return result;
 }
 
 static int APS5_VABI FormatListS(char* buffer, size_t size, const char* format, ...) {
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
+    APS5_VA_BEGIN(format);
     VaList list;
     std::memcpy(&list, args, sizeof(list));
     const int result = vsnprintf_s_nid_postfix(buffer, size, format, &list);
-    __builtin_sysv_va_end(args);
+    APS5_VA_END();
     return result;
 }
 
 static int APS5_VABI ScanListS(const char* buffer, const char* format, ...) {
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
+    APS5_VA_BEGIN(format);
     VaList list;
     std::memcpy(&list, args, sizeof(list));
     const int result = vsscanf_s_nid_postfix(buffer, format, &list);
-    __builtin_sysv_va_end(args);
+    APS5_VA_END();
     return result;
 }
 
 static int APS5_VABI PrintList(const char* format, ...) {
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
+    APS5_VA_BEGIN(format);
     VaList list;
     std::memcpy(&list, args, sizeof(list));
     const int result = vprintf_nid_postfix(format, &list);
-    __builtin_sysv_va_end(args);
+    APS5_VA_END();
     return result;
 }
 
@@ -131,19 +122,19 @@ __attribute__((noinline)) static void APS5_VABI RunChecks() {
         Require(std::strcmp(buffer, "-4294967297 4294967297 -5 7 -8 9") == 0);
         snprintf_nid_postfix(buffer, sizeof(buffer), "%s:%*.*f:%d", "test", -8, 2, 1.25, 7);
         Require(std::strcmp(buffer, "test:1.25    :7") == 0);
-        FormatList(buffer, sizeof(buffer), "%d %d %d %d %d %d %d %.3Lf %.1f", 1, 2, 3, 4, 5, 6, 7, 1.125L, 2.5);
+        FormatList(buffer, sizeof(buffer), "%d %d %d %d %d %d %d %.3Lf %.1f", 1, 2, 3, 4, 5, 6, 7, GuestLongDoubleFromDouble(1.125), 2.5);
         Require(std::strcmp(buffer, "1 2 3 4 5 6 7 1.125 2.5") == 0);
     }
     snprintf_nid_postfix(buffer, sizeof(buffer), "%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f", 1., 2., 3., 4., 5., 6., 7., 8., 9., 10.);
     Require(std::strcmp(buffer, "1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0") == 0);
-    snprintf_nid_postfix(buffer, sizeof(buffer), "%.3Lf %d %.1f", 1.125L, 7, 2.5);
+    snprintf_nid_postfix(buffer, sizeof(buffer), "%.3Lf %d %.1f", GuestLongDoubleFromDouble(1.125), 7, 2.5);
     Require(std::strcmp(buffer, "1.125 7 2.5") == 0);
     Require(snprintf_nid_postfix(buffer, sizeof(buffer), "%'d|%'u|%'.2f|%'-8ld|%'+05d|%'g", 1234567, 4000000000u, 1234567.891, 1234567LL, 42, 1e6) == 50);
     Require(std::strcmp(buffer, "1234567|4000000000|1234567.89|1234567 |+0042|1e+06") == 0);
     Require(FormatList(buffer, sizeof(buffer), "%'lld %'zu", 1234567890123LL, static_cast<std::size_t>(9876543210)) == 24 && std::strcmp(buffer, "1234567890123 9876543210") == 0);
     Require(FormatList(buffer, sizeof(buffer), "%'d %ls", 1234567, u"x") == 9 && std::strcmp(buffer, "1234567 x") == 0);
     Require(sprintf_nid_postfix(buffer, "%2$s %1$d %2$s", 7, "x") == 5 && std::strcmp(buffer, "x 7 x") == 0);
-    Require(snprintf_nid_postfix(buffer, sizeof(buffer), "%3$.1Lf|%2$.2f|%1$hhd|%4$s", 257, 2.5, 1.5L, "end") == 14);
+    Require(snprintf_nid_postfix(buffer, sizeof(buffer), "%3$.1Lf|%2$.2f|%1$hhd|%4$s", 257, 2.5, GuestLongDoubleFromDouble(1.5), "end") == 14);
     Require(std::strcmp(buffer, "1.5|2.50|1|end") == 0);
     Require(sprintf_nid_postfix(buffer, "%9$d%8$d%7$d%6$d%5$d%4$d%3$d%2$d%1$d", 1, 2, 3, 4, 5, 6, 7, 8, 9) == 9 && std::strcmp(buffer, "987654321") == 0);
     Require(FormatList(buffer, sizeof(buffer), "%11$d %10$g %9$g %8$g %7$g %6$g %5$g %4$g %3$g %2$g %1$g", 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11) == 23 &&

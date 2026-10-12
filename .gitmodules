@@ -31,3 +31,8 @@
 [submodule "3rdparty/libjpeg-turbo"]
 	path = 3rdparty/libjpeg-turbo
 	url = https://github.com/libjpeg-turbo/libjpeg-turbo.git
+[submodule "3rdparty/FEX"]
+	path = 3rdparty/FEX
+	url = https://github.com/arvindfroi/FEX.git
+	branch = anyps5-macos
+	shallow = true

@@ -40,6 +40,13 @@ Add `--to-intel` for Intel hosts, or `--to-rosetta` for Rosetta; a title that ru
 
 The executable, registry, icon and desktop entry output files must not refer to the input executable or a bundled module being converted, including through a hard link or symbolic link. These collisions fail before any output is written. An existing output file can be replaced if it is separate from those inputs.
 
+Linux output on Apple silicon without Rosetta, through `aps5-fex`, which an arm64 build makes from `3rdparty/FEX` and which translates the title's x86-64 code with FEXCore. It loads the libraries from `libs/` beside the executable:
+
+```sh
+relinker source/input.elf out/app.elf
+build/core/fex/aps5-fex out/app.elf
+```
+
 ## Options
 
 All switches are disabled by default. `unused-filter` defaults to `0`; `--rpath` defaults to `$ORIGIN/libs`.

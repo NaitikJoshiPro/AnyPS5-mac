@@ -1,5 +1,7 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
@@ -61,35 +63,15 @@ int APS5_VABI ftrylockfile_nid_postfix(FileStream*);
 }
 static void Require(bool value) { if (!value) std::abort(); }
 static int APS5_VABI WriteFormatted(FileStream* stream, const char* format, ...) {
-#ifdef _WIN32
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
-#else
-    std::va_list args;
-    va_start(args, format);
-#endif
+    APS5_VA_BEGIN(format);
     const int result = vfprintf_nid_postfix(stream, format, args);
-#ifdef _WIN32
-    __builtin_sysv_va_end(args);
-#else
-    va_end(args);
-#endif
+    APS5_VA_END();
     return result;
 }
 static int APS5_VABI FormatString(char* buffer, const char* format, ...) {
-#ifdef _WIN32
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
-#else
-    std::va_list args;
-    va_start(args, format);
-#endif
+    APS5_VA_BEGIN(format);
     const int result = vsprintf_nid_postfix(buffer, format, args);
-#ifdef _WIN32
-    __builtin_sysv_va_end(args);
-#else
-    va_end(args);
-#endif
+    APS5_VA_END();
     return result;
 }
 static bool CheckFileBytes(const std::string& filename, const std::string& expected, const char* mode, bool reopen) {
@@ -371,7 +353,7 @@ int main() {
     Require(written == sizeof(expectedString) - 1 && count == written);
     Require(std::strcmp(stringOutput, expectedString) == 0 && stringOutput[written + 1] == '!');
     Require(FormatString(stringOutput, "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.2Lf",
-        1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 1.25L) == 25);
+        1., 2., 3., 4., 5., 6., 7., 8., 9., 10., GuestLongDoubleFromDouble(1.25)) == 25);
     Require(std::strcmp(stringOutput, "1 2 3 4 5 6 7 8 9 10 1.25") == 0);
     Require(FormatString(stringOutput, "") == 0 && stringOutput[0] == '\0');
     Require(__isthreaded_nid_postfix == 1);

@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 #include <bit>
 #include <cerrno>
 #include <cfenv>
@@ -12,7 +13,7 @@
 extern "C" {
 double APS5_VABI atof_nid_postfix(const char*);
 float APS5_VABI strtof_nid_postfix(const char*, char**);
-long double APS5_VABI strtold_nid_postfix(const char*, char**);
+GuestLongDouble APS5_VABI strtold_nid_postfix(const char*, char**);
 std::int64_t APS5_VABI strtol_nid_postfix(const char*, char**, int);
 std::uint64_t APS5_VABI strtoul_nid_postfix(const char*, char**, int);
 std::intmax_t APS5_VABI strtoimax_nid_postfix(const char*, char**, int);
@@ -477,7 +478,11 @@ int main() {
     *__error_nid_postfix() = 0;
     Require(std::isinf(strtof_nid_postfix("1e1000", nullptr)));
     Require(*__error_nid_postfix() == 34);
+#if defined(__x86_64__)
     Require(strtold_nid_postfix("1.0000000000000000001!", &end) > 1.L && *end == '!');
+#else
+    Require(strtold_nid_postfix("1.0000000000000000001!", &end) == X87Extended{0x8000000000000001, 0x3fff} && *end == '!');
+#endif
     Require(fmodf_nid_postfix(5.5f, 2.f) == 1.5f);
     Require(fmodf_nid_postfix(-5.5f, 2.f) == -1.5f);
     Require(std::signbit(fmodf_nid_postfix(-4.f, 2.f)));

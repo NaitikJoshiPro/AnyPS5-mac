@@ -24,6 +24,7 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
+#include "prx/libc/include/ProgramCall.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 
 struct GuestFileMode {
@@ -372,7 +373,7 @@ void* APS5_VABI bsearch_nid_postfix(const void* key, const void* base, size_t co
         const size_t half = count / 2;
         const size_t middle = first + half;
         const auto* element = bytes + middle * size;
-        const int result = compare(key, element);
+        const int result = CallProgram(compare, key, element);
         if (result == 0) return const_cast<unsigned char*>(element);
         if (result < 0) count = half;
         else { first = middle + 1; count -= half + 1; }
@@ -397,8 +398,8 @@ void APS5_VABI qsort_nid_postfix(void* base, size_t count, size_t size, int (APS
     const auto siftDown = [bytes, size, compare, &swapElements](size_t root, size_t heapSize) {
         while (root < heapSize / 2) {
             size_t child = root * 2 + 1;
-            if (child + 1 < heapSize && compare(bytes + child * size, bytes + (child + 1) * size) < 0) ++child;
-            if (compare(bytes + root * size, bytes + child * size) >= 0) return;
+            if (child + 1 < heapSize && CallProgram(compare, bytes + child * size, bytes + (child + 1) * size) < 0) ++child;
+            if (CallProgram(compare, bytes + root * size, bytes + child * size) >= 0) return;
             swapElements(root, child);
             root = child;
         }

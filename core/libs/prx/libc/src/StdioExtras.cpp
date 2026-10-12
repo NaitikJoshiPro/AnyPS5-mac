@@ -10,8 +10,9 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/General.hpp"
 #include "SceTypes.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 
-#ifdef _WIN32
+#if !APS5_GUEST_VA_LIST_IS_HOST
 #include "prx/libc/include/WindowsFormatting.hpp"
 #endif
 
@@ -38,17 +39,16 @@ void* Allocate(std::size_t size) {
 
 extern "C" {
 
-#ifdef _WIN32
+#if !APS5_GUEST_VA_LIST_IS_HOST
 
 int APS5_VABI vsprintf_s_nid_postfix(char* buffer, size_t size, const char* format, VaList* args) {
     return LibcDetail::FormatWindows(buffer, size, format, args);
 }
 
 int APS5_VABI sprintf_s_nid_postfix(char* buffer, size_t size, const char* format, ...) {
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
+    APS5_VA_BEGIN(format);
     const int result = LibcDetail::FormatWindows(buffer, size, format, args);
-    __builtin_sysv_va_end(args);
+    APS5_VA_END();
     return result;
 }
 

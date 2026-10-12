@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 #include <climits>
 #include <cstddef>
 #include <cstdlib>
@@ -23,7 +24,7 @@ char16_t* APS5_VABI wcstok_nid_postfix(char16_t* text, const char16_t* delimiter
 char16_t* APS5_VABI wmemset_nid_postfix(char16_t* s, char16_t c, std::size_t n);
 double APS5_VABI wcstod_nid_postfix(const char16_t* str, char16_t** endptr);
 float APS5_VABI wcstof_nid_postfix(const char16_t* str, char16_t** endptr);
-long double APS5_VABI wcstold_nid_postfix(const char16_t* str, char16_t** endptr);
+GuestLongDouble APS5_VABI wcstold_nid_postfix(const char16_t* str, char16_t** endptr);
 long long APS5_VABI wcstol_nid_postfix(const char16_t* str, char16_t** endptr, int base);
 long long APS5_VABI wcstoll_nid_postfix(const char16_t* str, char16_t** endptr, int base);
 unsigned long long APS5_VABI wcstoul_nid_postfix(const char16_t* str, char16_t** endptr, int base);
@@ -172,7 +173,7 @@ int main() {
     require(wcstod_nid_postfix(letters, &end) == 0.0 && end == letters);
     require(wcstof_nid_postfix(u"0.25", nullptr) == 0.25f);
     const char16_t* half = u"-1.5é";
-    require(wcstold_nid_postfix(half, &end) == -1.5L && end == half + 4);
+    require(wcstold_nid_postfix(half, &end) == GuestLongDoubleFromDouble(-1.5) && end == half + 4);
 
     require(wcscoll_nid_postfix(u"a", u"b") < 0);
     require(wcscoll_nid_postfix(u"￿", u"a") > 0);

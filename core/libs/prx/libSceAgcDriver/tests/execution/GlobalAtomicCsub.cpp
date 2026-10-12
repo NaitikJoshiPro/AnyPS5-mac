@@ -10,6 +10,9 @@
 #include <windows.h>
 #endif
 #include <algorithm>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -85,11 +88,14 @@ public:
     GuestBlock() {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-        block = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, BlockBytes));
-#endif
         Require(block != nullptr, "global atomic csub: cannot allocate the guest block");
         GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
+#else
+        const auto bytes = std::max<std::size_t>(BlockBytes, static_cast<std::size_t>(getpagesize()));
+        block = static_cast<std::uint8_t*>(std::aligned_alloc(bytes, bytes));
+        Require(block != nullptr, "global atomic csub: cannot allocate the guest block");
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+#endif
     }
 
     ~GuestBlock() {
