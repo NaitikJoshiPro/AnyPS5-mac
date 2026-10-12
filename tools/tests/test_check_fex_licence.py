@@ -35,19 +35,42 @@ def commit(directory, message):
     return git(directory, "rev-parse", "HEAD")
 
 
-def superproject(root, branch=None):
-    fex = Path(root) / check_fex_licence.SUBMODULE
-    write(fex, "CMakeLists.txt", "project(FEX)\n")
-    write(fex, "LICENSE", MIT)
-    git(fex, "init", "-q")
-    pinned = commit(fex, "fex")
-    modules = f'[submodule "{check_fex_licence.SUBMODULE}"]\n\tpath = {check_fex_licence.SUBMODULE}\n\turl = https://example.invalid/FEX.git\n'
-    if branch:
-        modules += f"\tbranch = {branch}\n"
-    write(root, ".gitmodules", modules)
+BASE = "14c92681f4d62cf84d901460e0358de09c8847a7"
+SOURCE = "ac555dd81fa84f86d1927476e152451005e78f49"
+FMT = "c07e2aa4b130b4fd359a1c6455a5201b17af01fa"
+VENDORED = check_fex_licence.VENDORED
+
+
+def vendored(root, base=BASE):
+    """A repository with FEX vendored the way `git subtree add --squash` records it."""
     git(root, "init", "-q")
+    write(root, "README.md", "AnyPS5\n")
     commit(root, "superproject")
-    return fex, pinned
+    write(Path(root) / VENDORED, "CMakeLists.txt", "project(FEX)\n")
+    write(Path(root) / VENDORED, "LICENSE", MIT)
+    commit(root, f"Squashed '{VENDORED}/' content from commit {base[:9]}\n\n"
+                 f"git-subtree-dir: {VENDORED}\ngit-subtree-split: {base}\n")
+
+
+def commit_as(root, author, message, relative="FEXCore/x.cpp"):
+    name, _, email = author.partition(" <")
+    write(Path(root) / VENDORED, relative, f"// SPDX-License-Identifier: MIT\n// {message}\n")
+    git(root, "add", "-A")
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "--no-verify", "--no-gpg-sign", "--author",
+                    f"{name} <{email.rstrip('>')}>", "-m", message], env=GIT_ENVIRONMENT, check=True)
+    return git(root, "rev-parse", "HEAD")
+
+
+def add_gitlink(root, path, sha, branch=None):
+    modules = Path(root) / ".gitmodules"
+    text = modules.read_text() if modules.exists() else ""
+    text += f'[submodule "{path}"]\n\tpath = {path}\n\turl = https://example.invalid/x.git\n'
+    if branch:
+        text += f"\tbranch = {branch}\n"
+    modules.write_text(text)
+    git(root, "update-index", "--add", "--cacheinfo", f"160000,{sha},{path}")
+    git(root, "add", ".gitmodules")
+    git(root, "commit", "-q", "--no-verify", "--no-gpg-sign", "-m", f"add {path}")
 
 
 class ScanTests(unittest.TestCase):
@@ -102,49 +125,112 @@ class ScanTests(unittest.TestCase):
             self.assertEqual(check_fex_licence.scan(Path(tree)), ([], 1))
 
 
-class PinTests(unittest.TestCase):
-    def test_audited_pin_passes(self):
+class VendoredTests(unittest.TestCase):
+    def check(self, root):
+        return check_fex_licence.check(Path(root), {BASE: "test base"}, {SOURCE}, {f"{VENDORED}/External/fmt": {FMT}})
+
+    def test_audited_base_and_series_pass(self):
         with tempfile.TemporaryDirectory() as root:
-            _, pinned = superproject(root)
-            findings, count = check_fex_licence.check(Path(root), {pinned: "test"})
+            vendored(root)
+            commit_as(root, "Will Faust <willtechnoduck@gmail.com>",
+                      f"iOS port\n\n(ported from arvindfroi/FEX commit {SOURCE}\n to FEX-Emu FEX-2610)")
+            commit_as(root, "Arvind Fr\u00f8iland <arvind@example.invalid>", "Apple: keep the JIT off x18", "a.cpp")
+            commit_as(root, "t <t@example.invalid>", "fix(fex): our own change", "b.cpp")
+            add_gitlink(root, f"{VENDORED}/External/fmt", FMT)
+            findings, count, summary = self.check(root)
             self.assertEqual(findings, [])
-            self.assertEqual(count, 2)
+            self.assertEqual(count, 5)
+            self.assertEqual(summary, f"{VENDORED}: FEX-Emu {BASE} (test base) + 1 ported commits")
 
-    def test_unaudited_pin_fails_for_each_place_it_is_read(self):
+    def test_unaudited_base_fails(self):
         with tempfile.TemporaryDirectory() as root:
-            _, pinned = superproject(root)
-            findings, _ = check_fex_licence.check(Path(root), {})
-            self.assertEqual(len(findings), 3)
-            for where in ("recorded in HEAD", "staged in the index", "checked out"):
-                self.assertIn(f"commit {pinned} ({where}) is not audited", "\n".join(findings))
+            vendored(root, base="0" * 40)
+            findings, _, _ = self.check(root)
+            self.assertEqual(len(findings), 1)
+            self.assertIn(f"upstream base {'0' * 40}", findings[0])
 
-    def test_checkout_moved_away_from_the_pin_fails(self):
+    def test_latest_subtree_record_wins(self):
         with tempfile.TemporaryDirectory() as root:
-            fex, pinned = superproject(root)
-            write(fex, "FEXCore/new.cpp", "// SPDX-License-Identifier: MIT\n")
-            moved = commit(fex, "unaudited")
-            findings, _ = check_fex_licence.check(Path(root), {pinned: "test"})
-            self.assertEqual(findings, [f"{check_fex_licence.SUBMODULE} commit {moved} (checked out) is not audited; "
-                                        "audit its history and add it to AUDITED"])
+            vendored(root)
+            write(Path(root) / VENDORED, "Readme.md", "FEX\n")
+            commit(root, f"Squashed '{VENDORED}/' changes from {BASE[:9]}..{'1' * 9}\n\n"
+                         f"git-subtree-dir: {VENDORED}\ngit-subtree-split: {'1' * 40}\n")
+            findings, _, _ = self.check(root)
+            self.assertEqual(len(findings), 1)
+            self.assertIn(f"upstream base {'1' * 40}", findings[0])
 
-    def test_tracked_branch_fails(self):
+    def test_missing_subtree_record_fails(self):
         with tempfile.TemporaryDirectory() as root:
-            _, pinned = superproject(root, branch="anyps5-macos")
-            findings, _ = check_fex_licence.check(Path(root), {pinned: "test"})
-            self.assertEqual(findings, [f".gitmodules tracks branch anyps5-macos for {check_fex_licence.SUBMODULE}; "
-                                        "remove it so the pin cannot drift"])
+            git(root, "init", "-q")
+            write(Path(root) / VENDORED, "CMakeLists.txt", "project(FEX)\n")
+            commit(root, "copied FEX by hand")
+            findings, _, _ = self.check(root)
+            self.assertEqual(findings, [f"no git-subtree-split recorded for {VENDORED}; add FEX with `git subtree add --squash`"])
 
-    def test_marker_in_an_audited_checkout_fails(self):
+    def test_submodule_layout_fails(self):
         with tempfile.TemporaryDirectory() as root:
-            fex, pinned = superproject(root)
-            write(fex, "LICENSE-MADEIRA.md", "")
-            findings, _ = check_fex_licence.check(Path(root), {pinned: "test"})
-            self.assertEqual(findings, [f"{check_fex_licence.SUBMODULE}/LICENSE-MADEIRA.md: GPL-3.0 marker file"])
+            fex = Path(root) / VENDORED
+            write(fex, "CMakeLists.txt", "project(FEX)\n")
+            git(fex, "init", "-q")
+            commit(fex, "fex")
+            git(root, "init", "-q")
+            commit(root, f"superproject\n\ngit-subtree-dir: {VENDORED}\ngit-subtree-split: {BASE}\n")
+            findings, _, _ = self.check(root)
+            self.assertIn(f"{VENDORED} is a submodule in HEAD; D13 vendors FEX-Emu FEX-2610 with git subtree", findings)
 
-    def test_missing_checkout_fails(self):
+    def test_will_faust_commit_without_audited_source_fails(self):
         with tempfile.TemporaryDirectory() as root:
-            self.assertEqual(check_fex_licence.check(Path(root)),
-                             ([f"{check_fex_licence.SUBMODULE} is not checked out"], 0))
+            vendored(root)
+            plain = commit_as(root, "Will Faust <willtechnoduck@gmail.com>", "Madeira: something new")
+            other = commit_as(root, "Will Faust <willtechnoduck@gmail.com>",
+                              f"later work\n\n(ported from arvindfroi/FEX commit {'2' * 40})", "c.cpp")
+            findings, _, _ = self.check(root)
+            self.assertEqual(findings, [
+                f"commit {other} is ported from {'2' * 40}, which is not in AUDITED_SOURCES",
+                f"commit {plain} by Will Faust <willtechnoduck@gmail.com> changes {VENDORED} "
+                "without naming an audited source commit"])
+
+    def test_gpl3_period_contributor_fails_even_with_a_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            vendored(root)
+            bad = commit_as(root, "spitefulowl <owl@example.invalid>",
+                            f"FEXCore/iOS: diagnostics\n\n(ported from arvindfroi/FEX commit {SOURCE})")
+            findings, _, _ = self.check(root)
+            self.assertEqual(findings, [f"commit {bad} by spitefulowl <owl@example.invalid> changes {VENDORED}; "
+                                        "willfaust/FEX contributors after 188e8224 are GPL-3.0"])
+
+    def test_unaudited_or_tracking_nested_submodule_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            vendored(root)
+            add_gitlink(root, f"{VENDORED}/External/fmt", "3" * 40)
+            add_gitlink(root, f"{VENDORED}/External/rpmalloc", "4" * 40, branch="ios-madeira")
+            findings, _, _ = self.check(root)
+            self.assertEqual(findings, [
+                f"submodule {VENDORED}/External/fmt at {'3' * 40} is not audited; add it to AUDITED_NESTED after auditing it",
+                f"submodule {VENDORED}/External/rpmalloc at {'4' * 40} is not audited; add it to AUDITED_NESTED after auditing it",
+                f".gitmodules tracks branch ios-madeira for {VENDORED}/External/rpmalloc; remove it so the pin cannot drift"])
+
+    def test_marker_in_the_vendored_tree_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            vendored(root)
+            write(Path(root) / VENDORED, "LICENSE-MADEIRA.md", "")
+            findings, _, _ = self.check(root)
+            self.assertEqual(findings, [f"{VENDORED}/LICENSE-MADEIRA.md: GPL-3.0 marker file"])
+
+    def test_runner_must_switch_off_gdb_symbols(self):
+        with tempfile.TemporaryDirectory() as root:
+            vendored(root)
+            write(root, check_fex_licence.RUNNER_CMAKE, "ExternalProject_Add(fexcore\n    CMAKE_ARGS\n        -DENABLE_LTO=OFF)\n")
+            findings, _, _ = self.check(root)
+            self.assertEqual(findings, [f"{check_fex_licence.RUNNER_CMAKE} does not pass -DENABLE_GDB_SYMBOLS=OFF; FEX would "
+                                        "include GDB's GPL-3.0 <gdb/jit-reader.h> wherever it is installed"])
+            write(root, check_fex_licence.RUNNER_CMAKE,
+                  "ExternalProject_Add(fexcore\n    CMAKE_ARGS\n        -DENABLE_GDB_SYMBOLS=OFF\n        -DENABLE_LTO=OFF)\n")
+            self.assertEqual(self.check(root)[0], [])
+
+    def test_missing_tree_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(check_fex_licence.check(Path(root)), ([f"{VENDORED} is not checked out"], 0, None))
 
 
 if __name__ == "__main__":
