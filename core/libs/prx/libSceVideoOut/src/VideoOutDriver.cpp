@@ -13,6 +13,7 @@
 #include "SDL_vulkan.h"
 #ifdef __APPLE__
 #include "SDL_metal.h"
+#include <mach/mach_time.h>
 #endif
 #include "prx/libSceVideoOut/include/MainThread.hpp"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
@@ -719,11 +720,24 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
 void VideoOutDriver::vblankLoop(std::stop_token token) {
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 60000>>;
     const auto start = std::chrono::steady_clock::now();
+#ifdef __APPLE__
+    // macOS: absolute deadlines on the mach clock (mach_wait_until wakes within tens of
+    // microseconds, sleep_for drifts by its wake-up latency every frame).
+    mach_timebase_info_data_t timebase {};
+    mach_timebase_info(&timebase);
+    const auto machStart = mach_absolute_time();
+#endif
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
+#ifdef __APPLE__
+            const auto nanoseconds = static_cast<unsigned __int128>(frame) * 1001u * 1000000000u / 60000u;
+            mach_wait_until(machStart + static_cast<std::uint64_t>(nanoseconds * timebase.denom / timebase.numer));
+            (void)start;
+#else
             const auto next = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(Frame(frame));
             const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - std::chrono::steady_clock::now()).count();
             if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+#endif
             {
                 std::lock_guard lock(flipQueue->mutex);
                 if (token.stop_requested() || flipQueue->failure) return;
