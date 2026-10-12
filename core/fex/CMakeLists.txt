@@ -63,5 +63,8 @@ if(BUILD_TESTING)
             ${CMAKE_SOURCE_DIR})
         add_test(NAME fex_licence_checker COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/tools/tests/test_check_fex_licence.py)
+        add_test(NAME fex_bench_smoke COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_bench.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --smoke)
+        set_tests_properties(fex_bench_smoke PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     endif()
 endif()
