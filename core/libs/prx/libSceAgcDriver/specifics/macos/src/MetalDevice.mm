@@ -351,6 +351,133 @@ void VulkanDevice::State::CheckFaults() {
     throw std::runtime_error(message);
 }
 
+
+// Devices alive in the process, torn down by an exit handler when exit() runs with one still
+// alive (a test returning from main through exit(), a title quitting): the GPU driver must never
+// see a terminating process with residency sets on a queue, batches in flight or no-copy wrappers
+// of static pages (the 2026-10-12 panic, DECISIONS D19.5). Leaked so no static destructor races it;
+// the handler is registered after the first device finished construction, so it runs before the
+// destructors of statics that construction created.
+struct LiveDevices {
+    struct Entry {
+        const void* state;
+        void (*teardown)(const void*);
+    };
+    std::mutex mutex;
+    std::vector<Entry> states;
+    std::once_flag handler;
+};
+
+LiveDevices& Live() {
+    static LiveDevices* const live = new LiveDevices;
+    return *live;
+}
+
+std::mutex& TeardownReportMutex() {
+    static std::mutex* const mutex = new std::mutex;
+    return *mutex;
+}
+
+Metal::TeardownReport& TeardownReportValue() {
+    static Metal::TeardownReport* const report = new Metal::TeardownReport;
+    return *report;
+}
+
+void TeardownLiveDevicesAtExit() {
+    auto& live = Live();
+    std::vector<LiveDevices::Entry> states;
+    {
+        std::lock_guard lock(live.mutex);
+        states.swap(live.states);
+    }
+    for (const auto& entry : states) entry.teardown(entry.state);
+}
+
+void RegisterLiveDevice(const void* state, void (*teardown)(const void*)) {
+    auto& live = Live();
+    {
+        std::lock_guard lock(live.mutex);
+        live.states.push_back({state, teardown});
+    }
+    std::call_once(live.handler, [] { std::atexit(TeardownLiveDevicesAtExit); });
+}
+
+void UnregisterLiveDevice(const void* state) {
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    std::erase_if(live.states, [&](const LiveDevices::Entry& entry) { return entry.state == state; });
+}
+
+Metal::TeardownReport Metal::LastTeardown() {
+    std::lock_guard lock(TeardownReportMutex());
+    return TeardownReportValue();
+}
+
+void VulkanDevice::State::Teardown(bool atExit) noexcept {
+    if (tornDown) return;
+    tornDown = true;
+    tearingDown = true;
+    static const bool log = std::getenv("APS5_METAL_TEARDOWN_LOG") != nullptr;
+    Metal::TeardownReport report;
+    report.atExit = atExit;
+    @autoreleasepool {
+        // 1. Every submitted batch completes before anything it may use is released. A Sync that
+        //    throws (a fault record, a failed completion) has still retired the batches before the
+        //    failing one; retry until the recorder is idle (bounded: a hung GPU fails each wait
+        //    after the recorder's batch timeout).
+        for (std::uint32_t attempt = 0; recorder != nullptr && attempt < 64u; ++attempt) {
+            try {
+                Sync();
+                if (recorder->Idle()) break;
+            } catch (const std::exception& error) {
+                ++report.syncFailures;
+                std::fprintf(stderr, "[metal] teardown: %s\n", error.what());
+            }
+        }
+        report.idle = recorder == nullptr || recorder->Idle();
+        // 2. The recorder: its destructor syncs again, joins the release thread and removes its
+        //    residency set (and its command stream's) from the queue.
+        recorder.reset();
+        context.recorder = nullptr;
+        // 3. The guest-memory wrappers (no-copy buffers over guest and static __DATA pages) and
+        //    the cached BDA table holding their addresses.
+        report.wrappersDropped = wrappers.size();
+        if (residency != nil) {
+            for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
+        }
+        wrappers.clear();
+        ++wrapperEpoch;
+        addressTable = {};
+        // 4. The device's own residency set leaves the queue before it is released.
+        if (queue != nil && residency != nil) {
+            [queue removeResidencySet:residency];
+            [residency removeAllAllocations];
+            [residency commit];
+            report.residencyRemoved = true;
+        }
+        {
+            std::lock_guard lock(pipelinesMutex);
+            computePipelines.clear();
+            libraries.clear();
+        }
+        arguments = nil;
+        workgroupArena = nil;
+        faults = nil;
+        residency = nil;
+        // 5. The buffer pool (its residency set leaves the queue in its destructor) and the queue.
+        context.bufferPool.reset();
+    }
+    {
+        std::lock_guard lock(TeardownReportMutex());
+        report.teardowns = TeardownReportValue().teardowns + 1u;
+        TeardownReportValue() = report;
+    }
+    if (log) {
+        std::fprintf(stderr, "[metal] teardown%s: recorder %s, %u failed syncs, %llu wrappers dropped, device residency set %s\n", atExit ? " at exit" : "",
+                     report.idle ? "idle" : "NOT idle", report.syncFailures, static_cast<unsigned long long>(report.wrappersDropped), report.residencyRemoved ? "removed from the queue" : "not attached");
+    }
+}
+
 VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(window, false) {
 }
 
@@ -358,79 +485,79 @@ VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {
 }
 
 VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial(NextSerial()) {
-    if (window != nullptr) Unimplemented("presentation to a window", "work package D6");
-    @autoreleasepool {
-        state->device = MTLCreateSystemDefaultDevice();
-        if (state->device == nil) throw std::runtime_error("Metal device: no Metal device");
-        if (![state->device supportsFamily:MTLGPUFamilyMetal4] || ![state->device supportsFamily:MTLGPUFamilyApple7]) throw std::runtime_error("Metal device: the GPU lacks the Metal 4 / Apple7 feature set this driver needs");
-        NSError* error = nil;
-        state->compiler = [state->device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
-        if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler: " + Describe(error));
-        for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
-            state->capabilities.push_back(static_cast<std::uint32_t>(capability));
-        }
-        // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
-        state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityFloat64));
-        // half arithmetic rounds to nearest even and keeps f16 denormals on Apple GPUs (probe_float_b2),
-        // so packed f16 add/mul run natively (FPAdd16x2/FPMul16x2, MslAluMath.cpp).
-        for (const auto capability : {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve}) state->capabilities.push_back(static_cast<std::uint32_t>(capability));
-        std::ranges::sort(state->capabilities);
-        state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
-        if (compileOnly) return;
-        state->queue = [state->device newMTL4CommandQueue];
-        MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
-        residency.initialCapacity = 64;
-        state->residency = [state->device newResidencySetWithDescriptor:residency error:&error];
-        if (state->queue == nil || state->residency == nil) throw std::runtime_error("Metal device: queue setup failed: " + Describe(error));
-        state->faults = [state->device newBufferWithLength:Bda::FaultBufferBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-        if (state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the fault buffer");
-        std::memset(state->faults.contents, 0, state->faults.length);
-        [state->residency addAllocation:state->faults];
-        [state->residency commit];
-        [state->queue addResidencySet:state->residency];
-        MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
-        table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
-        state->arguments = [state->device newArgumentTableWithDescriptor:table error:&error];
-        if (state->arguments == nil) throw std::runtime_error("Metal device: argument table setup failed: " + Describe(error));
+    try {
+        if (window != nullptr) Unimplemented("presentation to a window", "work package D6");
+        @autoreleasepool {
+            state->device = MTLCreateSystemDefaultDevice();
+            if (state->device == nil) throw std::runtime_error("Metal device: no Metal device");
+            if (![state->device supportsFamily:MTLGPUFamilyMetal4] || ![state->device supportsFamily:MTLGPUFamilyApple7]) throw std::runtime_error("Metal device: the GPU lacks the Metal 4 / Apple7 feature set this driver needs");
+            NSError* error = nil;
+            state->compiler = [state->device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+            if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler: " + Describe(error));
+            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery}) {
+                state->capabilities.push_back(static_cast<std::uint32_t>(capability));
+            }
+            // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityFloat64));
+            // half arithmetic rounds to nearest even and keeps f16 denormals on Apple GPUs (probe_float_b2),
+            // so packed f16 add/mul run natively (FPAdd16x2/FPMul16x2, MslAluMath.cpp).
+            for (const auto capability : {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve}) state->capabilities.push_back(static_cast<std::uint32_t>(capability));
+            std::ranges::sort(state->capabilities);
+            state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+            if (compileOnly) return;
+            state->queue = [state->device newMTL4CommandQueue];
+            MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
+            residency.initialCapacity = 64;
+            state->residency = [state->device newResidencySetWithDescriptor:residency error:&error];
+            if (state->queue == nil || state->residency == nil) throw std::runtime_error("Metal device: queue setup failed: " + Describe(error));
+            state->faults = [state->device newBufferWithLength:Bda::FaultBufferBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            if (state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the fault buffer");
+            std::memset(state->faults.contents, 0, state->faults.length);
+            [state->residency addAllocation:state->faults];
+            [state->residency commit];
+            [state->queue addResidencySet:state->residency];
+            MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
+            table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
+            state->arguments = [state->device newArgumentTableWithDescriptor:table error:&error];
+            if (state->arguments == nil) throw std::runtime_error("Metal device: argument table setup failed: " + Describe(error));
 
-        // The Context of the D2-D6 twins (D2's integration steps, docs/mac/M2_DESIGN.md §9 D2).
-        auto& context = state->context;
-        context.device = Graphics::Metal::DeviceHandle(state->device);
-        context.queue = Graphics::Metal::QueueHandle(state->queue);
-        context.bufferDeviceAddress = true;
-        const auto bufferLength = static_cast<std::uint64_t>(state->device.maxBufferLength);
-        context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
-        context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
-        context.limits.maxPushConstantsSize = Abi::PushDataBytes;
-        context.limits.maxBoundDescriptorSets = 4u;
-        context.limits.minStorageBufferOffsetAlignment = 4u;
-        context.limits.nonCoherentAtomSize = 1u;
-        const auto threads = state->device.maxThreadsPerThreadgroup;
-        context.limits.maxComputeWorkGroupCount[0] = context.limits.maxComputeWorkGroupCount[1] = context.limits.maxComputeWorkGroupCount[2] = GroupLimit;
-        context.limits.maxComputeWorkGroupSize[0] = static_cast<std::uint32_t>(threads.width);
-        context.limits.maxComputeWorkGroupSize[1] = static_cast<std::uint32_t>(threads.height);
-        context.limits.maxComputeWorkGroupSize[2] = static_cast<std::uint32_t>(threads.depth);
-        context.limits.maxComputeWorkGroupInvocations = 1024u;
-        context.limits.maxComputeSharedMemorySize = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
-        context.subgroup.subgroupSize = 32u;
-        context.bufferPool = std::make_shared<Graphics::BufferPool>(context);
-        state->recorder = std::make_unique<Graphics::Recorder>(context, true);
-        context.recorder = state->recorder.get();
-        state->recorder->Activate();
+            // The Context of the D2-D6 twins (D2's integration steps, docs/mac/M2_DESIGN.md §9 D2).
+            auto& context = state->context;
+            context.device = Graphics::Metal::DeviceHandle(state->device);
+            context.queue = Graphics::Metal::QueueHandle(state->queue);
+            context.bufferDeviceAddress = true;
+            const auto bufferLength = static_cast<std::uint64_t>(state->device.maxBufferLength);
+            context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
+            context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
+            context.limits.maxPushConstantsSize = Abi::PushDataBytes;
+            context.limits.maxBoundDescriptorSets = 4u;
+            context.limits.minStorageBufferOffsetAlignment = 4u;
+            context.limits.nonCoherentAtomSize = 1u;
+            const auto threads = state->device.maxThreadsPerThreadgroup;
+            context.limits.maxComputeWorkGroupCount[0] = context.limits.maxComputeWorkGroupCount[1] = context.limits.maxComputeWorkGroupCount[2] = GroupLimit;
+            context.limits.maxComputeWorkGroupSize[0] = static_cast<std::uint32_t>(threads.width);
+            context.limits.maxComputeWorkGroupSize[1] = static_cast<std::uint32_t>(threads.height);
+            context.limits.maxComputeWorkGroupSize[2] = static_cast<std::uint32_t>(threads.depth);
+            context.limits.maxComputeWorkGroupInvocations = 1024u;
+            context.limits.maxComputeSharedMemorySize = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
+            context.subgroup.subgroupSize = 32u;
+            context.bufferPool = std::make_shared<Graphics::BufferPool>(context);
+            state->recorder = std::make_unique<Graphics::Recorder>(context, true);
+            context.recorder = state->recorder.get();
+            state->recorder->Activate();
+        }
+    } catch (...) {
+        // A half-built device releases what it attached (residency sets on the queue) before unwinding.
+        state->Teardown(false);
+        throw;
     }
+    RegisterLiveDevice(state.get(), [](const void* live) { const_cast<State*>(static_cast<const State*>(live))->Teardown(true); });
 }
 
 VulkanDevice::~VulkanDevice() {
     if (state == nullptr) return;
-    state->tearingDown = true;
-    try {
-        state->Sync();
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[metal] %s\n", error.what());
-    }
-    // The recorder's teardown frees what its batches kept; the wrappers go after it.
-    state->recorder.reset();
-    state->context.recorder = nullptr;
+    state->Teardown(false);
+    UnregisterLiveDevice(state.get());
 }
 
 ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePipelineCapture&, std::span<const std::byte>) {

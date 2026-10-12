@@ -11,3 +11,10 @@ foreach(agcMetalDeviceMode IN ITEMS bindings submission profile)
     add_test(NAME agc_metal_device_${agcMetalDeviceMode} COMMAND agc_metal_device_tests ${agcMetalDeviceMode})
     set_tests_properties(agc_metal_device_${agcMetalDeviceMode} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
 endforeach()
+# D19.5 teardown hygiene: a failed MSL compile, a dispatch in flight and a wrapped static page at teardown
+# (through ~VulkanDevice, and with the device still alive at exit()). Run under validation via gpu_suite.
+add_test(NAME agc_metal_device_teardown COMMAND agc_metal_device_tests teardown)
+set_tests_properties(agc_metal_device_teardown PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_TEARDOWN_LOG=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+add_test(NAME agc_metal_device_teardown_exit COMMAND agc_metal_device_tests teardown_exit)
+set_tests_properties(agc_metal_device_teardown_exit PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_TEARDOWN_LOG=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "\\[metal\\] teardown at exit: recorder idle, 0 failed syncs, [1-9][0-9]* wrappers dropped, device residency set removed from the queue")

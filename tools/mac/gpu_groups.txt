@@ -461,6 +461,8 @@ agc_metal_alu_helpers G7
 agc_metal_device_bindings G7
 agc_metal_device_profile G7
 agc_metal_device_submission G7
+agc_metal_device_teardown G7
+agc_metal_device_teardown_exit G7
 agc_metal_msl_compile G7
 agc_metal_msl_corpus G7
 agc_metal_recorder G7

@@ -62,6 +62,21 @@ struct DeviceProfile {
 // a failure is recorded in the profile and every fact stays at its conservative default.
 const DeviceProfile& Profile(id<MTLDevice> device);
 
+// What the last device teardown did (DECISIONS D19.5), for the teardown tests and logs: the device
+// waited for every recorded batch, joined the release thread (through ~Recorder), removed its own
+// residency set from the queue and dropped its guest-memory wrappers (static __DATA pages included).
+struct TeardownReport {
+    std::uint64_t teardowns = 0;
+    // The recorder was idle (every submitted batch completed) before anything was released.
+    bool idle = false;
+    std::uint32_t syncFailures = 0;
+    std::uint64_t wrappersDropped = 0;
+    bool residencyRemoved = false;
+    // The teardown ran from the exit handler (a device still alive at exit()).
+    bool atExit = false;
+};
+TeardownReport LastTeardown();
+
 }
 
 struct VulkanDevice::State {
@@ -90,6 +105,13 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Recorder> recorder;
     // The device is being destroyed: completion actions log faults instead of throwing.
     bool tearingDown = false;
+    // Teardown() ran (from ~VulkanDevice or from the exit handler, whichever came first).
+    bool tornDown = false;
+    // Releases everything in the order the GPU driver needs (D19.5): waits for every submitted
+    // batch, destroys the recorder (joins the release thread, removes its residency set), drops the
+    // wrappers, removes the device's residency set from the queue, then the buffer pool's.
+    // Idempotent, never throws.
+    void Teardown(bool atExit) noexcept;
 
     // Guest memory wrapped in place (newBufferWithBytesNoCopy over 16 KiB pages), dropped only when
     // the recorder is idle (batches read them, and Metal 4 command buffers retain nothing);

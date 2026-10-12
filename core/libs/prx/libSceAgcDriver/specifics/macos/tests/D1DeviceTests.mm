@@ -6,6 +6,10 @@
 //   agc_metal_device_tests bindings   (agc_metal_device_bindings)
 //   agc_metal_device_tests submission (agc_metal_device_submission)
 //   agc_metal_device_tests profile    (agc_metal_device_profile)
+//   agc_metal_device_tests teardown   (agc_metal_device_teardown: D19.5 teardown after a failed MSL
+//                                      compile with work in flight, through ~VulkanDevice)
+//   agc_metal_device_tests teardown_exit (agc_metal_device_teardown_exit: the same, the device still
+//                                      alive at exit(); the exit handler tears it down)
 
 #include "../src/MetalDeviceState.h"
 #include "BdaAbi.hpp"
@@ -426,6 +430,40 @@ void CheckProfile(AgcDriver::VulkanDevice& device) {
     std::printf("device profile: vertex SIMD groups %s, odd strip order %s\n", profile.vertexSimdGroups ? "yes" : "no", profile.oddStripOrder == AgcDriver::Metal::DeviceProfile::StripOrder::I_I2_I1 ? "(v_i, v_i+2, v_i+1)" : "other");
 }
 
+// DECISIONS D19.5: a device torn down after a failed MSL compile, with a dispatch in flight and a
+// static (__DATA) page wrapped, waits for its batches, drops its wrappers and removes its residency
+// set from the queue. With `viaExit` the device is still alive when the process calls exit(); the
+// driver's exit handler tears it down (checked by the test's PASS_REGULAR_EXPRESSION on its log).
+void CheckTeardown(std::unique_ptr<AgcDriver::VulkanDevice>& device, bool viaExit) {
+    alignas(16384) static std::array<std::uint32_t, 64> output {};
+    output.fill(0u);
+    const std::vector<TableSpec> specs {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(output.data(), sizeof(output))}};
+    const auto good = Kernel("if (local == 0u) atomic_fetch_add_explicit(reinterpret_cast<device atomic_uint*>(out(0)), 1u, memory_order_relaxed);", specs, {32, 1, 1});
+    device->Dispatch(good, 4, 1, 1);
+    device->WaitIdle();
+    Require(output[0] == 4u, "teardown: the first dispatch ran " + std::to_string(output[0]) + " workgroups, expected 4");
+    const auto broken = Kernel("out(0)[0] = aps5_teardown_undefined_identifier;", specs, {32, 1, 1});
+    const auto failure = Throws([&] { device->Dispatch(broken, 1, 1, 1); });
+    Require(!failure.empty(), "teardown: a kernel whose MSL does not compile was accepted");
+    std::printf("teardown: the broken kernel was refused: %.120s\n", failure.c_str());
+    // Left in flight for the teardown to wait for.
+    device->Dispatch(good, 8, 1, 1);
+    if (viaExit) {
+        std::puts("teardown: exiting with the device alive");
+        std::fflush(stdout);
+        std::exit(0);
+    }
+    const auto before = AgcDriver::Metal::LastTeardown().teardowns;
+    device.reset();
+    const auto report = AgcDriver::Metal::LastTeardown();
+    Require(report.teardowns == before + 1u && !report.atExit, "teardown: ~VulkanDevice did not tear the device down");
+    Require(report.idle && report.syncFailures == 0u, "teardown: the recorder was not idle before the release (" + std::to_string(report.syncFailures) + " failed syncs)");
+    Require(report.residencyRemoved, "teardown: the device's residency set was not removed from the queue");
+    Require(report.wrappersDropped >= 1u, "teardown: no guest-memory wrapper was dropped (the static page was not wrapped?)");
+    Require(output[0] == 12u, "teardown: the dispatch in flight at teardown did not complete (" + std::to_string(output[0]) + " workgroups)");
+    std::printf("teardown: waited for the in-flight dispatch, dropped %llu wrapper(s), removed the residency set\n", static_cast<unsigned long long>(report.wrappersDropped));
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -449,6 +487,10 @@ int main(int argc, char** argv) {
             CheckSubmission(*device);
         } else if (mode == "profile") {
             CheckProfile(*device);
+        } else if (mode == "teardown" || mode == "teardown_exit") {
+            CheckTeardown(device, mode == "teardown_exit");
+            std::printf("metal device %s tests passed\n", mode.c_str());
+            return 0;
         } else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;
@@ -459,7 +501,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         try {
-            device->WaitIdle();
+            if (device != nullptr) device->WaitIdle();
         } catch (const std::exception& idle) {
             std::fprintf(stderr, "%s\n", idle.what());
         }
