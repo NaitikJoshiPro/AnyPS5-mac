@@ -256,36 +256,9 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bit
 
 // LockedLdsUpdate: `critical` runs under the LDS lock, once per invocation that reaches here.
 void Locked(MslEmitterState& state, const IrValue& instruction, const Shared& shared, const std::function<void()>& critical) {
-    const auto lock = AtomicPointer(shared, shared.length);
     const auto done = state.Temporary("aps5_done");
-    const auto rounds = state.Temporary("aps5_round");
-    const auto expected = state.Temporary("aps5_lk");
     state.Line("bool " + done + " = false;");
-    state.Line("for (uint " + rounds + " = 0u;; ++" + rounds + ") {");
-    state.Indent();
-    state.Line("if (!" + done + " && simd_is_first()) {");
-    state.Indent();
-    state.Line("uint " + expected + " = 0u;");
-    state.Line("if (atomic_compare_exchange_weak_explicit(" + lock + ", &" + expected + ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
-    state.Indent();
-    state.Line(Fence(shared.flags, "memory_order_acquire", shared.scope));
-    critical();
-    state.Line(Fence(shared.flags, "memory_order_release", shared.scope));
-    state.Line("atomic_store_explicit(" + lock + ", 0u, memory_order_relaxed);");
-    state.Line(done + " = true;");
-    state.Outdent();
-    state.Line("}");
-    state.Outdent();
-    state.Line("}");
-    state.Line("if (!simd_any(!" + done + ")) break;");
-    state.Line("if (" + rounds + " == " + U32(LockRoundLimit) + ") {");
-    state.Indent();
-    state.Line("if (simd_is_first()) " + MslRecordFault(state, 6u, MslHex(state.program.Resources().shaderHash) + "ul", U32(LockRoundLimit), MslB5Pc(instruction)));
-    state.Line("break;");
-    state.Outdent();
-    state.Line("}");
-    state.Outdent();
-    state.Line("}");
+    MslLockLoop(state, instruction, {AtomicPointer(shared, shared.length), Fence(shared.flags, "memory_order_acquire", shared.scope), Fence(shared.flags, "memory_order_release", shared.scope)}, done, critical);
 }
 
 // One 32-bit LDS/GDS atomic: `native` when Metal has the operation, else a compare-exchange loop
@@ -543,6 +516,42 @@ MslB5Storage MslLdsStorage(MslEmitterState& state) {
     return {"aps5_lds", dwords};
 }
 
+void MslLockLoop(MslEmitterState& state, const IrValue& instruction, const MslLock& lock, std::string_view done, const std::function<void()>& critical) {
+    const auto rounds = state.Temporary("aps5_round");
+    const auto expected = state.Temporary("aps5_lk");
+    const std::string flag(done);
+    state.Line("for (uint " + rounds + " = 0u;; ++" + rounds + ") {");
+    state.Indent();
+    // The election is its own branch: simd_is_first() picks the first lane among those still waiting.
+    state.Line("if (!" + flag + ") {");
+    state.Indent();
+    state.Line("if (simd_is_first()) {");
+    state.Indent();
+    state.Line("uint " + expected + " = 0u;");
+    state.Line("if (atomic_compare_exchange_weak_explicit(" + lock.pointer + ", &" + expected + ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
+    state.Indent();
+    state.Line(lock.acquire);
+    critical();
+    state.Line(lock.release);
+    state.Line("atomic_store_explicit(" + lock.pointer + ", 0u, memory_order_relaxed);");
+    state.Line(flag + " = true;");
+    state.Outdent();
+    state.Line("}");
+    state.Outdent();
+    state.Line("}");
+    state.Outdent();
+    state.Line("}");
+    state.Line("if (!simd_any(!" + flag + ")) break;");
+    state.Line("if (" + rounds + " == " + U32(LockRoundLimit) + ") {");
+    state.Indent();
+    state.Line("if (simd_is_first()) " + MslRecordFault(state, 6u, MslHex(state.program.Resources().shaderHash) + "ul", U32(LockRoundLimit), MslB5Pc(instruction)));
+    state.Line("break;");
+    state.Outdent();
+    state.Line("}");
+    state.Outdent();
+    state.Line("}");
+}
+
 void MslLdsLocked(MslEmitterState& state, const IrValue& instruction, const std::function<void()>& critical) {
     if (!state.requirements.ldsLock) state.Fail(instruction, "an LDS update under the lock in a program without the LDS lock (work package B3)");
     const auto storage = MslLdsStorage(state);
@@ -568,45 +577,21 @@ std::string MslDeviceAtomic64(MslEmitterState& state, const IrValue& instruction
     state.Line("ulong " + result + " = 0ul;");
     const Shared lockSpace{"", "", "device", "mem_flags::mem_device", "thread_scope_device", false, true};
     const auto done = state.Temporary("aps5_done");
-    const auto rounds = state.Temporary("aps5_round");
-    const auto expected = state.Temporary("aps5_lk");
     const auto lock = state.Temporary("aps5_lock");
     const auto words = state.Temporary("aps5_w64");
     state.Line("device atomic_uint* " + lock + " = aps5_atomic64_lock(aps5_driver.atomicLocks, " + std::string(address) + ");");
     state.Line("device uint* " + words + " = reinterpret_cast<device uint*>(" + std::string(address) + ");");
     state.Line("bool " + done + " = aps5_driver.atomicLocks == 0ul;");
     state.Line("if (" + done + ") " + MslRecordFault(state, 6u, std::string(address), "8u", MslB5Pc(instruction)));
-    state.Line("for (uint " + rounds + " = 0u;; ++" + rounds + ") {");
-    state.Indent();
-    state.Line("if (!" + done + " && simd_is_first()) {");
-    state.Indent();
-    state.Line("uint " + expected + " = 0u;");
-    state.Line("if (atomic_compare_exchange_weak_explicit(" + lock + ", &" + expected + ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
-    state.Indent();
-    state.Line(Fence(lockSpace.flags, "memory_order_acquire", lockSpace.scope));
-    state.Line(result + " = ulong(atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + words + "), memory_order_relaxed)) | (ulong(atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + words + ") + 1, memory_order_relaxed)) << 32u);");
-    const auto updated = state.Temporary("aps5_n64");
-    state.Line("const ulong " + updated + " = aps5_atomic64_next(" + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + result + ", ulong(" + std::string(value) + "), ulong(" + std::string(comparator.empty() ? "0ul" : comparator) + "));");
-    // Commit the new value with one 64-bit atomic (max when it grows, min when it shrinks: the lock
-    // holder knows the old value), so 64-bit loads elsewhere never see half of it.
-    state.Line("if (" + updated + " > " + result + ") atomic_max_explicit(reinterpret_cast<device atomic_ulong*>(" + words + "), " + updated + ", memory_order_relaxed);");
-    state.Line("else if (" + updated + " < " + result + ") atomic_min_explicit(reinterpret_cast<device atomic_ulong*>(" + words + "), " + updated + ", memory_order_relaxed);");
-    state.Line(Fence(lockSpace.flags, "memory_order_release", lockSpace.scope));
-    state.Line("atomic_store_explicit(" + lock + ", 0u, memory_order_relaxed);");
-    state.Line(done + " = true;");
-    state.Outdent();
-    state.Line("}");
-    state.Outdent();
-    state.Line("}");
-    state.Line("if (!simd_any(!" + done + ")) break;");
-    state.Line("if (" + rounds + " == " + U32(LockRoundLimit) + ") {");
-    state.Indent();
-    state.Line("if (simd_is_first()) " + MslRecordFault(state, 6u, MslHex(state.program.Resources().shaderHash) + "ul", U32(LockRoundLimit), MslB5Pc(instruction)));
-    state.Line("break;");
-    state.Outdent();
-    state.Line("}");
-    state.Outdent();
-    state.Line("}");
+    MslLockLoop(state, instruction, {lock, Fence(lockSpace.flags, "memory_order_acquire", lockSpace.scope), Fence(lockSpace.flags, "memory_order_release", lockSpace.scope)}, done, [&] {
+        state.Line(result + " = ulong(atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + words + "), memory_order_relaxed)) | (ulong(atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + words + ") + 1, memory_order_relaxed)) << 32u);");
+        const auto updated = state.Temporary("aps5_n64");
+        state.Line("const ulong " + updated + " = aps5_atomic64_next(" + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + result + ", ulong(" + std::string(value) + "), ulong(" + std::string(comparator.empty() ? "0ul" : comparator) + "));");
+        // Commit the new value with one 64-bit atomic (max when it grows, min when it shrinks: the lock
+        // holder knows the old value), so 64-bit loads elsewhere never see half of it.
+        state.Line("if (" + updated + " > " + result + ") atomic_max_explicit(reinterpret_cast<device atomic_ulong*>(" + words + "), " + updated + ", memory_order_relaxed);");
+        state.Line("else if (" + updated + " < " + result + ") atomic_min_explicit(reinterpret_cast<device atomic_ulong*>(" + words + "), " + updated + ", memory_order_relaxed);");
+    });
     return result;
 }
 

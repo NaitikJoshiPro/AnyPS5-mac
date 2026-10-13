@@ -66,6 +66,20 @@ struct MslB5Storage {
 // (plus the lock dword when SpirvRequirements::ldsLock), or the workgroup's slice of the device
 // arena (`device uint* aps5_lds`) when it exceeds threadgroup memory. MslB5Lds forwards here.
 [[nodiscard]] MslB5Storage MslLdsStorage(MslEmitterState& state);
+// Package B3: the lock loop of every emulated atomic (the LDS lock, 64-bit device and image
+// atomics). Lanes of one Apple SIMD group have no independent forward progress, so no lane may wait
+// for another lane of its own SIMD group: each round elects one waiting lane per SIMD group
+// (`if (!done) { if (simd_is_first())`), which try-locks once and, when it gets the lock, runs
+// `acquire`, `critical`, `release` and the unlocking store in the same iteration; a failed try only
+// goes round again. The loop ends once no lane of the SIMD group waits (simd_any) or after the round
+// limit with a LoopLimit fault (reason 6). `done` names a bool the caller declared (true: the
+// invocation takes no part); `pointer` is a device/threadgroup `atomic_uint*` expression.
+struct MslLock {
+    std::string pointer;
+    std::string acquire;
+    std::string release;
+};
+void MslLockLoop(MslEmitterState& state, const IrValue& instruction, const MslLock& lock, std::string_view done, const std::function<void()>& critical);
 // Package B3: runs `critical` (a plain read-modify-write of LDS) under the LDS lock, once per
 // invocation that reaches this point (SpirvRequirements::ldsLock programs: LockedLdsUpdate).
 void MslLdsLocked(MslEmitterState& state, const IrValue& instruction, const std::function<void()>& critical);

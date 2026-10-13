@@ -6,6 +6,8 @@
 //   of the WorkgroupMemory arena with Reflection::workgroupMemoryStrideDwords = N + 1;
 // - 64-bit LDS atomics take the LDS lock: lock dword reset before a barrier, elected try-lock per
 //   SIMD group per round, a LoopLimit fault after the round limit instead of a hang;
+// - every lock loop (LDS, 64-bit device atomics of global_atomics64 and look_back_scan) has
+//   MslLockLoop's forward-progress shape (CheckLockLoops), and look-back readers never spin on a lock;
 // - ds_append/ds_consume issue one atomic per wave and broadcast its result.
 // The GPU behaviour is covered by the execution tests (agc_driver_*); this test keeps the emitted
 // shape from regressing in ways those tests would only show as a hang.
@@ -18,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -164,6 +167,41 @@ alignas(256) constexpr std::array<std::uint32_t, 475> LdsAtomics64Code{
     0xe07011c4, 0x80013103, 0xbf810000,
 };
 
+// tests/execution/GlobalAtomics64.cpp (GlobalAtomicsCode): eleven 64-bit global atomics.
+alignas(256) constexpr std::array<std::uint32_t, 159> GlobalAtomics64Code{
+    0x34020083, 0x34040084, 0x340a0083, 0x7e2802ff, 0x05e471e1, 0x7e2a02ff, 0x05e471e1, 0x4a060280,
+    0x4a080480, 0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0a80, 0xdd418000, 0x14080a03, 0xbf8c3f70,
+    0xe0741000, 0x80011406, 0x4a0602ff, 0x00000200, 0x4a0804ff, 0x00000400, 0xe0381000, 0x80000a04,
+    0xbf8c3f70, 0x4a0c0aff, 0x00000200, 0xdd458000, 0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406,
+    0x4a0602ff, 0x00000400, 0x4a0804ff, 0x00000800, 0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff,
+    0x00000400, 0xdd498000, 0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406, 0x4a0602ff, 0x00000600,
+    0x4a0804ff, 0x00000c00, 0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff, 0x00000600, 0xdd4d8000,
+    0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406, 0x4a0602ff, 0x00000800, 0x4a0804ff, 0x00001000,
+    0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff, 0x00000800, 0xdd558000, 0x14080a03, 0xbf8c3f70,
+    0xe0741000, 0x80011406, 0x4a0602ff, 0x00000a00, 0x4a0804ff, 0x00001400, 0xe0381000, 0x80000a04,
+    0xbf8c3f70, 0x4a0c0aff, 0x00000a00, 0xdd598000, 0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406,
+    0x4a0602ff, 0x00000c00, 0x4a0804ff, 0x00001800, 0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff,
+    0x00000c00, 0xdd5d8000, 0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406, 0x4a0602ff, 0x00000e00,
+    0x4a0804ff, 0x00001c00, 0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff, 0x00000e00, 0xdd618000,
+    0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406, 0x4a0602ff, 0x00001000, 0x4a0804ff, 0x00002000,
+    0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff, 0x00001000, 0xdd658000, 0x14080a03, 0xbf8c3f70,
+    0xe0741000, 0x80011406, 0x4a0602ff, 0x00001200, 0x4a0804ff, 0x00002400, 0xe0381000, 0x80000a04,
+    0xbf8c3f70, 0x4a0c0aff, 0x00001200, 0xdd698000, 0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406,
+    0x4a0602ff, 0x00001400, 0x4a0804ff, 0x00002800, 0xe0381000, 0x80000a04, 0xbf8c3f70, 0x4a0c0aff,
+    0x00001400, 0xdd6d8000, 0x14080a03, 0xbf8c3f70, 0xe0741000, 0x80011406, 0xbf810000
+};
+
+// tests/execution/LookBackScan.cpp (ScanCode): wave64 decoupled look-back; blocks spin on GLC dwordx2
+// reads of the pairs their predecessors publish with 64-bit atomics.
+alignas(256) constexpr std::array<std::uint32_t, 43> LookBackScanCode{
+    0xbefe0481, 0x7e020281, 0x7e000280, 0xe0c85000, 0x80000100, 0xbf8c3f70, 0x7e200501, 0x34040282,
+    0xe0301000, 0x80010302, 0x34080283, 0xbf8c3f70, 0xbf068010, 0x85118182, 0x7e0c0211, 0x7e0e0303,
+    0xe1401000, 0x80020604, 0x7e100280, 0xbf068010, 0xbf85000f, 0x80928110, 0x8f138312, 0x7e120213,
+    0xe0345000, 0x80020a09, 0xbf8c3f70, 0x7e28050a, 0x7e2a050b, 0xbf068014, 0xbf85fff7, 0x4a101015,
+    0xbf068214, 0xbf850002, 0x80928112, 0xbf82fff2, 0x4a1a0708, 0x7e180282, 0xe1401000, 0x80020c04,
+    0xe0701000, 0x80030802, 0xbf810000,
+};
+
 std::vector<std::uint32_t> Backing(512u, 0u);
 
 ShaderRecompiler::SpirvTarget MetalTarget() {
@@ -218,6 +256,59 @@ void Has(const Program& program, const std::string& source, const std::string& n
 
 void Lacks(const Program& program, const std::string& source, const std::string& needle) {
     Require(source.find(needle) == std::string::npos, std::string(program.name) + ": the MSL has `" + needle + "`\n" + source);
+}
+
+// The text of the brace block that opens at the first '{' at or after `from`.
+std::string Block(const std::string& text, std::size_t from) {
+    const auto open = text.find('{', from);
+    Require(open != std::string::npos, "no block after offset " + std::to_string(from));
+    int depth = 0;
+    for (auto at = open; at < text.size(); ++at) {
+        if (text[at] == '{') ++depth;
+        if (text[at] == '}' && --depth == 0) return text.substr(open, at - open + 1);
+    }
+    throw std::runtime_error("unbalanced block after offset " + std::to_string(from));
+}
+
+std::string Squeeze(const std::string& text) {
+    std::string out;
+    for (const char c : text) {
+        if (c != ' ' && c != '\n') out += c;
+    }
+    return out;
+}
+
+// MslLockLoop's shape, which keeps every emulated atomic free of intra-SIMD-group waits (Apple SIMD
+// groups have no independent forward progress): each round, inside `if (!done)`, one lane elected by
+// simd_is_first() try-locks once; acquire, the critical section, release and the unlocking store all
+// run in that same `if` and nothing in it loops; the loop leaves through simd_any or the round limit's
+// LoopLimit fault. Returns the number of lock loops.
+std::size_t CheckLockLoops(const Program& program, const std::string& source) {
+    std::size_t loops = 0;
+    for (auto at = source.find("for (uint aps5_round"); at != std::string::npos; at = source.find("for (uint aps5_round", at + 1u)) {
+        ++loops;
+        const auto name = std::string(program.name) + " lock loop " + std::to_string(loops);
+        const auto loop = Block(source, at);
+        const auto flat = Squeeze(loop);
+        const std::regex head(R"(^\{if\(!(aps5_done\w+|aps5_ia64\w+_done)\)\{if\(simd_is_first\(\)\)\{uintaps5_lk\w+=0u;if\(atomic_compare_exchange_weak_explicit\(([^,]+),&aps5_lk\w+,1u,memory_order_relaxed,memory_order_relaxed\)\)\{)");
+        std::smatch match;
+        Require(std::regex_search(flat, match, head), name + ": the round does not start with the elected try-lock\n" + loop);
+        const std::string done = match[1];
+        const std::string lock = match[2];
+        const auto critical = Block(loop, loop.find("atomic_compare_exchange_weak_explicit("));
+        const auto inner = Squeeze(critical);
+        Require(inner.find("memory_order_acquire") != std::string::npos || inner.find("memory_order_seq_cst") != std::string::npos, name + ": no acquire fence after the lock is taken");
+        const auto unlock = "atomic_store_explicit(" + lock + ",0u,memory_order_relaxed);" + done + "=true;}";
+        Require(inner.size() >= unlock.size() && inner.compare(inner.size() - unlock.size(), unlock.size(), unlock) == 0, name + ": the critical section does not end with the unlocking store and " + done + " = true\n" + critical);
+        for (const char* forbidden : {"for(", "while(", "simd_any(", "simd_ballot(", "simd_shuffle("}) {
+            Require(inner.find(forbidden) == std::string::npos, name + ": `" + forbidden + "` inside the critical section\n" + critical);
+        }
+        Require(flat.find("if(!simd_any(!" + done + "))break;") != std::string::npos, name + ": the loop does not end once no lane of the SIMD group waits");
+        Require(flat.find("==1048576u){if(simd_is_first())aps5_record_fault(aps5_driver.faultBuffer,6u,") != std::string::npos, name + ": no LoopLimit fault at the round limit");
+    }
+    Lacks(program, source, "while (atomic_exchange");
+    Require(std::regex_search(source, std::regex(R"(while \(!?atomic_[a-z_]*\(aps5_lock)")) == false, std::string(program.name) + ": a lane spins on a lock word");
+    return loops;
 }
 
 std::string Check(const Program& program) {
@@ -286,6 +377,27 @@ int main() {
             Has(program, source, "memory_order_acquire");
             Has(program, source, "memory_order_release");
             Lacks(program, source, "while (atomic_exchange");
+            Require(CheckLockLoops(program, source) > 0u, "lds_atomics64: no lock loop");
+        }
+        // 64-bit device atomics: every one in the shared lock loop (forward progress, MslLockLoop).
+        {
+            const Program program {"global_atomics64", GlobalAtomics64Code, 64u, 32u, 0u, 10u};
+            const auto source = Check(program);
+            Require(CheckLockLoops(program, source) == 11u, "global_atomics64: expected eleven lock loops");
+            Has(program, source, "aps5_atomic64_lock(aps5_driver.atomicLocks, ");
+            Has(program, source, "atomic_max_explicit(reinterpret_cast<device atomic_ulong*>(");
+            Lacks(program, source, "coherent(device) device const ulong*");
+        }
+        // Look-back scan (wave64, two lanes per invocation): the publishing atomics are lock loops; the
+        // spinning reader never takes a lock and its GLC dwordx2 read is a bounded atomic re-read.
+        {
+            const Program program {"look_back_scan", LookBackScanCode, 64u, 64u, 0u, 16u};
+            const auto source = Check(program);
+            Require(CheckLockLoops(program, source) >= 2u, "look_back_scan: expected the publishing lock loops");
+            Has(program, source, ".read2(");
+            Has(program, source, "for (uint attempt = 0u; attempt < 64u; ++attempt) {");
+            Lacks(program, source, "coherent(device) device const ulong*");
+            Has(program, source, "aps5_loop_limit");
         }
         std::puts("msl wave/lds emission check passed");
         return 0;

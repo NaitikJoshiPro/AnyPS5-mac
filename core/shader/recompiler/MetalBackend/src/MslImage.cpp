@@ -981,9 +981,9 @@ std::optional<std::uint32_t> Atomic64Op(IrOpcode opcode) {
 
 // 64-bit image atomics: Apple9 has only atomic_max/min (no result) on 64-bit (RG32Uint) textures,
 // so every read-modify-write of a texel takes a lock word of the driver's lock table
-// (DriverData.atomicLocks, the Atomics64 chunk of MslMemory.cpp), one elected invocation per SIMD
-// group per round as MslDeviceAtomic64; the new value is committed with a max or min so a texel
-// is never seen half-written.
+// (DriverData.atomicLocks, the Atomics64 chunk of MslMemory.cpp) in the shared lock loop
+// (MslLockLoop: one elected invocation per SIMD group per round, as MslDeviceAtomic64); the new
+// value is committed with a max or min so a texel is never seen half-written.
 void EmitAtomic64(MslEmitterState& state, const Access& access) {
     const auto op = Atomic64Op(access.inst.Opcode());
     if (!op) state.Fail(access.inst, "is a 64-bit image atomic the MSL backend does not know");
@@ -1015,28 +1015,13 @@ void EmitAtomic64(MslEmitterState& state, const Access& access) {
     key += ")";
     state.Line("device atomic_uint* " + tag + "_lock = aps5_atomic64_lock(aps5_driver.atomicLocks, " + key + " << 3u);");
     state.Line("if (aps5_driver.atomicLocks == 0ul) " + tag + "_done = true;");
-    state.Line("for (uint " + tag + "_round = 0u; " + tag + "_round < 1048576u; ++" + tag + "_round) {");
-    state.Indent();
-    state.Line("if (!" + tag + "_done && simd_is_first()) {");
-    state.Indent();
-    state.Line("uint " + tag + "_expected = 0u;");
-    state.Line("if (atomic_compare_exchange_weak_explicit(" + tag + "_lock, &" + tag + "_expected, 1u, memory_order_relaxed, memory_order_relaxed)) {");
-    state.Indent();
-    state.Line("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);");
-    state.Line(result + " = " + texture + ".read(" + where + ").x;");
-    state.Line("const ulong " + tag + "_next = aps5_atomic64_next(" + U(*op) + ", " + result + ", ulong(" + value + "), ulong(" + comparator + "));");
-    state.Line("if (" + tag + "_next > " + result + ") " + texture + ".atomic_max(" + where + ", " + tag + "_next);");
-    state.Line("else if (" + tag + "_next < " + result + ") " + texture + ".atomic_min(" + where + ", " + tag + "_next);");
-    state.Line("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);");
-    state.Line("atomic_store_explicit(" + tag + "_lock, 0u, memory_order_relaxed);");
-    state.Line(tag + "_done = true;");
-    state.Outdent();
-    state.Line("}");
-    state.Outdent();
-    state.Line("}");
-    state.Line("if (!simd_any(!" + tag + "_done)) break;");
-    state.Outdent();
-    state.Line("}");
+    const std::string fence = "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);";
+    MslLockLoop(state, access.inst, {tag + "_lock", fence, fence}, tag + "_done", [&] {
+        state.Line(result + " = " + texture + ".read(" + where + ").x;");
+        state.Line("const ulong " + tag + "_next = aps5_atomic64_next(" + U(*op) + ", " + result + ", ulong(" + value + "), ulong(" + comparator + "));");
+        state.Line("if (" + tag + "_next > " + result + ") " + texture + ".atomic_max(" + where + ", " + tag + "_next);");
+        state.Line("else if (" + tag + "_next < " + result + ") " + texture + ".atomic_min(" + where + ", " + tag + "_next);");
+    });
 }
 
 void EmitAtomic(MslEmitterState& state, const Access& access) {
