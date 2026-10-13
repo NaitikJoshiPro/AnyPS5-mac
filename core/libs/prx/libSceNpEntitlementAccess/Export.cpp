@@ -13,6 +13,8 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 
 static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER = static_cast<int>(0x80558003);
@@ -153,13 +155,17 @@ int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfo(void) {
     return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpEntitlementAccessGetPftFlag(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceNpEntitlementAccessGetPftFlag(uint32_t* flag) {
+    constexpr int errorParameter = static_cast<int>(0x817D0002);
+    if (!flag) return errorParameter;
+    *flag = 0;
     return 0;
 }
 
-int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(uint32_t* flag) {
+    constexpr int errorParameter = static_cast<int>(0x817D0002);
+    if (!flag) return errorParameter;
+    *flag = 0;
     return 0;
 }
 

@@ -6,6 +6,9 @@
 #include <limits>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <unistd.h>
 #endif
 #if defined(__APPLE__) && defined(__aarch64__)
 #include "prx/libc/include/specifics/macos/GuestImages.hpp"
@@ -26,7 +29,15 @@ static void RawWrite(const char* data, std::size_t size) {
         size -= written;
     }
 #else
-    std::fwrite(data, 1, size, stderr);
+    const int kept = HostStandardError_nid_no_patch();
+    const int descriptor = kept >= 0 ? kept : STDERR_FILENO;
+    while (size != 0) {
+        const auto written = ::write(descriptor, data, size);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return;
+        data += written;
+        size -= static_cast<std::size_t>(written);
+    }
 #endif
 }
 
@@ -266,7 +277,7 @@ void APS5_VABI __cxa_free_exception_nid_postfix(void* object) {
     ThrowFromSite(object, type, destructor, __builtin_return_address(0));
 }
 
-LibcException::Header* __cxa_init_primary_exception_nid_postfix(void* object, std::type_info* type, void (*destructor)(void*)) {
+LibcException::Header* APS5_VABI __cxa_init_primary_exception_nid_postfix(void* object, std::type_info* type, void (*destructor)(void*)) {
     using namespace LibcException;
     auto* header = FromObject(object);
     AllocationOf(header)->references.store(0, std::memory_order_relaxed);
@@ -400,8 +411,8 @@ void APS5_VABI __cxa_rethrow_primary_exception_nid_postfix(void* object) {
     InvokeTerminate(header->terminate);
 }
 
-void* __dynamic_cast_nid_postfix(const void* source, const __cxxabiv1::__class_type_info* sourceType,
-                               const __cxxabiv1::__class_type_info* destinationType, std::ptrdiff_t) {
+void* APS5_VABI __dynamic_cast_nid_postfix(const void* source, const __cxxabiv1::__class_type_info* sourceType,
+                                         const __cxxabiv1::__class_type_info* destinationType, std::ptrdiff_t) {
     using namespace LibcException;
     if (!source) return nullptr;
     auto* vtable = *static_cast<const std::uintptr_t* const*>(source);

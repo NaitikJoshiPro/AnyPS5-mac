@@ -133,7 +133,7 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
 std::uint32_t SpirvValueEmitContext::FirstLane(std::uint32_t ballot) {
     if (otherHalf == nullptr) {
         const auto result = state.module.AllocateId();
-        state.module.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), ballot);
+        EmitSubgroupBallotFindLsb(state, result, ballot);
         return result;
     }
     const auto low = state.module.AllocateId();
@@ -243,7 +243,13 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.float64DenormPreserve = target.float64DenormPreserve;
     state.registrationModules = target.registrationModules;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
+    state.float16DenormPreserve = target.float16DenormPreserve;
     state.hostSubgroupSize = target.subgroupSize;
+    if (HostSubgroupSingleLane(state)) {
+        state.requirements.subgroupBallot = false;
+        state.requirements.subgroupShuffle = false;
+        state.requirements.subgroupLocalInvocationId = false;
+    }
     state.splitSubgroup = program.WaveSize() == 32u && target.subgroupSize > 32u;
     if (state.splitSubgroup && (state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) state.requirements.subgroupLocalInvocationId = true;
     const auto* workgroup = ShaderWorkgroupInputFor(state);

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
@@ -97,9 +98,8 @@ VkConservativeRasterizationModeEXT decodeConservativeRasterization(const QueueSt
 
 // The register rules DecodeState and DrawRejection share (the precheck must reject exactly what
 // DecodeState would): the masks whose set bits are unsupported, and the depth-control verdict.
-// Render target index, viewport index and the misc export vector that carries them are accepted but
-// not routed: color targets are single-layer, so layered draws land in layer 0.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
+constexpr std::uint32_t ClipCullExports = 0xffffu | (1u << 22u) | (1u << 23u);
 constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
@@ -541,6 +541,9 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
             if (number == floating) return {VK_FORMAT_R32G32B32A32_SFLOAT, 16};
             if (number == uint) return {VK_FORMAT_R32G32B32A32_UINT, 16};
             return fail();
+        case 17:
+            if (swap != 0 || number != unorm) return fail();
+            return {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 2, 0xc6u};
         default:
             return fail();
     }
@@ -613,23 +616,20 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, c
         validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
         if ((parameters & ~0x000600ffu) != 0) Require(false, zeroMessage(0x2db, parameters, "VGT_TF_PARAM donut, factor detection, memory type or reserved state"));
         const auto supported = [](std::uint32_t mask, std::uint32_t value) { return value < 32u && ((mask >> value) & 1u) != 0; };
+        const auto minimum = readFloat(queue.context, 0x287);
+        const auto maximum = readFloat(queue.context, 0x286);
         if (features == ShaderRecompiler::TessellationFeatures{}) {
-            validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
+            validate((tess.domain == 1 || tess.domain == 2) && tess.partitioning == 2 && (tess.outputTopology == 2 || tess.outputTopology == 3), "only triangle and quad domains with fractional-odd partitioning and triangle output are supported by the reference path");
+            Require(minimum >= 0.0f && minimum <= 63.0f && minimum <= maximum && maximum >= 1.0f, "tessellation level clamps need 0 <= VGT_HOS_MIN_TESS_LEVEL <= 63, VGT_HOS_MAX_TESS_LEVEL >= 1 and the minimum at most the maximum");
         } else {
             validate(tess.domain != 0 || tess.outputTopology < 2, "isoline tessellation cannot output triangles");
             validate(supported(features.domains, tess.domain) && supported(features.partitionings, tess.partitioning) && supported(features.topologies, tess.outputTopology), "the tessellation domain, partitioning or output topology is not supported by the target");
-        }
-        const auto minimum = readFloat(queue.context, 0x287);
-        const auto maximum = readFloat(queue.context, 0x286);
-        if (features.levelClamps) {
             // DECISIONS D26: the clamps apply to the hull program's factors after patch culling.
             Require(std::isfinite(minimum) && std::isfinite(maximum) && minimum <= maximum, "tessellation level clamps must be finite with VGT_HOS_MIN_TESS_LEVEL <= VGT_HOS_MAX_TESS_LEVEL");
-        } else {
-            Require(minimum <= 1.0f && maximum >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
         }
         result.tessellation = tess;
-        result.tessellationMinLevel = minimum;
-        result.tessellationMaxLevel = maximum;
+        result.minTessellationLevel = minimum;
+        result.maxTessellationLevel = maximum;
     } else {
         validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
         const auto group = read(queue.userConfig, 0x25b, RegisterBank::UserConfig);
@@ -689,6 +689,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
     switch (primitive) {
         case 1: Require(result.stages.mesh.has_value(), "point-list vertex rendering requires point-size output support"); result.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case 2: result.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case 3: result.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
         case 7:
         case 17:
             Require(result.stages.path == ShaderPath::Vertex, "rect-list requires vertex routing");
@@ -703,14 +704,9 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    if ((read(cx, 0x207) & LayerExports) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
-        }
-    }
-    zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
+    zero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports");
+    Require(std::popcount(read(cx, 0x207) & 0xffffu) <= 8, "more than eight clip and cull distances are unsupported");
+    result.paClVsOutCntl = read(cx, 0x207);
     result.samples = decodeSamples(cx);
     decodeSampleLocations(cx, result);
     {
@@ -763,7 +759,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
     const auto raster = read(cx, 0x205);
     // Bits 5-10 give the front/back polygon type (2 = filled triangles), which POLY_MODE (bit 3) turns on
     // explicitly; KEEP_TOGETHER_ENABLE (bit 24) only affects primitive distribution across the chip.
-    const bool pointsOrLines = result.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || result.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    const bool pointsOrLines = result.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || result.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || result.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     const auto lineOffset = (raster & 0x1800u) != 0 && !pointsOrLines ? 0x2000u : 0u;
     const auto rasterMode = raster & ~0x7u & ~(1u << 24u) & ~0x1800u & ~lineOffset & ~(1u << 19u) & ~(1u << 16u);
     if (rasterMode != 0 && rasterMode != 0x240u && rasterMode != 0x248u) throw std::runtime_error("AGC graphics: " + zeroMessage(0x205, raster, "polygon mode, depth bias or nonstandard rasterization"));
@@ -809,6 +805,11 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
         if (slotExport == 7 && ((read(cx, 0x31c + slot * 0xfu) >> 8u) & 7u) != 4u) throw std::runtime_error("AGC graphics: color export format 7 (UINT16_ABGR) into a target that is not unsigned integer is unsupported");
         color.exportIndex = index;
         color.uintExport = slotExport == 7;
+        if (color.samples > 1 && result.samples == 1 && result.colors.empty() && !result.depth && !result.alphaToCoverage && (read(cx, 0x292) & 1u) == 0) {
+            result.samples = color.samples;
+            result.customSampleLocations = true;
+            result.sampleLocations.fill(0);
+        }
         Require(color.samples == result.samples, "a color target's sample count differs from the rasterizer's");
         APS5_LOG_OUT_DEBUG("Color %u address=0x%llx extent=%ux%u bytes=%llu VkFormat=%u", slot, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned>(color.format));
         if (result.colors.empty()) {
@@ -820,6 +821,12 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
     }
     if (result.hasColorTarget) {
         result.color = result.colors.front();
+        result.renderLayers = result.color.layers;
+        for (const auto& color : result.colors) Require(color.layers == result.renderLayers, "color targets with different layer counts are unsupported");
+        if (result.renderLayers > 1) {
+            Require(!result.depth, "layered rendering with a depth target is unsupported");
+            result.layerExports = read(cx, 0x207) & (1u << 18u);
+        }
         if (result.depth) result.renderExtent = {std::min(result.renderExtent.width, result.depth->extent.width), std::min(result.renderExtent.height, result.depth->extent.height)};
     } else if (result.depth) {
         result.renderExtent = result.depth->extent;
@@ -829,6 +836,13 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
         result.renderExtent = {screenBottomRight & 0xffffu, screenBottomRight >> 16u};
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
         Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
+    }
+    if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u)) != 0) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
+        }
     }
     const auto xs = readFloat(cx, 0x10f);
     const auto xo = readFloat(cx, 0x110);
@@ -958,6 +972,17 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
     return packings;
 }
 
+ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
+    if (state.rectList) return ShaderRecompiler::RasterPrimitive::Rectangle;
+    if (state.stages.mesh.has_value() || state.stages.tessellation.has_value()) return ShaderRecompiler::RasterPrimitive::Triangle;
+    switch (state.topology) {
+        case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return ShaderRecompiler::RasterPrimitive::Point;
+        case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+        case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return ShaderRecompiler::RasterPrimitive::Line;
+        default: return ShaderRecompiler::RasterPrimitive::Triangle;
+    }
+}
+
 std::array<std::uint8_t, 8> ExportMappings(const State& state) {
     std::array<std::uint8_t, 8> mappings{};
     mappings.fill(0xe4u);
@@ -980,6 +1005,41 @@ std::uint32_t ColorWriteMask(const Registers& context) {
         if (info != context.end() && ((info->second >> 2u) & 0x1fu) == 0) mask &= ~channels;
     }
     return mask;
+}
+
+namespace {
+
+std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
+    if (const auto guest = FindGuestColorTargetFormat(format, elementBytes)) return *guest;
+    throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
+}
+
+}
+
+GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
+    Require(color.tileMode != ColorTileMode::Linear, "linear color targets are not resident");
+    const bool chain = color.mipCount > 1;
+    GuestTextureResource surface{};
+    surface.baseAddress = chain ? color.surfaceAddress : color.address;
+    surface.pipeBankXor = color.pipeBankXor;
+    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
+    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
+    surface.depthOrLastArray = color.depth - 1u;
+    surface.baseArray = 0;
+    surface.mipCount = color.mipCount;
+    surface.baseLevel = 0;
+    surface.lastLevel = color.mipCount - 1;
+    surface.tileMode = ColorTextureTileMode(color.tileMode);
+    surface.dimension = color.depth > 1 ? TextureDimension::k3D : TextureDimension::k2D;
+    surface.format = GuestFormatFor(color.format, color.elementBytes);
+    surface.dstSelX = 4;
+    surface.dstSelY = 5;
+    surface.dstSelZ = 6;
+    surface.dstSelW = 7;
+    surface.dccAddress = color.dccAddress;
+    surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
+    surface.dccPipeAligned = color.dccPipeAligned;
+    return surface;
 }
 
 ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
@@ -1005,7 +1065,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    const auto lastSlice = (view >> 13u) & 0x1fffu;
+    Require(lastSlice >= slice, "the color view ends before its first slice");
     const auto viewMip = (view >> 26u) & 0xfu;
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
@@ -1017,13 +1078,18 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     Require(((attrib3 >> 24u) & 3u) != 0u || (attrib2 & 0x3fffu) == 0u, "1D color targets taller than one row are unsupported");
     if (volume) {
         color.depth = (attrib3 & 0x1fffu) + 1u;
-        Require(maxMip == 0 && (info & 0x10000000u) == 0, "mipmapped or DCC 3D color targets are unsupported");
-        Require(slice < color.depth, "the color view slice is beyond the 3D surface");
+        Require(maxMip == 0, "mipmapped 3D color targets are unsupported");
+        Require(slice < color.depth && lastSlice >= slice, "the color view slices are outside the 3D surface");
         color.depthSlice = slice;
+        color.layers = std::min(lastSlice + 1u, color.depth) - slice;
     } else if ((attrib3 & 0x1fffu) != 0) {
-        Require(slice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
+        Require(lastSlice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
         color.arrayLastSlice = attrib3 & 0x1fffu;
         color.arraySlice = slice;
+    }
+    if (!volume && lastSlice != slice) {
+        const auto exports = find(cx, 0x207);
+        Require(exports == cx.end() || (exports->second & (1u << 18u)) == 0, "layered draws into a color view of several array slices are unsupported");
     }
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
@@ -1047,6 +1113,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         color.pipeBankXor = static_cast<std::uint32_t>(color.surfaceAddress & (ColorTileModeBlockBytes(color.tileMode) - 1u));
         color.surfaceAddress -= color.pipeBankXor;
     }
+    Require(color.tileMode != ColorTileMode::D64KBX || (color.pipeBankXor & ~0xcf00u) == 0, "unsupported display color pipe/bank XOR column bits");
     color.arrayAddress = color.arrayLastSlice != 0 ? color.surfaceAddress : 0;
     if (slice != 0 && !volume) color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
     color.address = color.surfaceAddress + mipOffset;
@@ -1089,6 +1156,10 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
             }
         }
     }
+    if (volume && (color.tileMode == ColorTileMode::RenderTarget || color.tileMode == ColorTileMode::Standard4KB)) {
+        color.bytes = DescribeSurface(SurfaceForTarget(color)).guestBytes;
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
+    }
     return color;
 }
 
@@ -1098,12 +1169,15 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     if (control == cx.end()) return std::nullopt;
     const auto mode = (control->second >> 4u) & 7u;
     const auto aaConfig = find(cx, 0x2f8);
-    const bool resolve = mode == 3u && aaConfig != cx.end() && (aaConfig->second & 7u) != 0;
+    const bool rasterizerSamples = aaConfig != cx.end() && (aaConfig->second & 7u) != 0;
+    const auto sourceAttrib = find(cx, 0x31d);
+    const bool sourceSamples = sourceAttrib != cx.end() && ((sourceAttrib->second >> 12u) & 7u) != 0;
+    const bool resolve = mode == 3u && (rasterizerSamples || sourceSamples);
     if (mode != 2u && mode != 6u && !resolve) return std::nullopt;
     ColorMetadataPass pass{resolve ? ColorMetadataPass::Mode::Resolve : mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : ColorMetadataPass::Mode::DccDecompress, {}, std::nullopt};
     Require((control->second & ~0x70u) == 0xcc0000u, "CB metadata pass with a nonstandard ROP, dual quads disabled or degamma");
-    Require((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0, "CB metadata pass with depth or stencil work");
-    const auto samples = resolve ? decodeSamples(cx) : 1u;
+    Require(depthPlanesAbsent(cx) || ((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0), "CB metadata pass with depth or stencil work");
+    const auto samples = resolve && rasterizerSamples ? decodeSamples(cx) : 1u;
     if (!resolve) zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
     zero(cx, 0x80, ~0u, "window offset");
     const auto viewportControl = read(cx, 0x206);
@@ -1127,7 +1201,7 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     if (resolve) {
         const auto source = DecodeColorBuffer(cx, 0);
         const auto destination = DecodeColorBuffer(cx, 1);
-        Require(source.samples == samples, "CB resolve from a target whose sample count differs from the rasterizer's");
+        Require(samples == 1 || source.samples == samples, "CB resolve from a target whose sample count differs from the rasterizer's");
         Require(destination.samples == 1, "CB resolve into a multisampled target is unsupported");
         Require(destination.cmaskAddress == 0, "CB resolve into a fast-clear color target is unsupported (the resolve does not update its CMASK)");
         Require(source.format == destination.format && source.extent.width == destination.extent.width && source.extent.height == destination.extent.height, "CB resolve between different formats or extents is unsupported");
@@ -1171,7 +1245,8 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if (value(queue.userConfig, 0x242, primitive) && (primitive & 0x3fu) != 1 && (primitive & 0x3fu) != 2 && (primitive & 0x3fu) != 3 && (primitive & 0x3fu) != 4 && (primitive & 0x3fu) != 5 && (primitive & 0x3fu) != 6) return "AGC graphics: primitive restart is only supported for point, line and triangle topologies";
         if (value(cx, 0x103, resetIndex) && (resetIndex & 0xffffu) != 0xffffu) return "AGC graphics: primitive restart index other than all ones is unsupported";
     }
-    if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
+    if (auto reason = nonzero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
+    if (value(cx, 0x207, word) && std::popcount(word & 0xffffu) > 8) return require(false, "more than eight clip and cull distances are unsupported");
     if (value(cx, 0x200, word)) {
         const auto renderControl = find(cx, 0x000);
         const bool depthClear = renderControl != cx.end() && (renderControl->second & 1u) != 0;

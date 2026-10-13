@@ -4,6 +4,7 @@
 #include "SceTypes.hpp"
 #include "X87Extended.hpp"
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <climits>
@@ -13,6 +14,8 @@
 #include <string>
 #include <vector>
 #include <type_traits>
+
+extern "C" int APS5_VABI strerror_r_nid_postfix(int error, char* buffer, std::size_t length);
 
 namespace LibcDetail {
 
@@ -241,6 +244,7 @@ inline std::vector<ArgumentClass> NumberedArgumentClasses(const char* format) {
 
 inline int FormatWindows(char* buffer, size_t size, const char* format, const void* source, std::string* complete = nullptr) {
     if (!format || !source) throw std::invalid_argument("Null formatting argument");
+    const int savedError = errno;
     const char* const formatStart = format;
     FormatArguments args(source);
     args.Number(NumberedArgumentClasses(format));
@@ -366,6 +370,10 @@ inline int FormatWindows(char* buffer, size_t size, const char* format, const vo
         } else if (conversion == 'p' && length.empty()) {
             const std::string text = FormatPointer(spec, args.Next<void*>());
             output.Append(text.data(), text.size());
+        } else if (conversion == 'm') {
+            char message[128];
+            strerror_r_nid_postfix(savedError, message, sizeof(message));
+            output.Value(spec + 's', static_cast<const char*>(message));
         } else if (conversion == 'n' && integerLength && spec == "%") {
             void* pointer = args.Next<void*>();
             if (!pointer) throw std::invalid_argument("Null format count pointer");

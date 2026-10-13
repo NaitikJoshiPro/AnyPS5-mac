@@ -93,6 +93,7 @@ struct SpirvEmitterState {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
+    bool float16DenormPreserve = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds
@@ -123,6 +124,7 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
     bool nativeF16ModesEmitted = false;
+    bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};

@@ -1,5 +1,6 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include "IntermediateRepresentation/IrBlock.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
@@ -225,8 +226,31 @@ struct HalfWaveScan {
     const IrValue* source = nullptr;
 };
 
+const IrValue* StoredWindowValue(const IrValue* load) {
+    const auto* slot = load->Argument(0)->Resolve();
+    const auto* block = load->Parent();
+    if (slot == nullptr || !slot->HasImmediate() || block == nullptr) return nullptr;
+    const auto& instructions = block->Instructions();
+    auto at = std::find(instructions.begin(), instructions.end(), load);
+    if (at == instructions.end()) return nullptr;
+    while (at != instructions.begin()) {
+        const auto* previous = *--at;
+        if (previous->HasImmediate() || previous->Opcode() != IrOpcode::StoreVectorWindow) continue;
+        const auto* stored = previous->Argument(0)->Resolve();
+        if (stored == nullptr || !stored->HasImmediate()) return nullptr;
+        if (stored->ImmediateU32() == slot->ImmediateU32()) return previous->Argument(1)->Resolve();
+    }
+    return nullptr;
+}
+
 const IrValue* Resolved(const IrValue* value) {
-    return value != nullptr ? value->Resolve() : nullptr;
+    value = value != nullptr ? value->Resolve() : nullptr;
+    while (value != nullptr && !value->HasImmediate() && value->Opcode() == IrOpcode::LoadVectorWindow) {
+        const auto* stored = StoredWindowValue(value);
+        if (stored == nullptr) break;
+        value = stored;
+    }
+    return value;
 }
 
 bool Is(const IrValue* value, IrOpcode opcode) {
@@ -537,6 +561,7 @@ std::optional<std::uint32_t> EmitHalfWaveReduction(SpirvValueEmitContext& ctx, c
         if (lane < 32u || state.hostSubgroupSize > 32u) return std::nullopt;
         return ConstantU32(state, scan->reduction->identity);
     }
+    if (HostSubgroupSingleLane(state)) return lane >= 32u ? ConstantU32(state, scan->reduction->identity) : ctx.Def(scan->source);
     const auto read = "v_readlane_b32 of lane " + std::to_string(lane) + " of a wave64 half-wave reduction scan";
     const auto& capabilities = state.supportedCapabilities;
     if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformArithmetic)) == capabilities.end()) {
@@ -1389,7 +1414,7 @@ static void EmitNativeF16Modes(SpirvEmitterState& state) {
     state.module.EmitCapability(spv::CapabilityDenormPreserve);
     if (!state.nativeF16ModesEmitted) {
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeRoundingModeRTE, 16u);
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 16u);
+        EmitF16DenormPreserve(state);
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
         state.nativeF16ModesEmitted = true;
     }
@@ -1521,8 +1546,16 @@ std::uint32_t EmitBitCastU32F32(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitBitCastU16F16(state, arg0);
 }
 
-std::uint32_t EmitConvertF32F16(SpirvEmitterState& state, std::uint32_t bits) {
-    return EmitF16BitsToF32(state, bits);
+static bool NarrowF16Field(const IrValue& half) {
+    const IrValue* value = half.Resolve();
+    while (value->Opcode() == IrOpcode::BitCastF16U16 || value->Opcode() == IrOpcode::ConvertU16U32) value = value->Argument(0)->Resolve();
+    if (value->Opcode() != IrOpcode::BitFieldUExtract && value->Opcode() != IrOpcode::BitFieldSExtract) return false;
+    const IrValue* count = value->Argument(2)->Resolve();
+    return !count->HasImmediate() || count->ImmediateU32() < 16u;
+}
+
+std::uint32_t EmitConvertF32F16(SpirvEmitterState& state, const IrValue& inst, std::uint32_t bits) {
+    return NarrowF16Field(*inst.Argument(0)) ? EmitF16BitsToF32Decoded(state, bits) : EmitF16BitsToF32(state, bits);
 }
 
 std::uint32_t EmitCompositeExtractU32x2(SpirvEmitterState& state, std::uint32_t arg0, const IrValue* arg1) {

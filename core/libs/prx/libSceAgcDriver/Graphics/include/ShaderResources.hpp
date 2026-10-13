@@ -38,6 +38,7 @@ TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
+void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -166,6 +167,7 @@ public:
     bool UsesAddressTable() const { return usesBda; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
+    bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest

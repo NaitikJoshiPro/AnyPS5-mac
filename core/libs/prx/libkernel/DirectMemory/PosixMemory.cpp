@@ -36,6 +36,8 @@ constexpr int GuestSyncAsync = 0x1;
 constexpr int GuestSyncInvalidate = 0x2;
 constexpr int GuestAdviceCore = 9;
 constexpr int GuestAdviceProtect = 10;
+constexpr int GuestLockCurrent = 0x1;
+constexpr int GuestLockFuture = 0x2;
 constexpr std::uintptr_t GuestUserAddressEnd = 0x800000000000;
 constexpr int GuestAlignedSuper = 0x1000000;
 constexpr std::size_t SuperpageSize = std::size_t{1} << 21;
@@ -207,6 +209,15 @@ int APS5_VABI munlock_nid_postfix(const void* address, std::size_t length) {
     return -1;
 }
 
+int APS5_VABI mlockall_nid_postfix(int flags) {
+    if (flags == 0 || (flags & ~(GuestLockCurrent | GuestLockFuture)) != 0) {
+        SetError(GuestInvalid);
+        return -1;
+    }
+    if ((flags & GuestLockFuture) != 0) throw std::runtime_error("mlockall: MCL_FUTURE is not implemented: later mappings are not locked");
+    throw std::runtime_error("mlockall: MCL_CURRENT is not implemented: the process also holds host stacks, heaps, modules and driver mappings");
+}
+
 int APS5_VABI msync_nid_postfix(void* address, std::size_t length, int flags) {
     const auto failed = [](int error) {
         SetError(error);
@@ -225,7 +236,7 @@ int APS5_VABI msync_nid_postfix(void* address, std::size_t length, int flags) {
 }
 
 int APS5_VABI madvise_nid_postfix(void* address, std::size_t length, int advice) {
-    if (advice == GuestAdviceProtect) NotImplemented_nid_no_patch("madvise MADV_PROTECT");
+    if (advice == GuestAdviceProtect) return 0;
     const auto start = reinterpret_cast<std::uintptr_t>(address);
     if (advice < 0 || advice > GuestAdviceCore || start > GuestUserAddressEnd || length > GuestUserAddressEnd - start) {
         SetError(GuestInvalid);
