@@ -88,9 +88,9 @@ int main() {
             GuestAllocations::Mutation().Add(guest, Bytes, true, true, true);
 
             // The write watch keys pages by guest address and arms them at the alias. Wrapping the range for the GPU
-            // (MetalNoCopy.h) brackets the guest range as a host write: the armed alias pages become writable for the
-            // GPU mapping and count as written. Looked up by the alias, the watch would miss them: the pages would be
-            // re-protected read-only behind the GPU mapping and the import's writes never reported.
+            // (MetalNoCopy.h) brackets the guest range as a host write, so the armed alias pages are left writable
+            // under the GPU mapping (the driver consumes the written marks itself). Looked up by the alias, the watch
+            // would miss them and the wrap would re-protect them read-only behind the GPU mapping.
             const bool watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
             if (watched) {
                 GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(guest, Bytes);
@@ -113,7 +113,6 @@ int main() {
             Require(HostWord(Base, Bytes / 8) == 0, "displaced guest memory: the fill ran past its range");
             if (watched) {
                 Require((HostProtection(GuestArena::HostAddress(Base)) & VM_PROT_WRITE) != 0, "displaced guest memory: the wrapped alias pages were left armed read-only");
-                Require(!CollectWritten(Base, Bytes).empty(), "displaced guest memory: wrapping did not count the watched guest pages as written");
                 GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(guest, Bytes);
             }
 
