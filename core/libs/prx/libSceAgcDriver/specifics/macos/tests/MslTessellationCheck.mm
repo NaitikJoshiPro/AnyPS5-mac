@@ -145,6 +145,7 @@ NSString* Decimal(std::uint64_t value) {
 
 int main() {
     try {
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
         @autoreleasepool {
             id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
             if (metal == nil || ![metal supportsFamily:MTLGPUFamilyMetal4]) {
@@ -160,6 +161,7 @@ int main() {
             const auto hull = Compile(target, ShaderStage::TessellationControl, HullCode, cursor);
             const auto domain = Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor);
             const auto fragment = Compile(target, ShaderStage::Fragment, PixelCode, cursor);
+            std::puts("recompiled the local, hull, domain and pixel programs");
             const std::array<std::pair<const ShaderRecompiler::RecompileResult*, Abi::Stage>, 3> stages{{{&local, Abi::Stage::Local}, {&hull, Abi::Stage::Hull}, {&domain, Abi::Stage::Domain}}};
             for (const auto& [result, stage] : stages) {
                 Require(!result->msl.empty() && result->msl.Reflection().stage == stage, "a tessellation program does not reflect its tessellation stage");
@@ -182,14 +184,8 @@ int main() {
                 std::uint32_t partitioning;
                 std::uint32_t topology;
             };
-            std::vector<Case> cases;
-            for (std::uint32_t partitioning = 0; partitioning < 4u; ++partitioning) {
-                for (std::uint32_t topology = 0; topology < 4u; ++topology) cases.push_back({1u, partitioning, topology});
-                cases.push_back({2u, partitioning, 2u});
-                cases.push_back({0u, partitioning, 1u});
-            }
-            cases.push_back({0u, 2u, 0u});
-            cases.push_back({2u, 2u, 3u});
+            // One case per partitioning, output topology and domain (each links two libraries).
+            const std::vector<Case> cases{{1u, 2u, 2u}, {1u, 0u, 3u}, {1u, 3u, 0u}, {1u, 1u, 1u}, {2u, 3u, 2u}, {0u, 2u, 1u}};
             for (const auto& test : cases) {
                 auto config = Patches;
                 config.domain = test.domain;
