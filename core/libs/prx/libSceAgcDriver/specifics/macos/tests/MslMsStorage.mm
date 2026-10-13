@@ -191,13 +191,15 @@ constexpr std::uint32_t Samples = 4u;
 // Layers * Samples slices and checks that exactly the addressed sample's slice holds the data.
 // Control: texture atomics on an R32Uint 2D array, through an argument buffer (slice 7) and a
 // direct texture binding (slice 6), with the same texture setup as Run. Returns the two texels.
-std::pair<std::uint32_t, std::uint32_t> AtomicControl(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+std::pair<std::uint32_t, std::uint32_t> AtomicControl(id<MTLDevice> device, id<MTLCommandQueue> queue, bool clear) {
     const char* source = R"(
 #include <metal_stdlib>
 using namespace metal;
 struct T { array<texture2d_array<uint, access::read_write>, 1> a; };
 kernel void control(device const T& t [[buffer(0)]], texture2d_array<uint, access::read_write> d [[texture(0)]], uint3 id [[thread_position_in_threadgroup]]) {
+    atomic_thread_fence(mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);
     t.a[0].atomic_exchange(id.xy, 7u, 0x1234u);
+    atomic_thread_fence(mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);
     d.atomic_exchange(id.xy, 6u, 0x5678u);
 }
 )";
@@ -219,6 +221,13 @@ kernel void control(device const T& t [[buffer(0)]], texture2d_array<uint, acces
     id<MTLBuffer> table = [device newBufferWithBytes:&handle length:sizeof(handle) options:MTLResourceStorageModeShared];
     id<MTLBuffer> readback = [device newBufferWithLength:8 * 8 * 4 * 8 options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> commands = [queue commandBuffer];
+    if (clear) {
+        id<MTLBuffer> zero = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        std::memset(zero.contents, 0, 256);
+        id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+        for (std::uint32_t slice = 0; slice < 8u; ++slice) [blit copyFromBuffer:zero sourceOffset:0 sourceBytesPerRow:32 sourceBytesPerImage:256 sourceSize:MTLSizeMake(8, 8, 1) toTexture:texture destinationSlice:slice destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+    }
     id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:table offset:0 atIndex:0];
@@ -360,8 +369,10 @@ int main() {
             std::puts("multisampled storage MSL compiles with Metal (4 samples)");
             id<MTLCommandQueue> queue = [device newCommandQueue];
             Require(queue != nil, "no command queue");
-            const auto [tableAtomic, directAtomic] = AtomicControl(device, queue);
-            std::printf("control: texture2d_array atomic_exchange through an argument buffer 0x%x (expected 0x1234), direct binding 0x%x (expected 0x5678)\n", tableAtomic, directAtomic);
+            for (const bool clear : {false, true}) {
+                const auto [tableAtomic, directAtomic] = AtomicControl(device, queue, clear);
+                std::printf("control%s: texture2d_array atomic_exchange through an argument buffer 0x%x (expected 0x1234), direct binding 0x%x (expected 0x5678)\n", clear ? " after a blit clear" : "", tableAtomic, directAtomic);
+            }
             // The 64-bit atomic needs the driver's lock table: covered by the compile above only.
             for (std::size_t index = 0; index < variants.size(); ++index) {
                 if (!variants[index].atomic64) Run(device, queue, variants[index], results[index]);
