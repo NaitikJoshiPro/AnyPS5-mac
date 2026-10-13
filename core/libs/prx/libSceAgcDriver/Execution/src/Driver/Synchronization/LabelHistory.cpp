@@ -49,9 +49,9 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
 
 namespace {
 
-// APS5_TRACE_LABEL_LANDING=1 (with APS5_TRACE_LABEL): a watcher thread polls the guest address of
-// every traced RELEASE_MEM / WRITE_DATA every 0.5 ms and reports when the CPU first sees the
-// written value there, or that it never did within 5 s. It answers "did the label land where the
+// APS5_TRACE_LABEL_LANDING=<ms> (with APS5_TRACE_LABEL): a watcher thread polls the guest address
+// of every traced RELEASE_MEM every 0.5 ms and reports when the CPU first sees the written value
+// there, or what it saw instead after <ms> (default 1000). It answers "did the label land where the
 // guest polls it", which the driver's own waits (label table shortcut) cannot.
 struct LandingWatch {
     std::uint64_t address;
@@ -61,8 +61,13 @@ struct LandingWatch {
 };
 
 void WatchLanding(std::uint64_t address, std::uint64_t value, std::size_t bytes) {
-    static const bool enabled = std::getenv("APS5_TRACE_LABEL_LANDING") != nullptr;
-    if (!enabled || address == 0 || address % bytes != 0) return;
+    static const double limitMs = [] {
+        const char* value = std::getenv("APS5_TRACE_LABEL_LANDING");
+        if (value == nullptr) return 0.0;
+        const double parsed = std::strtod(value, nullptr);
+        return parsed > 1.0 ? parsed : 1000.0;
+    }();
+    if (limitMs == 0.0 || address == 0 || address % bytes != 0) return;
     static std::mutex mutex;
     static std::condition_variable changed;
     static std::deque<LandingWatch> watches;
@@ -79,8 +84,8 @@ void WatchLanding(std::uint64_t address, std::uint64_t value, std::size_t bytes)
                     if (readable && seen == it->value) {
                         std::fprintf(stderr, "[landing] %.1f 0x%llx == 0x%llx seen by the CPU after %.1f ms\n", now, static_cast<unsigned long long>(it->address), static_cast<unsigned long long>(it->value), now - it->since);
                         it = watches.erase(it);
-                    } else if (now - it->since > 5000.0) {
-                        std::fprintf(stderr, "[landing] %.1f 0x%llx never showed 0x%llx in 5 s (CPU sees 0x%llx%s)\n", now, static_cast<unsigned long long>(it->address), static_cast<unsigned long long>(it->value), static_cast<unsigned long long>(seen), readable ? "" : ", unreadable");
+                    } else if (now - it->since > limitMs) {
+                        std::fprintf(stderr, "[landing] %.1f 0x%llx did not show 0x%llx in %.0f ms (CPU sees 0x%llx%s)\n", now, static_cast<unsigned long long>(it->address), static_cast<unsigned long long>(it->value), limitMs, static_cast<unsigned long long>(seen), readable ? "" : ", unreadable");
                         it = watches.erase(it);
                     } else {
                         ++it;
