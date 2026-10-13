@@ -17,6 +17,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostEntropy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/SortSecure.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StandardStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
@@ -67,6 +68,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_array_callbacks PROPERTIES TIMEOUT 10)
     if(WIN32)
         set_tests_properties(guest_array_callbacks PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_qsort_s_tests ${LIBS_INCLUDE_DIR}/tests/GuestQsortS.cpp)
+    target_include_directories(guest_qsort_s_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_qsort_s_tests PRIVATE libc)
+    configure_windows_unwind(guest_qsort_s_tests)
+    add_test(NAME guest_qsort_s COMMAND guest_qsort_s_tests)
+    set_tests_properties(guest_qsort_s PROPERTIES TIMEOUT 10)
+    if(WIN32)
+        set_tests_properties(guest_qsort_s PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_time_conversion_tests ${LIBS_INCLUDE_DIR}/tests/GuestTimeConversion.cpp)
