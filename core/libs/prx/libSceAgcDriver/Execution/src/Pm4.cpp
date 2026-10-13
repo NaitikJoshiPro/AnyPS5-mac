@@ -374,6 +374,15 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
                     size(2);
                     require(eventIndex == 0, "invalid VGT_FLUSH event index");
                     break;
+                case 0x0e:
+                    // BREAK_BATCH closes the primitive binner's current batch (Mesa emits it with index 0 on the
+                    // graphics queue when binning is allowed: si_state.c, ac_shadowed_regs.c). Binning changes
+                    // neither memory nor rendered results and this driver executes packets in order, so the
+                    // event is an ordering point like the other non-memory events.
+                    graphics();
+                    size(2);
+                    require(eventIndex == 0, "invalid BREAK_BATCH event index");
+                    break;
                 case 0x39:
                     graphics();
                     size(4);

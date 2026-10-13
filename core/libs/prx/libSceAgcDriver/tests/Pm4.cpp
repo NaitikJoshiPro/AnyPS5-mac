@@ -662,6 +662,12 @@ void testEventWrite() {
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x24}), 0x20); }, "compute queue");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x424}), 0); }, "VGT_FLUSH event index");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x1e, 0x1000, 0}), 0); }, "event type 30");
+    AgcDriver::Pm4::Validate(makePacket(0x46, {0x0e}), 0);
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x0e}), 0x20); }, "compute queue");
+    for (std::uint32_t index = 1; index < 8; ++index) {
+        expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x46, {(index << 8u) | 0x0eu}), 0); }, "BREAK_BATCH event index");
+    }
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x0e, 0}), 0); }, "packet size");
 }
 
 void testAcquireMem() {
