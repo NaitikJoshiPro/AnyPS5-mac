@@ -6,7 +6,8 @@
 // no Metal counterpart here and the work package that owns its port; listed checks are not run. `--probe` runs every
 // upstream check in its own process and prints which pass: the owner of a twin that breaks a check moves it to
 // MetalTwins or VulkanOnly with a reason, or ports it.
-// Flag modes: --descriptor-layout-flags (agc_compute_descriptor_layout_flags) runs the Metal twin of
+// Flag modes: --covered-centroid-state (agc_driver_covered_centroid_state) runs upstream's multisampleTests;
+// --descriptor-layout-flags (agc_compute_descriptor_layout_flags) runs the Metal twin of
 // descriptorLayoutFlagTests; --descriptor-pool-reset-failure (agc_descriptor_pool_reset_failure) skips: Metal
 // descriptor pools are tokens whose reset cannot fail (TechnicalDebt metal-vulkan-internal-tests);
 // --sparse-buffer-holes (agc_sparse_buffer_holes) runs upstream's RunSparseBufferHoleTests over the Metal device's
@@ -88,6 +89,7 @@ std::vector<Check> Checks() {
         {"unorm10_11_11TargetTests", unorm10_11_11TargetTests},
         {"DepthBoundsBiasTests", DepthBoundsBiasTests},
         {"conservativeZExportTests", conservativeZExportTests},
+        {"earlyFragmentTestsTests", earlyFragmentTestsTests},
         {"orderedPixelShaderTests", orderedPixelShaderTests},
         {"stencilRefExportTests", stencilRefExportTests},
         {"aliasedBufferViewTests", aliasedBufferViewTests},
@@ -394,6 +396,47 @@ int MetalSparseBufferHoles() {
     return passed ? 0 : 1;
 }
 
+// earlyFragmentTestsTests on Metal (upstream fdefd7660): the MSL fragment function carries
+// [[early_fragment_tests]] (reflection earlyFragmentTests) for the same DB_SHADER_CONTROL values that
+// declare EarlyFragmentTests in SPIR-V, except that Metal refuses the attribute on a function returning
+// [[depth]], so DEPTH_BEFORE_SHADER with Z_EXPORT_ENABLE keeps late tests (TechnicalDebt
+// metal-early-depth-export). Each request is also checked after a serializer round trip.
+bool MetalDeclaresEarlyFragmentTests(const ShaderRecompiler::RecompileRequest& request) {
+    const auto result = ShaderRecompiler::Recompile(request);
+    Require(!result.msl.empty(), "the depth-export pixel program produced no MSL");
+    const bool reflected = result.msl.Reflection().earlyFragmentTests;
+    const bool attributed = std::string(result.msl.Source()).find("[[early_fragment_tests]]") != std::string::npos;
+    Require(reflected == attributed, "the MSL reflection and the stage function disagree on early fragment tests");
+    return reflected;
+}
+
+void MetalEarlyFragmentTestsTests() {
+    const std::array<std::pair<std::uint32_t, bool>, 9> cases{{
+        {0x0000u, false},
+        {0x0020u, false},
+        {0x0010u, true},
+        {0x0030u, true},
+        {0x0050u, false},
+        {0x0011u, false},
+        {0x1000u, true},
+        {0x1050u, true},
+        {0x1031u, false},  // upstream: true; Z_EXPORT_ENABLE keeps late tests on Metal
+    }};
+    const ShaderRecompiler::RequestSerializer serializer;
+    for (const auto& [shaderControl, expected] : cases) {
+        const auto request = depthExportRequest(shaderControl);
+        const auto replayed = serializer.Deserialize(serializer.Serialize(request));
+        Require(MetalDeclaresEarlyFragmentTests(request) == expected && MetalDeclaresEarlyFragmentTests(replayed.request) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + (expected ? " did not declare" : " declared") + " early fragment tests");
+    }
+    Require(depthExportRequest(0x1031u).context.pixel->earlyZ, "DEPTH_BEFORE_SHADER with a depth export did not decode early tests (only the Metal stage function keeps them late)");
+    for (const auto shaderControl : {0x0010u, 0x1000u}) {
+        auto request = depthExportRequest(shaderControl);
+        request.context.pixel->alphaToCoverage = true;
+        const auto replayed = serializer.Deserialize(serializer.Serialize(request));
+        Require(!MetalDeclaresEarlyFragmentTests(request) && !MetalDeclaresEarlyFragmentTests(replayed.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with alpha-to-coverage declared early fragment tests");
+    }
+}
+
 struct Twin {
     const char* name;
     const char* what;
@@ -405,6 +448,7 @@ const std::vector<Twin> MetalTwins{
     {"descriptorPoolTests", "pools never exhaust, one chain pool is recycled", MetalDescriptorPoolTests},
     {"descriptorCacheTests", "dedicated pools for oversized sets, per-set limits", MetalDescriptorCacheTests},
     {"copiedWriterIndirectOverlapTests", "copied vs direct written ranges over a Metal host import", MetalCopiedWriterIndirectOverlapTests},
+    {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export", MetalEarlyFragmentTestsTests},
 };
 
 const Twin* TwinOf(const std::string& name) {
@@ -491,11 +535,21 @@ int main(int argc, char** argv) {
         std::cout << "skipped, the device has no Vulkan descriptor pools: Metal descriptor pools are tokens whose reset cannot fail, so the termination on a failed reset is unreachable\n";
         return 77;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--covered-centroid-state") {
+        // agc_driver_covered_centroid_state (upstream fdefd7660): register decoding only, as upstream.
+        const auto error = Run({"multisampleTests", multisampleTests});
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cout << "Covered-centroid and multisample state checks passed\n";
+        return 0;
+    }
     setenv("APS5_PIN_WAIT_MS", "200", 1);
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
     if (argc == 2 && std::string_view(argv[1]) == "--probe") return Probe();
     if (argc != 1) {
-        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes]\n";
+        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state]\n";
         return 2;
     }
     std::size_t ran = 0;
