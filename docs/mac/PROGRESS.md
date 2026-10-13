@@ -188,3 +188,12 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - SHD4: pixel_interlock passes (d80f1643a). Conservative raster is emulated and passes (D21, f27bde0f7). MSL mesh functions + MTL4 mesh pipelines (D23: 76b008405, f940c9b7d) make agc_driver_mesh pass. G3 34/34, G4 36/39 (gpu-suite/shd4-g3g4-v2). D19 slip: one direct test-binary run (0.04 s, harmless).
 - Tessellation: MTL4 has no drawPatches. Design: object stage (LS+HS) + mesh stage (software tessellator + DS). Agent TESS is implementing it.
 - Running: TESS (tessellation), MSIMG (MS storage writes, D22), T1 (agc_driver_graphics Vulkan-internal split + BdaDeviceTwin.mm).
+
+## 2026-10-13 ~13:00 — M2: tessellation, MS storage, corpus, T1 twins done
+- TESS: tessellation on MTL4 object/mesh pipelines (D24, MslAbi v7). The tessellator is a port of the D3D11 reference (MIT) and is bit-exact against it (agc_metal_tessellator: 131,088 factor sets, 0 failures). agc_driver_tessellation and prepared_graphics pass (tess-set1 6/6). G3 34/34, G4 38/39 + 1 allowlisted skip (tess-g3g4). Next, TESS2: open the shared front end for quad/isoline/all partitionings, capability-gated; the Vulkan target keeps its current set.
+- MSIMG: multisampled storage writes (D22, MslAbi v6), the 4 prepared_shaders tests pass. Gap: guest MSAA T# 14/15 are rejected upstream too (M3 backlog).
+- T1: agc_driver_graphics split (72/80 checks run), BdaDeviceTwin passes, CapabilityStorageImageMultisample advertised (c1b4b133e). G1 181/182.
+- CORPUS: 338/338 SpirvBackend-accepted requests produce valid MSL (D25). shader_clock is emulated as a read counter (TechnicalDebt metal-shader-clock; later: real GPU timestamps). The corpus needs a re-dump now that mesh/tess have landed.
+- REGRESSION: agc_driver_global_atomics64 and buffer_atomics_or_swap64 time out. Quarantined (bd73a0a1a). ATOM is on it (suspect 28a79003e, lock-table spin forward progress), along with look_back_scan.
+- gpu_suite now holds a build lease for the whole run (065898379), so runs are no longer voided by other agents' rebuilds.
+- M2 exit still open: ATOM fixes; lds_atomics64 HOLD release; f16_denormal_flush rerun (it caused the 2026-10-12 kernel panic; waiting for the user to be away from the laptop); corpus re-dump; full-suite verification.
