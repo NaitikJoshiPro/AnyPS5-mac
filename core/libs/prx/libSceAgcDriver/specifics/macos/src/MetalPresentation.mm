@@ -115,6 +115,12 @@ bool Readback() {
     return readback;
 }
 
+// APS5_METAL_TRACE: presenter attach, every present and every drawable handed to the display.
+bool PresentTrace() {
+    static const bool trace = std::getenv("APS5_METAL_TRACE") != nullptr;
+    return trace;
+}
+
 std::mutex& FrameMutex() {
     static std::mutex mutex;
     return mutex;
@@ -238,6 +244,7 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
         [queue addResidencySet:presenter->layer.residencySet];
     }
     presenter->MakeOffscreen();
+    if (PresentTrace()) std::fprintf(stderr, "[metal] present attach: %s, drawable %ux%u%s\n", presenter->layer != nil ? "CAMetalLayer" : "headless (offscreen target)", width, height, presenter->layer != nil ? (presenter->layer.displaySyncEnabled ? ", display sync" : ", no display sync") : "");
 
     MTLCompileOptions* options = [MTLCompileOptions new];
     options.languageVersion = MTLLanguageVersion3_2;
@@ -424,6 +431,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         if (presenter->drawable != nil) [state->queue waitForDrawable:presenter->drawable];
         const auto serial = recorder.SubmitAndEpoch();
         if (presenter->drawable != nil) [state->queue signalDrawable:presenter->drawable];
+        if (PresentTrace()) std::fprintf(stderr, "[metal] present %llu: source %ux%u%s into %lux%lu, %s, batch %llu\n", static_cast<unsigned long long>(Counters().presents + 1u), width, height, hasSource ? "" : " (clear)", static_cast<unsigned long>(presenter->target.width), static_cast<unsigned long>(presenter->target.height), presenter->drawable != nil ? "drawable" : "offscreen", static_cast<unsigned long long>(serial));
         presenter->slots.push_back({serial, presenter->drawable, readback, static_cast<std::uint32_t>(presenter->target.width), static_cast<std::uint32_t>(presenter->target.height)});
         presenter->queuePending = presenter->drawable != nil;
         presenter->target = nil;
@@ -474,6 +482,7 @@ void VulkanDevice::QueuePresent() {
     presenter->queuePending = false;
     if (presenter->drawable != nil) {
         [presenter->drawable present];
+        if (PresentTrace()) std::fprintf(stderr, "[metal] present queued to the display (drawable %lux%lu)\n", static_cast<unsigned long>(presenter->drawable.texture.width), static_cast<unsigned long>(presenter->drawable.texture.height));
         presenter->drawable = nil;
     }
 }
