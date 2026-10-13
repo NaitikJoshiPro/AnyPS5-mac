@@ -326,6 +326,7 @@ void RequireUniform(const std::vector<std::uint32_t>& texels, std::uint32_t chan
 
 // Multisampled targets live for the device's lifetime, keyed by address (upstream's model): every
 // target of a check keeps its own live guest block, so no later one reuses an earlier one's samples.
+// Cleared before the check returns (static destruction would outlive GuestAllocations).
 std::vector<std::unique_ptr<GuestBlock>> sources;
 
 void CheckMasks(AgcDriver::VulkanDevice& device) {
@@ -358,6 +359,7 @@ void CheckMasks(AgcDriver::VulkanDevice& device) {
         RequireUniform(texels, 0u, 63.75, "per-sample shading");
         RequireUniform(texels, 3u, 255.0, "per-sample shading alpha");
     }
+    sources.clear();
     std::puts("masks: exported sample mask, emulated alpha-to-coverage, per-sample shading passed");
 }
 
@@ -400,6 +402,7 @@ void CheckInteger(AgcDriver::VulkanDevice& device) {
         const auto texels = Resolve(device, target, destination);
         for (std::uint32_t index = 0; index < texels.size(); ++index) Require(texels[index] == expected, "R32_UINT resolve with sample mask " + std::to_string(mask) + ": pixel " + std::to_string(index) + " is " + Hex(texels[index]) + ", expected " + Hex(expected));
     }
+    sources.clear();
     std::puts("integer: R32_UINT resolve takes sample 0 passed");
 }
 
@@ -486,6 +489,7 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
+        sources.clear();
         try {
             if (device != nullptr) device->WaitIdle();
         } catch (const std::exception& idle) {
