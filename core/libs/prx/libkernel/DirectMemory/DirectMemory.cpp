@@ -937,6 +937,8 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
 
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
+    // Traced before validation as well, so a request that fails or throws still shows its address and flags.
+    Trace("map direct request %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", *addr, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
         return SCE_KERNEL_ERROR_EINVAL;

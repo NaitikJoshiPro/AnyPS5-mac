@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mach/mach.h>
+#include <unistd.h>
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
@@ -391,16 +392,32 @@ FEXCore::ArchHelpers::Arm64::UnalignedHandlerType unalignedHandler = FEXCore::Ar
 // The M3 raises SIGBUS (BUS_ADRALN) when an ordered access (LDAPR/LDAPUR/STLR/STLUR) or an atomic crosses a
 // 16-byte boundary. FEX emulates the access or backpatches it to a plain access plus barrier; the backpatch writes
 // through the code pool's writable alias (FEX Arm64.cpp).
+void ReportUnaligned(const char* what, std::uint64_t pc, const siginfo_t* info) {
+    char message[200];
+    const int length = std::snprintf(message, sizeof(message), "[aps5-fex] unaligned access %s: pc 0x%llx instruction 0x%08x address 0x%llx\n", what,
+        static_cast<unsigned long long>(pc), *reinterpret_cast<const std::uint32_t*>(pc), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
+    if (length > 0) (void)!write(STDERR_FILENO, message, std::min(static_cast<std::size_t>(length), sizeof(message) - 1));
+}
+
 bool HandleUnaligned(int signal, siginfo_t* info, __darwin_mcontext64* machine) {
     if (signal != SIGBUS || info->si_code != BUS_ADRALN || currentThread == nullptr) return false;
     const std::uint64_t pc = arm_thread_state64_get_pc(machine->__ss);
-    if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) return false;
+    if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) {
+        // Pool memory outside FEX's code buffers holds the displaced-access stubs (GuestDisplaced.cpp). FEX's
+        // backpatch would rewrite the stub's neighbouring words, so the fault is not handled here: name it, since
+        // the chained default action ends the process without saying why.
+        if (pool != nullptr && pool->Contains(reinterpret_cast<const void*>(pc))) ReportUnaligned("in JIT pool memory outside FEX's code buffers", pc, info);
+        return false;
+    }
     // __x[0..28], __fp, __lr, __sp and __pc are contiguous: FEX indexes the GPRs as x0..x31.
     static_assert(offsetof(__darwin_arm_thread_state64, __x) + 29 * 8 == offsetof(__darwin_arm_thread_state64, __fp));
     static_assert(offsetof(__darwin_arm_thread_state64, __fp) + 8 == offsetof(__darwin_arm_thread_state64, __lr));
     static_assert(offsetof(__darwin_arm_thread_state64, __lr) + 8 == offsetof(__darwin_arm_thread_state64, __sp));
     const auto result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(currentThread, unalignedHandler, pc, machine->__ss.__x);
-    if (!result) return false;
+    if (!result) {
+        ReportUnaligned("that FEX cannot emulate", pc, info);
+        return false;
+    }
     arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(pc + *result));
     return true;
 }
