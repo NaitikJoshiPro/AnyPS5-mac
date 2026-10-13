@@ -13,6 +13,7 @@
 #ifdef __linux__
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include "SceTypes.hpp"
@@ -42,6 +43,7 @@ constexpr int GuestEnoent = 2;
 constexpr int GuestEperm = 1;
 constexpr int GuestEio = 5;
 constexpr int GuestEfault = 14;
+constexpr int GuestEnotdir = 20;
 constexpr int GuestEinval = 22;
 constexpr int GuestEexist = 17;
 constexpr int GuestExdev = 18;
@@ -174,6 +176,15 @@ bool HasLongComponent(std::string_view path) {
             return std::filesystem::is_directory(prefix, error);
         }
         start = end + 1;
+    }
+    return false;
+}
+
+bool HasNonDirectoryPrefix(const std::filesystem::path& native) {
+    std::error_code error;
+    for (auto prefix = native.parent_path(); prefix.has_relative_path(); prefix = prefix.parent_path()) {
+        const auto status = std::filesystem::status(prefix, error);
+        if (std::filesystem::exists(status)) return !std::filesystem::is_directory(status);
     }
     return false;
 }
@@ -354,6 +365,43 @@ int APS5_VABI openat_nid_postfix(int fd, const char* path, int flags, ...) {
     const int result = OpenInDirectory_nid_no_patch(fd, path, flags, static_cast<std::uint16_t>(mode));
     if (result < 0) return static_cast<int>(Fail(result & 0xffff));
     return result;
+}
+
+int APS5_VABI mkdir_nid_postfix(const char* path, std::uint16_t mode);
+
+int APS5_VABI mkdirat_nid_postfix(int fd, const char* path, std::uint16_t mode) {
+    if (path == nullptr) return static_cast<int>(Fail(GuestEfault));
+    if (*path == '\0') return static_cast<int>(Fail(GuestEnoent));
+    if (fd == GuestAtFdcwd || *path == '/') return mkdir_nid_postfix(path, mode);
+    if (std::strlen(path) >= GuestPathMax || HasLongComponent(path)) return static_cast<int>(Fail(GuestEnametoolong));
+    int error = 0;
+    const char* base = GetDirectoryDescriptorPath_nid_no_patch(fd, &error);
+    if (base == nullptr) return static_cast<int>(Fail(error));
+    auto native = std::filesystem::path(reinterpret_cast<const char8_t*>(base)) /
+                  std::filesystem::path(reinterpret_cast<const char8_t*>(path));
+    while (!native.has_filename() && native.has_relative_path()) native = native.parent_path();
+#ifdef _WIN32
+    if (!CreateDirectoryW(native.wstring().c_str(), nullptr)) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS) return static_cast<int>(Fail(GuestEexist));
+        if (code == ERROR_ACCESS_DENIED) return static_cast<int>(Fail(GuestEperm));
+        if (code == ERROR_FILENAME_EXCED_RANGE) return static_cast<int>(Fail(GuestEnametoolong));
+        if (code == ERROR_PATH_NOT_FOUND) {
+            if (HasNonDirectoryPrefix(native)) return static_cast<int>(Fail(GuestEnotdir));
+            return static_cast<int>(Fail(GuestEnoent));
+        }
+        return static_cast<int>(Fail(GuestEio));
+    }
+#else
+    if (::mkdir(native.c_str(), static_cast<mode_t>(mode & 0777)) != 0) {
+        const int nativeError = errno;
+        if ((nativeError == ENOENT || nativeError == ENOTDIR) && HasNonDirectoryPrefix(native))
+            return static_cast<int>(Fail(GuestEnotdir));
+        return static_cast<int>(Fail(GuestError(std::error_code(nativeError, std::generic_category()))));
+    }
+#endif
+    RecordWrittenPath_nid_no_patch(native);
+    return 0;
 }
 
 }
