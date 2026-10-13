@@ -6,18 +6,23 @@
 //   agc_metal_device_tests bindings   (agc_metal_device_bindings)
 //   agc_metal_device_tests submission (agc_metal_device_submission)
 //   agc_metal_device_tests profile    (agc_metal_device_profile)
+//   agc_metal_device_tests memory     (agc_metal_device_memory: the Context's device-local heap and its
+//                                      VK_EXT_memory_budget report, MetalMemoryBudget.h)
 //   agc_metal_device_tests teardown   (agc_metal_device_teardown: D19.5 teardown after a failed MSL
 //                                      compile with work in flight, through ~VulkanDevice)
 //   agc_metal_device_tests teardown_exit (agc_metal_device_teardown_exit: the same, the device still
 //                                      alive at exit(); the exit handler tears it down)
 
 #include "../src/MetalDeviceState.h"
+#include "../src/MetalCommandStream.h"
+#include "../src/MetalMemoryBudget.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mach/mach.h>
@@ -35,6 +40,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -695,6 +708,52 @@ void CheckTeardown(std::unique_ptr<AgcDriver::VulkanDevice>& device, bool viaExi
 
 }
 
+// The device's Context describes the device-local heap of a unified-memory Mac (the recommended working set) and
+// answers upstream's VK_EXT_memory_budget query, so the texture caches size themselves by it (D5).
+void CheckMemory(AgcDriver::VulkanDevice& device) {
+    namespace Metal = AgcDriver::Graphics::Metal;
+    using Metal::MemoryBudget;
+    using Metal::MemoryPressure;
+    constexpr std::uint64_t GiB = 1ull << 30u;
+    // The budget rule: the working set bounds it, usage plus the system's headroom (halved at WARN, none at CRITICAL).
+    Require(MemoryBudget(10 * GiB, 1 * GiB, 4 * GiB, MemoryPressure::Normal) == 5 * GiB, "the budget is not usage + headroom");
+    Require(MemoryBudget(10 * GiB, 1 * GiB, 4 * GiB, MemoryPressure::Warn) == 3 * GiB, "memory pressure WARN does not halve the headroom");
+    Require(MemoryBudget(10 * GiB, 1 * GiB, 4 * GiB, MemoryPressure::Critical) == 1 * GiB, "memory pressure CRITICAL leaves headroom");
+    Require(MemoryBudget(10 * GiB, 1 * GiB, UINT64_MAX, MemoryPressure::Normal) == 10 * GiB, "the working set does not bound the budget");
+    Require(MemoryBudget(10 * GiB, 12 * GiB, 4 * GiB, MemoryPressure::Normal) == 10 * GiB, "usage past the working set raises the budget");
+
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    id<MTLDevice> metal = Metal::DeviceOf(context);
+    Require(metal != nil, "the device's Context carries no MTLDevice");
+    const auto workingSet = static_cast<std::uint64_t>(metal.recommendedMaxWorkingSetSize);
+    Require(context.memory.memoryHeapCount == 1u, "the Context describes " + std::to_string(context.memory.memoryHeapCount) + " memory heaps, not the one unified heap");
+    const auto& heap = context.memory.memoryHeaps[0];
+    Require((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0, "the Context's heap is not device-local");
+    Require(heap.size == workingSet && workingSet > 0u, "the Context's heap of " + std::to_string(heap.size) + " bytes is not the recommended working set of " + std::to_string(workingSet));
+    Require(context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE, "the Context has no VK_EXT_memory_budget report");
+
+    const auto before = static_cast<std::uint64_t>(metal.currentAllocatedSize);
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &reported;
+    context.memoryProperties2(context.physical, &properties);
+    const auto after = static_cast<std::uint64_t>(metal.currentAllocatedSize);
+    Require(properties.memoryProperties.memoryHeapCount == 1u && properties.memoryProperties.memoryHeaps[0].size == workingSet, "the report's memory properties are not the Context's heap");
+    const auto usage = reported.heapUsage[0];
+    const auto budget = reported.heapBudget[0];
+    Require(usage > 0u, "the report counts no usage on a device that has allocated its tables");
+    Require(usage >= std::min(before, after) && usage <= std::max(before, after), "the reported usage " + std::to_string(usage) + " is not the device's allocated size");
+    Require(budget > 0u && budget <= workingSet, "the reported budget " + std::to_string(budget) + " is not within the working set " + std::to_string(workingSet));
+    Require(budget >= std::min(usage, workingSet), "the reported budget is below the device's usage within the working set");
+    for (std::uint32_t other = 1; other < VK_MAX_MEMORY_HEAPS; ++other) Require(reported.heapBudget[other] == 0u && reported.heapUsage[other] == 0u, "the report describes a heap the Context does not have");
+    const auto sampled = AgcDriver::Graphics::SampledTextureBudget(context.memory, &reported, 0);
+    const auto storage = AgcDriver::Graphics::TextureCacheBudget(context.memory);
+    Require(storage == std::max<std::uint64_t>(2 * GiB, workingSet / 4u), "the storage image cache budget is not a quarter of the working set (2 GiB floor)");
+    Require(sampled >= 2 * GiB && sampled <= std::max<std::uint64_t>(2 * GiB, budget), "the sampled texture cache budget " + std::to_string(sampled) + " is outside [2 GiB, budget]");
+    const char* level = Metal::CurrentMemoryPressure() == MemoryPressure::Normal ? "normal" : Metal::CurrentMemoryPressure() == MemoryPressure::Warn ? "warn" : "critical";
+    std::printf("heap %llu MiB, budget %llu MiB, usage %llu MiB, system headroom %llu MiB, pressure %s; sampled cache budget %llu MiB, storage image cache budget %llu MiB\n", static_cast<unsigned long long>(workingSet >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(Metal::SystemMemoryHeadroom() >> 20u), level, static_cast<unsigned long long>(sampled >> 20u), static_cast<unsigned long long>(storage >> 20u));
+}
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "bindings";
     std::unique_ptr<AgcDriver::VulkanDevice> device;
@@ -721,6 +780,8 @@ int main(int argc, char** argv) {
             CheckSubmission(*device);
         } else if (mode == "profile") {
             CheckProfile(*device);
+        } else if (mode == "memory") {
+            CheckMemory(*device);
         } else if (mode == "teardown" || mode == "teardown_exit") {
             CheckTeardown(device, mode == "teardown_exit");
             std::printf("metal device %s tests passed\n", mode.c_str());

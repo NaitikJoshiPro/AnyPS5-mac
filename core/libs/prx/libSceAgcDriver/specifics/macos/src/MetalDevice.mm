@@ -10,6 +10,7 @@
 // the GuestMemory flush hook and WAIT_REG_MEM.
 
 #include "MetalDeviceState.h"
+#include "MetalMemoryBudget.h"
 #include "MetalCommandStream.h"
 #include "MetalPipelineCache.h"
 #include "MetalImages.h"
@@ -664,6 +665,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.limits.maxComputeWorkGroupInvocations = 1024u;
             context.limits.maxComputeSharedMemorySize = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
             context.subgroup.subgroupSize = 32u;
+            // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
+            // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
+            Graphics::Metal::DescribeMemory(context, state->device);
             context.bufferPool = std::make_shared<Graphics::BufferPool>(context);
             state->recorder = std::make_unique<Graphics::Recorder>(context, true);
             context.recorder = state->recorder.get();

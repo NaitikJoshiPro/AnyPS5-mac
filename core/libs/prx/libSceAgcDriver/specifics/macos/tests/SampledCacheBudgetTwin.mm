@@ -6,13 +6,11 @@
 // instance, the Context is the Metal image cache's (Metal::ImageCache::Attach, as MetalDevice.mm builds it) with
 // - host imports as the device enables them (no-copy Metal buffers over whole 16 KiB pages, D3), so the storage-image
 //   view and resource-cache checks run (upstream needs VK_EXT_external_memory_host for them);
-// - the device-local heap of a unified-memory Mac, its recommended working set (as BufferPool.mm describes it), and
-//   the MTLDevice standing in for the physical device;
-// - a memory budget report (upstream's VK_EXT_memory_budget query) from the same device: budget = the recommended
-//   working set, usage = the device's currently allocated size. The `memory` mode replaces it with upstream's fixed
-//   report, as upstream does.
-// Gap (TechnicalDebt metal-vulkan-internal-tests): the Metal device's own Context does not describe its heap or
-// report a budget yet, so outside these tests the texture caches keep the 2 GiB floor.
+// - the device-local heap and memory budget report the Metal device's own Context has (Metal::DescribeMemory,
+//   MetalMemoryBudget.h, as MetalDevice.mm calls it): one heap of the recommended working set, and upstream's
+//   VK_EXT_memory_budget query answered with usage = the device's currently allocated size and a budget bounded by
+//   the working set, the system's free memory and OS memory pressure. The `memory` mode replaces the report with
+//   upstream's fixed one, as upstream does.
 
 #define main AgcDriverSampledCacheBudgetVulkanMain
 #include "../../../tests/execution/SampledCacheBudget.cpp"
@@ -22,6 +20,7 @@
 #import <Metal/Metal.h>
 
 #include "../src/MetalImages.h"
+#include "../src/MetalMemoryBudget.h"
 #include "MetalTestDevice.h"
 
 namespace MetalSampledCacheTwin {
@@ -31,13 +30,6 @@ using namespace AgcDriver::Graphics;
 constexpr int Skipped = 77;
 
 id<MTLDevice> reportingDevice = nil;
-
-// VK_EXT_memory_budget's report for the Metal device: one device-local heap, the recommended working set.
-void VKAPI_PTR ReportMetalBudget(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
-    auto* reported = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
-    reported->heapBudget[0] = static_cast<VkDeviceSize>(reportingDevice.recommendedMaxWorkingSetSize);
-    reported->heapUsage[0] = static_cast<VkDeviceSize>(reportingDevice.currentAllocatedSize);
-}
 
 // The Metal test device as upstream's Device: GetContext() is the image cache's Context (detiler, placeholders,
 // sampler and texture caches). No recorder is active, as upstream's test has none: with one, the batch it records
@@ -53,11 +45,8 @@ public:
         context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
         context.limits.maxComputeWorkGroupCount[0] = context.limits.maxComputeWorkGroupCount[1] = context.limits.maxComputeWorkGroupCount[2] = 65535u;
         context.hostImportAlignment = 16384u;
-        context.physical = reinterpret_cast<VkPhysicalDevice>(context.device);
-        context.memory.memoryHeapCount = 1;
-        context.memory.memoryHeaps[0] = {static_cast<VkDeviceSize>(test.device.recommendedMaxWorkingSetSize), VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        Metal::DescribeMemory(context, test.device);
         reportingDevice = test.device;
-        context.memoryProperties2 = &ReportMetalBudget;
         cache.Attach(context);
     }
     ~Device() {
