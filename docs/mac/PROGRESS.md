@@ -172,3 +172,11 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Regression: DOOM PPSA99666 headless 60 s --validation (libs3-doom): alive, 6 frames, title menu correct. Showcase PPSA99005 still stops at the known "submission retirement failed".
 - Disk 10.1 GB of 100 GB.
 - Next: DRV: EVENT_WRITE BREAK_BATCH (and whatever radeonsi's first IB needs next) through sceAgcDriverSubmitCommandBuffer.
+
+## 2026-10-14 ~01:15 — M3 start: upstream sync (UPSYNC) on mac-native-upsync, verified
+- Pass 1: upstream/main 0f2683cb7 (v0.1.2, 937 commits) merged as c1a9158a1 (40 conflicted files; D29). Pass 2: fdefd7660 (189 more commits incl. #4555) merged as 400b692bc (12 conflicted files). mac-native-metal (df4280b91) merged as 7fcfc9a96 (VA2's interim FileDuplicate.cpp replaced by upstream's DescriptorControl.cpp; SetCloseOnExec now mirrors FD_CLOEXEC on the host).
+- Ports: MetalBackend mirrors upstream's SPIR-V changes (D30, MslAbi v10 then v11: cull distances, flat P10, layered rendering incl. mesh layer, hull control points, level clamps, f16 native conversion, one-lane vertex waves, unnormalized base level, patch constants, LayerExported, coherent GDS, early fragment tests); 14 stale Metal twins re-synced (DRIVERPORT ledger .mac-work/logs/upsync/driverport-ledger.md; port_ledger reviewed fdefd7660); depth storage + depth-plane sampling, R16Uint 1_5_5_5/5_6_5 targets, packed mip tails outside the image cache; macOS backends for upstream's new CPU-library code (kqueue vnode watches, JIT memory, module lists, statvfs, poll urgent data, ...).
+- Verification (build-sync, --validation): gpu-suite/upsync-final2 at e29d6604b: 573 run, 558 pass, 0 fail, 0 timeout, 15 allowlisted skips (+1 held: f16_denormal_flush, private quarantine). CPU ctest -LE "gpu|slow" 2822/2822 (56 known FEX skips). MSL corpus 3329/3329 valid (fresh dump upsync-final1 + seed; 764 front-end-, 56 spirv-, 4 host-width-rejected). check_test_registration clean; gpu_groups up to date (574).
+- D19 slip: FINALFIX ran the compile-only corpus binary directly once (under the machine-wide GPU lock, validation env) after two 30 s gpu_suite timeouts on a cold Metal compiler cache (70 s cold, <1 s warm). Then it passed via gpu_suite (20261013T190104Z).
+- Disk 10.7 GB of 100 GB.
+- Next: main fast-forwards mac-native(-metal) to mac-native-upsync; M3 titles.
