@@ -42,7 +42,9 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
 
 void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue) {
     static const std::uint64_t watched = [] {
+        // A hex guest address (packets within 0x100 of it), or "all" for every label packet.
         const char* value = std::getenv("APS5_TRACE_LABEL");
+        if (value != nullptr && std::string_view(value) == "all") return ~0ull;
         return value ? std::strtoull(value, nullptr, 16) : 0ull;
     }();
     const auto opcode = (packet[0] >> 8u) & 0xffu;
@@ -65,7 +67,7 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
         auto& entry = writeHistory()[writeCursor()++ % writeHistory().size()];
         entry = {target, length, queue, opcode};
     }
-    if (watched == 0 || target + length + 0x100 < watched || target > watched + 0x100) return;
+    if (watched == 0 || (watched != ~0ull && (target + length + 0x100 < watched || target > watched + 0x100))) return;
     std::fprintf(stderr, "[label] %lld ms queue 0x%x %s 0x%llx:", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), queue, kind, static_cast<unsigned long long>(target));
     for (std::size_t i = 1; i < packet.size() && i < 9; ++i) std::fprintf(stderr, " %08x", packet[i]);
     std::fprintf(stderr, "\n");
