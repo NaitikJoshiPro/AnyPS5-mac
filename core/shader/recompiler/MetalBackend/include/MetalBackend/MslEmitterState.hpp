@@ -258,6 +258,12 @@ struct MslGraphicsInterface {
     std::string epilogue;
 };
 [[nodiscard]] MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state);
+// MslAbi Version 5 triangle-vertices helpers (MslStageIo.cpp): defaults of the per-vertex macros, the
+// preprocessor condition of the mode, of one per-vertex location, and corner fields (pv<L>_<vertex>).
+[[nodiscard]] std::string TriangleVertexMacroDefaults();
+[[nodiscard]] std::string TriangleVerticesCondition();
+[[nodiscard]] std::string PerVertexLocationCondition(std::uint32_t location);
+[[nodiscard]] std::string PerVertexField(std::uint32_t location, std::uint32_t vertex);
 // The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
 // laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.
 [[nodiscard]] std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInputInfo& workgroup, std::uint32_t laneCount);

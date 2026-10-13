@@ -1,4 +1,5 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include "MetalBackend/MslConservative.hpp"
 #include "PipelineSpecialization.hpp"
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include <algorithm>
@@ -22,6 +23,24 @@ namespace ShaderRecompiler {
 //   APS5_VERTEX_OUTPUTS macros, with the SPIR-V path's interpolation choice.
 // The guest body runs in a helper function (MslEntryPoint.cpp), so its `return` statements keep
 // working; the stage function fills `aps5_out` through it and applies the epilogue.
+
+std::string TriangleVertexMacroDefaults() {
+    return "#ifndef APS5_PER_VERTEX_LOCATIONS\n#define APS5_PER_VERTEX_LOCATIONS 0\n#endif\n"
+           "#ifndef APS5_PER_VERTEX_LOCATIONS_HI\n#define APS5_PER_VERTEX_LOCATIONS_HI 0\n#endif\n"
+           "#ifndef APS5_BARYCENTRICS\n#define APS5_BARYCENTRICS 0\n#endif\n";
+}
+
+std::string TriangleVerticesCondition() {
+    return "defined(APS5_TRIANGLE_VERTICES) && APS5_TRIANGLE_VERTICES";
+}
+
+std::string PerVertexLocationCondition(std::uint32_t location) {
+    return std::string("((") + (location < 32u ? "APS5_PER_VERTEX_LOCATIONS" : "APS5_PER_VERTEX_LOCATIONS_HI") + " >> " + std::to_string(location % 32u) + ") & 1)";
+}
+
+std::string PerVertexField(std::uint32_t location, std::uint32_t vertex) {
+    return "pv" + std::to_string(location) + "_" + std::to_string(vertex);
+}
 
 namespace {
 
@@ -76,6 +95,33 @@ std::string InstanceId(MslEmitterState& state) {
     return "aps5_instance_id";
 }
 
+// Emulated per-vertex values (MslAbi Version 5, the triangle-vertices expansion): the corner weights
+// interpolated perspective-correct (bit 0) or linearly (bit 1), as gl_BaryCoordKHR / NoPerspKHR.
+std::string EmulatedBarycentric(MslEmitterState& state, bool linear) {
+    state.reflection.emulatedBarycentrics |= linear ? 2u : 1u;
+    return linear ? "aps5_in.aps5_bwl" : "aps5_in.aps5_bw";
+}
+
+// One channel of corner `vertex`'s value of a per-vertex pixel parameter at Vulkan location
+// `location`, as a float (flat input user(aps5_pv<L>_<vertex>), zero when the vertex function does
+// not write the location).
+std::string PerVertexValue(MslEmitterState& state, std::uint32_t location, std::uint32_t vertex, std::uint32_t channel) {
+    state.reflection.perVertexLocations |= std::uint64_t {1u} << location;
+    return "aps5_pv_" + std::to_string(location) + "(" + std::to_string(vertex) + ", " + std::to_string(channel & 3u) + ")";
+}
+
+bool InputIsPerVertex(MslEmitterState& state, std::uint32_t attribute) {
+    return std::ranges::any_of(state.program.Info().inputs, [&](const StageInput& input) { return input.kind == StageInputKind::Parameter && input.location == attribute && input.perVertex; });
+}
+
+std::uint32_t PixelLocation(MslEmitterState& state, const IrValue& instruction, std::uint32_t attribute) {
+    const auto& pixel = PixelInfo(state);
+    if (attribute >= PixelParameterLimit || attribute >= pixel.inputNum) state.Fail(instruction, "pixel interpolator index is out of range");
+    const auto location = pixel.InputSlot(attribute);
+    if (location >= 64u) state.Fail(instruction, "pixel input location " + std::to_string(location) + " is beyond 63");
+    return location;
+}
+
 // EmitBuiltinU32 for vertex and pixel programs: the value's bits as a uint.
 std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
     const auto stage = StageOf(state);
@@ -107,13 +153,13 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
         case StageInputKind::HelperInvocation:
             return "(simd_is_helper_thread() ? 1u : 0u)";
         case StageInputKind::BaryCoordSmooth:
-            if (component > 1u) state.Fail(instruction, "barycentric component is out of range");
-            state.AddParameter("float3 aps5_bary [[barycentric_coord, center_perspective]]");
-            return "as_type<uint>(aps5_bary[" + std::to_string(component + 1u) + "])";
         case StageInputKind::BaryCoordNoPerspective:
+            // Exact barycentrics only exist in programs the recompiler translated for the emulated
+            // per-vertex values (ProgramMetadata::barycentricEmulation): the triangle-vertices vertex
+            // function emits one-hot corner weights, interpolated as the hardware interpolates the
+            // guest's I/J (EmulatedBarycentric).
             if (component > 1u) state.Fail(instruction, "barycentric component is out of range");
-            state.AddParameter("float3 aps5_bary_linear [[barycentric_coord, center_no_perspective]]");
-            return "as_type<uint>(aps5_bary_linear[" + std::to_string(component + 1u) + "])";
+            return "as_type<uint>(" + EmulatedBarycentric(state, kind == StageInputKind::BaryCoordNoPerspective) + "[" + std::to_string(component + 1u) + "])";
         default:
             break;
         }
@@ -140,14 +186,19 @@ std::string PixelAttribute(MslEmitterState& state, const IrValue& instruction, s
     const auto& pixel = PixelInfo(state);
     if (attribute >= PixelParameterLimit || attribute >= pixel.inputNum) state.Fail(instruction, "pixel interpolator index is out of range");
     if (pixel.InputIsDefault(attribute)) return MslHex(pixel.InputDefaultBits(attribute, channel & 3u)) + "u";
-    for (const auto& input : state.program.Info().inputs) {
-        if (input.kind == StageInputKind::Parameter && input.location == attribute && input.perVertex) state.Fail(instruction, "per-vertex (barycentric emulation) pixel inputs are not implemented in the MSL backend (work package B6)");
-    }
-    const auto location = pixel.InputSlot(attribute);
-    if (location >= 64u) state.Fail(instruction, "pixel input location " + std::to_string(location) + " is beyond 63");
+    const auto location = PixelLocation(state, instruction, attribute);
     const bool flat = (pixel.interpolatorSettings[attribute] & PsInputFlatShade) != 0u && !pixel.InputIsCustom(attribute);
     const auto& metadata = state.program.Metadata();
     const bool linear = pixel.InputIsLinear(attribute, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs);
+    if (InputIsPerVertex(state, attribute)) {
+        // A slot read per vertex is interpolated from its corner values, as the SPIR-V path's
+        // EmitAttributeValue: corner 0 when flat, else the barycentric-weighted sum.
+        if (flat) return "as_type<uint>(" + PerVertexValue(state, location, 0u, channel) + ")";
+        const auto weights = EmulatedBarycentric(state, linear);
+        std::string sum = PerVertexValue(state, location, 0u, channel) + " * " + weights + "[0]";
+        for (std::uint32_t vertex = 1u; vertex < 3u; ++vertex) sum = "(" + sum + " + " + PerVertexValue(state, location, vertex, channel) + " * " + weights + "[" + std::to_string(vertex) + "])";
+        return "as_type<uint>(" + sum + ")";
+    }
     state.fragmentInputs.emplace(location, flat ? ", flat" : linear ? ", center_no_perspective" : ", center_perspective");
     return "aps5_input_" + std::to_string(location) + "(" + std::to_string(channel & 3u) + ")";
 }
@@ -177,6 +228,46 @@ void GetAttribute(MslEmitterState& state, const IrValue& instruction) {
         value = "(" + selector + " == " + U32(component + 4u) + " ? " + VertexAttribute(state, instruction, attribute, component) + " : " + value + ")";
     }
     state.Define(instruction, value);
+}
+
+// v_interp_mov / barycentric-mode v_interp_p1/p2 (GetInterpolationParameter: mode 0 P10, 1 P20,
+// 2 P0) and their 16-bit forms (GetInterpolationParameterF16, the low or high half), as the SPIR-V
+// path's EmitInterpolationParameterValue / EmitInterpolationParameterF16Value: corner (mode + 1) % 3
+// minus corner 0 for the deltas (not for pass-through inputs; the 16-bit delta rounds to half).
+void GetInterpolationParameter(MslEmitterState& state, const IrValue& instruction, bool half) {
+    if (StageOf(state) != IrShaderStage::Pixel) state.Fail(instruction, "interpolation parameters outside pixel programs");
+    const auto attribute = instruction.Argument(0)->Resolve()->ImmediateU32();
+    const auto channel = instruction.Argument(1)->Resolve()->ImmediateU32();
+    const auto mode = instruction.Argument(2)->Resolve()->ImmediateU32();
+    if (mode > 2u) state.Fail(instruction, "interpolation parameter mode is out of range");
+    const auto& pixel = PixelInfo(state);
+    if (!half) {
+        if (pixel.InputIsDefault(attribute)) {
+            state.Define(instruction, mode == 2u ? PixelAttribute(state, instruction, attribute, channel) : std::string("0u"));
+            return;
+        }
+        if (!InputIsPerVertex(state, attribute)) {
+            state.Define(instruction, PixelAttribute(state, instruction, attribute, channel));
+            return;
+        }
+        const auto location = PixelLocation(state, instruction, attribute);
+        std::string value = PerVertexValue(state, location, (mode + 1u) % 3u, channel);
+        if (!pixel.InputIsCustom(attribute) && mode < 2u) value = "(" + value + " - " + PerVertexValue(state, location, 0u, channel) + ")";
+        state.Define(instruction, "as_type<uint>(" + value + ")");
+        return;
+    }
+    const bool high = instruction.Argument(3)->Resolve()->ImmediateU32() != 0u;
+    if (pixel.InputHalfIsDefault(attribute, high)) {
+        state.Define(instruction, "as_type<float>(" + MslHex(mode == 2u ? pixel.InputHalfDefaultBits(attribute, channel & 3u, high) : 0u) + "u)");
+        return;
+    }
+    if (!InputIsPerVertex(state, attribute)) state.Fail(instruction, "16-bit interpolation parameter is not read per vertex");
+    const auto location = PixelLocation(state, instruction, attribute);
+    const auto corner = [&](std::uint32_t vertex) {
+        return "float(as_type<half>(ushort(as_type<uint>(" + PerVertexValue(state, location, vertex, channel) + ")" + (high ? " >> 16u" : "") + ")))";
+    };
+    if (mode == 2u) state.Define(instruction, corner(0u));
+    else state.Define(instruction, "float(half(" + corner(mode + 1u) + " - " + corner(0u) + "))");
 }
 
 std::uint32_t MrtOutputMode(MslEmitterState& state, const ExportInfo& exp) {
@@ -412,6 +503,12 @@ bool EmitMslStageInstruction(MslEmitterState& state, const IrValue& instruction)
     case IrOpcode::SetAttribute:
         SetAttribute(state, instruction);
         return true;
+    case IrOpcode::GetInterpolationParameter:
+        GetInterpolationParameter(state, instruction, false);
+        return true;
+    case IrOpcode::GetInterpolationParameterF16:
+        GetInterpolationParameter(state, instruction, true);
+        return true;
     default:
         return false;
     }
@@ -443,6 +540,23 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         }
         // Metal's compiler fails past 124 scalar varyings (M2_DESIGN §4).
         if (scalars > 124u) state.Fail("the vertex function exceeds 124 scalar varyings");
+        // MslAbi Version 5, triangle-vertices draws: each per-vertex location the fragment function
+        // reads (APS5_PER_VERTEX_LOCATIONS) also goes out as its triangle's three corner values,
+        // flat; the corner weights stand in for the barycentrics (APS5_BARYCENTRICS); conservative
+        // rasterization adds its triangle (MslConservative). The driver keeps the total within
+        // Metal's varying limit (the library compile fails otherwise).
+        text += TriangleVertexMacroDefaults();
+        text += "#if " + TriangleVerticesCondition() + "\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            text += "#endif\n";
+        }
+        text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
+        text += "#if (APS5_BARYCENTRICS & 2)\n    float3 aps5_bwl [[user(aps5_bwl)]];\n#endif\n";
+        text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::VertexOutputFields() + "#endif\n";
+        text += "#endif\n";
         text += "    float aps5_clip [[clip_distance]] [" + std::to_string(clips) + "];\n};\n\n";
         result.outputType = "Aps5VertexOut";
         // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w]. The y
@@ -467,6 +581,19 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += guard + "    float4 p" + std::to_string(location) + " [[user(locn" + std::to_string(location) + ")" + qualifier + "]];\n#endif\n";
         accessors += guard + "#define aps5_input_" + std::to_string(location) + "(c) as_type<uint>(aps5_in.p" + std::to_string(location) + "[c])\n#else\n#define aps5_input_" + std::to_string(location) + "(c) 0u\n#endif\n";
     }
+    // MslAbi Version 5: per-vertex values and emulated barycentrics (triangle-vertices draws).
+    for (std::uint32_t location = 0; location < 64u; ++location) {
+        if (((state.reflection.perVertexLocations >> location) & 1u) == 0u) continue;
+        const auto macro = location < 32u ? std::string("APS5_VERTEX_OUTPUTS") : std::string("APS5_VERTEX_OUTPUTS_HI");
+        const auto guard = "#if ((" + macro + " >> " + std::to_string(location % 32u) + ") & 1)\n";
+        text += guard;
+        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(location, vertex) + " [[user(aps5_" + PerVertexField(location, vertex) + "), flat]];\n";
+        text += "#endif\n";
+        accessors += guard + "#define aps5_pv_" + std::to_string(location) + "(v, c) aps5_in.pv" + std::to_string(location) + "_##v[c]\n#else\n#define aps5_pv_" + std::to_string(location) + "(v, c) 0.0f\n#endif\n";
+    }
+    if ((state.reflection.emulatedBarycentrics & 1u) != 0u) text += "    float3 aps5_bw [[user(aps5_bw), center_perspective]];\n";
+    if ((state.reflection.emulatedBarycentrics & 2u) != 0u) text += "    float3 aps5_bwl [[user(aps5_bwl), center_no_perspective]];\n";
+    text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentInputFields() + "#endif\n";
     text += "};\n" + accessors + "\n";
     std::string members;
     for (const auto& output : state.program.Info().outputs) {
@@ -520,7 +647,9 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     // (EmitMslEntryPoint, BufferIndex::RasterOrder).
     if (pixel.psOrderedPixelShader) state.reflection.rasterOrder = true;
     if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable && !pixel.psStencilRefExportEnable && !pixel.psAlphaToCoverage) {
-        result.attributes = "[[early_fragment_tests]] ";
+        // Conservative rasterization discards in the stage function (MslConservative), which
+        // early fragment tests would not wait for.
+        result.attributes = "#if !(defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE)\n[[early_fragment_tests]]\n#endif\n";
         state.reflection.earlyFragmentTests = true;
     }
     if (state.usesValidMask) {

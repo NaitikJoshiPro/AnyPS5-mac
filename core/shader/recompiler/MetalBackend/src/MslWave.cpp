@@ -520,7 +520,7 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
             state.Define(instruction, "0u");
             return;
         }
-        if (lane >= 32u) state.Fail(instruction, "v_readlane_b32 of a lane outside the 32-lane host SIMD group that runs this wave64 graphics program (work package B6)");
+        if (lane >= 32u) state.Fail(instruction, "v_readlane_b32 of lane " + std::to_string(lane) + " is outside the 32-lane host SIMD group that runs this wave64 graphics program at one lane per invocation (work package B6)");
     }
     const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & " + U32(state.program.WaveSize() - 1u), "aps5_rl");
     state.Define(instruction, Shuffle(state, instruction, 0u, lane));

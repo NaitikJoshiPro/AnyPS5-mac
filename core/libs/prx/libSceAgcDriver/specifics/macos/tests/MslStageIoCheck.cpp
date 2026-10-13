@@ -12,6 +12,7 @@
 
 #include "ControlFlow/RequestSerializer.hpp"
 #include "MslAbi.hpp"
+#include "MetalBackend/MslConservative.hpp"
 #include "Recompiler.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -54,7 +55,11 @@ void Check(const fs::path& file, std::uint32_t& vertex, std::uint32_t& fragment)
     const auto name = file.filename().string();
     Require(!result.msl.empty(), name + ": no MSL");
     const auto& reflection = result.msl.Reflection();
-    const std::string source(result.msl.Source());
+    std::string source(result.msl.Source());
+    // The conservative-rasterization discard (APS5_CONSERVATIVE, MslAbi Version 5) is the driver's,
+    // not the guest program's: Reflection::usesDiscard does not count it.
+    const auto conservative = ShaderRecompiler::MslConservative::FragmentText();
+    if (const auto at = source.find(conservative); at != std::string::npos) source.erase(at, conservative.size());
     Require(reflection.abiVersion == ShaderRecompiler::MslAbi::Version, name + ": unexpected MslAbi version");
     if (reflection.stage == ShaderRecompiler::MslAbi::Stage::Vertex) {
         ++vertex;

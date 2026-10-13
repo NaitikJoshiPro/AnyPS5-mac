@@ -175,7 +175,14 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
     translateOptions.sharedMemoryBytes = DeviceMemoryLdsBytes(request);
-    translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
+    // The MSL backend's fragmentShaderBarycentricEnabled means per-vertex values are emulated
+    // (MslAbi::TriangleVerticesMacro: the vertex function sees its triangle's 3 vertices). Programs
+    // still start with host interpolation, and only those that need per-vertex values (raw P0/P10/
+    // P20 reads, 16-bit interpolation, exact barycentrics) pay for the emulation, as on Vulkan
+    // devices without VK_KHR_fragment_shader_barycentric.
+    const bool emulatedPerVertex = request.target.fragmentShaderBarycentricEnabled && request.target.backend == ShaderBackend::Msl;
+    translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled && !emulatedPerVertex;
+    translateOptions.barycentricFallback = emulatedPerVertex;
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
@@ -228,7 +235,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         }
     };
     simplify();
-    if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel)) {
+    if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && (program.Metadata().barycentricEmulation || !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel))) {
         translateOptions.fragmentShaderBarycentricEnabled = true;
         program = translator.Translate(decoded, cfg, translateOptions);
         program.Metadata().barycentricEmulation = true;
@@ -806,13 +813,17 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources / RuntimeAbi::VertexSelectorsPerDword> runtimeSelectors{};
+    // Embedded-fetch selectors (dst_sel, "one" bits) are specialization constants of the module. The
+    // SPIR-V path records them as vertex-input patches; MSL libraries read them as function constants
+    // (MslStageIo GetAttribute) with no patches, so an MSL embedded-fetch program is prepared too.
+    const bool preparedVertex = !artifact.vertexInputPatches.empty() || (!artifact.msl.empty() && request.context.vertex && request.context.vertex->fetchEmbedded && !result.vertexInputs.empty());
     for (const auto& input : result.vertexInputs) {
         if (!request.context.vertex || input.location >= request.context.vertex->resourcesNum || input.location >= request.context.vertex->resources.size()) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
         const auto& vertex = *request.context.vertex;
         const auto& resource = vertex.resources[input.location];
         const auto fetchIndex = vertex.fetchEmbedded ? vertex.resourcesDst[input.location].fetchIndex : input.fetchIndex;
         result.vertexAttributes.push_back({input.location, input.components, resource, fetchIndex});
-        if (!artifact.vertexInputPatches.empty()) {
+        if (preparedVertex) {
             const auto format = static_cast<IrBufferFormat>((resource.fields[3] >> 12u) & 0x7fu);
             const auto numeric = registrationDefaults && format == IrBufferFormat::Invalid ? IrTextureNumericClass::Float : VertexInputNumericClass(format);
             if (numeric == IrTextureNumericClass::Unsupported) throw std::runtime_error("unsupported prepared vertex format");
@@ -831,7 +842,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || preparedVertex || request.context.pixel) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -849,7 +860,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
             }
-            if (!artifact.vertexInputPatches.empty()) {
+            if (preparedVertex) {
                 for (const auto& input : result.vertexInputs) {
                     const auto selectors = moduleKey[index++];
                     const auto first = PipelineSpecialization::VertexBase + input.location * PipelineSpecialization::VertexWords;

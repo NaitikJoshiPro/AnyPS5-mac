@@ -1,4 +1,5 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include "MetalBackend/MslConservative.hpp"
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -176,6 +177,13 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     // only (the guest body never touches it).
     const bool rasterOrder = fragment && state.reflection.rasterOrder;
     if (rasterOrder) parameters.push_back("device uint* aps5_rog [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::RasterOrder)) + "), raster_order_group(0)]]");
+    // Triangle-vertices draws (MslAbi Version 5): the TriangleVerticesHeader and the guest vertex ids,
+    // a stage-function parameter only in that mode (other draws bind nothing at the slot).
+    if (!fragment) {
+        text += "struct Aps5TriangleVertices {\n    float4 viewport;\n    float2 depthRange;\n    uint triangles;\n    uint flags;\n};\n";
+        text += "static_assert(sizeof(Aps5TriangleVertices) == 32, \"MslAbi::TriangleVerticesHeader\");\n\n";
+        parameters.back() += "\n#if " + TriangleVerticesCondition() + "\n    , device const uint* aps5_triangles [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::TriangleVertices)) + ")]]\n#endif";
+    }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
     text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n\n";
@@ -185,6 +193,10 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     text += ")\n{\n";
     if (!graphics.outputType.empty()) text += "    " + graphics.outputType + " aps5_out = {};\n";
     if (state.usesValidMask) text += "    uint aps5_valid = 1u;\n";
+    // Alpha to coverage starts from full coverage, as the SPIR-V path's StoreCoverage(-1): only a
+    // float MRT0 export lowers it, so uint exports keep every sample.
+    if (fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) text += "    aps5_out.aps5_sample_mask = 0xffffffffu;\n";
+    if (fragment) text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentText() + "#endif\n";
     const auto call = [&](const std::string& vertexId, const std::string& output) {
         std::string line = "aps5_body(";
         for (std::size_t index = 0; index < arguments.size(); ++index) {
@@ -224,6 +236,30 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "    const float aps5_w = aps5_v[0].aps5_position.w;\n";
         text += "    const bool aps5_valid_rect = aps5_edges == 1u && aps5_w > 0.0f && aps5_v[1].aps5_position.w == aps5_w && aps5_v[2].aps5_position.w == aps5_w && all(isfinite(aps5_out.aps5_position));\n";
         text += "    if (!aps5_valid_rect) aps5_out.aps5_position = float4(0.0f);\n";
+        // APS5_TRIANGLE_VERTICES (MslAbi Version 5): 3 host vertices per guest triangle, non-indexed;
+        // each runs the guest program for its triangle's 3 guest vertices (TriangleVerticesHeader,
+        // then the ids) and emits its corner, plus the corner values of the per-vertex locations,
+        // one-hot barycentric weights and the conservative-rasterization outputs the macros ask for.
+        text += "#elif " + TriangleVerticesCondition() + "\n";
+        text += "    device const Aps5TriangleVertices& aps5_tv = *reinterpret_cast<device const Aps5TriangleVertices*>(aps5_triangles);\n";
+        text += "    device const uint* aps5_tv_ids = aps5_triangles + 8u;\n";
+        text += "    const uint aps5_triangle = aps5_vertex_id / 3u;\n";
+        text += "    const uint aps5_corner = aps5_vertex_id % 3u;\n";
+        text += "    Aps5VertexOut aps5_v[3] = {};\n";
+        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
+            text += "    " + call("aps5_tv_ids[aps5_triangle * 3u + " + std::to_string(vertex) + "u]", "aps5_v[" + std::to_string(vertex) + "]") + "\n";
+        }
+        text += "    aps5_out = aps5_v[aps5_corner];\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    aps5_out." + PerVertexField(output.location, vertex) + " = aps5_v[" + std::to_string(vertex) + "].p" + std::to_string(output.location) + ";\n";
+            text += "#endif\n";
+        }
+        text += "    const float3 aps5_weights = float3(aps5_corner == 0u ? 1.0f : 0.0f, aps5_corner == 1u ? 1.0f : 0.0f, aps5_corner == 2u ? 1.0f : 0.0f);\n";
+        text += "#if (APS5_BARYCENTRICS & 1)\n    aps5_out.aps5_bw = aps5_weights;\n#endif\n";
+        text += "#if (APS5_BARYCENTRICS & 2)\n    aps5_out.aps5_bwl = aps5_weights;\n#endif\n";
+        text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::VertexText() + "#endif\n";
         text += "#else\n    " + call("aps5_vertex_id", "aps5_out") + "\n#endif\n";
     } else if (rasterOrder) {
         // The guest program is the critical section, as the SPIR-V path's Begin/End invocation

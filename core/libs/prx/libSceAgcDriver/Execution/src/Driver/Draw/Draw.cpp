@@ -261,7 +261,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // the vertex function instead (MslAbi::RectListMacro, work package D6), with no extra stages.
     const bool rectListStages = localDevice->Target().backend != ShaderRecompiler::ShaderBackend::Msl;
     if (graphics.rectList && rectListStages) buildRectList();
-    if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active) {
+    // Emulated barycentrics take a generated geometry stage on the SPIR-V path; the Metal device
+    // draws them through its triangle-vertices expansion instead (MslAbi Version 5).
+    if (rectListStages && !programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active) {
         require(!graphics.rectList && graphics.stages.path == Graphics::ShaderPath::Vertex && programs.size() == 2 && programResults[0] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric needs a vertex shader before it");
         results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits()));
         stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});

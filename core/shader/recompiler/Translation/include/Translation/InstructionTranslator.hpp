@@ -33,6 +33,10 @@ struct TranslateOptions {
     std::uint32_t sharedMemoryBytes = 0;
     std::uint64_t shaderHash = 0;
     bool fragmentShaderBarycentricEnabled = false;
+    // Without fragmentShaderBarycentricEnabled: 16-bit interpolation is translated anyway and marks
+    // the program (ProgramMetadata::barycentricEmulation) for the barycentric re-translation, as a
+    // host-interpolation failure does (devices that emulate per-vertex values: the MSL backend).
+    bool barycentricFallback = false;
     bool nativeFloat16 = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;

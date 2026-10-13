@@ -250,6 +250,7 @@ function(add_shader_recompiler target runtimeTarget)
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader
             MslAbi::Index
+            MslConservative::FragmentText
             GetPreparedArtifact
             MaterializeShader
             RegistrationResult

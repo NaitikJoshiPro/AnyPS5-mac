@@ -99,7 +99,9 @@ void TranslationContext::vInterpMovF32(const RdnaInstruction& inst) {
 
 IrF32 TranslationContext::interpolationParameterF16(const RdnaInstruction& inst, std::uint32_t mode) {
     if (!fragmentShaderBarycentricEnabled) {
-        throw std::runtime_error("16-bit interpolation of pixel input " + std::to_string(inst.source1.value) + " requires fragmentShaderBarycentric");
+        if (!barycentricFallback) throw std::runtime_error("16-bit interpolation of pixel input " + std::to_string(inst.source1.value) + " requires fragmentShaderBarycentric");
+        // The recompiler re-translates the program with barycentrics (emulated per-vertex values).
+        program.Metadata().barycentricEmulation = true;
     }
     if (pixelInput == nullptr || !pixelInput->InputIsFp16(inst.source1.value)) {
         throw std::runtime_error("pixel input " + std::to_string(inst.source1.value) + " is read with 16-bit interpolation without FP16_INTERP_MODE");

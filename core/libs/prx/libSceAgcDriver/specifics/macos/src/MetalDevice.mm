@@ -692,10 +692,11 @@ std::string VulkanDevice::DeviceName() const {
 ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     const auto threadgroupMemory = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
     const auto threads = state->device.maxThreadsPerThreadgroup;
-    // fragmentShaderBarycentricEnabled stays false: the front end's barycentric mode interpolates
-    // from per-vertex attribute values (VK_KHR_fragment_shader_barycentric), which Metal has only
-    // on Apple10 (vertex_value); Apple7+ has [[barycentric_coord]] alone (DeviceProfile, B6).
-    ShaderRecompiler::SpirvTarget target {0u, 0u, 32u, Bda::Version, state->capabilities, state->extensions, false, {static_cast<std::uint32_t>(threads.width), static_cast<std::uint32_t>(threads.height), static_cast<std::uint32_t>(threads.depth)}, 1024u, threadgroupMemory, {}, {}};
+    // fragmentShaderBarycentricEnabled: per-vertex fragment values are emulated (MslAbi Version 5
+    // triangle-vertices draws; Metal's own per-vertex values are Apple10-only). On the MSL backend
+    // the recompiler still starts every pixel program with host interpolation and switches to the
+    // emulation only for programs that need per-vertex values (Recompiler.cpp).
+    ShaderRecompiler::SpirvTarget target {0u, 0u, 32u, Bda::Version, state->capabilities, state->extensions, true, {static_cast<std::uint32_t>(threads.width), static_cast<std::uint32_t>(threads.height), static_cast<std::uint32_t>(threads.depth)}, 1024u, threadgroupMemory, {}, {}};
     target.backend = ShaderRecompiler::ShaderBackend::Msl;
     // Formats whose sRGB decode the image path does in the texture view (D4, MetalImages.h).
     target.srgbDecodeFormats = Graphics::Metal::SrgbDecodeFormats();
