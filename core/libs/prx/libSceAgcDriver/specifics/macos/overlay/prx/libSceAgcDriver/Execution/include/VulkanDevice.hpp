@@ -223,9 +223,10 @@ public:
     // batches whose completion record was missing; sums of the batches submitted between the flip
     // packet and the blit (ahead of it) and behind the blit (after_flip), of the last-submit and
     // blit-submit times after the flip packet; noted in-place reads checked
-    // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
+    // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence; frames dropped because
+    // the layer had no free drawable (nextDrawable returned nil).
     struct PresentStatistics {
-        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten;
+        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
     };
     static PresentStatistics PresentCounts();

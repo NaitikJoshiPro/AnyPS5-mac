@@ -429,8 +429,14 @@ bool VulkanDevice::AcquireImage() {
     if (presenter->target != nil) return true;
     @autoreleasepool {
         if (presenter->layer != nil) {
+            // Upstream acquires with a zero timeout and drops the frame when no swapchain image is
+            // free. CAMetalLayer has no non-blocking acquire: nextDrawable waits up to its 1 s
+            // timeout and returns nil, which is counted as the same drop.
             id<CAMetalDrawable> drawable = [presenter->layer nextDrawable];
-            if (drawable == nil) return false;
+            if (drawable == nil) {
+                ++Counters().acquireDrops;
+                return false;
+            }
             presenter->drawable = drawable;
             presenter->target = drawable.texture;
         } else {

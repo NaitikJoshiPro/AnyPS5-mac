@@ -2288,6 +2288,22 @@ void GuestBufferMemory::AcquireRegistered() {
                     publish = false;
                     spaces.unpublished.fetch_add(1, std::memory_order_relaxed);
                 } else {
+                    // Upstream fdefd7660: adjacent regions of one import with the same access merge
+                    // before publishing, so the address-space table holds one range per run.
+                    std::size_t kept = 0;
+                    for (std::size_t index = 0; index < regions.size(); ++index) {
+                        auto& region = regions[index];
+                        if (kept != 0) {
+                            auto& previous = regions[kept - 1];
+                            if (region.direct != nullptr && previous.direct == region.direct && previous.end == region.begin && previous.writable == region.writable && region.mirror == nullptr && previous.mirror == nullptr && !region.sparse && !previous.sparse && region.end <= region.direct->base + region.direct->bytes) {
+                                previous.end = region.end;
+                                continue;
+                            }
+                        }
+                        if (kept != index) regions[kept] = std::move(region);
+                        ++kept;
+                    }
+                    regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(kept), regions.end());
                     for (const auto& region : regions) {
                         if (region.direct != nullptr || region.mirror != nullptr) ranges.push_back(addressRange(region));
                     }

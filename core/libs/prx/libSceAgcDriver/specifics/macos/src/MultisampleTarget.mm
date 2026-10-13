@@ -207,8 +207,19 @@ struct GuardedRange {
     std::uint32_t samples;
 };
 
+// Upstream 4d37c9336: winpthreads initializes a static rwlock on its first lock and fails a
+// concurrent first lock, so the mutex is locked once at construction. Harmless on macOS; kept in
+// step with the original.
+class PrimedSharedMutex : public std::shared_mutex {
+public:
+    PrimedSharedMutex() {
+        lock();
+        unlock();
+    }
+};
+
 std::shared_mutex& guardedMutex() {
-    static std::shared_mutex mutex;
+    static PrimedSharedMutex mutex;
     return mutex;
 }
 

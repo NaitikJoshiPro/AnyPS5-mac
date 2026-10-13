@@ -94,8 +94,13 @@ int main(int argc, char** argv) {
         BuildBands();
         const GuestVolume volume((VolumeTarget(nullptr).bytes + 65535u) & ~std::size_t{65535u});
         const auto color = VolumeTarget(volume.Data());
-        Run(*device, color, false);
-        Check(volume.Data(), color, "vertex draw");
+        Run(*device, color, false, PixelCode, false);
+        Check(volume.Data(), color, "vertex draw", WhiteBands);
+        // Upstream fdefd7660: a pixel shader reading the layer from its packed ancillary word.
+        const GuestVolume fieldVolume((VolumeTarget(nullptr).bytes + 65535u) & ~std::size_t{65535u});
+        const auto fieldColor = VolumeTarget(fieldVolume.Data());
+        Run(*device, fieldColor, false, LayerFieldPixelCode, true);
+        Check(fieldVolume.Data(), fieldColor, "a pixel shader reading the render target index of its packed ancillary word", LayerFieldBands);
         if (vertexOnly) {
             std::puts("layered volume vertex draw tests passed");
         } else if (target.mesh.has_value()) {
@@ -103,7 +108,7 @@ int main(int argc, char** argv) {
             const GuestVolume meshVolume((VolumeTarget(nullptr).bytes + 65535u) & ~std::size_t{65535u});
             const auto meshColor = VolumeTarget(meshVolume.Data());
             RunMesh(*device, meshColor);
-            Check(meshVolume.Data(), meshColor, "mesh draw");
+            Check(meshVolume.Data(), meshColor, "mesh draw", WhiteBands);
         } else {
             std::puts("mesh case skipped, the device has no VK_EXT_mesh_shader");
         }
