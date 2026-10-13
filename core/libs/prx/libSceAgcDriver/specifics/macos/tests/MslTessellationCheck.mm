@@ -16,6 +16,7 @@
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include <array>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <optional>
@@ -162,6 +163,11 @@ int main() {
             const auto domain = Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor);
             const auto fragment = Compile(target, ShaderStage::Fragment, PixelCode, cursor);
             std::puts("recompiled the local, hull, domain and pixel programs");
+            if (std::getenv("APS5_TESS_DUMP") != nullptr || true) {
+                const std::string hs(hull.msl.Source());
+                const std::string ls(local.msl.Source());
+                std::printf("=== LOCAL BODY\n%s\n=== HULL BODY\n%s\n", ls.substr(ls.find("static void aps5_body(")).c_str(), hs.substr(hs.find("static void aps5_body(")).c_str());
+            }
             const std::array<std::pair<const ShaderRecompiler::RecompileResult*, Abi::Stage>, 3> stages{{{&local, Abi::Stage::Local}, {&hull, Abi::Stage::Hull}, {&domain, Abi::Stage::Domain}}};
             for (const auto& [result, stage] : stages) {
                 Require(!result->msl.empty() && result->msl.Reflection().stage == stage, "a tessellation program does not reflect its tessellation stage");
