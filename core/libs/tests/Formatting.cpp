@@ -53,12 +53,11 @@ static int APS5_VABI FormatListS(char* buffer, size_t size, const char* format, 
 }
 
 static int APS5_VABI ScanList(const char* buffer, const char* format, ...) {
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
+    APS5_VA_BEGIN(format);
     VaList list;
     std::memcpy(&list, args, sizeof(list));
     const int result = vsscanf_nid_postfix(buffer, format, &list);
-    __builtin_sysv_va_end(args);
+    APS5_VA_END();
     return result;
 }
 

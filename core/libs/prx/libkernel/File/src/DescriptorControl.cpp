@@ -306,7 +306,11 @@ Entry InitialEntry(int fd) {
     if (host & O_APPEND) status |= Append;
     if (host & O_ASYNC) status |= Asynchronous;
     if ((host & O_SYNC) == O_SYNC) status |= Synchronous;
+#ifdef O_DIRECT
     if (host & O_DIRECT) status |= Direct;
+#endif
+    // macOS has no O_DIRECT status flag (uncached I/O is the per-descriptor F_NOCACHE, which cannot be
+    // read back); open never sets it on the host, so the guest's Direct bit lives only in the entry.
     return {(descriptorFlags & FD_CLOEXEC) != 0, std::make_shared<int>(status)};
 }
 

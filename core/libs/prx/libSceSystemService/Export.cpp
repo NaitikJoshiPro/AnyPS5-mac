@@ -13,10 +13,14 @@
 #include <vector>
 #if defined(_WIN32)
 #include <windows.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #endif
 #include "prx/libc/include/Shutdown.hpp"
+#ifdef __APPLE__
+#include "prx/libc/include/GuestMachineState.hpp"
+#include "prx/libc/include/specifics/macos/ExecutablePath.hpp"
+#endif
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -140,16 +144,23 @@ void StartHostExecutable(HostLaunch& launch) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
 }
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 struct HostLaunch {
     std::string executable;
     std::vector<std::string> arguments;
 };
 
 HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
+#ifdef __APPLE__
+    // Under the arm64 runner the process image is the runner, not the converted title: starting the next
+    // title would have to go through the runner's command line, which is not wired up yet.
+    if (LibcHasMachineState_nid_no_patch()) UnconvertedExecutable("starting an executable under the arm64 runner");
+    const auto own = MacOsExecutablePath();
+#else
     std::error_code error;
     const auto own = std::filesystem::read_symlink("/proc/self/exe", error);
     if (error) throw std::runtime_error("sceSystemServiceLoadExec: cannot read /proc/self/exe: " + error.message());
+#endif
     HostLaunch launch;
     if (std::strcmp(path, MainExecutable) == 0) {
         const char* main = std::getenv(MainExecutableVariable);

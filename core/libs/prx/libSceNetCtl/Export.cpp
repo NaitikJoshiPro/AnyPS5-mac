@@ -10,6 +10,11 @@
 #ifdef __linux__
 #include <netpacket/packet.h>
 #endif
+#ifdef __APPLE__
+#include <net/route.h>
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 #include <cstdint>
 #include <cstddef>
@@ -19,7 +24,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #include <vector>
 #endif
 
@@ -115,6 +120,27 @@ static void HostTraffic(std::uint64_t& sent, std::uint64_t& received) {
         received += NetCtlReadByteCounter_nid_no_patch((statistics + "rx_bytes").c_str());
     }
     freeifaddrs(interfaces);
+#elif defined(__APPLE__)
+    // NET_RT_IFLIST2 reports each interface's 64-bit counters (getifaddrs' if_data has 32-bit ones that wrap).
+    int request[] = {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0};
+    std::size_t length = 0;
+    if (::sysctl(request, 6, nullptr, &length, nullptr, 0) != 0)
+        throw std::runtime_error("sceNetCtlGetIfStat: the host interface list is unavailable");
+    std::vector<char> buffer(length);
+    if (::sysctl(request, 6, buffer.data(), &length, nullptr, 0) != 0)
+        throw std::runtime_error("sceNetCtlGetIfStat: the host interface list is unavailable");
+    for (std::size_t offset = 0; offset + sizeof(if_msghdr) <= length;) {
+        const auto* header = reinterpret_cast<const if_msghdr*>(buffer.data() + offset);
+        if (header->ifm_msglen == 0) break;
+        if (header->ifm_type == RTM_IFINFO2) {
+            const auto* info = reinterpret_cast<const if_msghdr2*>(header);
+            if ((info->ifm_flags & IFF_UP) && !(info->ifm_flags & IFF_LOOPBACK)) {
+                sent += info->ifm_data.ifi_obytes;
+                received += info->ifm_data.ifi_ibytes;
+            }
+        }
+        offset += header->ifm_msglen;
+    }
 #else
     throw std::runtime_error("sceNetCtlGetIfStat: host interface byte counters are not implemented on this platform");
 #endif

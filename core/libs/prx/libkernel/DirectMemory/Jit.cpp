@@ -26,6 +26,10 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <cstdlib>
+#include <filesystem>
+#endif
 #endif
 
 namespace {
@@ -137,8 +141,21 @@ int DuplicateDescriptor(int descriptor) {
 }
 #else
 int CreateBacking(std::size_t bytes, int* descriptor, std::shared_ptr<JitObject>* object) {
+#ifdef __APPLE__
+    // macOS has no memfd: back the object with an unlinked temporary file, as anonymous shm_open does.
+    auto path = (std::filesystem::temp_directory_path() / "anyps5-jit-XXXXXX").string();
+    const int file = mkstemp(path.data());
+    if (file < 0) return HostFailure("create JIT shared memory", errno);
+    ::unlink(path.c_str());
+    if (fcntl(file, F_SETFD, FD_CLOEXEC) != 0) {
+        const int error = errno;
+        ::close(file);
+        return HostFailure("create JIT shared memory", error);
+    }
+#else
     const int file = memfd_create("anyps5 jit shared memory", MFD_CLOEXEC);
     if (file < 0) return HostFailure("create JIT shared memory", errno);
+#endif
     const bool representable = bytes <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
     if (!representable || ftruncate(file, static_cast<off_t>(bytes)) != 0) {
         const int error = !representable || errno == EFBIG ? ENOMEM : errno;

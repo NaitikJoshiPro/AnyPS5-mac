@@ -9,6 +9,8 @@
 #include <string>
 #if !APS5_GUEST_VA_LIST_IS_HOST
 #include "prx/libc/include/WindowsFormatting.hpp"
+#endif
+#ifdef _WIN32
 #include <process.h>
 #else
 #include <unistd.h>

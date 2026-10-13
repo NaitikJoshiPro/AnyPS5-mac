@@ -245,8 +245,12 @@ int APS5_VABI _Cnd_timedwait_nid_postfix(void** conditionHandle, void** mutexHan
     std::unique_lock lock(mutex->native, std::adopt_lock);
     bool timeout = false;
     try {
+        // system_clock::duration is microseconds on libc++ (macOS) and nanoseconds on libstdc++;
+        // convert each part separately so the seconds range checked above cannot overflow, and
+        // round the sub-second part up so the wait never ends before the deadline.
         const auto deadlineTime = std::chrono::system_clock::time_point(
-            std::chrono::seconds(deadline.tv_sec) + std::chrono::nanoseconds(deadline.tv_nsec));
+            std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::seconds(deadline.tv_sec)) +
+            std::chrono::ceil<std::chrono::system_clock::duration>(std::chrono::nanoseconds(deadline.tv_nsec)));
         timeout = (condition->native.wait_until(lock, deadlineTime) == std::cv_status::timeout);
     } catch (const std::system_error&) {
         lock.release();

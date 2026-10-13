@@ -8,8 +8,10 @@
 #include <windows.h>
 #include <io.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+#include <stdexcept>
 
 struct LibcStatvfs;
 extern "C" int APS5_VABI fstatvfs_nid_postfix(int, LibcStatvfs*);
@@ -99,6 +101,25 @@ int OpenMetadata(const std::filesystem::path& path, bool directory) {
         return Fail(HostError(error));
     }
     return descriptor;
+#elif defined(__APPLE__)
+    // macOS has no O_PATH: opening still checks read permission, blocks on a FIFO and fails on a socket. Resolve
+    // the path with stat (which needs none of that), open it for events only when that can work, and otherwise
+    // open its parent directory, which lies on the same volume unless the path is a mount point.
+    struct stat status{};
+    if (::stat(path.c_str(), &status) != 0) return Fail(HostError(errno));
+    if (directory && !S_ISDIR(status.st_mode)) return Fail(20);
+    if (S_ISDIR(status.st_mode) || S_ISREG(status.st_mode)) {
+        const int descriptor = ::open(path.c_str(), O_EVTONLY | O_NONBLOCK | O_CLOEXEC | (directory ? O_DIRECTORY : 0));
+        if (descriptor >= 0) return descriptor;
+        if (errno != EACCES) return Fail(HostError(errno));
+    }
+    auto parent = path.parent_path();
+    if (parent.empty()) parent = ".";
+    struct stat parentStatus{};
+    if (S_ISDIR(status.st_mode) && (::stat(parent.c_str(), &parentStatus) != 0 || parentStatus.st_dev != status.st_dev))
+        throw std::runtime_error("statvfs: an unreadable mount point is not supported on macOS: " + path.string());
+    const int descriptor = ::open(parent.c_str(), O_EVTONLY | O_DIRECTORY | O_CLOEXEC);
+    return descriptor < 0 ? Fail(HostError(errno)) : descriptor;
 #else
     const int descriptor = ::open(path.c_str(), O_PATH | O_CLOEXEC | (directory ? O_DIRECTORY : 0));
     return descriptor < 0 ? Fail(HostError(errno)) : descriptor;

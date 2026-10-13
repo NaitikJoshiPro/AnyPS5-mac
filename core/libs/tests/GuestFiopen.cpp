@@ -149,7 +149,8 @@ int main() {
     Require(stream != nullptr && std::fgetc(stream->GetHandle()) == 'k');
     fclose_nid_postfix(stream);
 
-#ifndef _WIN32
+#ifdef __linux__
+    // /dev/full is Linux-only (macOS has none).
     auto* full = std::fopen("/dev/full", "wb");
     Require(full != nullptr);
     auto* fullStream = new FileStream(full, true);

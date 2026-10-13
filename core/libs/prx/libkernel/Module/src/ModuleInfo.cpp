@@ -68,6 +68,9 @@ void SetName(TInfo& info, const std::string& name) {
 struct GuestImage {
     const void* native;
     std::uintptr_t address;
+#ifdef __APPLE__
+    std::string name;
+#endif
 };
 
 std::uint64_t PageSpan(std::uint64_t address, std::uint64_t size) {
@@ -206,6 +209,33 @@ std::vector<GuestImage> GuestImages() {
     }
     return images;
 }
+#else
+int CollectGuestImage(dl_phdr_info* image, std::size_t, void* data) {
+    const std::string_view name = image->dlpi_name ? image->dlpi_name : "";
+    if (!name.empty() && !name.ends_with(".prx")) return 0;
+    for (std::uint16_t i = 0; i < image->dlpi_phnum; ++i) {
+        const auto& header = image->dlpi_phdr[i];
+        if (header.p_type != PT_LOAD) continue;
+        static_cast<std::vector<GuestImage>*>(data)->push_back({nullptr, image->dlpi_addr + header.p_vaddr, std::string(name)});
+        return 0;
+    }
+    return 0;
+}
+
+// macOS has no link_map: dl_iterate_phdr (specifics/macos/GuestImages.cpp) lists the relinked dyld images
+// and the images the runner maps itself. A dyld image is keyed by its Mach-O header, as
+// sceKernelGetModuleInfoFromAddr does; a runner-mapped image (no dyld entry) by its first PT_LOAD address.
+std::vector<GuestImage> GuestImages() {
+    std::vector<GuestImage> images;
+    dl_iterate_phdr(CollectGuestImage, &images);
+    for (auto& image : images) {
+        Dl_info symbol{};
+        image.native = dladdr(reinterpret_cast<const void*>(image.address), &symbol) && symbol.dli_fbase
+                           ? symbol.dli_fbase
+                           : reinterpret_cast<const void*>(image.address);
+    }
+    return images;
+}
 #endif
 
 int AddGuestSegmentBytes(dl_phdr_info* image, std::size_t, void* data) {
@@ -227,8 +257,12 @@ std::uint64_t GuestSegmentBytes() {
 }
 
 bool SystemImage(const GuestImage& image) {
+#ifdef __APPLE__
+    const std::string_view path = image.name;
+#else
     const auto* name = static_cast<const link_map*>(image.native)->l_name;
     const std::string_view path = name ? name : "";
+#endif
     return !path.empty() && !path.ends_with(GuestModuleSuffix);
 }
 #else
@@ -439,17 +473,6 @@ int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, M
     return 0;
 }
 
-#ifdef __APPLE__
-int APS5_VABI sceKernelGetModuleList(KernelModule*, std::size_t, std::size_t*) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceKernelGetModuleInfo(KernelModule, ModuleInfo*) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-#else
 int APS5_VABI sceKernelGetModuleList(KernelModule* handles, std::size_t count, std::size_t* actual) {
     return FillModuleList(handles, count, actual, false);
 }
@@ -494,7 +517,6 @@ std::int32_t APS5_VABI sceKernelInternalMemoryGetModuleSegmentInfo_nid_postfix(I
     *result = {reinterpret_cast<std::uintptr_t>(address), size};
     return 0;
 }
-#endif
 
 std::uint64_t GuestImageSegmentBytes_nid_no_patch() {
     return GuestSegmentBytes();

@@ -46,10 +46,20 @@ void* Map(int fd, int prot, void* hint = nullptr) {
 }
 
 int Call(const void* code) {
+#if defined(__x86_64__)
     using Function = int (*)();
     Function function;
     std::memcpy(&function, &code, sizeof(function));
     return function();
+#else
+    // On arm64 the guest's x86-64 code runs in the translator, never natively: check that the executable
+    // view holds the `mov eax, imm32; ret` the writable view wrote and return its immediate.
+    const auto* bytes = static_cast<const unsigned char*>(code);
+    Require(bytes[0] == 0xb8 && bytes[5] == 0xc3);
+    std::uint32_t value;
+    std::memcpy(&value, bytes + 1, sizeof(value));
+    return static_cast<int>(value);
+#endif
 }
 
 void WriteReturn(void* code, std::uint32_t value) {

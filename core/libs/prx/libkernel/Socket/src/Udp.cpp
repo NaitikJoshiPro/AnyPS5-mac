@@ -13,6 +13,9 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/select.h>
+#endif
 #include <cerrno>
 #endif
 #include "prx/libc/include/GuestArena.hpp"
@@ -705,6 +708,13 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
             argument = type == File::FcntlArgument::Int ? __builtin_va_arg(arguments, int)
                                                         : reinterpret_cast<std::intptr_t>(__builtin_va_arg(arguments, void*));
             __builtin_sysv_va_end(arguments);
+#elif !APS5_GUEST_VA_LIST_IS_HOST
+            // Guest variadic arguments use the x86-64 SysV layout, not the host va_list.
+            APS5_VA_BEGIN(command);
+            LibcDetail::FormatArguments guestArguments(args);
+            argument = type == File::FcntlArgument::Int ? guestArguments.Next<int>()
+                                                        : reinterpret_cast<std::intptr_t>(guestArguments.Next<void*>());
+            APS5_VA_END();
 #else
             std::va_list arguments;
             va_start(arguments, command);
@@ -1302,6 +1312,48 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
             return ready;
         }
     }
+#elif defined(__APPLE__)
+    // XNU's poll never reports a TCP socket's pending out-of-band byte (POLLPRI and POLLRDBAND stay clear and
+    // the wait does not wake), while select's exception set does. When the guest asks a socket for urgent data,
+    // wait in short poll slices and read the exception set after each one.
+    std::vector<std::size_t> urgent;
+    for (std::size_t i = 0; i < socketCount; ++i)
+        if (native[i].events & (POLLPRI | POLLRDBAND)) urgent.push_back(i);
+    const auto markUrgent = [&] {
+        int found = 0;
+        for (const auto i : urgent) {
+            if (native[i].fd >= FD_SETSIZE)
+                throw std::runtime_error("poll: urgent data on socket " + std::to_string(native[i].fd) + " beyond FD_SETSIZE is not supported on macOS");
+            fd_set exceptional;
+            FD_ZERO(&exceptional);
+            FD_SET(native[i].fd, &exceptional);
+            timeval now{};
+            if (::select(native[i].fd + 1, nullptr, nullptr, &exceptional, &now) == 1 && FD_ISSET(native[i].fd, &exceptional)) {
+                native[i].revents = static_cast<short>(native[i].revents | (native[i].events & (POLLPRI | POLLRDBAND)));
+                ++found;
+            }
+        }
+        return found;
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout < 0 ? 0 : timeout);
+    for (;;) {
+        int wait = ready ? 0 : timeout;
+        if (!urgent.empty() && wait != 0) {
+            if (timeout < 0) wait = 5;
+            else {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+                wait = static_cast<int>(std::clamp<long long>(left, 0, 5));
+            }
+        }
+        for (auto& request : native) request.revents = 0;
+        const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), wait);
+        if (result < 0) return Fail(NativeError());
+        const int urgentFound = urgent.empty() ? 0 : markUrgent();
+        const bool expired = timeout >= 0 && std::chrono::steady_clock::now() >= deadline;
+        if (urgent.empty() || ready || result > 0 || urgentFound > 0 || expired || timeout == 0) break;
+    }
+    for (std::size_t i = 0; i < native.size(); ++i) collect(i, i >= socketCount);
+    return ready;
 #else
     const int wait = ready ? 0 : timeout;
     const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), wait);

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <thread>
 #include <typeinfo>
@@ -76,6 +77,25 @@ static void OnTerminate() {
     std::fprintf(stderr, "unexpected termination at expiry\n");
     std::_Exit(1);
 }
+
+#ifdef __APPLE__
+// libkernel's host threads throw through the host's libc++abi on macOS, not through libc's guest exception
+// runtime as on Linux (where libc interposes the C++ ABI), so the expiry reaches the host terminate handler.
+static void OnHostTerminate() {
+    try {
+        if (std::current_exception()) std::rethrow_exception(std::current_exception());
+    } catch (const std::runtime_error& error) {
+        if (std::strstr(error.what(), "it_interval 0.250000 s") != nullptr && delivered == 0) {
+            std::printf("expiry threw: %s\n", error.what());
+            std::fflush(stdout);
+            std::_Exit(0);
+        }
+    } catch (...) {
+    }
+    std::fprintf(stderr, "unexpected termination at expiry\n");
+    std::_Exit(1);
+}
+#endif
 
 int main() {
     const auto ignore = reinterpret_cast<Handler>(std::uintptr_t{1});
@@ -156,6 +176,9 @@ int main() {
 
     Require(signal_nid_postfix(14, OnAlarm) == ignore, "SIGALRM handler was not installed");
     _ZSt13set_terminatePFvvE_nid_postfix(OnTerminate);
+#ifdef __APPLE__
+    std::set_terminate(OnHostTerminate);
+#endif
     const GuestItimerval handled{{0, 250000}, {0, 50000}};
     Require(setitimer_nid_postfix(0, &handled, nullptr) == 0, "arming the handled timer failed");
     std::this_thread::sleep_for(std::chrono::seconds(2));

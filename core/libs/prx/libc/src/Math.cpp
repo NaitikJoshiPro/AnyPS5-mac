@@ -118,6 +118,9 @@ float AtanhfLog1p(float x) {
     return kFloat * Ln2High - ((halfSquare - (s * (halfSquare + r) + (kFloat * Ln2Low + c))) - f);
 }
 
+#if defined(__x86_64__)
+// The x87-exact asinl below needs the host long double to be the guest's x87 type. On arm64 the
+// long double exports take the host's double (see TechnicalDebt.md, "long double math exports").
 static_assert(std::numeric_limits<long double>::digits == 64, "guest long double is the x87 80-bit format");
 
 struct ExtendedParts {
@@ -163,6 +166,7 @@ long double AsinDenominator(long double t) {
     const auto& q = AsinDenominatorCoefficients;
     return 1.0L + t * (q[0] + t * (q[1] + t * (q[2] + t * (q[3] + t * q[4]))));
 }
+#endif
 
 }
 
@@ -184,6 +188,13 @@ float APS5_VABI asinf_nid_postfix(float x) {
     return result;
 }
 float APS5_VABI acosf_nid_postfix(float x) {
+#if !defined(__x86_64__)
+    // The console's (x - x) / (x - x) yields the x86 default NaN (sign set); arm64's default NaN is positive.
+    if (std::fabs(x) > 1.0f) {
+        std::feraiseexcept(FE_INVALID);
+        return std::bit_cast<float>(0xffc00000u);
+    }
+#endif
     const int saved_errno = errno;
     const float result = std::acos(x);
     errno = saved_errno;
@@ -249,6 +260,15 @@ double APS5_VABI fma_nid_postfix(double x, double y, double z) { return std::fma
 long double APS5_VABI acosl_nid_postfix(long double x) { return std::acos(x); }
 
 long double APS5_VABI asinl_nid_postfix(long double x) {
+#if !defined(__x86_64__)
+    // Host long double is double here; keep the FreeBSD domain error contract (EDOM + FE_INVALID).
+    if (std::isnan(x) || std::fabs(x) > 1.0L) {
+        std::feraiseexcept(FE_INVALID);
+        errno = EDOM;
+        return std::numeric_limits<long double>::quiet_NaN();
+    }
+    return std::asin(x);
+#else
     const ExtendedParts parts = SplitExtended(x);
     const int exponent = parts.signExponent & 0x7fff;
     if (exponent >= 0x3fff) {
@@ -276,6 +296,7 @@ long double APS5_VABI asinl_nid_postfix(long double x) {
         result = QuarterPiHigh - ((2.0L * s * r - (HalfPiLow - 2.0L * c)) - (QuarterPiHigh - 2.0L * w));
     }
     return (parts.signExponent & 0x8000) != 0 ? -result : result;
+#endif
 }
 
 long double APS5_VABI frexpl_nid_postfix(long double x, int* exponent) {
