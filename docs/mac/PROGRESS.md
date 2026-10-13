@@ -197,3 +197,14 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - REGRESSION: agc_driver_global_atomics64 and buffer_atomics_or_swap64 time out. Quarantined (bd73a0a1a). ATOM is on it (suspect 28a79003e, lock-table spin forward progress), along with look_back_scan.
 - gpu_suite now holds a build lease for the whole run (065898379), so runs are no longer voided by other agents' rebuilds.
 - M2 exit still open: ATOM fixes; lds_atomics64 HOLD release; f16_denormal_flush rerun (it caused the 2026-10-12 kernel panic; waiting for the user to be away from the laptop); corpus re-dump; full-suite verification.
+
+## 2026-10-13 evening — M2 exit verification: all four criteria PASS (EXIT, 5415f5dfd at dba2dbd7d)
+1. Corpus: 2,827/2,827 valid (fresh dump exit-dump1 + seed). 795 front-end-rejected, 54 spirv-rejected, 4 host-width-rejected (M3).
+2. gpu-suite/exit-final1 (all, --validation --build-first): 502 run, 488 pass, 0 fail, 0 timeout, 14 allowlisted skips (pipeline-library Vulkan internals x12, descriptor pools x2). No binaries changed during the run.
+3. G5 14/14 headless. Earlier windowed present/decode/overlay rc=0.
+4. Pipeline cache: second run 0 compiled / 3 archive hits.
+- CPU ctest -LE gpu 5,015/5,015 (56 known FEX skips). tools/mac unittests 68/68.
+- Since the last entry: ATOM (atomics64 timeouts were slow validated compiles; MslLockLoop; look_back_scan fixed; quarantine empty), lds_atomics64 released from HOLD (HOLD now empty), TESS2 (all domains/partitionings, D26, MslAbi v8), TWIN-A/B (12 pending twins written, CmdClearColorImage keep-alive fix c1d3a0e15).
+- Excluded: agc_driver_f16_denormal_flush_tests (caused the 2026-10-12 kernel panic). It needs a supervised run with the user warned.
+- Running: MSAA (MSAA render targets + resolves; draws still refuse samples>1, a gap the suite didn't catch), BUDGET (Metal device memory heap and budget).
+- Next: the f16 supervised run, merge mac-native-metal into mac-native, M3.
