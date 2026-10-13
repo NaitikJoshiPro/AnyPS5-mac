@@ -7,3 +7,5 @@
 # released 2026-10-13 after a supervised rerun under validation (passed, 0.2 s; .mac-work/logs/gpu-suite/20261012T193150Z-agc_driver_copied_writer_copy): cause was a CPU deadlock on a strong BDA-table lease, fixed in 4633c51d2:
 # agc_driver_copied_writer_copy | timeout (30 s hang, no GPU fault) 2026-10-13 00:47 after DRV 1b7067f7b routed registered memory through host imports; suspected CPU deadlock (pin waiter / leases) | metal-gpu-quarantine
 agc_driver_look_back_scan | GPU batch did not finish within 20000 ms (recorder timeout, machine recovered) in .mac-work/logs/gpu-suite/shd-final2 at db6d57ea (passed under validation at 46b3059b in shd-r5); cross-workgroup spin on 64-bit atomics (B3 lock table) suspected | metal-gpu-quarantine
+agc_driver_global_atomics64 | 30 s TIMEOUT in 3 runs at HEAD ~80442f901 (gpu-suite/corpus-v1/v2/v3, machine recovered); passed at db6d57ea4; 28a79003e (64-bit atomic reads via the lock table) suspected | metal-gpu-quarantine
+agc_driver_buffer_atomics_or_swap64 | 30 s TIMEOUT in 3 runs at HEAD ~80442f901 (gpu-suite/corpus-v1/v2/v3, machine recovered); passed at db6d57ea4; 28a79003e suspected | metal-gpu-quarantine
