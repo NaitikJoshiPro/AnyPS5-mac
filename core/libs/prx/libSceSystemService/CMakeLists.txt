@@ -1,4 +1,4 @@
-add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp)
+add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp AppState.cpp)
 target_include_directories(libSceSystemService PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceSystemService)
 
@@ -18,6 +18,19 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "Guest quick_exit handlers completed")
     if(WIN32)
         set_tests_properties(guest_system_exit guest_system_exit_parameters guest_immediate_exit guest_return_from_main guest_quick_exit PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_system_service_app_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemServiceApp.cpp)
+    target_include_directories(guest_system_service_app_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_system_service_app_tests PRIVATE libSceSystemService libkernel libc)
+    configure_windows_unwind(guest_system_service_app_tests)
+    set(systemServiceAppRun ${CMAKE_CURRENT_BINARY_DIR}/system_service_app)
+    file(WRITE ${systemServiceAppRun}/app0/sce_sys/param.json
+        "{\"titleId\":\"PPSA00000\",\"localizedParameters\":{\"en-US\":{\"titleName\":\"Example\"}},\"downloadDataSize\":0,"
+        "\"userDefinedParam1\":0,\"userDefinedParam2\":0,\"userDefinedParam3\":0,\"userDefinedParam4\":0}")
+    add_test(NAME guest_system_service_app COMMAND guest_system_service_app_tests WORKING_DIRECTORY ${systemServiceAppRun})
+    if(WIN32)
+        set_tests_properties(guest_system_service_app PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_system_service_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemService.cpp)
