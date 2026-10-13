@@ -1,6 +1,7 @@
-// Fixed guest mappings inside the macOS arm64 GPU carveout (D31): the kernel keeps 64-448 GiB as a permanent
-// guard in every process, so guest memory there is backed at guest | DisplacedFlip and native accesses to the guest
-// address are redirected by the fault handler. Translated (FEX) accesses are covered by the `displaced` fixture.
+// Fixed guest mappings in host-reserved ranges on macOS arm64 (D31, D33): the dyld shared region's unused tail, the
+// commpage guard and the GPU carveout (64-448 GiB, a permanent guard in every process) are backed at
+// guest | DisplacedFlip, and native accesses to the guest address are redirected by the fault handler. Translated
+// (FEX) accesses are covered by the `displaced` fixture.
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
@@ -24,7 +25,8 @@ int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
 
 namespace {
 
-constexpr std::uintptr_t Base = 0x4000000000ull;
+constexpr std::uintptr_t Base = 0x4000000000ull;     // GPU carveout (oops-sdk AGC_VM_BASE)
+constexpr std::uintptr_t TailBase = 0x400000000ull;  // shared region tail (oops-mesa's GPU VA high range)
 constexpr std::size_t Bytes = 0x400000;
 constexpr int CpuGpuReadWrite = 0x33;
 constexpr int CpuRead = 0x01;
@@ -74,7 +76,34 @@ int main() {
         Require(GuestArena::GuestDisplacedActive_nid_no_patch(), "the displaced window is not active on macOS arm64");
         Require(GuestArena::HostAddress(Base) == (Base | GuestArena::DisplacedFlip) && GuestArena::GuestAddress(Base | GuestArena::DisplacedFlip) == Base,
             "guest and host addresses do not round-trip");
-        Require(GuestArena::HostAddress(0x900000000ull) == 0x900000000ull, "an address outside the window was translated");
+        Require(GuestArena::HostAddress(0x100000000ull) == 0x100000000ull, "an address below the window was translated");
+        Require(GuestArena::HostAddress(0x8000000000ull) == 0x8000000000ull, "an address above the window was translated");
+
+        // The range table: shared region tail, commpage guard, GPU carveout, contiguous, one flip.
+        const GuestArena::DisplacedRange* ranges = nullptr;
+        std::size_t rangeCount = 0;
+        GuestArena::GuestDisplacedRanges_nid_no_patch(&ranges, &rangeCount);
+        for (std::size_t i = 0; i < rangeCount; ++i)
+            std::printf("displaced range %s 0x%llx-0x%llx at 0x%llx\n", ranges[i].name, static_cast<unsigned long long>(ranges[i].guestStart),
+                static_cast<unsigned long long>(ranges[i].guestEnd), static_cast<unsigned long long>(ranges[i].hostBase));
+        Require(rangeCount == 3, "expected three displaced ranges (shared region tail, commpage guard, GPU carveout)");
+        Require(ranges[0].guestStart == GuestArena::DisplacedStart() && ranges[2].guestEnd == GuestArena::DisplacedEnd, "the table does not span the window");
+        for (std::size_t i = 0; i < rangeCount; ++i) {
+            Require(ranges[i].hostBase == (ranges[i].guestStart | GuestArena::DisplacedFlip), "a range's alias is not its guest address with the flip");
+            Require(i == 0 || ranges[i].guestStart == ranges[i - 1].guestEnd, "the displaced ranges are not contiguous");
+        }
+        Require(ranges[1].guestStart == 0xFC0000000ull && ranges[2].guestStart == 0x1000000000ull, "unexpected commpage guard or carveout bounds");
+        Require(GuestArena::DisplacedStart() <= TailBase && GuestArena::DisplacedStart() > 0x180000000ull, "0x400000000 is not in the shared region tail");
+        Require(GuestArena::HostAddress(TailBase) == (TailBase | GuestArena::DisplacedFlip), "the shared region tail is not translated");
+        Require(GuestArena::HostAddress(GuestArena::DisplacedStart() - 0x4000) == GuestArena::DisplacedStart() - 0x4000, "the shared cache was translated");
+
+        // First-fit placement never lands in a displaced range.
+        for (int i = 0; i < 8; ++i) {
+            void* placed = GuestArena::GuestArenaAllocate_nid_postfix(0x10000000, 0x200000);
+            const auto at = reinterpret_cast<std::uintptr_t>(placed);
+            Require(at >= GuestArena::DisplacedEnd || at + 0x10000000 <= GuestArena::DisplacedLowest, "first fit placed an allocation in a displaced range");
+            GuestArena::GuestArenaRelease_nid_postfix(placed, 0x10000000);
+        }
 
         std::int64_t physical = 0;
         Require(sceKernelAllocateDirectMemory(0, 0x100000000ll, Bytes, 0x200000, 3, &physical) == 0, "allocate direct memory");
@@ -116,6 +145,36 @@ int main() {
         void* again = reinterpret_cast<void*>(Base);
         Require(sceKernelMapDirectMemory(&again, Bytes, CpuGpuReadWrite, MapFixed, physical, 0x200000) == 0 && again == fixed, "mapping again in the window");
         Require(Load<std::uint32_t>(Base + 0x104) == 0xa5a5a5a5u, "the mapping again lost the direct memory contents");
+
+        // A fixed mapping in the shared region tail at 0x400000000 (SuperTuxKart's first GEM_VA).
+        void* tail = reinterpret_cast<void*>(TailBase);
+        Require(sceKernelMapDirectMemory(&tail, Bytes, CpuGpuReadWrite, MapFixed, physical, 0x200000) == 0 && tail == reinterpret_cast<void*>(TailBase),
+            "the fixed mapping at 0x400000000 failed");
+        const auto tailFaults = Faults();
+        Require(Load<std::uint32_t>(TailBase + 0x104) == 0xa5a5a5a5u, "a native load in the shared region tail missed the alias");
+        Store<std::uint64_t>(TailBase + 0x2000, 0x0102030405060708ull);
+        Require(Load<std::uint64_t>(GuestArena::HostAddress(TailBase) + 0x2000) == 0x0102030405060708ull, "a native store in the shared region tail missed the alias");
+        Require(Load<std::uint64_t>(Base + 0x2000) == 0x0102030405060708ull, "the tail and carveout views do not share the pages");
+        Require(Faults() >= tailFaults + 3, "the tail accesses did not go through the fault handler");
+        Require(sceKernelMprotect(tail, 0x4000, CpuRead) == 0 && HostProtection(GuestArena::HostAddress(TailBase)) == VM_PROT_READ, "mprotect in the tail");
+        Require(sceKernelMunmap(tail, Bytes) == 0 && HostProtection(GuestArena::HostAddress(TailBase)) == VM_PROT_NONE, "munmap in the tail");
+
+        const auto refusedWith = [](std::uintptr_t at, std::size_t bytes, const char* expected) {
+            try {
+                GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(at), bytes);
+            } catch (const std::runtime_error& error) {
+                std::printf("refused 0x%llx+0x%zx: %s\n", static_cast<unsigned long long>(at), bytes, error.what());
+                return std::string(error.what()).find(expected) != std::string::npos;
+            }
+            GuestArena::GuestArenaRelease_nid_postfix(reinterpret_cast<void*>(at), bytes);
+            return false;
+        };
+        // Across the shared cache's end: half host memory, half alias.
+        Require(refusedWith(GuestArena::DisplacedStart() - 0x4000, 0x8000, "straddles"), "a range straddling the shared cache's end was accepted");
+        // The PS5 system-reserved range (0x7FFFFC000-0x1000000000) covers the tail/commpage and commpage/carveout
+        // boundaries: refused there as on every host, with its own message.
+        Require(refusedWith(0xFC0000000ull - 0x4000, 0x8000, "system-reserved"), "a range across the tail/commpage boundary was accepted");
+        Require(refusedWith(0x1000000000ull - 0x4000, 0x8000, "system-reserved"), "a range across the commpage/carveout boundary was accepted");
 
         // A range across the window's edge has no single backing.
         bool refused = false;

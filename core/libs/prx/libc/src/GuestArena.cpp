@@ -124,6 +124,12 @@ public:
     void MarkUsed(const void* pointer, std::size_t bytes) {
         std::lock_guard lock(_lock);
         const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+        if (bytes != 0 && start < SystemReservedEnd && start + bytes > SystemReservedStart) {
+            char message[192];
+            std::snprintf(message, sizeof(message), "fixed guest mapping 0x%llx+0x%zx overlaps the PS5 system-reserved range 0x%llx-0x%llx",
+                static_cast<unsigned long long>(start), bytes, static_cast<unsigned long long>(SystemReservedStart), static_cast<unsigned long long>(SystemReservedEnd));
+            throw std::runtime_error(message);
+        }
         auto& used = UsedFor(start, bytes);
         const auto next = used.lower_bound(start);
         if ((next != used.end() && next->first < start + bytes) || (next != used.begin() && std::prev(next)->second > start)) {
@@ -221,7 +227,8 @@ private:
     // The PS5 layout from 8 GiB is reserved as on Linux, around what the host already mapped there: on
     // arm64 the dyld shared region spans 6 to 63 GiB, system guard ranges follow up to 448 GiB, and malloc
     // places its regions between 448 and 512 GiB (macOS 27). Those stay host regions; what the host maps
-    // later lands below 8 GiB or above the arena.
+    // later lands below 8 GiB or above the arena. The shared region's unused tail, the commpage guard and the GPU
+    // carveout are displaced instead (D31, D33).
     void SeedAppleUsedRanges() {
         _displacedActive = GuestDisplacedEnable_nid_no_patch();
         for (mach_vm_address_t address = ArenaStart; address < ApplicationAreaEnd;) {
@@ -234,11 +241,11 @@ private:
             const auto last = std::min<std::uintptr_t>(address + size, ApplicationAreaEnd);
             address += size;
             if (_displacedActive && OverlapsDisplaced(first, last - first)) {
-                // The kernel's guard there is backed by the displaced alias (GuestDisplaced.hpp): it stays out of
-                // first-fit placement (AddUsed below) but takes fixed guest mappings.
-                if (first < DisplacedStart) {
-                    AddUsed(first, DisplacedStart);
-                    _hostRegions.emplace_back(first, DisplacedStart);
+                // The host's reserved ranges there are backed by the displaced alias (GuestDisplaced.hpp): they stay
+                // out of first-fit placement (AddUsed below) but take fixed guest mappings.
+                if (first < DisplacedStart()) {
+                    AddUsed(first, DisplacedStart());
+                    _hostRegions.emplace_back(first, DisplacedStart());
                 }
                 if (last > DisplacedEnd) {
                     AddUsed(DisplacedEnd, last);
@@ -249,7 +256,7 @@ private:
             AddUsed(first, last);
             _hostRegions.emplace_back(first, last);
         }
-        if (_displacedActive) AddUsed(DisplacedStart, DisplacedEnd);
+        if (_displacedActive) AddUsed(DisplacedStart(), DisplacedEnd);
         AddUsed(SystemReservedStart, SystemReservedEnd);
         _hostRegions.emplace_back(SystemReservedStart, SystemReservedEnd);
         ReserveFreeRanges();
@@ -318,12 +325,16 @@ private:
     // one used range so first-fit placement never lands there.
     std::map<std::uintptr_t, std::uintptr_t>& UsedFor(std::uintptr_t start, std::size_t bytes) {
         if (!_displacedActive || !OverlapsDisplaced(start, bytes)) return _used;
-        if (start < DisplacedStart || start + bytes > DisplacedEnd) {
-            char message[192];
-            std::snprintf(message, sizeof(message), "guest range 0x%llx+0x%zx straddles the edge of the displaced window 0x%llx-0x%llx",
-                static_cast<unsigned long long>(start), bytes, static_cast<unsigned long long>(DisplacedStart), static_cast<unsigned long long>(DisplacedEnd));
+        if (start < DisplacedStart() || start + bytes > DisplacedEnd) {
+            // The ranges inside the window share one contiguous alias, so a range may cross from one to the next;
+            // across the window's outer edges half of it would be backed by the host and half by the alias.
+            char message[224];
+            std::snprintf(message, sizeof(message), "guest range 0x%llx+0x%zx straddles the edge of the displaced window 0x%llx-0x%llx (host-reserved memory on one side)",
+                static_cast<unsigned long long>(start), bytes, static_cast<unsigned long long>(DisplacedStart()), static_cast<unsigned long long>(DisplacedEnd));
             throw std::runtime_error(message);
         }
+        // The PS5 system-reserved range stays a used range, as on every host: fixed guest mappings there are refused.
+        if (start < SystemReservedEnd && start + bytes > SystemReservedStart) return _used;
         return _displacedUsed;
     }
 

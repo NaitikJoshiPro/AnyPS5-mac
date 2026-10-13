@@ -413,9 +413,10 @@ void OnFault(int signal, siginfo_t* info, void* context) {
         arm_thread_state64_set_pc_fptr(machine->__ss, &Aps5GuestCallEntry);
         return;
     }
-    // macOS raises SIGBUS/BUS_ADRALN for protection faults as well. One on a displaced guest address is the kernel's
-    // GPU-carveout guard; libc's GuestDisplaced handler, further down the chain, runs the access at the alias (D31).
-    if (!GuestArena::IsDisplaced(reinterpret_cast<std::uintptr_t>(info->si_addr)) && HandleUnaligned(signal, info, machine)) return;
+    // macOS raises SIGBUS/BUS_ADRALN for protection faults as well. One on a displaced guest address is a host guard
+    // (D31, D33); libc's GuestDisplaced handler, further down the chain, runs the access at the alias. fex does not
+    // link libc, so it skips the coarse bounds (the dyld shared cache below the window is never guest memory).
+    if (!GuestArena::MayBeDisplaced(reinterpret_cast<std::uintptr_t>(info->si_addr)) && HandleUnaligned(signal, info, machine)) return;
     const struct sigaction& previous = signal == SIGBUS ? previousBus : previousSegv;
     if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
         previous.sa_sigaction(signal, info, context);

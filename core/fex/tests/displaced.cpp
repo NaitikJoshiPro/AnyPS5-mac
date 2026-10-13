@@ -1,5 +1,6 @@
 // Fixed guest mappings in the macOS arm64 GPU carveout (64-448 GiB), as the oops-sdk display path makes at
-// 0x4000000000 (D31). The memory is backed at a host alias; translated code reaches it through backpatched stubs
+// 0x4000000000 (D31), and in the dyld shared region's unused tail, as oops-mesa's GPU VA high range does at
+// 0x400000000 (D33). The memory is backed at a host alias; translated code reaches it through backpatched stubs
 // and native library code through the fault path. A second, ordinary view of the same direct memory checks that
 // both name the same pages.
 extern "C" int sceKernelAllocateDirectMemory(long searchStart, long searchEnd, unsigned long length, unsigned long alignment, int type, long* physical);
@@ -10,6 +11,7 @@ extern "C" void* memcpy(void* destination, const void* source, unsigned long len
 extern "C" [[noreturn]] void exit(int);
 
 constexpr unsigned long Base = 0x4000000000ul;
+constexpr unsigned long TailBase = 0x400000000ul;
 constexpr unsigned long Bytes = 0x400000ul; // 4 MiB, two 2 MiB pages
 constexpr int ReadWrite = 0x33;          // CPU and GPU read/write
 constexpr int MapFixed = 0x10;
@@ -20,6 +22,14 @@ void (*volatile exitPointer)(int) = exit;
 template <typename T>
 static T Load(const void* address) {
     return *static_cast<const volatile T*>(address);
+}
+
+// One load site for every pointer: once it is patched for a displaced address, the stub's window check must send
+// ordinary addresses down the plain path and both displaced ranges through the alias.
+[[gnu::noinline]] static unsigned long SumWords(const volatile unsigned long* words, unsigned long count) {
+    unsigned long sum = 0;
+    for (unsigned long i = 0; i < count; ++i) sum += words[i];
+    return sum;
 }
 
 extern "C" [[noreturn]] void _start(void*) {
@@ -64,6 +74,18 @@ extern "C" [[noreturn]] void _start(void*) {
     if (Load<unsigned char>(static_cast<char*>(view) + 0x2000 + 255) != 0x5a) exit(10);
     memcpy(reinterpret_cast<void*>(Base + 0x3000), reinterpret_cast<void*>(Base + 0x2000), 128);
     if (Load<unsigned char>(static_cast<char*>(view) + 0x3000 + 127) != 0x5a) exit(11);
+
+    // The shared region tail: a third view of the same pages at 0x400000000.
+    void* tail = reinterpret_cast<void*>(TailBase);
+    if (sceKernelMapDirectMemory(&tail, Bytes, ReadWrite, MapFixed, physical, 0x200000) != 0 || tail != reinterpret_cast<void*>(TailBase)) exit(15);
+    auto* tailWords = static_cast<volatile unsigned long*>(tail);
+    if (tailWords[7] != 0x1234) exit(16);
+    for (unsigned long i = 0; i < 4096; ++i) tailWords[1024 + i] = i ^ 0xabcdef;
+    if (Load<unsigned long>(static_cast<char*>(view) + 8 * 2000) != (976ul ^ 0xabcdef)) exit(17);
+    const unsigned long tailSum = SumWords(tailWords + 1024, 4096);
+    if (SumWords(words + 1024, 4096) != tailSum || SumWords(static_cast<volatile unsigned long*>(view) + 1024, 4096) != tailSum) exit(18);
+    if (SumWords(tailWords + 1024, 4096) != tailSum) exit(19);
+    if (sceKernelMunmap(tail, Bytes) != 0) exit(20);
 
     // Unmap and map again at the same place.
     if (sceKernelMunmap(fixed, Bytes) != 0) exit(12);

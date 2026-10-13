@@ -15,22 +15,27 @@
 #include <sys/ucontext.h>
 #include <unistd.h>
 
-// D31. Every 64-bit macOS arm64 process starts with a permanent, inaccessible VM_MEMORY_GUARD entry over
-// [MACH_VM_MIN_GPU_CARVEOUT_ADDRESS, MACH_VM_MAX_GPU_CARVEOUT_ADDRESS) = [64 GiB, 448 GiB) (xnu vm_map_exec,
-// vm_reserved_regions "GPU Carveout"): it cannot be deallocated, overwritten or reprotected, and no entitlement
-// removes it. Guest memory there is backed at guest | DisplacedFlip, reserved here up front.
+extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsystem_kernel; the shared cache's address
+
+// D31, D33. Every 64-bit macOS arm64 process starts with permanent, inaccessible ranges the guest may ask for at
+// fixed addresses: the VM_MEMORY_GUARD entry over [MACH_VM_MIN_GPU_CARVEOUT_ADDRESS, MACH_VM_MAX_GPU_CARVEOUT_ADDRESS)
+// = [64 GiB, 448 GiB) and the commpage nesting guard [0xFC0000000, 64 GiB) (xnu vm_map_exec, vm_reserved_regions),
+// which cannot be deallocated, overwritten or reprotected; and the dyld shared region, whose submap runs to
+// 0xFC0000000 with nothing but inaccessible entries after the shared cache. The tail could be overwritten, but that is
+// undocumented and depends on dyld; it is displaced like the guards. Guest memory in these ranges is backed at
+// guest | DisplacedFlip, reserved here up front. The ranges are found at startup (the cache moves with its slide).
 //
 // A guest (or native) load/store to a displaced address faults with si_addr in the window. The handler builds a
 // stub for that instruction that runs it with its base register flipped into the alias:
 //
 //   checked: sub sp, sp, #144          ; keep clear of the 128-byte red zone
 //            stp xA, xB, [sp]
-//            lsr xA, xN, #39           ; >= 512 GiB: not displaced
-//            cbnz xA, plain
-//            lsr xA, xN, #36           ; 64 GiB units: 1..6 are displaced
-//            movz xB, #0x7e
-//            lsrv xB, xB, xA
-//            tbz xB, #0, plain
+//            ldr xB, start             ; d = xN - start
+//            sub xA, xN, xB
+//            ldr xB, size              ; displaced iff d < size (unsigned): d - size borrows and d >= 0
+//            sub xB, xA, xB
+//            bic xB, xB, xA
+//            tbz xB, #63, plain
 //   flip:    eor xA, xN, #(1 << 40)
 //            <instruction with Rn = xA>
 //            [eor xN, xA, #(1 << 40)]  ; only for writeback forms
@@ -44,6 +49,8 @@
 //   forced:  sub sp, sp, #144
 //            stp xA, xB, [sp]
 //            b flip
+//   start:   .quad window start
+//   size:    .quad window size
 //
 // The signal path resumes at `forced` (the base need not be the displaced operand of a register-offset form); a JIT
 // site is then patched to `b checked`, so later executions cost ~12 instructions and no signal. Nothing in the stub
@@ -52,7 +59,9 @@
 namespace GuestArena {
 namespace {
 
-constexpr std::uint32_t kSlotWords = 32;
+std::uintptr_t g_start = CarveoutStart;
+
+constexpr std::uint32_t kSlotWords = 32; // longest stub: 8 check + 8 flip + 6 plain + 3 forced + 1 pad + 4 literal words
 constexpr std::size_t kChunkBytes = 1u << 20;
 constexpr std::size_t kMaxChunks = 64;
 constexpr std::size_t kTableSize = 1u << 15;
@@ -74,6 +83,10 @@ struct Site {
     std::uint32_t instruction = 0; // JIT code at pc can be freed and reused for another instruction
     bool far = false;
 };
+
+constexpr std::size_t kMaxRanges = 4;
+DisplacedRange g_ranges[kMaxRanges];
+std::size_t g_rangeCount = 0;
 
 std::atomic<bool> g_enabled{false};
 std::atomic<bool> g_attempted{false};
@@ -251,14 +264,14 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
         return at + 3;
     };
     const auto eorFlip = [](unsigned dst, unsigned src) { return 0xd2400000u | (24u << 16) | (src << 5) | dst; };
-    const auto lsr = [](unsigned dst, unsigned src, unsigned amount) { return 0xd340fc00u | (amount << 16) | (src << 5) | dst; };
+    const auto sub = [](unsigned dst, unsigned left, unsigned right) { return 0xcb000000u | (right << 16) | (left << 5) | dst; };
     words[n++] = subSp;
     words[n++] = stp;
-    words[n++] = lsr(a, rn, 39);
-    const auto cbnzAt = n++;
-    words[n++] = lsr(a, rn, 36);
-    words[n++] = 0xd2800000u | (0x7eu << 5) | b;
-    words[n++] = 0x9ac02400u | (a << 16) | (b << 5) | b;
+    const auto ldrStartAt = n++;
+    words[n++] = sub(a, rn, b);
+    const auto ldrSizeAt = n++;
+    words[n++] = sub(b, a, b);
+    words[n++] = 0x8a200000u | (a << 16) | (b << 5) | b; // bic xB, xB, xA
     const auto tbzAt = n++;
     const auto flipAt = n;
     words[n++] = eorFlip(a, rn);
@@ -277,8 +290,14 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     words[n++] = stp;
     words[n] = 0x14000000u | ((flipAt - n) & 0x03ffffffu);
     ++n;
-    words[cbnzAt] = 0xb5000000u | (((plainAt - cbnzAt) & 0x7ffffu) << 5) | a;
-    words[tbzAt] = 0x36000000u | (((plainAt - tbzAt) & 0x3fffu) << 5) | b;
+    n = (n + 1) & ~1u; // 8-byte literals (slots are 128-byte aligned)
+    const auto literalAt = n;
+    const std::uint64_t window[2] = {DisplacedStart(), DisplacedEnd - DisplacedStart()};
+    std::memcpy(&words[n], window, sizeof(window));
+    n += 4;
+    words[ldrStartAt] = 0x58000000u | ((literalAt - ldrStartAt) << 5) | b;
+    words[ldrSizeAt] = 0x58000000u | ((literalAt + 2 - ldrSizeAt) << 5) | b;
+    words[tbzAt] = 0xb6f80000u | (((plainAt - tbzAt) & 0x3fffu) << 5) | b; // tbz xB, #63
     std::memcpy(code, words, n * 4);
     sys_icache_invalidate(reinterpret_cast<void*>(stub), n * 4);
     auto* site = FindSite(pc, true);
@@ -382,23 +401,103 @@ void OnFault(int signal, siginfo_t* info, void* context) {
     if (!handled) Chain(signal, info, context);
 }
 
+struct Entry {
+    mach_vm_address_t start = 0;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info{};
+};
+
+// The leaf entry at or above `address`, descending into submaps (the shared region is one).
+bool LeafAt(mach_vm_address_t address, Entry& entry) {
+    for (natural_t depth = 0; depth < 4;) {
+        entry.start = address;
+        entry.depth = depth;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &entry.start, &entry.size, &entry.depth, reinterpret_cast<vm_region_recurse_info_t>(&entry.info), &count) != KERN_SUCCESS)
+            return false;
+        if (!entry.info.is_submap || entry.depth != depth) return true;
+        ++depth;
+    }
+    return true;
+}
+
+bool Inaccessible(const Entry& entry) {
+    return entry.info.protection == VM_PROT_NONE && entry.info.max_protection == VM_PROT_NONE;
+}
+
+// [start, end) is covered, without holes, by inaccessible entries only (submap contents included).
+bool AllInaccessible(mach_vm_address_t start, mach_vm_address_t end) {
+    for (auto cursor = start; cursor < end;) {
+        Entry entry;
+        if (!LeafAt(cursor, entry) || entry.start > cursor || !Inaccessible(entry)) return false;
+        cursor = entry.start + entry.size;
+    }
+    return true;
+}
+
+// The shared region's tail: from the end of the shared cache's last accessible mapping to `limit`, when everything in
+// between is an inaccessible entry of the shared region submap (no hole the host could map into later).
+mach_vm_address_t SharedRegionTail(mach_vm_address_t limit) {
+    std::uint64_t cache = 0;
+    const bool cacheKnown = __shared_region_check_np(&cache) == 0 && cache >= DisplacedLowest && cache < limit;
+    mach_vm_address_t tail = 0;
+    mach_vm_address_t cursor = cacheKnown ? cache : DisplacedLowest;
+    while (cursor < limit) {
+        Entry leaf;
+        if (!LeafAt(cursor, leaf) || leaf.start >= limit) return 0; // unmapped up to the limit
+        if (leaf.start > cursor) tail = 0;                           // a hole the host can map into
+        if (leaf.depth > 0 && Inaccessible(leaf)) {
+            if (tail == 0) tail = leaf.start;
+        } else {
+            tail = 0;
+        }
+        cursor = leaf.start + leaf.size;
+    }
+    if (tail == 0 || (cacheKnown && cache >= tail)) return 0;
+    // Cross-check with the cache header (dyld_cache_header: sharedRegionStart at 224, sharedRegionSize at 232; the
+    // first mapping's unslid address gives the slide): the cache's own extent must lie below the tail.
+    if (cacheKnown && std::memcmp(reinterpret_cast<const void*>(cache), "dyld_v1", 7) == 0) {
+        const auto* header = reinterpret_cast<const std::uint8_t*>(cache);
+        std::uint32_t mappingOffset = 0;
+        std::uint64_t regionStart = 0, regionSize = 0, unslid = 0;
+        std::memcpy(&mappingOffset, header + 16, sizeof(mappingOffset));
+        std::memcpy(&regionStart, header + 224, sizeof(regionStart));
+        std::memcpy(&regionSize, header + 232, sizeof(regionSize));
+        if (mappingOffset >= 248 && mappingOffset < 0x4000) std::memcpy(&unslid, header + mappingOffset, sizeof(unslid));
+        if (unslid != 0 && cache >= unslid && regionStart + regionSize + (cache - unslid) > tail) return 0;
+    }
+    return tail;
+}
+
 bool Enable() {
     g_trace = std::getenv("APS5_DISPLACED_TRACE") != nullptr;
-    // Only needed where the window is really a host guard: probe it.
-    mach_vm_address_t probe = DisplacedStart;
-    mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info{};
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object = MACH_PORT_NULL;
-    if (mach_vm_region(mach_task_self(), &probe, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || probe > DisplacedStart)
-        return false;
-    mach_vm_address_t alias = DisplacedStart | DisplacedFlip;
-    if (mach_vm_map(mach_task_self(), &alias, DisplacedEnd - DisplacedStart, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_DEFAULT) != KERN_SUCCESS) {
-        std::fprintf(stderr, "[memory] the displaced guest window's alias 0x%llx+0x%llx is occupied; fixed guest mappings in 0x%llx-0x%llx will fail\n",
-            static_cast<unsigned long long>(DisplacedStart | DisplacedFlip), static_cast<unsigned long long>(DisplacedEnd - DisplacedStart),
-            static_cast<unsigned long long>(DisplacedStart), static_cast<unsigned long long>(DisplacedEnd));
-        return false;
+    // Only needed where the ranges really are host guards: probe them. The carveout is the anchor; the commpage guard
+    // and the shared region's tail join only when each is contiguous with the next range up.
+    if (!AllInaccessible(CarveoutStart, DisplacedEnd)) return false;
+    std::size_t count = 0;
+    DisplacedRange found[kMaxRanges];
+    found[count++] = {CarveoutStart, DisplacedEnd, CarveoutStart | DisplacedFlip, "GPU carveout"};
+    constexpr std::uintptr_t CommpageStart = 0x0000000FC0000000ull; // _COMM_PAGE64_NESTING_START
+    if (std::getenv("APS5_DISPLACED_CARVEOUT_ONLY") == nullptr && AllInaccessible(CommpageStart, CarveoutStart)) {
+        found[count++] = {CommpageStart, CarveoutStart, CommpageStart | DisplacedFlip, "commpage guard"};
+        if (const auto tail = SharedRegionTail(CommpageStart); tail != 0)
+            found[count++] = {static_cast<std::uintptr_t>(tail), CommpageStart, static_cast<std::uintptr_t>(tail) | DisplacedFlip, "shared region tail"};
     }
+    // The alias of the whole window, lowest range first; drop the lower ranges if their alias is taken.
+    while (count > 0) {
+        const auto start = found[count - 1].guestStart;
+        mach_vm_address_t alias = start | DisplacedFlip;
+        if (mach_vm_map(mach_task_self(), &alias, DisplacedEnd - start, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_DEFAULT) == KERN_SUCCESS)
+            break;
+        std::fprintf(stderr, "[memory] the displaced alias 0x%llx-0x%llx is occupied; fixed guest mappings in the %s will fail\n",
+            static_cast<unsigned long long>(start | DisplacedFlip), static_cast<unsigned long long>(DisplacedEnd | DisplacedFlip), found[count - 1].name);
+        --count;
+    }
+    if (count == 0) return false;
+    for (std::size_t i = 0; i < count; ++i) g_ranges[i] = found[count - 1 - i];
+    g_rangeCount = count;
+    g_start = g_ranges[0].guestStart;
     struct sigaction action {};
     action.sa_sigaction = OnFault;
     action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -407,8 +506,12 @@ bool Enable() {
     sigaction(SIGSEGV, &action, &g_previousSegv);
     action.sa_sigaction = OnTrap;
     sigaction(SIGTRAP, &action, &g_previousTrap);
-    if (g_trace) std::fprintf(stderr, "[displaced] alias 0x%llx reserved, fault handler installed (previous SIGSEGV %p)\n",
-        static_cast<unsigned long long>(DisplacedStart | DisplacedFlip), reinterpret_cast<void*>(g_previousSegv.sa_sigaction));
+    if (g_trace) {
+        for (std::size_t i = 0; i < g_rangeCount; ++i)
+            std::fprintf(stderr, "[displaced] %s 0x%llx-0x%llx at 0x%llx\n", g_ranges[i].name, static_cast<unsigned long long>(g_ranges[i].guestStart),
+                static_cast<unsigned long long>(g_ranges[i].guestEnd), static_cast<unsigned long long>(g_ranges[i].hostBase));
+        std::fprintf(stderr, "[displaced] fault handler installed (previous SIGSEGV %p)\n", reinterpret_cast<void*>(g_previousSegv.sa_sigaction));
+    }
     return true;
 }
 
@@ -426,6 +529,10 @@ bool GuestDisplacedActive_nid_no_patch() {
     return g_enabled.load(std::memory_order_acquire);
 }
 
+std::uintptr_t GuestDisplacedStart_nid_no_patch() {
+    return g_start; // written once, before any guest code, by the arena's static initialisation
+}
+
 void GuestDisplacedSetCodeWriter_nid_no_patch(bool (*writer)(std::uintptr_t, std::uint32_t), std::uintptr_t (*allocator)(std::uintptr_t, std::size_t, std::uintptr_t*)) {
     g_allocator.store(allocator, std::memory_order_release);
     g_writer.store(writer, std::memory_order_release);
@@ -436,15 +543,26 @@ void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patc
     if (patches != nullptr) *patches = g_patches.load(std::memory_order_relaxed);
 }
 
+void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count) {
+    const bool active = g_enabled.load(std::memory_order_acquire);
+    if (ranges != nullptr) *ranges = g_ranges;
+    if (count != nullptr) *count = active ? g_rangeCount : 0;
+}
+
 }
 #else
 namespace GuestArena {
+std::uintptr_t GuestDisplacedStart_nid_no_patch() { return 0; }
 bool GuestDisplacedEnable_nid_no_patch() { return false; }
 bool GuestDisplacedActive_nid_no_patch() { return false; }
 void GuestDisplacedSetCodeWriter_nid_no_patch(bool (*)(std::uintptr_t, std::uint32_t), std::uintptr_t (*)(std::uintptr_t, std::size_t, std::uintptr_t*)) {}
 void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patches) {
     if (faults != nullptr) *faults = 0;
     if (patches != nullptr) *patches = 0;
+}
+void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count) {
+    if (ranges != nullptr) *ranges = nullptr;
+    if (count != nullptr) *count = 0;
 }
 }
 #endif
