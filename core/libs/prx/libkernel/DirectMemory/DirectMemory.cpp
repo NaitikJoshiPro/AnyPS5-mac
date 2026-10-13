@@ -1019,7 +1019,7 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
 #ifdef _WIN32
         GuestArena::GuestArenaMap_nid_postfix(mapped, len, object, 0, WinProtFromPosix(nativeProtection));
 #else
-        if (::mmap(mapped, len, nativeProtection, MAP_SHARED | MAP_FIXED, object, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map shared memory");
+        if (::mmap(GuestArena::HostPointer(mapped), len, nativeProtection, MAP_SHARED | MAP_FIXED, object, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map shared memory");
 #endif
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
     } catch (...) {
