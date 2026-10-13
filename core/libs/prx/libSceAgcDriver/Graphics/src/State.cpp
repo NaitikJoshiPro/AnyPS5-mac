@@ -656,7 +656,10 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, c
         const auto primitives = group & 0x1ffu;
         const auto maxVertices = read(queue.context, 0x1ff);
         const auto verticesPerPrimitive = vertexWorkgroup ? 3u : read(queue.context, 0x2ce);
-        validate((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3, "unsupported geometry input or output assembly");
+        if (!((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3)) {
+            const std::string assembly = "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE " + std::to_string(primitive) + ", VGT_GS_OUT_PRIM_TYPE " + std::to_string(read(queue.context, 0x29b)) + ", " + std::to_string(verticesPerPrimitive) + " vertices per output primitive)";
+            validate(false, assembly.c_str());
+        }
         const auto inputSize = primitive == 1 ? 1u : primitive == 2 ? 2u : 3u;
         validate(vertices >= inputSize && maxVertices != 0 && (!vertexWorkgroup || maxVertices >= inputSize) && maxVertices <= 256 && verticesPerPrimitive <= 256, "invalid geometry subgroup output");
         const auto inputStep = primitive == 5 || primitive == 6 ? 1u : inputSize;
