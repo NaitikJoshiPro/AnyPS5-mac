@@ -40,6 +40,7 @@ namespace fs = std::filesystem;
 enum class Outcome {
     Compiled,
     FunctionOnly,
+    TessellationLibrary,
     FrontEndRejected,
     SpirvRejected,
     HostWidthRejected,
@@ -54,6 +55,7 @@ constexpr const char* OutcomeName(Outcome outcome) {
     switch (outcome) {
     case Outcome::Compiled: return "compiled";
     case Outcome::FunctionOnly: return "function-only";
+    case Outcome::TessellationLibrary: return "tessellation-library";
     case Outcome::FrontEndRejected: return "front-end-rejected";
     case Outcome::SpirvRejected: return "spirv-rejected";
     case Outcome::HostWidthRejected: return "host-width-rejected";
@@ -67,7 +69,7 @@ constexpr const char* OutcomeName(Outcome outcome) {
 }
 
 constexpr bool Counts(Outcome outcome) {
-    return outcome != Outcome::Compiled && outcome != Outcome::FunctionOnly && outcome != Outcome::FrontEndRejected && outcome != Outcome::SpirvRejected && outcome != Outcome::HostWidthRejected;
+    return outcome != Outcome::Compiled && outcome != Outcome::FunctionOnly && outcome != Outcome::TessellationLibrary && outcome != Outcome::FrontEndRejected && outcome != Outcome::SpirvRejected && outcome != Outcome::HostWidthRejected;
 }
 
 struct Result {
@@ -244,6 +246,19 @@ private:
             result.detail = MetalError(Describe(error));
             return;
         }
+        // Tessellation stage libraries (MslAbi Version 7) have no stage function: each defines
+        // aps5_stage(...) for LinkMslTessellation, which wraps local + hull into an object function and
+        // the domain program into the tessellator's mesh function. Valid here = the library compiles
+        // with the device's options and defines aps5_stage; the linked pipelines are checked by
+        // agc_metal_msl_tessellation (every domain, partitioning and topology) and
+        // agc_metal_tessellation_domains (GPU).
+        const auto stage = shader.reflection.stage;
+        if (stage == ShaderRecompiler::MslAbi::Stage::Local || stage == ShaderRecompiler::MslAbi::Stage::Hull || stage == ShaderRecompiler::MslAbi::Stage::Domain) {
+            const bool defined = shader.source.find(" aps5_stage(") != std::string::npos;
+            result.outcome = defined ? Outcome::TessellationLibrary : Outcome::PipelineFailed;
+            if (!defined) result.detail = "the tessellation stage library defines no aps5_stage";
+            return;
+        }
         MTL4LibraryFunctionDescriptor* function = [MTL4LibraryFunctionDescriptor new];
         function.name = @(ShaderRecompiler::MslAbi::EntryPoint);
         function.library = library;
@@ -408,7 +423,7 @@ int main(int argc, char** argv) {
             std::printf("%zu request(s) in %.1f s with %u worker(s):", results.size(), seconds, workers);
             for (const auto& [outcome, count] : counts) std::printf(" %s %zu", OutcomeName(outcome), count);
             std::printf("\n");
-            const std::size_t valid = counts[Outcome::Compiled] + counts[Outcome::FunctionOnly];
+            const std::size_t valid = counts[Outcome::Compiled] + counts[Outcome::FunctionOnly] + counts[Outcome::TessellationLibrary];
             const std::size_t applicable = results.size() - counts[Outcome::FrontEndRejected] - counts[Outcome::SpirvRejected] - counts[Outcome::HostWidthRejected];
             std::printf("MetalBackend produced valid MSL for %zu of %zu request(s) the front end accepts (%zu not valid)\n", valid, applicable, failing);
             if (failing != 0) return 1;
