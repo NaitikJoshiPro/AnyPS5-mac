@@ -89,7 +89,8 @@ void Run(AgcDriver::VulkanDevice& device, bool integer) {
         SrtRuntime runtime{};
         const auto capture = invocation.Capture(runtime);
         const auto pixel = invocation.Materialize(*capture);
-        Require(pixel->variantId == artifact.variantId && pixel->specialization.empty(), "export mapping did not materialize a prepared fragment module");
+        // MSL modules keep their function constants (the export selectors) for pipeline creation.
+        Require(pixel->variantId == artifact.variantId && (pixel->specialization.empty() || !pixel->msl.empty()), "export mapping did not materialize a prepared fragment module");
         if (!first) first = pixel;
         else if (mapping == 0xe4u) Require(pixel == first, "export mapping did not reuse the materialized result");
         else Require(pixel != first, "export mapping reused stale materialized data");
