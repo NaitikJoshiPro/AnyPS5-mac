@@ -25,6 +25,9 @@ pattern = re.compile(arguments[arguments.index("-R") + 1])
 plan = json.loads(open(os.environ["FAKE_CTEST_PLAN"]).read())
 with open(os.environ["FAKE_CTEST_LOG"], "a") as log:
     log.write(" ".join(arguments) + "\n")
+if os.environ.get("FAKE_CTEST_ENV_LOG"):
+    with open(os.environ["FAKE_CTEST_ENV_LOG"], "a") as seen:
+        seen.write("SDL_VIDEODRIVER=" + os.environ.get("SDL_VIDEODRIVER", "<unset>") + "\n")
 cases = []
 for name, (status, message, output) in sorted(plan.items()):
     if not pattern.search(name):
@@ -102,10 +105,13 @@ def write_build(root, tests, source=None):
 
 class GroupTests(unittest.TestCase):
     def test_held_tests(self):
-        for name in ("agc_driver_lds_atomics64", "agc_driver_flip", "agc_driver_flip_compute", "video_out_flip_lifetime",
-                     "video_out_frame_dump_queue", "guest_video_out_output_mode", "pad_sdl", "guest_buffer_reuse"):
+        self.assertTrue(gpu_groups.held("agc_driver_lds_atomics64"))
+        for name in ("agc_driver_flip", "agc_driver_flip_compute", "video_out_flip_lifetime", "video_out_frame_dump_queue",
+                     "guest_video_out_output_mode", "pad_sdl", "guest_buffer_reuse"):
             with self.subTest(name=name):
-                self.assertTrue(gpu_groups.held(name))
+                self.assertFalse(gpu_groups.held(name))
+                self.assertTrue(gpu_groups.PRESENTATION.search(name))
+                self.assertEqual(gpu_groups.classify_one(name, "x", ""), "G5")
         for name in ("agc_vector_window", "agc_vector_window_stage_inputs", "agc_driver_lds_atomics", "agc_display_buffer_dcc",
                      "linear_display_buffer", "agc_driver_vop1_control", "agc_driver_image_atomics64"):
             with self.subTest(name=name):
@@ -264,23 +270,34 @@ class SuiteRunTests(unittest.TestCase):
             "agc_driver_emission": ["fail", "Failed", "MSL emission failed: hash=0x1 stage=4 opcode=FPMul32 reason=has no MSL emitter"],
             "agc_driver_skip": ["notrun", "SKIP_RETURN_CODE=77", "skipped, the device has no shaderFloat64"],
             "agc_driver_lds_atomics64": ["run", "", "must never run"],
-            "agc_driver_flip": ["run", "", "must never run"],
+            "agc_driver_flip": ["run", "", "presentation runs headless"],
         }
         result, files, log = self.run_suite(plan, "re:^agc_driver_", "--batch-seconds", "60")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertNotIn("lds_atomics64", log)
-        self.assertNotIn("agc_driver_flip", log)
+        self.assertIn("agc_driver_flip", log)
         self.assertIn("-j1", log)
         self.assertIn("--timeout 30", log)
         summary = json.loads(files["summary.json"])
         outcomes = {entry["test"]: entry["outcome"] for entry in summary["results"]}
-        self.assertEqual(outcomes, {"agc_driver_ok": "passed", "agc_driver_emission": "failed", "agc_driver_skip": "skipped"})
-        self.assertEqual(sorted(summary["held"]), ["agc_driver_flip", "agc_driver_lds_atomics64"])
+        self.assertEqual(outcomes, {"agc_driver_ok": "passed", "agc_driver_emission": "failed", "agc_driver_skip": "skipped", "agc_driver_flip": "passed"})
+        self.assertEqual(sorted(summary["held"]), ["agc_driver_lds_atomics64"])
         self.assertTrue(any("agc_driver_skip skipped and is not in the allowlist" in error for error in summary["skip_errors"]))
         self.assertIn("opcode=FPMul32", files["summary.txt"])
         self.assertIn("<testcase", files["junit.xml"])
-        self.assertEqual(log.count("--output-junit"), 4)  # the canary, then one ctest process per test
+        self.assertEqual(log.count("--output-junit"), 5)  # the canary, then one ctest process per test
         self.assertTrue(log.splitlines()[0].endswith("^agc_canary_ok$") or "agc_canary_ok" in log.splitlines()[0])
+
+    def test_tests_run_with_sdl_offscreen(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            seen = Path(scratch) / "env.log"
+            result, files, _ = self.run_suite({"agc_driver_flip": ["run", "", ""]}, "agc_driver_flip",
+                                              env={"FAKE_CTEST_ENV_LOG": str(seen), "SDL_VIDEODRIVER": "cocoa"})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = seen.read_text().splitlines()
+            self.assertGreaterEqual(len(lines), 2)  # the canary and the test
+            self.assertEqual(set(lines), {"SDL_VIDEODRIVER=offscreen"})
+            self.assertEqual(json.loads(files["summary.json"])["meta"]["environment"]["SDL_VIDEODRIVER"], "offscreen")
 
     def test_dry_run_runs_nothing(self):
         result, files, log = self.run_suite({"agc_driver_ok": ["run", "", ""]}, "agc_driver_ok", "--dry-run")

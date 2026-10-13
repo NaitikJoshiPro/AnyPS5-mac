@@ -9,7 +9,7 @@ matched with re.search) or an exact test name. Selections are unions.
 
 GPU safety (CLAUDE.md, MISSION §5): every ctest invocation runs -j1 with a per-test timeout inside
 tools/mac/buildlock.py <build>, which is also the machine-wide GPU mutex; the tests gpu_groups.HOLD matches
-(agc_driver_lds_atomics64, flip, present, window and video-out tests) and the quarantined ones (tools/mac/
+(agc_driver_lds_atomics64) and the quarantined ones (tools/mac/
 gpu_quarantine.txt: tests that panicked or hung the machine; without a readable quarantine file nothing runs) are
 never run, whatever is selected; a batch
 holds the lock for at most --batch-seconds of worst-case test time (sum of the tests' timeouts), so other agents can
@@ -559,7 +559,8 @@ def main():
     out = out if out.is_absolute() else Path.cwd() / out
     (out / "batches").mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
-    extra = {}
+    # Presentation (G5) tests run headless: windowed runs happen only outside gpu_suite, with coordinator approval.
+    extra = {"SDL_VIDEODRIVER": "offscreen"}
     if args.validation:
         extra.update({"MTL_SHADER_VALIDATION": "1", "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1", "MTL_DEBUG_LAYER": "1"})
     if args.dump_requests:
@@ -567,6 +568,7 @@ def main():
         dump.mkdir(parents=True, exist_ok=True)
         extra["APS5_DUMP_REQUESTS"] = str(dump)
     environment.update(extra)
+    environment["SDL_VIDEODRIVER"] = "offscreen"
 
     started_wall = datetime.datetime.now().isoformat(timespec="seconds")
     started = time.monotonic()

@@ -20,12 +20,13 @@ Groups:
   G2 compute tests with images or samplers
   G3 draw tests
   G4 PM4/driver tests (submission through the driver, shutdown, prepared shaders, shared writes)
-  G5 presentation (flip, video out): held back, see HOLD
+  G5 presentation (flip, video out, pad): runs headless, gpu_suite forces SDL_VIDEODRIVER=offscreen
   G6 f64 and 64-bit atomics
   G7 Metal-only tests and the Vulkan-internal tests that Metal twins replace
 
 HOLD lists the tests tools/mac/gpu_suite.sh never runs, whatever the map says: the 64-bit LDS atomics
-test (it can hang the GPU, MISSION §5) and everything that flips, presents or opens a window (all of libSceVideoOut).
+test (it can hang the GPU, MISSION §5). PRESENTATION matches the G5 tests (flip, present, video out, libSceVideoOut):
+they run in normal suite runs, headless, because gpu_suite forces SDL_VIDEODRIVER=offscreen for every test.
 tools/mac/gpu_quarantine.txt adds tests that took the machine down (kernel panic, GPU hang) until they are cleared;
 a missing or malformed quarantine file stops gpu_suite.sh from running anything (fail closed).
 """
@@ -39,9 +40,11 @@ REPO = Path(__file__).resolve().parents[2]
 MAP = Path(__file__).resolve().parent / "gpu_groups.txt"
 GROUPS = ("G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7")
 
-# Never run by gpu_suite.sh (CLAUDE.md GPU safety): a wedged GPU can take WindowServer down.
-HOLD = re.compile(r"^agc_driver_lds_atomics64$|(^|_)(flip|visual|present|presentation|swapchain)(_|$)|^(guest_)?video_out_|^pad_sdl$|^guest_buffer_reuse$")
-HOLD_DIRECTORIES = ("core/libs/prx/libSceVideoOut",)
+# Never run by gpu_suite.sh (CLAUDE.md GPU safety): the 64-bit LDS atomics test can hang the GPU.
+HOLD = re.compile(r"^agc_driver_lds_atomics64$")
+# G5 presentation tests: run headless by gpu_suite (SDL_VIDEODRIVER=offscreen), no longer held.
+PRESENTATION = re.compile(r"(^|_)(flip|visual|present|presentation|swapchain)(_|$)|^(guest_)?video_out_|^pad_sdl$|^guest_buffer_reuse$")
+PRESENTATION_DIRECTORIES = ("core/libs/prx/libSceVideoOut",)
 # Tests quarantined after they took the machine down: `<test> | <reason> | <TechnicalDebt anchor>` per line.
 QUARANTINE = Path(__file__).resolve().parent / "gpu_quarantine.txt"
 
@@ -147,7 +150,7 @@ def classify_one(name, directory, text):
     """The group of one test from its name, its CTest directory and the text of its own test sources."""
     if name == "agc_driver_lds_atomics64":
         return "G6"
-    if HOLD.search(name) or any(directory == held or directory.startswith(held + "/") for held in HOLD_DIRECTORIES):
+    if PRESENTATION.search(name) or any(directory == shown or directory.startswith(shown + "/") for shown in PRESENTATION_DIRECTORIES):
         return "G5"
     if name.startswith("agc_metal_") or name in VULKAN_INTERNAL or VULKAN_INTERNAL_FAMILIES.search(name):
         return "G7"
@@ -205,7 +208,7 @@ def load_map(path=MAP):
 
 def write_map(groups, path=MAP):
     lines = ["# M2 GPU test groups (docs/mac/M2_DESIGN.md §8), written by tools/mac/gpu_groups.py --write.",
-             "# <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group."]
+             "# <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group (only agc_driver_lds_atomics64; G5 runs headless)."]
     for group in GROUPS:
         lines += [f"{name} {group}" for name in sorted(name for name, found in groups.items() if found == group)]
     Path(path).write_text("\n".join(lines) + "\n")
