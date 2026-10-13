@@ -46,6 +46,7 @@ constexpr int GuestEperm = 1;
 constexpr int GuestEio = 5;
 constexpr int GuestEfault = 14;
 constexpr int GuestEnotdir = 20;
+constexpr int GuestEisdir = 21;
 constexpr int GuestEinval = 22;
 constexpr int GuestEexist = 17;
 constexpr int GuestExdev = 18;
@@ -197,6 +198,64 @@ bool IsDotOrDotDot(std::string_view path) {
     const auto separator = path.find_last_of("/\\");
     const auto component = path.substr(separator == std::string_view::npos ? 0 : separator + 1);
     return component == "." || component == "..";
+}
+
+int RenamePath(const std::filesystem::path& source, const std::filesystem::path& destination) {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const auto sourceStatus = fs::symlink_status(source, error);
+    if (error && error != std::errc::no_such_file_or_directory) return FilesystemError(error);
+    if (sourceStatus.type() == fs::file_type::not_found)
+        return HasNonDirectoryPrefix(source) ? GuestEnotdir : GuestEnoent;
+
+    const auto parent = destination.parent_path().empty() ? fs::path(".") : destination.parent_path();
+    error.clear();
+    const auto parentStatus = fs::status(parent, error);
+    if (error) return FilesystemError(error);
+    if (!fs::exists(parentStatus))
+        return HasNonDirectoryPrefix(destination) ? GuestEnotdir : GuestEnoent;
+    if (!fs::is_directory(parentStatus)) return GuestEnotdir;
+
+    error.clear();
+    const auto destinationStatus = fs::symlink_status(destination, error);
+    if (error && error != std::errc::no_such_file_or_directory) return FilesystemError(error);
+    const bool destinationExists = destinationStatus.type() != fs::file_type::not_found;
+    const bool sourceIsDirectory = fs::is_directory(sourceStatus);
+    const bool destinationIsDirectory = destinationExists && fs::is_directory(destinationStatus);
+    bool sameFile = false;
+    if (destinationExists) {
+        error.clear();
+        sameFile = fs::equivalent(source, destination, error);
+        if (error == std::errc::no_such_file_or_directory) error.clear();
+        if (error) return FilesystemError(error);
+        if (!sameFile && sourceIsDirectory && !destinationIsDirectory) return GuestEnotdir;
+        if (!sameFile && !sourceIsDirectory && destinationIsDirectory) return GuestEisdir;
+    }
+    if (sourceIsDirectory && !sameFile) {
+        error.clear();
+        const auto canonicalSource = fs::weakly_canonical(source, error);
+        if (error) return FilesystemError(error);
+        const auto canonicalDestination = fs::weakly_canonical(destination, error);
+        if (error) return FilesystemError(error);
+        const auto relative = canonicalDestination.lexically_relative(canonicalSource);
+        if (!relative.empty() && *relative.begin() != "..") return GuestEinval;
+    }
+    if (destinationExists && !sameFile && destinationIsDirectory) {
+        error.clear();
+        if (!fs::is_empty(destination, error)) {
+            return error ? FilesystemError(error) : GuestEnotempty;
+        }
+    }
+#ifdef _WIN32
+    if (!sameFile && sourceIsDirectory && destinationIsDirectory) {
+        error.clear();
+        if (!fs::remove(destination, error)) return error ? FilesystemError(error) : GuestEio;
+    }
+#endif
+
+    error.clear();
+    fs::rename(source, destination, error);
+    return error ? FilesystemError(error) : 0;
 }
 }
 
@@ -485,6 +544,66 @@ int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
 #endif
     }
     RecordWrittenPath_nid_no_patch(native);
+    return 0;
+}
+
+int APS5_VABI rename_nid_postfix(const char* from, const char* to);
+
+int APS5_VABI renameat_nid_postfix(int oldfd, const char* from, int newfd, const char* to) {
+    if (from == nullptr || to == nullptr) return static_cast<int>(Fail(GuestEfault));
+    if (*from == '\0' || *to == '\0') return static_cast<int>(Fail(GuestEnoent));
+    if ((oldfd == GuestAtFdcwd || *from == '/') && (newfd == GuestAtFdcwd || *to == '/'))
+        return rename_nid_postfix(from, to);
+    if (std::strlen(from) >= GuestPathMax || HasLongComponent(from) ||
+        std::strlen(to) >= GuestPathMax || HasLongComponent(to))
+        return static_cast<int>(Fail(GuestEnametoolong));
+    if (IsDotOrDotDot(from) || IsDotOrDotDot(to)) return static_cast<int>(Fail(GuestEinval));
+
+    std::filesystem::path source;
+    if (oldfd == GuestAtFdcwd || *from == '/') {
+        if (const int error = ResolvePathError_nid_no_patch(from, source)) return static_cast<int>(Fail(error));
+    } else {
+        int error = 0;
+        const char* base = GetDirectoryDescriptorPath_nid_no_patch(oldfd, &error);
+        if (base == nullptr) return static_cast<int>(Fail(error));
+        source = std::filesystem::path(reinterpret_cast<const char8_t*>(base)) /
+                 std::filesystem::path(reinterpret_cast<const char8_t*>(from));
+    }
+
+    std::filesystem::path destination;
+    if (newfd == GuestAtFdcwd || *to == '/') {
+        if (const int error = ResolvePathError_nid_no_patch(to, destination)) return static_cast<int>(Fail(error));
+    } else {
+        int error = 0;
+        const char* base = GetDirectoryDescriptorPath_nid_no_patch(newfd, &error);
+        if (base == nullptr) return static_cast<int>(Fail(error));
+        destination = std::filesystem::path(reinterpret_cast<const char8_t*>(base)) /
+                      std::filesystem::path(reinterpret_cast<const char8_t*>(to));
+    }
+
+    const std::string_view fromView(from);
+    const std::string_view toView(to);
+    const bool oldTrailingSlash = !fromView.empty() && fromView.back() == '/';
+    const bool newTrailingSlash = !toView.empty() && toView.back() == '/';
+
+    while (!source.has_filename() && source.has_relative_path()) source = source.parent_path();
+    while (!destination.has_filename() && destination.has_relative_path()) destination = destination.parent_path();
+
+    std::error_code statusError;
+    const auto sourceStatus = std::filesystem::symlink_status(source, statusError);
+    if (oldTrailingSlash) {
+        if (sourceStatus.type() == std::filesystem::file_type::not_found)
+            return static_cast<int>(Fail(HasNonDirectoryPrefix(source) ? GuestEnotdir : GuestEnoent));
+        if (!std::filesystem::is_directory(sourceStatus)) return static_cast<int>(Fail(GuestEnotdir));
+    }
+    if (newTrailingSlash && sourceStatus.type() != std::filesystem::file_type::not_found &&
+        !std::filesystem::is_directory(sourceStatus))
+        return static_cast<int>(Fail(GuestEnotdir));
+
+    const int error = RenamePath(source, destination);
+    if (error) return static_cast<int>(Fail(error));
+    RecordWrittenPath_nid_no_patch(source);
+    RecordWrittenPath_nid_no_patch(destination);
     return 0;
 }
 
