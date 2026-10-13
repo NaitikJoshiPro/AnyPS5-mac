@@ -348,7 +348,7 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     // patch the raw factors do not cull; the clamped factors replace the raw ones in the payload, so
     // the mesh threadgroups tessellate exactly what the object stage counted.
     const auto clamp = "        if (aps5_patch.culled == 0) {\n"
-                       "            for (uint i = 0u; i < " + U32(MslAbi::TessellationPayloadFactorWords) + "u; ++i) {\n"
+                       "            for (uint i = 0u; i < " + U32(MslAbi::TessellationPayloadFactorWords) + "; ++i) {\n"
                        "                const float aps5_raw = as_type<float>(aps5_payload.words[i]);\n"
                        "                aps5_payload.words[i] = as_type<uint>(isnan(aps5_raw) ? aps5_raw : fmin(fmax(aps5_raw, aps5_draw.minLevel), aps5_draw.maxLevel));\n"
                        "                if (i < 4u) aps5_factors.outer[i] = as_type<float>(aps5_payload.words[i]); else aps5_factors.inner[i - 4u] = as_type<float>(aps5_payload.words[i]);\n"
