@@ -1771,6 +1771,13 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                     const auto host = reinterpret_cast<std::uint64_t>(target.contents) + store.offset;
                     std::fprintf(stderr, "[landing] store run: guest 0x%llx+0x%zx into buffer %p (contents %p, length 0x%llx) offset 0x%llx = host 0x%llx%s\n", static_cast<unsigned long long>(store.address), store.bytes.size(), (__bridge void*)target, target.contents, static_cast<unsigned long long>(target.length), static_cast<unsigned long long>(store.offset), static_cast<unsigned long long>(host), host == ::GuestArena::HostAddress(store.address) ? "" : " (NOT the guest's host address)");
                     std::fprintf(stderr, "[landing]   page now: %s\n", ::AgcDriver::Metal::VmWiredInfo(host).c_str());
+                    // APS5_TRACE_LABEL_LANDING_WATCH=1: backtrace of the first CPU store to the page after it.
+                    static const bool watchPage = std::getenv("APS5_TRACE_LABEL_LANDING_WATCH") != nullptr;
+                    static bool watched = false;
+                    if (watchPage && !watched) {
+                        watched = true;
+                        ::AgcDriver::Metal::WatchWrites(host);
+                    }
                 }
                 stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
                 run.recorded.emplace_back(store.buffer, store.offset, storeEnd);
