@@ -110,3 +110,9 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Counts: domain program runs 502 vs 1,744 corners over the test draws (gap 3); mesh threadgroups 19 vs 21 (gap 6, CPU count).
 - Disk: 8.0 GB of 100 GB.
 - Next: SPIR-V side of D26 stays unverifiable here; remaining gaps in TechnicalDebt metal-tessellation (payload fallback, per-slice sharing only, PA_SU_POINT_SIZE, clamp order unmeasured).
+
+## 2026-10-13 — M2 MSAA: multisampled Metal draws, CB resolves, sampled MSAA T#s (D27)
+- Done: draws with samples > 1 render into the MultisampleTarget host image and 2DMultisample depth surfaces at the guest's sample positions; CB resolves (MTLStoreActionMultisampleResolve; integer formats sample 0); guest 2D MSAA T#s (type 14) read a rendered target through texture2d_ms on MSL targets only (Image2DMultisample shape; SPIR-V unchanged). Commits 4cbbc423b, 4eb587c25, dee6bce48, 52b10f41b; MslAbi unchanged (v8).
+- Verification: `python3 tools/mac/gpu_suite.py --validation --busy-wait 1800 --build-first 're:^agc_metal_msaa_'` → gpu-suite/msaa-r3 5/5; `... G3 G4 G7` → gpu-suite/msaa-g347: G3 39/39, G4 38/39 + allowlisted skip, G7 55 + 13 allowlisted skips; check_skips and check_test_registration clean.
+- Gaps: 8x on Apple9 (throws; design in TechnicalDebt metal-msaa-8x), 2D MSAA array T#s, MSAA T#s over unrendered memory, sample-rate interpolation, proportional A2C, MSAA size query sample count (TechnicalDebt metal-msaa).
+- Disk 8.48 GB of 100 GB.
