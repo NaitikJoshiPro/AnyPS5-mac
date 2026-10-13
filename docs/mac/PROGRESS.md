@@ -237,3 +237,11 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Verification (--validation): gpu-suite/msaa2-g347: G3 44/44, G4 38/39 + 1 allowlisted skip, G7 55 + 13 allowlisted skips. CPU ctest -LE gpu 5,015/5,015. check_test_registration clean. Disk 8.94 GB.
 - Next: the f16 supervised run, merge mac-native-metal into mac-native, M3.
 
+
+## 2026-10-13 ~20:00 — M3: DOOM (PPSA99666) meets every M3 exit criterion (TITLEQA)
+- Boots to E1M1. Frames correct (58 soak frames, 12 windowed). Scripted input works (886 pad commands). Audio non-silent in all 20 × 30 s windows. Headless soak 11.5 min (690 s cap), RSS 95–100 MiB (+0.13 MiB/min), about 47% of one core. Native proof: P_TRANSLATED clear, ARM64 code type, no Rosetta runtime mapped. Windowed 60 s run passes after the main-thread fix (af22a8284: on macOS the guest runs on a secondary thread via Aps5StartGuest). Evidence in .mac-work/logs/m3-qa/; COMPATIBILITY.md row: Playable.
+- Tools: tools/mac/title_run.py (4a8755987), Mach-O import_audit (03136f2a9).
+- LIBS: STK goes from nothing to loads (4 modules a82c1c808, scePthreadAttrSetprio d11764f8b, console syscall gadget 6d087bca5, FEX disk-cache fix e7185c008). Blocker: fixed mapping at 0x4000000000 falls inside macOS 27's 385 GiB guard region. Agent VA is investigating; this is foundational for retail titles.
+- UPSYNC (merge of upstream/main, 937 commits) in progress in .mac-work/wt/sync.
+- Open: windowed audio not confirmed by ear; headless audio capture 578 s vs 680 s run (not investigated); the f16 supervised test still needs the user (auto-mode classifier denied main).
+- Origin: public fork NaitikJoshiPro/AnyPS5. All our commits rewritten to the NaitikJoshiPro identity before the first push.
