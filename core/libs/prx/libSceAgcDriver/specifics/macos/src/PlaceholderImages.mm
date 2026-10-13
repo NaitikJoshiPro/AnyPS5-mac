@@ -9,6 +9,18 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+// MslAbi Version 6: storage heaps of the 2D MSAA (array) dimensions are texture2d_array textures of
+// layers * samples slices (Metal shaders cannot write multisampled textures), so their placeholder
+// is a single-sample 2D array (one layer of one sample: the default sample count constant is 1).
+PlaceholderImageShape MetalShapeOf(std::uint32_t heap) {
+    auto shape = PlaceholderImageShapeOf(heap);
+    if (heap >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding && shape.samples != VK_SAMPLE_COUNT_1_BIT) {
+        shape.samples = VK_SAMPLE_COUNT_1_BIT;
+        shape.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    }
+    return shape;
+}
+
 bool Supported(const Context& context, const PlaceholderImageShape& shape) {
     VkFormatProperties properties{};
     Metal::Vk::GetPhysicalDeviceFormatProperties(context.physical, shape.format, &properties);
@@ -24,7 +36,7 @@ PlaceholderImages::PlaceholderImages(const Context& context) : context(context) 
     try {
         std::vector<VkImageMemoryBarrier> toClear;
         for (std::uint32_t index = 0; index < images.size(); ++index) {
-            const auto shape = PlaceholderImageShapeOf(ShaderRecompiler::RuntimeAbi::FirstImageBinding + index);
+            const auto shape = MetalShapeOf(ShaderRecompiler::RuntimeAbi::FirstImageBinding + index);
             if (!Supported(context, shape)) continue;
             auto& image = images[index];
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
