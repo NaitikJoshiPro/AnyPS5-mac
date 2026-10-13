@@ -277,7 +277,9 @@ void hostImportRetirementTests(const Device& device) {
             std::memcpy(expected.data(), reinterpret_cast<const void*>(sourceAddress), CopyBytes);
             recorder.Commands();
             recorder.Submit();
-            device.WaitQueue();
+            // Upstream waits for the queue (vkQueueWaitIdle) and leaves the batch unreaped; the twin harness's
+            // WaitQueue is Recorder::Sync, which reaps it, so wait on the batch's serial instead.
+            recorder.WaitSerial(recorder.NewestSubmitted());
             Require(!recorder.Recording() && recorder.InFlightBatches() == 1, ("host import retirement requires a submitted batch without an open batch (shape " + std::to_string(shape) + ", recording " + std::to_string(recorder.Recording()) + ", in flight " + std::to_string(recorder.InFlightBatches()) + ")").c_str());
             std::size_t changed = 0;
             if (shape == 0) {
