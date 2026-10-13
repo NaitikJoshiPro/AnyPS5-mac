@@ -116,3 +116,12 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Verification: `python3 tools/mac/gpu_suite.py --validation --busy-wait 1800 --build-first 're:^agc_metal_msaa_'` → gpu-suite/msaa-r3 5/5; `... G3 G4 G7` → gpu-suite/msaa-g347: G3 39/39, G4 38/39 + allowlisted skip, G7 55 + 13 allowlisted skips; check_skips and check_test_registration clean.
 - Gaps: 8x on Apple9 (throws; design in TechnicalDebt metal-msaa-8x), 2D MSAA array T#s, MSAA T#s over unrendered memory, sample-rate interpolation, proportional A2C, MSAA size query sample count (TechnicalDebt metal-msaa).
 - Disk 8.48 GB of 100 GB.
+
+## 2026-10-13 ~18:40 — M2: MSAA2, emulated 8x and the rest of MSAA (D28, MslAbi v9)
+- 8x on Apple9 is emulated as two 4x slices of a 2D multisample array (per-slice passes at the guest's positions, APS5_SAMPLE_BASE). 8 consecutive draws take 9 render passes. 4x rendered as 2 x 2x resolves bit-identically to native 4x.
+- Also done: type-15 T#s (sampled heaps are texture2d_ms_array); resinfo w = log2(samples)+1, inferred from Mesa (main asked for the sample count, see D28); guest storage stores/atomics to rendered targets through a coherent storage shadow; sample/centroid interpolation; PS_ITER_SAMPLE; measured proportional A2C (0xaa01).
+- Bug found and fixed: multisampled draws Sync()ed after every draw (8e64856a3).
+- Commits 07af885b6, f722a7f2a, 767f5b97e, 8e64856a3, ddb35b87d + docs. New G3 tests agc_metal_msaa_{emulated,sampled8,interp,a2c,storage}.
+- Verification (--validation): gpu-suite/msaa2-g347: G3 44/44, G4 38/39 + 1 allowlisted skip, G7 55 + 13 allowlisted skips. CPU ctest -LE gpu 5,015/5,015. check_test_registration clean. Disk 8.94 GB.
+- Next: the f16 supervised run, merge mac-native-metal into mac-native, M3.
+
