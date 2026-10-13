@@ -93,6 +93,11 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
         std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
         if (list.find(address) != std::string::npos) return 64u;
     }
+    // MSL compute and mesh programs run in threadgroups of 32-wide Apple SIMD groups, whatever width
+    // the target claims: a wave64 program is laid out at two guest lanes per invocation, as one lane
+    // per invocation would spread its wave over two SIMD groups that ballots, votes and lane reads
+    // cannot reach. Graphics stages keep the claimed width (MslGraphicsHalfWave).
+    if (request.target.backend == ShaderBackend::Msl && (request.shader.stage == ShaderStage::Compute || request.shader.stage == ShaderStage::Mesh)) return 32u;
     return request.target.subgroupSize;
 }
 

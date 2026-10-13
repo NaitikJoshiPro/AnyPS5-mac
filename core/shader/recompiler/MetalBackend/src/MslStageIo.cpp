@@ -443,6 +443,9 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
         state.Line("aps5_valid = " + exec + " ? 1u : 0u;");
     }
     if (exp.kind == ExportTargetKind::Null || exp.en == 0u || (exp.kind == ExportTargetKind::Primitive && stage != IrShaderStage::Mesh)) return;
+    // A pixel program's pos0 export has no fragment output to write (SpirvModuleEmitter.cpp finds
+    // no output variable for it and drops it the same way).
+    if (stage == IrShaderStage::Pixel && exp.kind == ExportTargetKind::Position && exp.index == 0u) return;
     state.Line("if (" + exec + ") {");
     state.Indent();
     const auto data = state.Temporary("aps5_ed");

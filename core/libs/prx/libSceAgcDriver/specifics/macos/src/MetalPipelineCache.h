@@ -102,6 +102,12 @@ struct RenderPipelineRequest {
     // `meshThreads` its threads per mesh threadgroup (Reflection::threadsPerThreadgroup).
     bool mesh = false;
     std::uint32_t meshThreads = 0;
+    // Tessellated draws (DECISIONS D24, MetalTessellation.h): the object function (local + hull
+    // programs) of the mesh pipeline, its threads per object threadgroup, and the most mesh
+    // threadgroups one object threadgroup launches.
+    std::optional<PipelineFunction> object;
+    std::uint32_t objectThreads = 0;
+    std::uint32_t meshGroups = 0;
     // Vertex amplification and raster order groups are not used by M2.
 };
 

@@ -244,6 +244,9 @@ std::string PipelineCache::RenderKey(const RenderPipelineRequest& request) {
     AppendFunction(key, request.vertex);
     if (request.fragment) AppendFunction(key, *request.fragment);
     else key += "-\n";
+    if (request.object) AppendFunction(key, *request.object);
+    else key += "-\n";
+    key += std::to_string(request.objectThreads) + ',' + std::to_string(request.meshGroups) + '\n';
     for (const auto& color : request.colors) AppendColor(key, color);
     for (const auto value : {static_cast<std::uint64_t>(request.depthFormat), static_cast<std::uint64_t>(request.stencilFormat), static_cast<std::uint64_t>(request.rasterSampleCount), static_cast<std::uint64_t>(request.alphaToCoverage),
                              static_cast<std::uint64_t>(request.alphaToOne), static_cast<std::uint64_t>(request.rasterization), static_cast<std::uint64_t>(request.topology),

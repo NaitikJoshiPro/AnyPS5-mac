@@ -145,8 +145,8 @@ APS5_TESS_FN uint aps5_tess_to_fixed(float value) {
     const int extra = 7 - exponent;
     if (extra >= 0) {
         const uint lsb = 1u << uint(extra);
-        const uint half = lsb >> 1u;
-        if ((mantissa & lsb) != 0u || (mantissa & (lsb - 1u)) > half) mantissa += half;
+        const uint halfway = lsb >> 1u;
+        if ((mantissa & lsb) != 0u || (mantissa & (lsb - 1u)) > halfway) mantissa += halfway;
         return mantissa >> uint(extra);
     }
     return mantissa << uint(-extra);
@@ -180,11 +180,11 @@ APS5_TESS_FN int aps5_tess_point_count(uint factor, int odd) {
 
 APS5_TESS_FN Aps5TessContext aps5_tess_context(uint factor, int odd) {
     Aps5TessContext context;
-    uint half = (factor + 1u) / 2u;
-    if (odd != 0 || half == 0x8000u) half += 0x8000u;
-    const uint lower = half & 0x7fff0000u;
-    const uint upper = aps5_tess_ceil_fixed(half);
-    context.halfFraction = half - lower;
+    uint halfway = (factor + 1u) / 2u;
+    if (odd != 0 || halfway == 0x8000u) halfway += 0x8000u;
+    const uint lower = halfway & 0x7fff0000u;
+    const uint upper = aps5_tess_ceil_fixed(halfway);
+    context.halfFraction = halfway - lower;
     context.halfPoints = int(upper >> 16u);
     if (upper == lower) {
         context.splitPoint = context.halfPoints + 1;

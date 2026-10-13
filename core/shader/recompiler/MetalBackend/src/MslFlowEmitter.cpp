@@ -431,6 +431,35 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
     return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
 }
 
+// s_memtime / s_memrealtime: MSL has no shader or device clock, so both read an emulated clock,
+// the 64-bit count of clock reads in the driver's table (MslAbi::ClockCounterWord, low then high
+// word). One elected invocation per SIMD group takes the next count and broadcasts it, so the value
+// is uniform over the guest wave (over each 32-lane view of a wave64 graphics program), nonzero,
+// and increases from read to read across waves, dispatches and draws of the device. It counts
+// reads, not time (TechnicalDebt metal-shader-clock). Without the table (atomicLocks 0) the count
+// is the invocation's own.
+void EmitClock(MslEmitterState& state, const IrValue& instruction) {
+    state.usesDriverData = true;
+    static constexpr const char* Local = "aps5_clock_reads";
+    if (state.locals.find(std::string(" ") + Local + " ") == std::string::npos) state.DeclareLocal("uint", Local, "0u");
+    const auto value = state.Temporary("aps5_clk");
+    state.Line(std::string(Local) + " += 1u;");
+    state.Line("uint2 " + value + " = uint2(" + Local + ", 0u);");
+    state.Line("if (aps5_driver.atomicLocks != 0ul) {");
+    state.Indent();
+    state.Line("if (simd_is_first()) {");
+    state.Indent();
+    state.Line("device atomic_uint* " + value + "_c = reinterpret_cast<device atomic_uint*>(aps5_driver.atomicLocks) + " + std::to_string(MslAbi::ClockCounterWord) + "u;");
+    state.Line(value + ".x = atomic_fetch_add_explicit(&" + value + "_c[0], 1u, memory_order_relaxed) + 1u;");
+    state.Line(value + ".y = " + value + ".x == 0u ? atomic_fetch_add_explicit(&" + value + "_c[1], 1u, memory_order_relaxed) + 1u : atomic_load_explicit(&" + value + "_c[1], memory_order_relaxed);");
+    state.Outdent();
+    state.Line("}");
+    state.Line(value + " = simd_broadcast_first(" + value + ");");
+    state.Outdent();
+    state.Line("}");
+    state.Define(instruction, "as_type<ulong>(" + value + ")");
+}
+
 void EmitBarrier(MslEmitterState& state, const IrValue& instruction) {
     const auto stage = state.program.Resources().stage;
     // Local and domain programs run per control point / corner in object and mesh functions, inside
@@ -506,6 +535,10 @@ bool EmitMslControlInstruction(MslEmitterState& state, const IrValue& instructio
         return true;
     case IrOpcode::GetShaderBase:
         state.Define(instruction, "0ul");
+        return true;
+    case IrOpcode::ShaderClock:
+    case IrOpcode::RealtimeClock:
+        EmitClock(state, instruction);
         return true;
     case IrOpcode::Barrier:
         EmitBarrier(state, instruction);

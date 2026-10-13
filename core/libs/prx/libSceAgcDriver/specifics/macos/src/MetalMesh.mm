@@ -23,6 +23,11 @@ id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRe
         }
         MTL4MeshRenderPipelineDescriptor* descriptor = [MTL4MeshRenderPipelineDescriptor new];
         descriptor.meshFunctionDescriptor = functionDescriptor(request.vertex);
+        // Tessellated draws (MetalTessellation.h): local + hull programs in the object function.
+        if (request.object) {
+            descriptor.objectFunctionDescriptor = functionDescriptor(*request.object);
+            descriptor.maxTotalThreadsPerObjectThreadgroup = request.objectThreads;
+        }
         if (request.fragment) descriptor.fragmentFunctionDescriptor = functionDescriptor(*request.fragment);
         for (std::size_t index = 0; index < request.colors.size(); ++index) {
             const auto& color = request.colors[index];
@@ -45,7 +50,8 @@ id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRe
         descriptor.alphaToOneState = request.alphaToOne ? MTL4AlphaToOneStateEnabled : MTL4AlphaToOneStateDisabled;
         descriptor.rasterizationEnabled = request.rasterization;
         if (request.meshThreads != 0u) descriptor.maxTotalThreadsPerMeshThreadgroup = request.meshThreads;
-        descriptor.maxTotalThreadgroupsPerMeshGrid = MaxMeshThreadgroupsPerGrid;
+        // An object stage launches at most meshGroups mesh threadgroups per object threadgroup.
+        descriptor.maxTotalThreadgroupsPerMeshGrid = request.object ? request.meshGroups : MaxMeshThreadgroupsPerGrid;
         NSError* error = nil;
         id<MTLRenderPipelineState> pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
         if (pipeline == nil) throw std::runtime_error("Metal device: mesh render pipeline creation failed: " + std::string(error != nil ? error.localizedDescription.UTF8String : "unknown error"));

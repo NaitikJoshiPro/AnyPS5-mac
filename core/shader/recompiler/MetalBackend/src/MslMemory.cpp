@@ -62,8 +62,9 @@ static inline bool aps5_f64_bits_equal(ulong left, ulong right) {
 
 // 64-bit atomics on device memory (buffer, flat and global *_x2 atomics). Apple9 has 64-bit device
 // atomics only as atomic_max/min without a result, so every 64-bit read-modify-write takes a lock
-// word of the driver's lock table (DriverData.atomicLocks, 1024 dwords hashed by address): one
+// word of the driver's lock table (DriverData.atomicLocks, MslAbi::AtomicLockWords dwords hashed by address): one
 // elected invocation per SIMD group per round, as the LDS lock.
+static_assert(MslAbi::AtomicLockWords == 512u, "aps5_atomic64_lock masks the hash with AtomicLockWords - 1");
 constexpr std::string_view Atomics64Text = R"(static ulong aps5_atomic64_next(uint op, ulong old, ulong value, ulong comparator) {
     switch (op) {
     case 0u: return value;
@@ -88,7 +89,7 @@ constexpr std::string_view Atomics64Text = R"(static ulong aps5_atomic64_next(ui
 
 static inline device atomic_uint* aps5_atomic64_lock(ulong locks, ulong address) {
     const uint hash = uint(address >> 3u) ^ uint(address >> 13u) ^ uint(address >> 32u);
-    return reinterpret_cast<device atomic_uint*>(locks) + (hash & 1023u);
+    return reinterpret_cast<device atomic_uint*>(locks) + (hash & 511u);
 }
 
 )";
