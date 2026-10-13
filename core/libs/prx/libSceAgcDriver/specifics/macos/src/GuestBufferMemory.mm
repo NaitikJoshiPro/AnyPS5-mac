@@ -5,6 +5,7 @@
 // carried in HostImport::buffer as a retained bridge (Metal::BufferOf reads it); HostImport::memory
 // stays null. The write-protection probe is not run: imported ranges are compared, not watched.
 // Port upstream changes to the original here (the twin ledger lists them).
+#include "MetalNoCopy.h"
 #include "MetalVmTrace.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -325,7 +326,7 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     if (trace) {
         for (auto page = entry.base; page < entry.base + entry.bytes; page += 0x4000u) std::fprintf(stderr, "[metal] host import page 0x%llx: %s\n", static_cast<unsigned long long>(page), AgcDriver::Metal::VmWiredInfo(page).c_str());
     }
-    id<MTLBuffer> buffer = [Metal::DeviceOf(context) newBufferWithBytesNoCopy:reinterpret_cast<void*>(entry.base) length:entry.bytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil];
+    id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), entry.base, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(entry.base).c_str());
     if (buffer == nil) {
         failure = VK_ERROR_OUT_OF_DEVICE_MEMORY;

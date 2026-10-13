@@ -13,6 +13,7 @@
 #include "MetalCommandStream.h"
 #include "MetalPipelineCache.h"
 #include "MetalImages.h"
+#include "MetalNoCopy.h"
 #include "MetalVmTrace.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
@@ -215,7 +216,7 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
             }
         }
     }
-    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:reinterpret_cast<void*>(pageBegin) length:pageEnd - pageBegin options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil];
+    id<MTLBuffer> buffer = Metal::NewNoCopyBuffer(device, pageBegin, pageEnd - pageBegin, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (buffer == nil) return 0;
     [residency addAllocation:buffer];
     [residency commit];
