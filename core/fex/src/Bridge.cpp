@@ -457,6 +457,11 @@ void Bridge::Open(const std::string& name) {
     }
 }
 
+void Bridge::OpenIfPresent(const std::string& name) {
+    std::error_code error;
+    if (std::filesystem::exists(directory / name, error)) Open(name);
+}
+
 void* Bridge::HostSymbol(const char* name) const {
     for (void* library : handles)
         if (void* symbol = dlsym(library, name)) return symbol;

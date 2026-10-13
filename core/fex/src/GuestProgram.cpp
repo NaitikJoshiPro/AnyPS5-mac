@@ -45,6 +45,10 @@ void* GuestModuleSymbol(void* image, const char* name) {
 GuestProgram::GuestProgram(const std::filesystem::path& executable, Bridge& bridge) {
     bridge.Open("libkernel.prx");
     bridge.Open("libc.prx");
+    // The console's libkernel exports POSIX calls (openat, unlinkat, pathconf, symlink, ...) that AnyPS5
+    // implements in libkernel_sys; a title importing them from libkernel finds them there. libkernel stays
+    // first, so a name both define resolves to libkernel's.
+    bridge.OpenIfPresent("libkernel_sys.prx");
     Load(std::filesystem::absolute(executable), bridge);
 
     std::vector<std::uint64_t> offsets {0};

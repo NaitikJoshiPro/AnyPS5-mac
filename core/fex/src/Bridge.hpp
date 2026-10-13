@@ -35,6 +35,8 @@ public:
     ~Bridge();
 
     void Open(const std::string& name);
+    // Opens the library when the library directory has it.
+    void OpenIfPresent(const std::string& name);
     void* HostSymbol(const char* name) const;
 
     void Connect();
