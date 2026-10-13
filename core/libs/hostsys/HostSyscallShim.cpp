@@ -12,6 +12,7 @@
 // are translated without scanning them.
 #include "prx/libc/include/GuestDisplaced.hpp"
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -547,6 +548,18 @@ APS5_HOST_SHIM int fprintf(FILE* __restrict stream, const char* __restrict forma
 }
 
 #undef APS5_HOST_SHIM
+
+}
+
+namespace {
+
+// libSystem's functions are resolved on first use (dlsym). write is resolved at load instead: the fault handler's
+// trace and crash paths call it inside signal handlers, where dlsym could deadlock on a lock the thread holds.
+__attribute__((constructor)) void ResolveSignalSafeCalls() {
+    const int saved = errno;
+    (void)!write(-1, nullptr, 0);
+    errno = saved;
+}
 
 }
 
