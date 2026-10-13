@@ -393,6 +393,50 @@ struct DrawCall {
 
 }
 
+// Upstream Draw.cpp prepareDrawInputs (fdefd7660): the index buffer and the vertex records a draw
+// reads must not alias its color target. A vertex buffer counts from the first record the draw
+// fetches (firstVertex, or firstInstance for instance-rate inputs), so a descriptor based below the
+// target is accepted when its fetched records lie past it; indirect draws (records unknown on the
+// CPU) count the whole descriptor, as upstream. Indices are scanned for the highest one only when
+// the descriptor reaches the target.
+template <typename Settle>
+static void CheckInputsClearOfTarget(Settle settle, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const ShaderRecompiler::VertexAttribute> attributes, std::uint64_t indexBegin, std::uint64_t indexBytes) {
+    if (!graphics.hasColorTarget) return;
+    const auto targetBegin = graphics.color.address;
+    const auto targetEnd = targetBegin + graphics.color.bytes;
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) { return begin < targetEnd && targetBegin < end; };
+    if (draw.indexed && overlaps(indexBegin, indexBegin + indexBytes)) throw std::runtime_error("AGC graphics: index buffer aliases the render target");
+    std::optional<std::uint32_t> maxIndex;
+    bool scanned = false;
+    for (const auto& attribute : attributes) {
+        if (Graphics::NullVertexDescriptor(attribute)) continue;
+        const auto& fields = attribute.resource.fields;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        const auto stride = (fields[1] >> 16u) & 0x3fffu;
+        const std::uint64_t extent = stride == 0u ? Graphics::ZeroStrideAvailableBytes(attribute) : static_cast<std::uint64_t>(fields[2]) * stride;
+        if (extent == 0u || !overlaps(address, address + extent)) continue;
+        std::uint64_t firstByte = 0;
+        std::uint64_t bytes = extent;
+        if (!draw.indirect) {
+            if (attribute.fetchIndex == 0u && !scanned) {
+                scanned = true;
+                if (!draw.indexed) {
+                    maxIndex = draw.firstVertex + draw.indexCount - 1u;
+                } else {
+                    settle(indexBegin, indexBytes);
+                    const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(indexBegin), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart && !listTopology);
+                    if (highest) maxIndex = *highest + draw.firstVertex;
+                }
+            }
+            if (attribute.fetchIndex == 0u && !maxIndex) continue;
+            bytes = Graphics::VertexBufferReadSize(attribute, maxIndex.value_or(0u), draw.instanceCount, draw.firstInstance);
+            firstByte = Graphics::VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance);
+        }
+        if (overlaps(address + firstByte, address + bytes)) throw std::runtime_error("AGC graphics: vertex buffer aliases the render target");
+    }
+}
+
 void VulkanDevice::State::SettleRange(std::uint64_t address, std::uint64_t bytes) {
     auto& state = *this;
     if (state.recorder->PendingWriteOverlaps(address, bytes) || state.recorder->PendingLabelIn(address, bytes)) {
@@ -523,6 +567,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // A batch over its kept-byte budget is submitted first (upstream's Draw does the same).
     recorder.BoundKeptBytes();
     const auto& vertexResult = *vertex.program;
+    // Before the indirect records are read, as upstream validates its inputs first.
+    CheckInputsClearOfTarget([&](std::uint64_t begin, std::uint64_t bytes) { state.SettleRange(begin, bytes); }, graphics, draw, (tessellation != nullptr ? *tessellation->local->program : vertexResult).vertexAttributes, draw.indexed ? draw.indexAddress : 0u, draw.indexed ? static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize : 0u);
     const auto& vertexReflection = vertexResult.msl.Reflection();
     const auto* fragmentResult = fragment != nullptr ? fragment->program : nullptr;
     const Abi::Reflection* fragmentReflection = fragmentResult != nullptr ? &fragmentResult->msl.Reflection() : nullptr;
