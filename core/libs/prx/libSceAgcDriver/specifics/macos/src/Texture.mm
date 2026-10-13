@@ -173,8 +173,10 @@ struct LiveImages {
 };
 
 LiveImages& Live() {
-    static LiveImages live;
-    return live;
+    // Leaked on purpose: ~StorageTexture of images still cached at exit runs from later static
+    // destructors (agc_driver_store_idle_results aborted locking a destroyed mutex).
+    static LiveImages* const live = new LiveImages;
+    return *live;
 }
 
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
@@ -1021,8 +1023,10 @@ struct PendingWrites {
 };
 
 PendingWrites& Pending() {
-    static PendingWrites pending;
-    return pending;
+    // Leaked on purpose: ~StorageTexture of images still cached at exit runs from later static
+    // destructors (agc_driver_store_idle_results aborted locking a destroyed mutex).
+    static PendingWrites* const pending = new PendingWrites;
+    return *pending;
 }
 
 // See StorageTexture::PendingSerial: bumped after every mutation of the registry above.

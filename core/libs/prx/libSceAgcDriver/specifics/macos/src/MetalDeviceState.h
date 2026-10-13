@@ -143,6 +143,12 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Recorder> recorder;
     // The device is being destroyed: completion actions log faults instead of throwing.
     bool tearingDown = false;
+    // The first BDA fault of a draw's graphics stage since the last WaitIdle (upstream throws it out
+    // of its synchronous Draw; recorded Metal draws surface it at WaitIdle). Dispatch faults stay
+    // logged only, as upstream's recorded dispatches.
+    std::mutex drawFaultMutex;
+    std::exception_ptr drawFault;
+    std::uint32_t lastFaultStage = 0;
     // Teardown() ran (from ~VulkanDevice or from the exit handler, whichever came first).
     bool tornDown = false;
     // Releases everything in the order the GPU driver needs (D19.5): waits for every submitted
@@ -246,7 +252,7 @@ struct VulkanDevice::State {
     // After the command was recorded: pending reads and writes of the planned ranges, and the
     // fault check of the batch.
     void NoteBindings(const StageBindings& plan);
-    void CheckFaultsOnComplete();
+    void CheckFaultsOnComplete(bool draw = false);
 
     // Draws (MetalDraw.mm, D6): the device's draw objects (made at the first draw), a sync when
     // recorded GPU work writes guest memory the CPU is about to read, the GPU buffer holding a

@@ -1185,7 +1185,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     state.NoteBindings(vertexPlan);
     state.NoteBindings(fragmentPlan);
     state.NoteBindings(targetPlan);
-    state.CheckFaultsOnComplete();
+    state.CheckFaultsOnComplete(true);
     if (Trace()) std::fprintf(stderr, "[metal] draw %s %zu calls (%llu recorded, %zu pipeline passes), %zu color targets, depth %s, pass %s\n", indexedDraw ? "indexed" : "direct", drawCalls.size(), static_cast<unsigned long long>(recorded), pipelinePasses.size(), colors.size(), depth != nullptr ? "yes" : "no", continued ? "continued" : "begun");
 }
 

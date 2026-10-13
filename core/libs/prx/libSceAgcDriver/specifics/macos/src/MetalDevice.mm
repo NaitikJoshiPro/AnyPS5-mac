@@ -400,6 +400,7 @@ void VulkanDevice::State::CheckFaults() {
         return;
     }
     std::string message = "Metal device: GPU fault: BDA access failed: address=" + Hex(report.address) + " instruction=" + Hex(report.instruction) + " bytes=" + std::to_string(report.bytes) + " stage=" + std::to_string(report.stage) + " reason=" + std::to_string(static_cast<std::uint32_t>(report.reason));
+    lastFaultStage = report.stage;
     if (report.reason == Bda::FaultReason::Unmapped) message += " (no guest allocation in the BDA page table covers it)";
     if (report.reason == Bda::FaultReason::Permission) message += " (a store to a read-only range of the BDA page table)";
     throw std::runtime_error(message);
@@ -738,6 +739,12 @@ void TraceGds(const char* where) {
 
 void VulkanDevice::WaitIdle() {
     state->Sync();
+    std::exception_ptr fault;
+    {
+        std::lock_guard lock(state->drawFaultMutex);
+        fault = std::exchange(state->drawFault, nullptr);
+    }
+    if (fault != nullptr) std::rethrow_exception(fault);
     TraceGds("after WaitIdle");
     if (std::getenv("APS5_TRACE_GDS") != nullptr) {
         const auto gds = Pm4::GdsAddress();
@@ -771,9 +778,14 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     state->recorder->Submit();
 }
 
-void VulkanDevice::StoreIdleResults(bool) {
-    // Pending storage-image results of the upstream image path (D4's Texture twin), as upstream.
-    if (Graphics::StorageTexture::AnyPending()) Graphics::StorageTexture::FlushAllPending("idle");
+void VulkanDevice::StoreIdleResults(bool reapFirst) {
+    // Pending storage-image results of the upstream image path (D4's Texture twin), as upstream
+    // (VulkanDevice.cpp): the write-back is recorded into the open batch, which is submitted here.
+    if (!Graphics::StorageTexture::AnyPending()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::StorageTexture::FlushAllPending("idle");
+    SubmitRecorded(reapFirst);
 }
 
 bool VulkanDevice::CanWaitUnlocked() const {
@@ -1278,13 +1290,24 @@ void VulkanDevice::State::NoteBindings(const StageBindings& plan) {
     if (!plan.writes.empty()) recorder->NotePendingWrites(plan.writes);
 }
 
-void VulkanDevice::State::CheckFaultsOnComplete() {
+void VulkanDevice::State::CheckFaultsOnComplete(bool draw) {
     // Faults and written pages of this batch's commands (one shared record) when it completes. As
     // upstream (BdaResources::CheckFault in a completion): a fault record throws, which the recorder
-    // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait.
-    recorder->OnComplete([this] {
+    // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait. A
+    // draw's graphics-stage fault is also kept for WaitIdle: upstream's draw over non-resident
+    // targets runs synchronously and throws it from Draw (agc_driver_pixel_interlock).
+    recorder->OnComplete([this, draw] {
         if (!tearingDown) {
-            CheckFaults();
+            try {
+                CheckFaults();
+            } catch (...) {
+                constexpr std::uint32_t ComputeStage = 4u;  // IrShaderStage::Compute in Bda::Fault::stage
+                if (draw && lastFaultStage != ComputeStage) {
+                    std::lock_guard lock(drawFaultMutex);
+                    if (drawFault == nullptr) drawFault = std::current_exception();
+                }
+                throw;
+            }
             return;
         }
         try {
