@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -208,12 +209,10 @@ void Run(id<MTLDevice> device, id<MTLCommandQueue> queue, const Variant& variant
         descriptor.width = Extent;
         descriptor.height = Extent;
         descriptor.arrayLength = Layers * Samples;
-        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.storageMode = MTLStorageModePrivate;
         descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | (index / 7u == 0u ? 0u : MTLTextureUsageShaderAtomic);
         id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
         Require(texture != nil, name + ": cannot create a 2D-array texture");
-        const std::vector<std::uint8_t> zero(Extent * Extent * 16u, 0u);
-        for (std::uint32_t slice = 0; slice < Layers * Samples; ++slice) [texture replaceRegion:MTLRegionMake2D(0, 0, Extent, Extent) mipmapLevel:0 slice:slice withBytes:zero.data() bytesPerRow:Extent * (index / 7u == 0u ? 16u : 4u) bytesPerImage:0];
         textures.push_back(texture);
         if (kind == written) target = texture;
     }
@@ -233,7 +232,20 @@ void Run(id<MTLDevice> device, id<MTLCommandQueue> queue, const Variant& variant
     for (std::uint32_t component = 0; component < 4u; ++component) push[base + 8u + component] = isFloat ? std::bit_cast<std::uint32_t>(floats[component]) : uints[component];
     id<MTLBuffer> tableBuffer = [device newBufferWithBytes:table.data() length:table.size() * sizeof(std::uint64_t) options:MTLResourceStorageModeShared];
     id<MTLBuffer> pushBuffer = [device newBufferWithBytes:push.data() length:sizeof(push) options:MTLResourceStorageModeShared];
+    // Private textures (as the driver's storage images): zero-filled by a blit before the dispatch,
+    // read back through a buffer after it.
+    const auto texelBytes = isFloat ? 16u : 4u;
+    const auto sliceBytes = Extent * Extent * 16u;
+    id<MTLBuffer> zero = [device newBufferWithLength:sliceBytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> readback = [device newBufferWithLength:sliceBytes * Layers * Samples options:MTLResourceStorageModeShared];
+    std::memset(zero.contents, 0, sliceBytes);
     id<MTLCommandBuffer> commands = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> clear = [commands blitCommandEncoder];
+    for (id<MTLTexture> texture : textures) {
+        const auto bytes = texture.pixelFormat == MTLPixelFormatRGBA32Float ? 16u : 4u;
+        for (std::uint32_t slice = 0; slice < Layers * Samples; ++slice) [clear copyFromBuffer:zero sourceOffset:0 sourceBytesPerRow:Extent * bytes sourceBytesPerImage:Extent * Extent * bytes sourceSize:MTLSizeMake(Extent, Extent, 1) toTexture:texture destinationSlice:slice destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+    [clear endEncoding];
     id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:tableBuffer offset:0 atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
@@ -241,13 +253,15 @@ void Run(id<MTLDevice> device, id<MTLCommandQueue> queue, const Variant& variant
     for (id<MTLTexture> texture : textures) [encoder useResource:texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(Extent, Extent, 1)];
     [encoder endEncoding];
+    id<MTLBlitCommandEncoder> copy = [commands blitCommandEncoder];
+    for (std::uint32_t slice = 0; slice < Layers * Samples; ++slice) [copy copyFromTexture:target sourceSlice:slice sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(Extent, Extent, 1) toBuffer:readback destinationOffset:slice * sliceBytes destinationBytesPerRow:Extent * texelBytes destinationBytesPerImage:Extent * Extent * texelBytes];
+    [copy endEncoding];
     [commands commit];
     [commands waitUntilCompleted];
     Require(commands.status == MTLCommandBufferStatusCompleted, name + ": the dispatch failed: " + Describe(commands.error));
     const auto slice = (arrayed ? variant.layer * Samples : 0u) + variant.sample;
     for (std::uint32_t check = 0; check < Layers * Samples; ++check) {
-        std::vector<std::uint32_t> texels(Extent * Extent * 4u, 0u);
-        [target getBytes:texels.data() bytesPerRow:Extent * (isFloat ? 16u : 4u) bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, Extent, Extent) mipmapLevel:0 slice:check];
+        const auto* texels = static_cast<const std::uint32_t*>(readback.contents) + check * sliceBytes / 4u;
         for (std::uint32_t texel = 0; texel < Extent * Extent; ++texel) {
             for (std::uint32_t component = 0; component < (isFloat ? 4u : 1u); ++component) {
                 const auto value = texels[texel * (isFloat ? 4u : 1u) + component];
