@@ -100,7 +100,7 @@ struct Parameters {
     std::uint32_t bits;
     std::uint32_t dwords;
     std::uint32_t used;
-    std::uint32_t coherent;
+    std::uint32_t glcAccess;
     std::uint32_t stops;
     std::uint32_t spanOffset;
     std::uint32_t stage;
@@ -121,7 +121,7 @@ struct Parameters {
     uint bits;
     uint dwords;
     uint used;
-    uint coherent;
+    uint glcAccess;
     uint stops;
     uint spanOffset;
     uint stage;
@@ -137,7 +137,7 @@ kernel void aps5_bda_check(constant Parameters& p [[buffer(0)]], uint local [[th
     bda.stage = p.stage;
     const uint pc = 0x1234u;
     const bool stops = p.stops != 0u;
-    const bool glc = p.coherent != 0u;
+    const bool glc = p.glcAccess != 0u;
     device uint* output = reinterpret_cast<device uint*>(p.output);
     bool stop = false;
     // Upstream's non-stopping shaders add LocalInvocationIndex to the address (one invocation: 0).
@@ -384,7 +384,7 @@ void ReadChecks(Gpu& gpu) {
         std::memcpy(words.contents, sentinels.data(), sizeof(sentinels));
         auto parameters = Base(table, TableBytes<2>(), fault, words, Mode::DwordRead, address);
         parameters.dwords = dwords;
-        parameters.coherent = coherent ? 1u : 0u;
+        parameters.glcAccess = coherent ? 1u : 0u;
         parameters.stops = stops ? 1u : 0u;
         gpu.Run(parameters, 1);
         const auto report = FaultOf(fault);
@@ -425,7 +425,7 @@ void ReadChecks(Gpu& gpu) {
         auto parameters = Base(spanTable, TableBytes<3>(), fault, words, Mode::SpanRead, address);
         parameters.spanOffset = static_cast<std::uint32_t>(offset);
         parameters.used = extracted;
-        parameters.coherent = coherent ? 1u : 0u;
+        parameters.glcAccess = coherent ? 1u : 0u;
         parameters.stops = stops ? 1u : 0u;
         gpu.Run(parameters, 1);
         const auto report = FaultOf(fault);
@@ -474,7 +474,7 @@ void StoreChecks(Gpu& gpu) {
         std::memset(output.contents, 0, output.length);
         auto parameters = Base(table, TableBytes<2>(), fault, output, Mode::Store, address);
         parameters.bits = bits;
-        parameters.coherent = coherent ? 1u : 0u;
+        parameters.glcAccess = coherent ? 1u : 0u;
         parameters.values[0] = 0xa1b2c3d4u;
         gpu.Run(parameters, 1);
         std::array<std::uint8_t, 5> actual {};
