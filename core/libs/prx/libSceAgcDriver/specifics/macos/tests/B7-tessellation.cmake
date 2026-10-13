@@ -21,3 +21,13 @@ if(CMAKE_CXX_COMPILER_LAUNCHER)
 endif()
 add_test(NAME agc_metal_msl_tessellation COMMAND agc_metal_msl_tessellation_tests)
 set_tests_properties(agc_metal_msl_tessellation PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+# agc_metal_tessellation_domains (DECISIONS D26): guest tessellated draws of quad, triangle and isoline
+# patches with every partitioning and the point, line, cw and ccw outputs, culled patches and level
+# clamps, checked against the software tessellator core (domain program runs per unique slice point,
+# its (u, v) bit for bit, coverage and winding of the rendered patch). GPU, one patch per draw.
+add_test_executable(agc_metal_tessellation_domains_tests ${agcMetalDir}/tests/TessellationDomains.cpp)
+target_include_directories(agc_metal_tessellation_domains_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/core/shader/recompiler/MetalBackend/include ${CMAKE_SOURCE_DIR}/core/libs/prx/libSceAgcDriver/tests/execution ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_metal_tessellation_domains_tests PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_metal_tessellation_domains_tests PROPERTIES CXX_STANDARD 20 CXX_EXTENSIONS OFF)
+add_test(NAME agc_metal_tessellation_domains COMMAND agc_metal_tessellation_domains_tests)
+set_tests_properties(agc_metal_tessellation_domains PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60 LABELS "gpu")
