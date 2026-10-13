@@ -135,6 +135,7 @@ agc_driver_d16_memory G1
 agc_driver_depth_fast_clear G1
 agc_driver_depth_storage_reuse G1
 agc_driver_device_selection G1
+agc_driver_displaced_guest_memory G1
 agc_driver_div_fixup_f16 G1
 agc_driver_division G1
 agc_driver_dpp16_inactive_source G1
@@ -207,7 +208,6 @@ agc_driver_global_vcc_base G1
 agc_driver_guarded_null_pointer G1
 agc_driver_half_expansion G1
 agc_driver_host_import_at_map G1
-agc_driver_displaced_guest_memory G1
 agc_driver_host_import_teardown G1
 agc_driver_image_by G1
 agc_driver_image_pck_n G1
@@ -454,6 +454,7 @@ agc_driver_tessellation G4
 agc_driver_vertex_clip_cull_draw G4
 agc_driver_vertex_clip_cull_draw_no_key G4
 agc_driver_wait_shutdown G4
+agc_driver_window_space_position_draw G4
 agc_driver_write_data_written_ahead G4
 agc_driver_zero_dword_fill G4
 agc_shared_write G4

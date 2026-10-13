@@ -2494,8 +2494,8 @@ void InitialContextTests() {
     // Window-space positions (radeonsi window_space_position shaders): VTX_XY_FMT | VTX_Z_FMT, no
     // viewport transform; the viewport becomes the render area with depth [0, 1] and clipping may be off.
     queue.context[0x206] = 0x300;
-    const auto clipControl = queue.context.at(0x204);
-    for (const auto clip : {clipControl, clipControl | 0x10000u}) {
+    const std::uint32_t clipControl = queue.context.at(0x204);
+    for (const std::uint32_t clip : {clipControl, clipControl | 0x10000u}) {
         queue.context[0x204] = clip;
         const auto window = AgcDriver::Graphics::DecodeState(queue);
         Require(window.windowSpacePosition && !window.negativeOneToOne, "window-space positions were not decoded");
