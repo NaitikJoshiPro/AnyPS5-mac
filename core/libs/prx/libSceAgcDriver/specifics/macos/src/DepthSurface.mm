@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "MetalDepthSurfaces.h"
@@ -69,9 +70,19 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
     return width * height * bytesPerTexel;
 }
 
-bool SampleLocationsCompatibleDepth(const Context&, VkFormat, std::uint32_t) {
-    // Metal has no programmable sample locations for depth attachments.
-    return false;
+bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples) {
+    // As upstream: sample counts with custom locations, then the depth format's multisample support
+    // through the context's query (a test's mock device) or the Metal device's. Metal sets sample
+    // positions per render pass (programmable sample positions), so any depth texture of a supported
+    // sample count is compatible.
+    if (samples <= 1 || (context.sampleLocationSampleCounts & samples) == 0) return false;
+    VkImageFormatProperties properties{};
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const auto result = context.imageFormatProperties != nullptr
+        ? context.imageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, &properties)
+        : Metal::Vk::GetPhysicalDeviceImageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, &properties);
+    if (result != VK_SUCCESS) return false;
+    return (properties.sampleCounts & samples) != 0;
 }
 
 VkImageView DepthSurfaceView(const Context&, const DepthTarget&) {
