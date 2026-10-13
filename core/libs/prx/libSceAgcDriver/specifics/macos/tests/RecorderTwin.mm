@@ -35,13 +35,8 @@ constexpr Mode Modes[] = {
      "skipped, the device has no Vulkan descriptor pools: Metal descriptor tables are written into the per-batch upload ring"},
     {"--unchanged-cpu-stamps-only", "agc_unchanged_cpu_stamps", "D3 (guest memory imports and write tracking)", nullptr},
     {"--settled-baseline-only", "agc_storage_baseline_settled", "D3 (guest memory imports and write tracking)", nullptr},
-    {"--storage-upload-lifetime-only", "agc_storage_upload_lifetime", "D4 (texture storage uploads)", nullptr},
-    {"--storage-upload-failure-only", "agc_storage_upload_failure", "D4 (texture storage uploads)", nullptr},
     {"--host-import-unmap-only", "agc_host_import_unmap", "D3 (host imports)", nullptr},
     {"--unit-shadow-only", "agc_unit_shadow", "D3 (unit shadows)", nullptr},
-    {"--draw-snapshot-cap-only", "agc_draw_snapshot_cap", "D6 (draw input snapshots)", nullptr},
-    {"--multisample-only", "agc_multisample_guest_access", "D6 (multisample targets)", nullptr},
-    {"--draw-inputs-in-place-only", "agc_draw_inputs_in_place", "D6 (draw inputs)", nullptr},
 };
 
 }

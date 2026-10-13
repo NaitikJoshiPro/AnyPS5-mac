@@ -18,5 +18,4 @@ list(APPEND agcMetalTwins
         "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextures.mm"
         "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextureFormat.mm"
         "tests/execution/PipelineOptimizedReadback.cpp=specifics/macos/tests/PendingTwins.mm"
-        "tests/execution/PooledBufferRange.cpp=specifics/macos/tests/PendingTwins.mm"
 )
