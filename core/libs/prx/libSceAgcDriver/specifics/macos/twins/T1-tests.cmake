@@ -18,4 +18,9 @@ list(APPEND agcMetalTwins
         "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextures.mm"
         "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextureFormat.mm"
         "tests/execution/PipelineOptimizedReadback.cpp=specifics/macos/tests/PendingTwins.mm"
+        # Upstream v0.1.2 (0f2683cb7) tests that build their own Vulkan instance or a MockVulkan recorder.
+        "tests/execution/DepthStorage.cpp=specifics/macos/tests/PendingTwins.mm"
+        "tests/execution/DepthPlaneGuestLayers.cpp=specifics/macos/tests/PendingTwins.mm"
+        "tests/execution/SparseBufferHoles.cpp=specifics/macos/tests/PendingTwins.mm"
+        "tests/HostImportRetireHold.cpp=specifics/macos/tests/PendingTwins.mm"
 )

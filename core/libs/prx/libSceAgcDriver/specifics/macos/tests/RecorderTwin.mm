@@ -37,6 +37,11 @@ constexpr Mode Modes[] = {
     {"--settled-baseline-only", "agc_storage_baseline_settled", "D3 (guest memory imports and write tracking)", nullptr},
     {"--host-import-unmap-only", "agc_host_import_unmap", "D3 (host imports)", nullptr},
     {"--unit-shadow-only", "agc_unit_shadow", "D3 (unit shadows)", nullptr},
+    // Upstream 0f2683cb7 modes: --integer-clear-only, --written-buffer-order-only, --parked-import-unmap-only and
+    // --host-import-retirement-only are ported in UpsyncRecorderModes.mm. copiedDirectOrderingTests dispatches a
+    // test-made SPIR-V compute pipeline through ShaderResources::Bind; it needs a Metal compute harness for
+    // test-made programs (TechnicalDebt metal-vulkan-internal-tests).
+    {"--copied-direct-only", "agc_copied_direct_ordering", "UPSYNC follow-up (Metal compute harness for test-made programs)", nullptr},
 };
 
 }
