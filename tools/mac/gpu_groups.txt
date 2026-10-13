@@ -467,6 +467,8 @@ agc_metal_device_teardown_exit G7
 agc_metal_msl_compile G7
 agc_metal_msl_per_vertex G7
 agc_metal_msl_mesh G7
+agc_metal_msl_tessellation G7
+agc_metal_tessellator G7
 agc_metal_msl_corpus G7
 agc_metal_recorder G7
 agc_metal_recorder_logic G7
