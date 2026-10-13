@@ -111,7 +111,7 @@ def with_abi_library(directory, source, libraries, extra=()):
 
 ABI_EXPORTS = ["Aps5AbiHfa", "Aps5AbiStack", "Aps5AbiMixed", "Aps5AbiLarge", "Aps5AbiLongDouble", "Aps5AbiInt128", "Aps5AbiPosition",
                "Aps5AbiManyDoubles", "Aps5AbiCallInts", "Aps5AbiCallShaped", "Aps5AbiCallLarge", "Aps5AbiCallLongDouble",
-               "Aps5AbiStore", "Aps5AbiLoad", "Aps5AbiCallStored"]
+               "Aps5AbiStore", "Aps5AbiLoad", "Aps5AbiCallStored", "Aps5AbiMainThreadProbe"]
 LIBRARIES = RUNNER = None
 
 COMPILED = {
@@ -123,6 +123,7 @@ COMPILED = {
                         "exp2l", "expl", "frexpl", "ldexpl", "log10l", "logl", "powl", "sinhl", "sinl", "tanhl", "tanl", "truncl",
                         "strtold", "wcstold", "__signbitl"]}), 43),
     "abi-callbacks": (lambda d: with_abi_library(d, "abi_callbacks.cpp", {"libc.prx": ["exit"]}), 43),
+    "main-thread": (lambda d: with_abi_library(d, "main_thread.cpp", {"libc.prx": ["exit"]}), 43),
     "context": (lambda d: compiled_executable(d, [str(HERE / "context.cpp")], {"libc.prx": ["exit"], "libkernel.prx": ["getcontext",
                 "setcontext", "sigsetjmp", "siglongjmp"], "libSceLibcInternal.prx": ["makecontext"]}), 43),
     "context-exit": (lambda d: compiled_executable(d, [str(HERE / "context.cpp")], {"libc.prx": ["exit"], "libkernel.prx": ["getcontext",
