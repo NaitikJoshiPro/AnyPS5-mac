@@ -25,6 +25,7 @@
 #include "MetalVulkanImages.h"
 #include "MetalDepthSurfaces.h"
 #include "MetalMesh.h"
+#include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -231,6 +232,8 @@ struct DrawCache {
     Graphics::Metal::ImageCache* images = nullptr;
     id<MTL4ArgumentTable> vertexArguments = nil;
     id<MTL4ArgumentTable> fragmentArguments = nil;
+    // Tessellated draws (MetalTessellation.h): the object stage's table.
+    id<MTL4ArgumentTable> objectArguments = nil;
     // MslAbi v4: the buffer of primitive-ordered fragment functions' raster order group (contents
     // ignored), made on first use, resident through the device's residency set.
     id<MTLBuffer> rasterOrder = nil;
@@ -294,7 +297,8 @@ Metal::DrawCache& VulkanDevice::State::Draws() {
         NSError* error = nil;
         cache->vertexArguments = [state.device newArgumentTableWithDescriptor:table error:&error];
         cache->fragmentArguments = [state.device newArgumentTableWithDescriptor:table error:&error];
-        if (cache->vertexArguments == nil || cache->fragmentArguments == nil) Fail("cannot create the draw argument tables: " + Metal::Describe(error));
+        cache->objectArguments = [state.device newArgumentTableWithDescriptor:table error:&error];
+        if (cache->vertexArguments == nil || cache->fragmentArguments == nil || cache->objectArguments == nil) Fail("cannot create the draw argument tables: " + Metal::Describe(error));
         state.draws = std::move(cache);
     }
     return *state.draws;
@@ -497,7 +501,7 @@ id<MTLBuffer> VulkanDevice::State::BufferAt(std::uint64_t address, std::uint64_t
     Fail("guest memory at " + std::to_string(address) + " has no GPU mapping");
 }
 
-void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
+void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots, const Graphics::Metal::TessellationStages* tessellation) {
     auto& state = *this;
     auto& cache = Draws();
     auto& recorder = *state.recorder;
@@ -509,7 +513,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const Abi::Reflection* fragmentReflection = fragmentResult != nullptr ? &fragmentResult->msl.Reflection() : nullptr;
     // Mesh draws (B6 stage 5, MetalMesh.h): the "vertex" stage is the NGG primitive shader's mesh function.
     const bool mesh = vertexReflection.stage == Abi::Stage::Mesh && graphics.stages.mesh.has_value();
-    if (vertexReflection.stage != Abi::Stage::Vertex && !mesh) Fail("the vertex stage's MSL is not a vertex function");
+    // Tessellated draws (MetalTessellation.h): the "vertex" stage is the domain program; the local
+    // and hull programs run in the object function.
+    const bool tess = tessellation != nullptr && vertexReflection.stage == Abi::Stage::Domain && graphics.stages.tessellation.has_value();
+    if (vertexReflection.stage != Abi::Stage::Vertex && !mesh && !tess) Fail("the vertex stage's MSL is not a vertex function");
     if (fragmentReflection != nullptr && fragmentReflection->stage != Abi::Stage::Fragment) Fail("the pixel stage's MSL is not a fragment function");
     if (vertexReflection.workgroupMemoryStrideDwords != 0u || (fragmentReflection != nullptr && fragmentReflection->workgroupMemoryStrideDwords != 0u)) Fail("device-memory LDS in a draw stage");
     if (graphics.samples > 1u) Fail("multisampled draws (" + std::to_string(graphics.samples) + " samples)");
@@ -519,7 +526,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const std::uint32_t conservativeMode = graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT ? 1u : graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT ? 2u : 0u;
     const bool perVertex = fragmentReflection != nullptr && (fragmentReflection->perVertexLocations != 0u || fragmentReflection->emulatedBarycentrics != 0u);
     const bool triangleVertices = conservativeMode != 0u || perVertex;
-    if (mesh && triangleVertices) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of mesh draws");
+    if ((mesh || tess) && triangleVertices) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws"));
+    if (tess && (draw.indirect || graphics.rectList)) Fail(draw.indirect ? "indirect tessellated draws (refused as upstream)" : "tessellated rect lists");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
     // The draws to record: direct, or the indirect records read on the CPU (through the checked
@@ -568,8 +576,19 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // Guest ranges of both stages, the vertex fetches, the indices and the color targets.
     StageBindings vertexPlan;
     StageBindings fragmentPlan;
+    StageBindings localPlan;
+    StageBindings hullPlan;
     state.PlanBindings(vertexResult, vertexPlan);
     if (fragmentResult != nullptr) state.PlanBindings(*fragmentResult, fragmentPlan);
+    if (tess) {
+        state.PlanBindings(*tessellation->local->program, localPlan);
+        state.PlanBindings(*tessellation->hull->program, hullPlan);
+    }
+    // Vertex pulling and the guest indices: the vertex function's, or a tessellated draw's local
+    // program in the object function.
+    const auto& fetchResult = tess ? *tessellation->local->program : vertexResult;
+    const auto& fetchReflection = fetchResult.msl.Reflection();
+    auto& fetchPlan = tess ? localPlan : vertexPlan;
     struct Fetch {
         std::uint32_t location;
         Abi::VertexFetchRecord record;
@@ -577,8 +596,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         std::uint64_t end;
     };
     std::vector<Fetch> fetches;
-    for (const auto& attribute : vertexResult.vertexAttributes) {
-        if (attribute.location >= 32u || (vertexReflection.vertexFetchLocations & (1u << attribute.location)) == 0u) continue;
+    for (const auto& attribute : fetchResult.vertexAttributes) {
+        if (attribute.location >= 32u || (fetchReflection.vertexFetchLocations & (1u << attribute.location)) == 0u) continue;
         Abi::VertexFetchRecord record {};
         record.word3 = attribute.resource.fields[3];
         record.rate = attribute.fetchIndex;
@@ -593,7 +612,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (bytes > 0xffffffffu) Fail("a vertex buffer exceeds 4 GiB");
             record.bytes = static_cast<std::uint32_t>(bytes);
             end = begin + bytes;
-            if (bytes != 0u) vertexPlan.reads.push_back({begin, end});
+            if (bytes != 0u) fetchPlan.reads.push_back({begin, end});
         }
         fetches.push_back({attribute.location, record, begin, end});
     }
@@ -603,7 +622,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         indexBegin = draw.indexAddress;
         indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
         if (indexBegin == 0u || indexBytes == 0u) Fail("an indexed draw without an index buffer");
-        vertexPlan.reads.push_back({indexBegin, indexBegin + indexBytes});
+        fetchPlan.reads.push_back({indexBegin, indexBegin + indexBytes});
     }
 
     // Color attachments by Vulkan location (exportIndex), written as the blend states allow.
@@ -657,11 +676,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         state.MaterializeCmask(*attachment.target, nullptr);
     }
 
-    const StageBindings* plans[] = {&vertexPlan, &fragmentPlan, &targetPlan};
+    const StageBindings* plans[] = {&vertexPlan, &fragmentPlan, &targetPlan, &localPlan, &hullPlan};
     state.SettleBindings(plans);
     Graphics::Metal::ImageBindings imageBindings(*state.images, [&state](std::uint64_t address, std::uint64_t bytes) { state.SettleRange(address, bytes); });
     state.PlanImages(vertexResult, imageBindings, vertexPlan);
     if (fragmentResult != nullptr) state.PlanImages(*fragmentResult, imageBindings, fragmentPlan);
+    if (tess) {
+        state.PlanImages(*tessellation->local->program, imageBindings, localPlan);
+        state.PlanImages(*tessellation->hull->program, imageBindings, hullPlan);
+    }
 
     // Tiled targets: their cache entries, and the guest bytes they load from (settled now, read
     // when the pass begins).
@@ -719,6 +742,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     request.vertex = Graphics::Metal::PipelineFunction::From(vertexResult);
     request.mesh = mesh;
     request.meshThreads = mesh ? vertexReflection.threadsPerThreadgroup[0] : 0u;
+    std::shared_ptr<const ShaderRecompiler::MslTessellationPipeline> linked;
+    if (tess) {
+        // The linked libraries carry their function constants resolved (LinkMslTessellation).
+        linked = Graphics::Metal::LinkTessellation(*tessellation, *graphics.stages.tessellation);
+        request.vertex = Graphics::Metal::PipelineFunction{std::make_shared<const ShaderRecompiler::MslShader>(linked->mesh), {}, {}};
+        request.object = Graphics::Metal::PipelineFunction{std::make_shared<const ShaderRecompiler::MslShader>(linked->object), {}, {}};
+        request.mesh = true;
+        request.meshThreads = linked->meshThreads;
+        request.objectThreads = linked->objectThreads;
+        request.meshGroups = linked->maxMeshThreadgroups;
+    }
     if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
@@ -774,7 +808,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // B6 emulates alpha-to-coverage in the fragment function's [[sample_mask]] (the guest's rule);
     // Metal's own would apply on top.
     request.alphaToCoverage = graphics.alphaToCoverage && !(fragmentReflection != nullptr && fragmentReflection->exportsSampleMask);
-    request.topology = mesh ? MTLPrimitiveTopologyClassUnspecified : primitive.topologyClass;
+    request.topology = mesh || tess ? MTLPrimitiveTopologyClassUnspecified : primitive.topologyClass;
     struct PipelinePass {
         id<MTLRenderPipelineState> pipeline;
         MTLCullMode cull;
@@ -840,7 +874,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
     // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
     const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
-    const bool expand = !mesh && (primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
+    const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
     if (expand) {
@@ -1052,6 +1086,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     };
     const auto vertexTable = state.WriteTable(vertexResult, snapshots, stream, vertexPlan, copyPush(vertexResult, vertex.pushConstantOffset));
     const auto fragmentTable = fragmentResult != nullptr ? state.WriteTable(*fragmentResult, snapshots, stream, fragmentPlan, copyPush(*fragmentResult, fragment->pushConstantOffset)) : 0u;
+    const auto localTable = tess ? state.WriteTable(*tessellation->local->program, snapshots, stream, localPlan, copyPush(*tessellation->local->program, tessellation->local->pushConstantOffset)) : 0u;
+    const auto hullTable = tess ? state.WriteTable(*tessellation->hull->program, snapshots, stream, hullPlan, copyPush(*tessellation->hull->program, tessellation->hull->pushConstantOffset)) : 0u;
     if (mesh) {
         // The mesh draw words after the mesh function's own push data (pushDrawConstants).
         if (vertexResult.pushConstants.size() > ShaderRecompiler::MeshDrawPushOffsetBytes) Fail("mesh push constants overlap the mesh draw words");
@@ -1101,7 +1137,19 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         rasterOrderAddress = cache.rasterOrder.gpuAddress;
     }
     [cache.fragmentArguments setAddress:rasterOrderAddress atIndex:Abi::Index(Abi::BufferIndex::RasterOrder)];
-    [encoder setArgumentTable:cache.vertexArguments atStages:mesh ? MTLRenderStageMesh : MTLRenderStageVertex];
+    if (tess) {
+        // The object stage (MetalTessellation.h): the local program's bindings, the hull program's
+        // table and, per call below, the TessellationDraw record.
+        [cache.objectArguments setAddress:localTable != 0u ? localTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
+        [cache.objectArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
+        [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
+        [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+        [cache.objectArguments setAddress:fetchAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
+        [cache.objectArguments setAddress:hullTable != 0u ? hullTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::TessellationHullTable)];
+        [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
+        [encoder setArgumentTable:cache.objectArguments atStages:MTLRenderStageObject];
+    }
+    [encoder setArgumentTable:cache.vertexArguments atStages:mesh || tess ? MTLRenderStageMesh : MTLRenderStageVertex];
     [encoder setArgumentTable:cache.fragmentArguments atStages:MTLRenderStageFragment];
 
     // Dynamic state. Vulkan's viewport transform is y_fb = y + (1 + y_ndc) h / 2, Metal's
@@ -1192,6 +1240,26 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             [encoder setRenderPipelineState:pass.pipeline];
             [encoder setCullMode:pass.cull];
             [encoder setDepthBias:pass.biasConstant slopeScale:pass.biasSlope clamp:graphics.depthBias ? graphics.depthBiasClamp : 0.0f];
+            if (tess) {
+                // One object threadgroup per patch and instance (MetalTessellation.h).
+                const auto controlPoints = graphics.stages.tessellation->inputControlPoints;
+                for (const auto& call : drawCalls) {
+                    const auto patches = call.count / controlPoints;
+                    if (patches == 0u || call.instances == 0u) continue;
+                    Abi::TessellationDraw record {};
+                    record.indexAddress = draw.indexed ? indexAddress : 0u;
+                    record.indexSize = draw.indexed ? draw.indexSize : 0u;
+                    record.firstIndex = call.first;
+                    record.vertexOffset = call.vertexOffset;
+                    record.firstInstance = call.firstInstance;
+                    [cache.objectArguments setAddress:stream.Write(std::as_bytes(std::span(&record, 1)), 16u).address atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
+                    [encoder drawMeshThreadgroups:MTLSizeMake(patches, call.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(linked->objectThreads, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(linked->meshThreads, 1, 1)];
+                    stream.CountCommand();
+                    ++recorded;
+                }
+                held->objects.push_back(pass.pipeline);
+                continue;
+            }
             if (mesh) {
                 // Grid (mesh groups, instances): the mesh function's WorkgroupId x and y.
                 [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
@@ -1272,11 +1340,16 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // Lifetimes and pending accesses.
     held->objects.push_back(cache.vertexArguments);
     held->objects.push_back(cache.fragmentArguments);
+    if (tess) held->objects.push_back(cache.objectArguments);
     recorder.Keep(held);
     if (!imageBindings.Empty()) imageBindings.Commit(recorder);
     state.NoteBindings(vertexPlan);
     state.NoteBindings(fragmentPlan);
     state.NoteBindings(targetPlan);
+    if (tess) {
+        state.NoteBindings(localPlan);
+        state.NoteBindings(hullPlan);
+    }
     state.CheckFaultsOnComplete(true);
     // As upstream (Draw.cpp, SyncNotResident): a draw over a colour target that is not a resident
     // image writes guest memory in place, which the CPU may read without a flush hook (a queue
@@ -1344,17 +1417,29 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot draw");
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
+    Graphics::Metal::TessellationStages tessellation;
     for (const auto& shader : shaders) {
         if ((shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Mesh) && vertex == nullptr) vertex = &shader;
         else if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && fragment == nullptr) fragment = &shader;
-        else Fail("draws with a " + std::to_string(static_cast<int>(shader.stage)) + " stage (the tessellation path is not implemented)");
+        else if (shader.stage == ShaderRecompiler::ShaderStage::Local && tessellation.local == nullptr) tessellation.local = &shader;
+        else if (shader.stage == ShaderRecompiler::ShaderStage::TessellationControl && tessellation.hull == nullptr) tessellation.hull = &shader;
+        else if (shader.stage == ShaderRecompiler::ShaderStage::TessellationEvaluation && tessellation.domain == nullptr) tessellation.domain = &shader;
+        else Fail("draws with a " + std::to_string(static_cast<int>(shader.stage)) + " stage");
+    }
+    // Tessellated draws (MetalTessellation.h): local + hull in the object function, the domain
+    // program (the stage feeding the fragment function) in the mesh function.
+    const bool tessellated = graphics.stages.path == Graphics::ShaderPath::Tessellation;
+    if (tessellated) {
+        if (vertex != nullptr || tessellation.local == nullptr || tessellation.hull == nullptr || tessellation.domain == nullptr || !graphics.stages.tessellation) Fail("a tessellated draw without exactly a local, hull and domain stage and a tessellation configuration");
+        vertex = tessellation.domain;
+    } else if (tessellation.local != nullptr || tessellation.hull != nullptr || tessellation.domain != nullptr || graphics.stages.tessellation) {
+        Fail("tessellation stages outside the tessellation path");
     }
     if (vertex == nullptr) Fail("a draw without a vertex or mesh stage");
     // Mesh draws: the geometry path's NGG primitive shader as a mesh function (MetalMesh.h).
     const bool meshDraw = vertex->stage == ShaderRecompiler::ShaderStage::Mesh;
-    if (graphics.stages.tessellation) Fail("the tessellation shader path");
-    if (meshDraw ? (graphics.stages.path != Graphics::ShaderPath::Geometry || !graphics.stages.mesh) : (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh)) Fail("the geometry shader path without a mesh configuration, or a mesh configuration on the vertex path");
-    for (const auto* shader : {vertex, fragment}) {
+    if (!tessellated && (meshDraw ? (graphics.stages.path != Graphics::ShaderPath::Geometry || !graphics.stages.mesh) : (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh))) Fail("the geometry shader path without a mesh configuration, or a mesh configuration on the vertex path");
+    for (const auto* shader : {vertex, fragment, tessellation.local, tessellation.hull}) {
         if (shader == nullptr) continue;
         if (shader->program->msl.empty()) throw std::runtime_error("Metal device: the shader has no MSL form (recompile it for the device's Target(), whose backend is Msl)");
         if (shader->program->msl.Reflection().abiVersion != ShaderRecompiler::MslAbi::Version) throw std::runtime_error("Metal device: the shader was emitted for MslAbi version " + std::to_string(shader->program->msl.Reflection().abiVersion) + ", the device binds version " + std::to_string(ShaderRecompiler::MslAbi::Version));
@@ -1362,15 +1447,18 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (draw.flags != 0u && draw.flags != 0x20u) Fail("draw flags " + std::to_string(draw.flags));
     if (!draw.indirect && (draw.indexCount == 0u || draw.instanceCount == 0u)) return;
     @autoreleasepool {
-        state->RecordDraw(graphics, draw, *vertex, fragment, snapshots);
+        state->RecordDraw(graphics, draw, *vertex, fragment, snapshots, tessellated ? &tessellation : nullptr);
     }
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
     const bool meshPath = graphics.stages.path == Graphics::ShaderPath::Geometry && graphics.stages.mesh;
-    if ((graphics.stages.path != Graphics::ShaderPath::Vertex && !meshPath) || graphics.stages.tessellation) return std::string("Metal draw (work package D6): the tessellation shader path and the geometry path without a mesh configuration are not implemented");
+    const bool tessellationPath = graphics.stages.path == Graphics::ShaderPath::Tessellation && graphics.stages.tessellation;
+    if (graphics.stages.path != Graphics::ShaderPath::Vertex && !meshPath && !tessellationPath) return std::string("Metal draw (work package D6): the geometry path without a mesh configuration and tessellation plus geometry are not implemented");
     for (const auto& shader : shaders) {
-        if (shader.stage != ShaderRecompiler::ShaderStage::Vertex && shader.stage != ShaderRecompiler::ShaderStage::Fragment && shader.stage != ShaderRecompiler::ShaderStage::Mesh) return std::string("Metal draw (work package D6): only vertex, mesh and pixel stages are implemented");
+        const auto stage = shader.stage;
+        const bool tessellationStage = stage == ShaderRecompiler::ShaderStage::Local || stage == ShaderRecompiler::ShaderStage::TessellationControl || stage == ShaderRecompiler::ShaderStage::TessellationEvaluation;
+        if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh && !(tessellationPath && tessellationStage)) return std::string("Metal draw (work package D6): only vertex, mesh, tessellation and pixel stages are implemented");
     }
     if (graphics.samples > 1u) return std::string("Metal draw (work package D6): multisampled draws are not implemented");
     return std::nullopt;

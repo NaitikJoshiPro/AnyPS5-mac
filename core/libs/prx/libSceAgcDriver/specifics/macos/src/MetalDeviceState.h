@@ -31,6 +31,7 @@ class StorageTexture;
 }
 
 namespace AgcDriver::Graphics::Metal {
+struct TessellationStages;
 class CommandStream;
 class PipelineCache;
 class ImageCache;
@@ -264,7 +265,8 @@ struct VulkanDevice::State {
     void MaterializeCmask(const Graphics::ColorTarget& color, Graphics::StorageTexture* resident);
     void MaterializeDcc(const Graphics::ColorTarget& color, Graphics::StorageTexture* resident);
     id<MTLBuffer> BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset);
-    void RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots);
+    // `tessellation`: a tessellated draw (MetalTessellation.h); `vertex` is then its domain stage.
+    void RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots, const Graphics::Metal::TessellationStages* tessellation = nullptr);
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).
     void Sync();
     void CheckFaults();
