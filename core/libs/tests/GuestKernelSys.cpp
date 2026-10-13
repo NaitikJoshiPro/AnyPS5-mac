@@ -462,7 +462,6 @@ int main() {
 #ifndef _WIN32
     Require(symlink_nid_postfix("loop", (root / "loop").string().c_str()) == 0);
     Require(fchmodat_nid_postfix(base, "loop/x", 0600, 0) == -1 && Error() == 62);
-    const std::string longName(300, 'a');
     Require(fchmodat_nid_postfix(base, longName.c_str(), 0600, 0) == -1 && Error() == 63);
 #endif
     Require(sceKernelClose(base) == 0);
