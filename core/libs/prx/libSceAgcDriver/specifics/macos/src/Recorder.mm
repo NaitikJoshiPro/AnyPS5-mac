@@ -9,6 +9,7 @@
 // heap timestamps; occlusion samples are visibility-result counters of the render passes, folded
 // by the MSL twins of the SampleCounter/SampleDumps kernels (RecorderKernels.h).
 #include "MetalCommandStream.h"
+#include "MetalVmTrace.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
@@ -1769,6 +1770,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                     auto target = Metal::BufferOf(store.buffer);
                     const auto host = reinterpret_cast<std::uint64_t>(target.contents) + store.offset;
                     std::fprintf(stderr, "[landing] store run: guest 0x%llx+0x%zx into buffer %p (contents %p, length 0x%llx) offset 0x%llx = host 0x%llx%s\n", static_cast<unsigned long long>(store.address), store.bytes.size(), (__bridge void*)target, target.contents, static_cast<unsigned long long>(target.length), static_cast<unsigned long long>(store.offset), static_cast<unsigned long long>(host), host == ::GuestArena::HostAddress(store.address) ? "" : " (NOT the guest's host address)");
+                    std::fprintf(stderr, "[landing]   page now: %s\n", ::AgcDriver::Metal::VmWiredInfo(host).c_str());
                 }
                 stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
                 run.recorded.emplace_back(store.buffer, store.offset, storeEnd);
