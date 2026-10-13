@@ -12,9 +12,20 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/event.h>
+#include <sys/ioctl.h>
+#include <sys/param.h>
 #include <sys/random.h>
+#include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
+#include <sys/un.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 extern "C" {
@@ -49,6 +60,133 @@ std::uint64_t Faults() {
 
 std::uint8_t Pattern(std::size_t index) {
     return static_cast<std::uint8_t>(index * 29u + 7u);
+}
+
+
+// Copies a NUL-terminated string into the window and returns its guest address.
+char* GuestString(std::uint8_t* guest, std::uint8_t* alias, std::size_t offset, const std::string& text) {
+    std::memcpy(alias + offset, text.c_str(), text.size() + 1);
+    return reinterpret_cast<char*>(guest + offset);
+}
+
+// Calls beyond read/write: paths, out-structs, socket options, arrays, ioctl/fcntl, sysctl, stdio.
+// Returns the faults fprintf took: its %s argument is read in userspace (correct through the fault path, not EFAULT).
+std::uint64_t RunKernelStructs(std::uintptr_t base, std::uint8_t* guest, std::uint8_t* alias, const std::filesystem::path& file) {
+    constexpr std::size_t Scratch = 3 * Size; // [3 * Size, Bytes) is free for this function
+    std::memset(alias + Scratch, 0, Bytes - Scratch);
+    const auto at = [&](std::size_t offset) { return guest + Scratch + offset; };
+    const auto host = [&](std::size_t offset) { return alias + Scratch + offset; };
+
+    // Paths and stat out-structs, both in the window.
+    const std::string directory = file.string() + ".d";
+    char* guestDirectory = GuestString(guest, alias, Scratch + 0x000, directory);
+    char* guestFile = GuestString(guest, alias, Scratch + 0x400, directory + "/a");
+    char* guestRenamed = GuestString(guest, alias, Scratch + 0x800, directory + "/b");
+    Require(::mkdir(guestDirectory, 0700) == 0, base, "mkdir with a displaced path");
+    const int fd = ::open(guestFile, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    Require(fd >= 0, base, "open with a displaced path");
+    Require(::write(fd, alias, 0x100) == 0x100, base, "write");
+    auto* status = reinterpret_cast<struct stat*>(at(0x1000));
+    auto* hostStatus = reinterpret_cast<struct stat*>(host(0x1000));
+    Require(::fstat(fd, status) == 0 && hostStatus->st_size == 0x100, base, "fstat into a displaced struct");
+    std::memset(hostStatus, 0, sizeof(struct stat));
+    Require(::stat(guestFile, status) == 0 && hostStatus->st_size == 0x100, base, "stat with a displaced path and struct");
+    Require(::access(guestFile, R_OK) == 0, base, "access with a displaced path");
+    using Access = int (*)(const char*, int);
+    const auto libSystemAccess = reinterpret_cast<Access>(dlsym(dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD), "access"));
+    errno = 0;
+    Require(libSystemAccess != nullptr && libSystemAccess(guestFile, R_OK) == -1 && errno == EFAULT, base,
+        "libSystem's access with the guest path did not fail with EFAULT");
+    char* path = reinterpret_cast<char*>(at(0x1400));
+    Require(::fcntl(fd, F_GETPATH, path) == 0 && std::strstr(reinterpret_cast<char*>(host(0x1400)), "/a") != nullptr, base,
+        "fcntl F_GETPATH into a displaced buffer");
+    auto* pending = reinterpret_cast<int*>(at(0x2000));
+    Require(::lseek(fd, 0, SEEK_SET) == 0, base, "lseek");
+    Require(::ioctl(fd, FIONREAD, pending) == 0 && *reinterpret_cast<int*>(host(0x2000)) == 0x100, base, "ioctl FIONREAD into a displaced int");
+    ::close(fd);
+    Require(::rename(guestFile, guestRenamed) == 0 && ::lstat(guestRenamed, status) == 0, base, "rename and lstat with displaced paths");
+    FILE* stream = std::fopen(guestRenamed, GuestString(guest, alias, Scratch + 0xc00, "r+"));
+    Require(stream != nullptr, base, "fopen with a displaced path and mode");
+
+    // stdio: a stream buffer in the window, fgets mapping its result back, fputs and a long %s from the window.
+    Require(::setvbuf(stream, reinterpret_cast<char*>(at(0x3000)), _IOFBF, 0x1000) == 0, base, "setvbuf with a displaced buffer");
+    std::memset(host(0x5000), 'x', 0x3000);
+    host(0x5000)[0x2fff] = 0;
+    const auto formatBefore = Faults();
+    Require(std::fprintf(stream, "%s\n", reinterpret_cast<char*>(at(0x5000))) == 0x3000, base, "fprintf of a long displaced string");
+    const auto formatFaults = Faults() - formatBefore;
+    Require(std::fputs(GuestString(guest, alias, Scratch + 0x8000, "tail line\n"), stream) >= 0 && std::fflush(stream) == 0, base,
+        "fputs of a displaced string");
+    Require(std::fseek(stream, 0x3000, SEEK_SET) == 0, base, "fseek");
+    char* line = reinterpret_cast<char*>(at(0x9000));
+    Require(std::fgets(line, 64, stream) == line && std::strcmp(reinterpret_cast<char*>(host(0x9000)), "tail line\n") == 0, base,
+        "fgets into a displaced buffer returns the guest pointer");
+    std::fclose(stream);
+    Require(::unlink(guestRenamed) == 0 && ::rmdir(guestDirectory) == 0, base, "unlink and rmdir with displaced paths");
+
+    // Sockets: name, options, poll/select/kevent arrays.
+    int pair[2] = {-1, -1};
+    auto* guestPair = reinterpret_cast<int*>(at(0xa000));
+    Require(::socketpair(AF_UNIX, SOCK_STREAM, 0, guestPair) == 0, base, "socketpair into a displaced array");
+    std::memcpy(pair, host(0xa000), sizeof(pair));
+    auto* length = reinterpret_cast<socklen_t*>(at(0xa100));
+    *reinterpret_cast<socklen_t*>(host(0xa100)) = sizeof(int);
+    Require(::getsockopt(pair[0], SOL_SOCKET, SO_TYPE, at(0xa200), length) == 0 && *reinterpret_cast<int*>(host(0xa200)) == SOCK_STREAM, base,
+        "getsockopt into displaced value and length");
+    *reinterpret_cast<int*>(host(0xa200)) = 0x10000;
+    Require(::setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, at(0xa200), sizeof(int)) == 0, base, "setsockopt from a displaced value");
+    *reinterpret_cast<socklen_t*>(host(0xa100)) = sizeof(sockaddr_un);
+    Require(::getsockname(pair[0], reinterpret_cast<sockaddr*>(at(0xa300)), length) == 0 &&
+            reinterpret_cast<sockaddr*>(host(0xa300))->sa_family == AF_UNIX,
+        base, "getsockname into a displaced address");
+    Require(::write(pair[1], "z", 1) == 1, base, "write to the pair");
+    auto* fds = reinterpret_cast<pollfd*>(at(0xb000));
+    *reinterpret_cast<pollfd*>(host(0xb000)) = {pair[0], POLLIN, 0};
+    Require(::poll(fds, 1, 1000) == 1 && (reinterpret_cast<pollfd*>(host(0xb000))->revents & POLLIN) != 0, base, "poll on a displaced array");
+    auto* readable = reinterpret_cast<fd_set*>(at(0xb100));
+    FD_ZERO(reinterpret_cast<fd_set*>(host(0xb100)));
+    FD_SET(pair[0], reinterpret_cast<fd_set*>(host(0xb100)));
+    *reinterpret_cast<timeval*>(host(0xb200)) = {1, 0};
+    Require(::select(pair[0] + 1, readable, nullptr, nullptr, reinterpret_cast<timeval*>(at(0xb200))) == 1 &&
+            FD_ISSET(pair[0], reinterpret_cast<fd_set*>(host(0xb100))),
+        base, "select on displaced fd_set and timeout");
+    const int queue = kqueue();
+    void* const udata = guest + 0x1234; // a guest pointer: must come back unchanged
+    EV_SET(reinterpret_cast<struct kevent*>(host(0xc000)), pair[0], EVFILT_READ, EV_ADD, 0, 0, udata);
+    *reinterpret_cast<timespec*>(host(0xc200)) = {1, 0};
+    Require(::kevent(queue, reinterpret_cast<struct kevent*>(at(0xc000)), 1, reinterpret_cast<struct kevent*>(at(0xc100)), 1,
+                reinterpret_cast<timespec*>(at(0xc200))) == 1 &&
+            reinterpret_cast<struct kevent*>(host(0xc100))->udata == udata,
+        base, "kevent with displaced arrays keeps the guest udata");
+    ::close(queue);
+    ::close(pair[0]);
+    ::close(pair[1]);
+    Require(::pipe(reinterpret_cast<int*>(at(0xd000))) == 0, base, "pipe into a displaced array");
+    ::close(reinterpret_cast<int*>(host(0xd000))[0]);
+    ::close(reinterpret_cast<int*>(host(0xd000))[1]);
+
+    // sysctl and friends.
+    auto* mib = reinterpret_cast<int*>(at(0xe000));
+    reinterpret_cast<int*>(host(0xe000))[0] = CTL_KERN;
+    reinterpret_cast<int*>(host(0xe000))[1] = KERN_OSTYPE;
+    auto* valueLength = reinterpret_cast<std::size_t*>(at(0xe100));
+    *reinterpret_cast<std::size_t*>(host(0xe100)) = 64;
+    Require(::sysctl(mib, 2, at(0xe200), valueLength, nullptr, 0) == 0 && std::strcmp(reinterpret_cast<char*>(host(0xe200)), "Darwin") == 0, base,
+        "sysctl with displaced MIB, value and length");
+    *reinterpret_cast<std::size_t*>(host(0xe100)) = 64;
+    std::memset(host(0xe200), 0, 64);
+    Require(::sysctlbyname(GuestString(guest, alias, Scratch + 0xe300, "kern.ostype"), at(0xe200), valueLength, nullptr, 0) == 0 &&
+            std::strcmp(reinterpret_cast<char*>(host(0xe200)), "Darwin") == 0,
+        base, "sysctlbyname with displaced name, value and length");
+    Require(::uname(reinterpret_cast<utsname*>(at(0xf000))) == 0 && std::strcmp(reinterpret_cast<utsname*>(host(0xf000))->sysname, "Darwin") == 0,
+        base, "uname into a displaced struct");
+    Require(::getrusage(RUSAGE_SELF, reinterpret_cast<rusage*>(at(0x10000))) == 0 &&
+            reinterpret_cast<rusage*>(host(0x10000))->ru_maxrss > 0,
+        base, "getrusage into a displaced struct");
+    Require(::getrlimit(RLIMIT_NOFILE, reinterpret_cast<rlimit*>(at(0x10200))) == 0 &&
+            reinterpret_cast<rlimit*>(host(0x10200))->rlim_cur > 0,
+        base, "getrlimit into a displaced struct");
+    return formatFaults;
 }
 
 void Run(std::uintptr_t base, const std::filesystem::path& file) {
@@ -127,7 +265,8 @@ void Run(std::uintptr_t base, const std::filesystem::path& file) {
     close(hostPair[0]);
     close(hostPair[1]);
 
-    Require(Faults() == before, base, "the shim's calls redirected faults");
+    const auto formatFaults = RunKernelStructs(base, guest, alias, file);
+    Require(Faults() == before + formatFaults, base, "the shim's calls redirected faults");
     std::filesystem::remove(file);
 }
 

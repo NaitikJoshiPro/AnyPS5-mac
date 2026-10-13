@@ -490,6 +490,21 @@ if(BUILD_TESTING)
         target_include_directories(host_syscall_shim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(host_syscall_shim_tests PRIVATE aps5_host_syscall_shim libkernel libc)
         add_test(NAME host_syscall_shim COMMAND host_syscall_shim_tests)
+        # D35: every libSystem symbol a prx imports is classified in hostsys/host_imports.tsv; shimmed ones are defined
+        # by the archive and, with the shim on, no longer imported. The negative twin drops a row and must fail.
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            set(HOST_IMPORTS_CHECK ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mac/check_host_imports.py
+                --inventory ${CMAKE_CURRENT_SOURCE_DIR}/hostsys/host_imports.tsv --libraries ${PATCHED_DIR}
+                --archive $<TARGET_FILE:aps5_host_syscall_shim>)
+            if(APS5_HOST_SYSCALL_SHIM)
+                list(APPEND HOST_IMPORTS_CHECK --shim-on)
+            endif()
+            add_test(NAME host_import_inventory COMMAND ${HOST_IMPORTS_CHECK})
+            add_test(NAME host_import_inventory_unclassified COMMAND ${HOST_IMPORTS_CHECK} --drop read)
+            set_tests_properties(host_import_inventory host_import_inventory_unclassified PROPERTIES TIMEOUT 120)
+            set_tests_properties(host_import_inventory_unclassified PROPERTIES PASS_REGULAR_EXPRESSION "error: read [(]imported by")
+        endif()
     endif()
 
     add_test_executable(guest_acm_tests tests/GuestAcm.cpp)
