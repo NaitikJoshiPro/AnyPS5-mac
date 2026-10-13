@@ -96,13 +96,15 @@ def main():
         for name in sorted(shimmed & set(importers)):
             errors.append(f"{name} is still imported from libSystem by {', '.join(importers[name])} with the shim on")
 
-    stale = sorted(set(rows) - set(importers))
+    stale = sorted(set(rows) - set(importers) - (shimmed if arguments.shim_on else set()))
     counts = {}
     for name in importers:
         kind, handling = rows.get(name, ("unclassified", "-"))
         counts[(kind, handling)] = counts.get((kind, handling), 0) + 1
     summary = ", ".join(f"{kind}/{handling} {count}" for (kind, handling), count in sorted(counts.items()))
     print(f"{len(libraries)} prx libraries import {len(importers)} libSystem symbols: {summary}")
+    if arguments.shim_on:
+        print(f"shim on: the {len(shimmed)} shimmed symbols are defined inside the libraries, none imported from libSystem")
     if stale:
         print(f"note: {len(stale)} classified symbols are no longer imported: {', '.join(stale)}")
     for error in errors:
