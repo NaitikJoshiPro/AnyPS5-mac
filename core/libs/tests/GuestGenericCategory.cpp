@@ -53,9 +53,9 @@ int main() {
     ApplicationHeapRegister_nid_no_patch(api.data());
     const Category* category = _ZSt16generic_categoryv_nid_postfix();
     REQUIRE(category && category == _ZSt16generic_categoryv_nid_postfix());
-    REQUIRE(std::strcmp(reinterpret_cast<Name>(category->vtable[2])(category), "generic") == 0);
-    const auto message = reinterpret_cast<Message>(category->vtable[3]);
-    const auto condition = reinterpret_cast<Condition>(category->vtable[4])(category, 35);
+    REQUIRE(std::strcmp(reinterpret_cast<Name>(const_cast<void*>(category->vtable[2]))(category), "generic") == 0);
+    const auto message = reinterpret_cast<Message>(const_cast<void*>(category->vtable[3]));
+    const auto condition = reinterpret_cast<Condition>(const_cast<void*>(category->vtable[4]))(category, 35);
     REQUIRE(condition.value == 35 && condition.category == category);
 
     struct Expected { int value; const char* text; };

@@ -185,6 +185,13 @@ static void CheckNearbyint() {
     Require(std::fetestexcept(FE_INEXACT) == 0);
 }
 
+#if !defined(__x86_64__)
+// Elsewhere the long double exports carry the guest's x87 bits in X87Extended.
+static bool ExtendedBits(const X87Extended& value, std::uint64_t mantissa, std::uint16_t signExponent) {
+    return value.significand == mantissa && value.signExponent == signExponent;
+}
+#endif
+
 #if defined(__x86_64__)
 // The long double exports take and return the host's long double, which is the guest's x87 type only on x86-64.
 static bool ExtendedBits(long double value, std::uint64_t mantissa, std::uint16_t signExponent) {
@@ -223,7 +230,7 @@ static void CheckNanConversions() {
             std::fprintf(stderr, "strtof(\"%s\") = 0x%08x\n", test.text, static_cast<unsigned>(single));
             correct = false;
         }
-        const long double extended = strtold_nid_postfix(test.text, &end);
+        const GuestLongDouble extended = strtold_nid_postfix(test.text, &end);
         if (!ExtendedBits(extended, 0xc000000000000000ull, test.negative ? 0xffff : 0x7fff) || end != expectedEnd) {
             std::uint64_t significand = 0;
             std::uint16_t signExponent = 0;
