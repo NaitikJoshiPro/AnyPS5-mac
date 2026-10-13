@@ -25,10 +25,20 @@ echo "$paths" | while IFS= read -r p; do
   printf '%-60s %8.2fG\n' "$p" "$(echo "$kb / 1048576" | bc -l)"
 done
 total_kb=$(echo "$paths" | while IFS= read -r p; do [ -e "$p" ] && du -sk "$p" 2>/dev/null; done | awk '{s+=$1} END {print s+0}')
+# Data the user provides (their own console dumps) is theirs, not the project's: list one absolute path per line
+# in .mac-work/user-data.txt and it is reported but not counted.
+user_list="$ROOT/.mac-work/user-data.txt"
+user_kb=0
+if [ -f "$user_list" ]; then
+  user_kb=$(while IFS= read -r p; do [ -n "$p" ] && [ -e "$p" ] && du -sk "$p" 2>/dev/null; done < "$user_list" | awk '{s+=$1} END {print s+0}')
+  printf '\nUser-provided data (not counted): %.2fG\n' "$(echo "$user_kb / 1048576" | bc -l)"
+fi
+total_kb=$((total_kb - user_kb))
 total_gb=$(echo "$total_kb / 1048576" | bc -l)
 free_gb=$(df -k / | awk 'NR==2 {printf "%.1f", $4/1048576}')
 printf '\nTOTAL used by project: %.2fG of %sG budget (warn at %sG). Disk free: %sG\n' "$total_gb" "$BUDGET_GB" "$WARN_GB" "$free_gb"
 
+if [ "$(echo "$free_gb < 15" | bc -l)" = 1 ]; then echo "LOW DISK: under 15G free; stop large builds and downloads and clean up."; exit 1; fi
 if [ "$(echo "$total_gb > $BUDGET_GB" | bc -l)" = 1 ]; then echo "OVER BUDGET: stop and clean up, or ask the user for an exception."; exit 2; fi
 if [ "$(echo "$total_gb > $WARN_GB" | bc -l)" = 1 ]; then echo "WARNING: above warning line, clean up before continuing."; exit 1; fi
 exit 0
