@@ -477,7 +477,6 @@ struct SampledMultisampleCoord {
 };
 
 SampledMultisampleCoord SampledMultisample(MslEmitterState& state, const Access& access, const std::string& texture, bool withSample) {
-    const auto base = CoordU32(state, access);
     const auto name = state.Temporary("aps5_mr");
     state.Line("const uint " + name + "_h = " + texture + ".get_num_samples();");
     state.Line("const uint " + name + "_n = max(" + StorageSampleCount(state, access) + ", " + name + "_h);");
@@ -486,6 +485,7 @@ SampledMultisampleCoord SampledMultisample(MslEmitterState& state, const Access&
     result.guestSamples = name + "_n";
     result.slicesPerLayer = name + "_p";
     if (!withSample) return result;
+    const auto base = CoordU32(state, access);
     state.Line("const uint2 " + name + "_xy = " + base.coord + ";");
     state.Line("const uint " + name + "_s = " + SampleIndex(state, access) + ";");
     state.Line("const uint " + name + "_l = " + (base.slice.empty() ? std::string("0u") : base.slice) + ";");

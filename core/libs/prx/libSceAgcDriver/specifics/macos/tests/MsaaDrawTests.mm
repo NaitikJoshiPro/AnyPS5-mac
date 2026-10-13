@@ -655,7 +655,7 @@ void RunGuest(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     std::vector<std::uint32_t> userData(16, 0u);
     const auto results = reinterpret_cast<std::uint64_t>(GuestResults.data());
     const std::array<std::uint32_t, 4> buffer {static_cast<std::uint32_t>(results), static_cast<std::uint32_t>((results >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(GuestResults)), 0x31016facu};
-    const std::array<std::uint32_t, 8> texture {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Extent - 1u) & 3u) << 30u), ((Extent - 1u) >> 2u) | ((Extent - 1u) << 14u), 0xfacu | (Log2(samples) << 16u) | (type << 28u), 0u, 2u << 4u, 0u, 0u};
+    const std::array<std::uint32_t, 8> texture {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Extent - 1u) & 3u) << 30u), ((Extent - 1u) >> 2u) | ((Extent - 1u) << 14u), 0xfacu | (Log2(samples) << 16u) | (type << 28u), 0u, Log2(samples) << 4u, 0u, 0u};
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory {{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
