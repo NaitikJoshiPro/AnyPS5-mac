@@ -8,6 +8,7 @@
 #ifdef __APPLE__
 #include "SDL_metal.h"
 #endif
+#include <cstring>
 #include <cstdio>
 #include <span>
 #include <stdexcept>
@@ -125,6 +126,10 @@ void* DisplayWindow::MetalLayer(SDL_Window* window) {
     if (window == nullptr) return nullptr;
     auto view = static_cast<SDL_MetalView>(SDL_GetWindowData(window, MetalViewKey));
     if (view == nullptr) {
+        // SDL_Metal_CreateView calls the video driver's hook unchecked: drivers without Metal
+        // (offscreen, the headless tests) would call a null pointer. They have no layer.
+        const char* driver = SDL_GetCurrentVideoDriver();
+        if (driver == nullptr || std::strcmp(driver, "cocoa") != 0) return nullptr;
         view = SDL_Metal_CreateView(window);
         if (view == nullptr) return nullptr;
         SDL_SetWindowData(window, MetalViewKey, view);
