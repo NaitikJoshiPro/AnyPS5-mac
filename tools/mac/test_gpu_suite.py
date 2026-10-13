@@ -15,6 +15,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import gpu_groups  # noqa: E402
+import buildlock  # noqa: E402
 import gpu_suite  # noqa: E402
 
 FAKE_CTEST = r'''#!/usr/bin/env python3
@@ -492,6 +493,81 @@ class GuardTests(unittest.TestCase):
             time.sleep(0.2)
             with self.assertRaises(ProcessLookupError):
                 os.kill(child, 0)
+
+
+class LeaseTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.build = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+
+    def write_lease(self, pid, started, max_seconds):
+        (self.build / buildlock.LEASE_NAME).write_text(json.dumps(
+            {"pid": pid, "started": started, "max_seconds": max_seconds, "run": "r1"}))
+
+    def dead_pid(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+        return process.pid
+
+    def builder(self, *extra_env):
+        env = dict(os.environ)
+        return subprocess.Popen([sys.executable, "-I", str(HERE / "buildlock.py"), str(self.build), "--", "true"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+    def test_a_live_lease_blocks_a_builder_until_released(self):
+        buildlock.take_lease(self.build, 600, run="r1")
+        process = self.builder()
+        time.sleep(1.0)
+        self.assertIsNone(process.poll(), "the builder must wait for the lease")
+        buildlock.release_lease(self.build)
+        _, error = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0)
+        self.assertIn("waiting for gpu_suite run r1", error)
+        self.assertIn(f"pid {os.getpid()}", error)
+
+    def test_a_stale_lease_is_ignored_and_removed(self):
+        for pid, started, limit in ((self.dead_pid(), time.time(), 600), (os.getpid(), time.time() - 700, 600)):
+            self.write_lease(pid, started, limit)
+            process = self.builder()
+            process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0)
+            self.assertFalse((self.build / buildlock.LEASE_NAME).exists())
+
+    def test_an_unreadable_lease_is_ignored(self):
+        (self.build / buildlock.LEASE_NAME).write_text("not json")
+        self.assertIsNone(buildlock.read_lease(self.build))
+        self.assertFalse((self.build / buildlock.LEASE_NAME).exists())
+
+    def test_release_only_removes_an_own_lease(self):
+        self.write_lease(self.dead_pid(), time.time(), 600)
+        buildlock.release_lease(self.build)
+        self.assertTrue((self.build / buildlock.LEASE_NAME).exists())
+
+    def test_the_owner_is_not_blocked_by_its_own_lease(self):
+        buildlock.take_lease(self.build, 600)
+        self.assertLess(buildlock.wait_for_lease(self.build, owner_pid=os.getpid(), poll=0.01), 1)
+
+    def test_lease_duration_is_the_worst_case_plus_ten_minutes_capped(self):
+        registered = {"a": {"properties": {"TIMEOUT": "10"}}, "b": {"properties": {}}}
+        self.assertEqual(gpu_suite.lease_seconds(["a", "b"], registered, 30, 2.0), 10 + 2 + 30 + 2 + 600)
+        many = {str(i): {"properties": {}} for i in range(500)}
+        self.assertEqual(gpu_suite.lease_seconds(list(many), many, 30, 2.0), 5400)
+
+    def test_gpu_suite_releases_the_lease_on_an_exception(self):
+        def boom():
+            buildlock.take_lease(self.build, 600)
+            gpu_suite.held_leases.append(self.build)
+            raise RuntimeError("boom")
+        original = gpu_suite.run_suite
+        gpu_suite.run_suite = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                gpu_suite.main()
+        finally:
+            gpu_suite.run_suite = original
+        self.assertFalse((self.build / buildlock.LEASE_NAME).exists())
+        self.assertEqual(gpu_suite.held_leases, [])
 
 
 if __name__ == "__main__":

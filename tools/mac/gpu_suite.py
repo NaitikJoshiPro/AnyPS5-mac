@@ -55,12 +55,15 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "tools"))
+import buildlock  # noqa: E402
 import gpu_groups  # noqa: E402
 import check_skips  # noqa: E402
 
 LOCK = HERE / "buildlock.py"
 CANARIES = HERE / "gpu_canaries.txt"
 MAX_TIMEOUT = 30
+LEASE_SLACK = 600.0
+LEASE_CAP = 5400.0
 PAUSE_SECONDS = 2.0
 LOAD_LIMIT = 6.0
 # The supervised rerun of a held test (--rerun-held) waits for a quieter machine.
@@ -458,7 +461,31 @@ def summarize(results, groups, held, selectors, meta, allow_errors, allow_warnin
     return "\n".join(lines[:head]), "\n".join(lines)
 
 
+def lease_seconds(order, registered, default_timeout, pause):
+    """Worst-case duration of a run (every test at its timeout, plus the pauses) plus 10 minutes, capped at 90 minutes."""
+    total = sum(effective_timeout(registered[name]["properties"].get("TIMEOUT"), default_timeout) + pause for name in order)
+    return min(total + LEASE_SLACK, LEASE_CAP)
+
+
+held_leases = []
+
+
+def release_leases():
+    while held_leases:
+        buildlock.release_lease(held_leases.pop())
+
+
 def main():
+    """Runs the suite; the build lease it takes is released on every exit path, including exceptions and SIGTERM."""
+    previous = signal.signal(signal.SIGTERM, lambda number, frame: sys.exit(128 + number))
+    try:
+        return run_suite()
+    finally:
+        release_leases()
+        signal.signal(signal.SIGTERM, previous)
+
+
+def run_suite():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog=__doc__.split("\n\n", 2)[2])
     parser.add_argument("selectors", nargs="+", metavar="SELECTOR")
@@ -475,6 +502,7 @@ def main():
     parser.add_argument("--validation", action="store_true", help="run with MTL_SHADER_VALIDATION=1 (reported to stderr) and MTL_DEBUG_LAYER=1")
     parser.add_argument("--dump-requests", type=Path, metavar="DIR", help="export APS5_DUMP_REQUESTS=DIR (relative to the repository root): every recompile request is written there, the corpus of agc_metal_msl_corpus (build-metal/msl-corpus)")
     parser.add_argument("--build-first", action="store_true", help="build the selected tests' executables (ninja -k 0, under the lock) before running")
+    parser.add_argument("--no-lease", action="store_true", help="do not freeze the build directory for the run (short single-test runs); other agents' builds may then void it")
     parser.add_argument("--allowlist", type=Path, default=check_skips.MACOS_ALLOWLIST, help="skip allowlist (default: tools/mac/m2_skip_allowlist.txt)")
     parser.add_argument("--dry-run", action="store_true", help="print the selection and the batches and run nothing")
     args = parser.parse_args()
@@ -579,6 +607,11 @@ def main():
     # D19 guards: consistent committed binaries, an idle machine, then the canaries.
     order = [name for name in canaries if name not in runnable] + [name for name in canaries if name in runnable] \
         + [name for name in runnable if name not in canaries]
+    if not args.no_lease:
+        # Builders (tools/mac/buildlock.py) wait while this lease exists; the GPU mutex is still taken per test.
+        lease = buildlock.take_lease(build, lease_seconds(order, registered, args.timeout, args.pause), run=out.name)
+        held_leases.append(build)
+        print(f"build lease {lease} held until the run ends", flush=True)
     guards = {}
     refusal = None
     try:
