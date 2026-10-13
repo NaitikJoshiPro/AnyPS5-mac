@@ -324,13 +324,17 @@ void RequireUniform(const std::vector<std::uint32_t>& texels, std::uint32_t chan
     }
 }
 
+// Multisampled targets live for the device's lifetime, keyed by address (upstream's model): every
+// target of a check keeps its own live guest block, so no later one reuses an earlier one's samples.
+std::vector<std::unique_ptr<GuestBlock>> sources;
+
 void CheckMasks(AgcDriver::VulkanDevice& device) {
     GuestBlock vertices(16384);
     WriteVertices(vertices, FullScreen);
     GuestBlock destination(DestinationBytes());
     // An exported sample mask (samples 0 and 2): half of every pixel.
     {
-        GuestBlock source(Extent * Extent * 4u * Samples);
+        auto& source = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * Samples));
         const auto target = Target(source.Address(), VK_FORMAT_R8G8B8A8_UNORM, Samples);
         Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0xff0000ffu, "#define MASK 1\n", 0x5u), 0u, 3u);
         RequireUniform(Resolve(device, target, destination), 0u, 127.5, "sample mask 0x5");
@@ -338,7 +342,7 @@ void CheckMasks(AgcDriver::VulkanDevice& device) {
     // Alpha-to-coverage as B6 emulates it (the guest's undithered rule: all samples at alpha >= 0.5):
     // the driver keeps Metal's own A2C off, which would cover 3 of 4 samples at alpha 0.75.
     for (const auto& [alpha, expected] : std::array<std::pair<std::uint32_t, double>, 2>{{{0xbfu, 255.0}, {0x40u, 0.0}}}) {
-        GuestBlock source(Extent * Extent * 4u * Samples);
+        auto& source = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * Samples));
         const auto target = Target(source.Address(), VK_FORMAT_R8G8B8A8_UNORM, Samples);
         auto state = BaseState(target);
         state.alphaToCoverage = true;
@@ -347,7 +351,7 @@ void CheckMasks(AgcDriver::VulkanDevice& device) {
     }
     // Per-sample shading: only sample 0 is red.
     {
-        GuestBlock source(Extent * Extent * 4u * Samples);
+        auto& source = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * Samples));
         const auto target = Target(source.Address(), VK_FORMAT_R8G8B8A8_UNORM, Samples);
         Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0xff0000ffu, "#define PER_SAMPLE 1\n"), 0u, 3u);
         const auto texels = Resolve(device, target, destination);
@@ -390,7 +394,7 @@ void CheckInteger(AgcDriver::VulkanDevice& device) {
     GuestBlock destination(DestinationBytes());
     // Samples 1..3 only: the sample-0 resolve sees the cleared 0; sample 0 alone: the value.
     for (const auto& [mask, expected] : std::array<std::pair<std::uint32_t, std::uint32_t>, 2>{{{0xeu, 0u}, {0x1u, 0x12345678u}}}) {
-        GuestBlock source(Extent * Extent * 4u * Samples);
+        auto& source = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * Samples));
         const auto target = Target(source.Address(), VK_FORMAT_R32_UINT, Samples);
         Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0x12345678u, "#define UINT_TARGET 1\n#define MASK 1\n", mask), 0u, 3u);
         const auto texels = Resolve(device, target, destination);
