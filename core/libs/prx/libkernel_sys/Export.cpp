@@ -547,13 +547,11 @@ int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
     return 0;
 }
 
-int APS5_VABI rename_nid_postfix(const char* from, const char* to);
-
 int APS5_VABI renameat_nid_postfix(int oldfd, const char* from, int newfd, const char* to) {
     if (from == nullptr || to == nullptr) return static_cast<int>(Fail(GuestEfault));
     if (*from == '\0' || *to == '\0') return static_cast<int>(Fail(GuestEnoent));
     if ((oldfd == GuestAtFdcwd || *from == '/') && (newfd == GuestAtFdcwd || *to == '/'))
-        return rename_nid_postfix(from, to);
+        return RenameGuestPath_nid_no_patch(from, to);
     if (std::strlen(from) >= GuestPathMax || HasLongComponent(from) ||
         std::strlen(to) >= GuestPathMax || HasLongComponent(to))
         return static_cast<int>(Fail(GuestEnametoolong));
