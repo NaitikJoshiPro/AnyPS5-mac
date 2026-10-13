@@ -348,7 +348,13 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
         case 0x28:
             graphics();
             size(3);
-            require((packet[1] & 0x7fffffffu) == 0 && (packet[2] & 0x7fffffffu) == 0, "CONTEXT_CONTROL register loading and shadowing are not implemented");
+            // Bit 31 of each dword (UPDATE_LOAD_ENABLES / UPDATE_SHADOW_ENABLES) latches the enable bits below it;
+            // with it clear the CP leaves the enables alone and the dword does nothing ("set load_enable otherwise
+            // this package is just NOPs", Linux amdgpu gfx_v10_0_ring_emit_cntxcntl). oops-mesa's fence stream
+            // sends (0x200, address >> 8) and retires on hardware.
+            for (const auto control : {packet[1], packet[2]}) {
+                require((control & 0x80000000u) == 0 || (control & 0x7fffffffu) == 0, "CONTEXT_CONTROL register loading and shadowing are not implemented");
+            }
             break;
         case 0x46: {
             require((packet[1] & ~0x73fu) == 0, "unsupported EVENT_WRITE flags or reserved bits");

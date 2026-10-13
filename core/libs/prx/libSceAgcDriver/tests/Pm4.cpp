@@ -133,6 +133,13 @@ void testRegisters() {
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x80000000, 0x80000002}), 0); }, "shadowing");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x80000000, 0x80000000}), 0x20); }, "compute queue");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x80000000}), 0); }, "packet size");
+    // Without the update bit the enable bits are not latched (oops-mesa's fence stream).
+    execute(state, makePacket(0x28, {0x200, 0x70038d00}));
+    AgcDriver::Pm4::Validate(makePacket(0x28, {0x7fffffff, 0x80000000}), 0);
+    AgcDriver::Pm4::Validate(makePacket(0x28, {0x80000000, 0x7fffffff}), 0);
+    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x200, 0x80000001}), 0); }, "shadowing");
+    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x80000200, 0x70038d00}), 0); }, "shadowing");
+    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x200, 0x70038d00}), 0x20); }, "compute queue");
     expectFailure([&] { execute(state, makePacket(0x69, {0xffff, 1, 2})); }, "overflow");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x9f, {0, 0, 0x80000000, 0}), 0x20); }, "compute");
 }
