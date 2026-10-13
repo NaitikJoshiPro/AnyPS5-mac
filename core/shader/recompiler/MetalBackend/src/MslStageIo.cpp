@@ -338,13 +338,29 @@ std::string ExportVector(MslEmitterState& state, const std::string& data, const 
     return name;
 }
 
+// The output record an export writes: the vertex function's aps5_out, or in a mesh function this
+// lane half's staged vertex (EmitMslEntryPoint copies it into the mesh after the guest program).
+std::string OutputRecord(MslEmitterState& state) {
+    if (StageOf(state) == IrShaderStage::Mesh) return "aps5_mv[" + std::to_string(state.half) + "]";
+    return "aps5_out";
+}
+
 void AuxPositionExport(MslEmitterState& state, const std::string& data, const ExportInfo& exp) {
     const auto& vertex = VertexInfo(state);
+    const bool mesh = StageOf(state) == IrShaderStage::Mesh;
     for (std::uint32_t component = 0; component < 4u; ++component) {
         if ((exp.en & (1u << component)) == 0u) continue;
         const auto output = DecodePositionExportComponent(vertex.paClVsOutCntl, exp.index, component);
         const auto raw = data + "[" + std::to_string(component) + "]";
-        if (output.layer) state.Line("aps5_out.aps5_layer = " + raw + " & 0x7ffu;");
+        // DefineMeshOutputs: mesh functions output the position, parameters and the layer only.
+        if (mesh && (output.viewport || output.pointSize || output.clipDistance != std::numeric_limits<std::uint32_t>::max() || output.cullDistance != std::numeric_limits<std::uint32_t>::max())) state.Fail("unsupported mesh output kind (viewport index, point size, clip or cull distance)");
+        if (output.layer && mesh) {
+            // Per vertex in threadgroup memory; each primitive takes its provoking vertex's layer.
+            const auto index = state.GuestInvocationIndex();
+            state.Line("if (" + index + " < " + U32(vertex.mesh.maxVertices) + ") aps5_mlayer[" + index + "] = " + raw + " & 0x7ffu;");
+        } else if (output.layer) {
+            state.Line("aps5_out.aps5_layer = " + raw + " & 0x7ffu;");
+        }
         if (output.viewport) state.Line("aps5_out.aps5_viewport = extract_bits(" + raw + ", 16u, 4u);");
         if (output.layer || output.viewport) continue;
         if (output.pointSize) {
@@ -354,6 +370,52 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
         if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_out.aps5_clip[" + std::to_string(output.clipDistance) + "] = as_type<float>(" + raw + ");");
         if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) state.Fail("cull distances have no Metal vertex output (work package B6)");
     }
+}
+
+// GS_ALLOC_REQ (EmitMeshAllocate): the first invocation stores M0's vertex count (bits 0-9) and
+// primitive count (bits 12-22) for the outputs written after the program.
+void MeshAllocate(MslEmitterState& state, const IrValue& instruction) {
+    if (StageOf(state) != IrShaderStage::Mesh) state.Fail(instruction, "GS_ALLOC_REQ outside a mesh function");
+    const auto value = state.Arg(instruction, 0u);
+    state.Line("if (" + state.GuestInvocationIndex() + " == 0u) {");
+    state.Indent();
+    state.Line("aps5_malloc[0] = extract_bits(uint(" + value + "), 0u, 10u);");
+    state.Line("aps5_malloc[1] = extract_bits(uint(" + value + "), 12u, 11u);");
+    state.Outdent();
+    state.Line("}");
+}
+
+// Mesh draw words: push dwords MeshDrawPushOffsetBytes / 4 + i of the stage's push data (slot 0, as
+// the Vulkan push range): {index count, first vertex, first instance, index size | restart table,
+// argument address low, high}.
+std::string MeshDrawWord(MslEmitterState& state, const IrValue& instruction, std::uint32_t index, std::uint32_t count) {
+    if (StageOf(state) != IrShaderStage::Mesh || index >= count) state.Fail(instruction, "invalid mesh draw parameter");
+    state.usesPushData = true;
+    return "aps5_push[" + U32(MeshDrawPushOffsetBytes / 4u + index) + "]";
+}
+
+std::string MeshArgumentAddress(MslEmitterState& state, const IrValue& instruction) {
+    const auto low = MeshDrawWord(state, instruction, MeshArgumentAddressDword, PushData::MeshDrawDwordCount);
+    const auto high = MeshDrawWord(state, instruction, MeshArgumentAddressDword + 1u, PushData::MeshDrawDwordCount);
+    const auto name = state.Temporary("aps5_ma");
+    state.Line("const ulong " + name + " = ulong(" + low + ") | (ulong(" + high + ") << 32u);");
+    return name;
+}
+
+// The indirect draw's argument record (MeshArguments helper), 0 without one (EmitMeshArgument).
+void MeshArgument(MslEmitterState& state, const IrValue& instruction) {
+    const auto index = instruction.Argument(0)->Resolve()->ImmediateU32();
+    if (StageOf(state) != IrShaderStage::Mesh || index >= MeshArgumentBytes / 4u) state.Fail(instruction, "invalid mesh argument");
+    const auto address = MeshArgumentAddress(state, instruction);
+    state.Define(instruction, address + " != 0ul ? reinterpret_cast<device const uint*>(" + address + ")[" + U32(index) + "] : 0u");
+}
+
+// Strip restart table (EmitMeshRestartStart): entry min(position, length - 1) when the condition holds.
+void MeshRestartStart(MslEmitterState& state, const IrValue& instruction) {
+    if (StageOf(state) != IrShaderStage::Mesh) state.Fail(instruction, "mesh restart table read outside a mesh shader");
+    const auto address = MeshArgumentAddress(state, instruction);
+    const auto table = "reinterpret_cast<device const uint*>(" + address + ")";
+    state.Define(instruction, "(" + state.Arg(instruction, 1u) + ") ? " + table + "[min(uint(" + state.Arg(instruction, 0u) + "), " + table + "[" + U32(MeshRestartLengthDword) + "] - 1u) + " + U32(MeshRestartTableDword) + "] : 0u");
 }
 
 // SelectExportPacking: 10_11_11 targets take the colour packed into the red channel.
@@ -367,7 +429,7 @@ std::string ExportPacking(MslEmitterState& state, std::uint32_t target, const st
 
 void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
     const auto stage = StageOf(state);
-    if (stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel) state.Fail(instruction, "exports of this stage are not implemented in the MSL backend yet (work package B6)");
+    if (stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh) state.Fail(instruction, "exports of this stage are not implemented in the MSL backend yet (work package B6)");
     const auto& exports = state.program.Metadata().exportInfo;
     const auto index = instruction.Flags<ExportFlags>().index;
     if (index >= exports.size()) state.Fail(instruction, "export metadata index is out of range");
@@ -377,11 +439,19 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
         state.usesValidMask = true;
         state.Line("aps5_valid = " + exec + " ? 1u : 0u;");
     }
-    if (exp.kind == ExportTargetKind::Null || exp.en == 0u || exp.kind == ExportTargetKind::Primitive) return;
+    if (exp.kind == ExportTargetKind::Null || exp.en == 0u || (exp.kind == ExportTargetKind::Primitive && stage != IrShaderStage::Mesh)) return;
     state.Line("if (" + exec + ") {");
     state.Indent();
     const auto data = state.Temporary("aps5_ed");
     state.Line("const uint4 " + data + " = uint4(" + state.Arg(instruction, 0u) + ");");
+    const auto record = OutputRecord(state);
+    if (exp.kind == ExportTargetKind::Primitive) {
+        // The packed primitive (three 10-bit vertex fields, bit 31 null), unpacked after the program.
+        state.Line("aps5_mprim[" + std::to_string(state.half) + "] = " + data + ".x;");
+        state.Outdent();
+        state.Line("}");
+        return;
+    }
     if (exp.kind == ExportTargetKind::Position && exp.index != 0u) {
         AuxPositionExport(state, data, exp);
     } else if (exp.kind == ExportTargetKind::MrtZ) {
@@ -401,9 +471,9 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
             }
             position = converted;
         }
-        state.Line("aps5_out.aps5_position = " + position + ";");
-        // The all-zero position cull distance (StoreZeroPositionClipDistance).
-        state.Line("aps5_out.aps5_clip[" + std::to_string(ClipDistanceCount(state)) + "] = ((as_type<uint4>(aps5_out.aps5_position).x | as_type<uint4>(aps5_out.aps5_position).y | as_type<uint4>(aps5_out.aps5_position).z | as_type<uint4>(aps5_out.aps5_position).w) & 0x7fffffffu) == 0u ? -1.0f : 0.0f;");
+        state.Line(record + ".aps5_position = " + position + ";");
+        // The all-zero position cull distance (StoreZeroPositionClipDistance; not on mesh outputs).
+        if (stage != IrShaderStage::Mesh) state.Line("aps5_out.aps5_clip[" + std::to_string(ClipDistanceCount(state)) + "] = ((as_type<uint4>(aps5_out.aps5_position).x | as_type<uint4>(aps5_out.aps5_position).y | as_type<uint4>(aps5_out.aps5_position).z | as_type<uint4>(aps5_out.aps5_position).w) & 0x7fffffffu) == 0u ? -1.0f : 0.0f;");
     } else {
         const auto kind = exp.kind == ExportTargetKind::Mrt ? StageOutputKind::Mrt : StageOutputKind::Parameter;
         const auto* output = FindOutput(state, kind, exp.index);
@@ -427,7 +497,7 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
                 if (!uintOutput && mode != 5u && mode != 6u) value = ExportPacking(state, exp.index, value);
                 state.Line("aps5_out.c" + std::to_string(output->location) + " = as_type<APS5_COLOR" + std::to_string(output->location) + "_TYPE>(" + value + ");");
             } else {
-                state.Line("aps5_out.p" + std::to_string(output->location) + " = as_type<float4>(" + value + ");");
+                state.Line(record + ".p" + std::to_string(output->location) + " = as_type<float4>(" + value + ");");
             }
         }
     }
@@ -493,7 +563,7 @@ bool EmitMslStageInstruction(MslEmitterState& state, const IrValue& instruction)
     case IrOpcode::GetBuiltin: {
         const auto kind = static_cast<StageInputKind>(instruction.Argument(0)->Resolve()->ImmediateU32());
         const auto component = instruction.Argument(1)->Resolve()->ImmediateU32();
-        if (StageOf(state) == IrShaderStage::Compute) state.Define(instruction, ComputeBuiltin(state, kind, component));
+        if (state.ThreadgroupStage()) state.Define(instruction, ComputeBuiltin(state, kind, component));
         else state.Define(instruction, GraphicsBuiltin(state, instruction, kind, component));
         return true;
     }
@@ -502,6 +572,18 @@ bool EmitMslStageInstruction(MslEmitterState& state, const IrValue& instruction)
         return true;
     case IrOpcode::SetAttribute:
         SetAttribute(state, instruction);
+        return true;
+    case IrOpcode::MeshAllocate:
+        MeshAllocate(state, instruction);
+        return true;
+    case IrOpcode::MeshDrawParameter:
+        state.Define(instruction, MeshDrawWord(state, instruction, instruction.Argument(0)->Resolve()->ImmediateU32(), PushData::MeshDrawDwordCount));
+        return true;
+    case IrOpcode::MeshArgument:
+        MeshArgument(state, instruction);
+        return true;
+    case IrOpcode::MeshRestartStart:
+        MeshRestartStart(state, instruction);
         return true;
     case IrOpcode::GetInterpolationParameter:
         GetInterpolationParameter(state, instruction, false);
@@ -570,7 +652,37 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                           "#endif\n";
         return result;
     }
-    if (stage != IrShaderStage::Pixel) state.Fail("only vertex and pixel graphics stages are implemented in the MSL backend so far (work package B6)");
+    if (stage == IrShaderStage::Mesh) {
+        // Mesh functions (NGG primitive shaders, as DefineMeshOutputs): the vertex record carries the
+        // position and the parameters, the primitive record the cull flag and the layer.
+        const auto& mesh = VertexInfo(state).mesh;
+        if (mesh.maxVertices == 0u || mesh.maxVertices > 256u) state.Fail("mesh functions output 1 to 256 vertices (Metal mesh<> limit), the subgroup has " + std::to_string(mesh.maxVertices));
+        if (mesh.maxPrimitives == 0u || mesh.maxPrimitives > 512u) state.Fail("mesh functions output 1 to 512 primitives (Metal mesh<> limit), the subgroup has " + std::to_string(mesh.maxPrimitives));
+        text += "struct Aps5MeshVertex {\n    float4 aps5_position [[position]];\n";
+        std::uint32_t scalars = 4u;
+        bool layer = false;
+        for (const auto& output : state.program.Info().outputs) {
+            switch (output.kind) {
+            case StageOutputKind::Position: break;
+            case StageOutputKind::Parameter:
+                if (output.location >= 64u) state.Fail("mesh parameter location " + std::to_string(output.location) + " is beyond 63");
+                text += "    float4 p" + std::to_string(output.location) + " [[user(locn" + std::to_string(output.location) + ")]];\n";
+                state.reflection.outputLocations |= std::uint64_t {1u} << output.location;
+                scalars += 4u;
+                break;
+            case StageOutputKind::Layer: layer = true; break;
+            default: state.Fail("unsupported mesh output kind");
+            }
+        }
+        if (scalars > 124u) state.Fail("the mesh function exceeds 124 scalar varyings");
+        text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
+        if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
+        text += "};\n\n";
+        text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(mesh.maxVertices) + ", " + std::to_string(mesh.maxPrimitives) + ", metal::topology::triangle>;\n\n";
+        result.outputType = "Aps5MeshVertex";
+        return result;
+    }
+    if (stage != IrShaderStage::Pixel) state.Fail("only vertex, mesh and pixel graphics stages are implemented in the MSL backend so far (work package B6)");
     const auto& pixel = PixelInfo(state);
     text += "#ifndef APS5_VERTEX_OUTPUTS\n#define APS5_VERTEX_OUTPUTS 0xffffffff\n#endif\n#ifndef APS5_VERTEX_OUTPUTS_HI\n#define APS5_VERTEX_OUTPUTS_HI 0xffffffff\n#endif\n";
     text += "struct Aps5FragmentIn {\n    float4 aps5_position [[position]];\n";

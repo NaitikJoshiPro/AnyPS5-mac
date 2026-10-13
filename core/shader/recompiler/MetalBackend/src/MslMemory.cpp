@@ -122,7 +122,7 @@ struct Shared {
 Shared SharedOf(MslEmitterState& state, const IrValue& instruction) {
     const auto& memory = state.Memory(instruction);
     Shared shared;
-    if (memory.kind == ResourceKind::Lds && state.program.Resources().stage != IrShaderStage::Compute) {
+    if (memory.kind == ResourceKind::Lds && !state.ThreadgroupStage()) {
         // Function LDS (SpirvRequirements::functionLds): graphics stages keep LDS per invocation, at the
         // constant lane addresses the front end assigns (FunctionLdsLaneAddresses), as on the SPIR-V path.
         if (!state.requirements.functionLds) state.Fail(instruction, "LDS in a graphics stage without function LDS");

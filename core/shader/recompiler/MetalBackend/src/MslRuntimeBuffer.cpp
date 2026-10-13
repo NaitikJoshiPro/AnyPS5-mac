@@ -637,7 +637,7 @@ B5Descriptor MakeDescriptor(MslEmitterState& state, const IrValue& instruction, 
     std::string invalid = "(extract_bits(" + descriptor.word3 + ", 30u, 2u) != 0u)";
     descriptor.index = "0u";
     if (memory.kind == ResourceKind::Buffer) {
-        if (state.program.Resources().stage == IrShaderStage::Compute) {
+        if (state.ThreadgroupStage()) {
             // The guest lane of the half being emitted (B1 core helper; laneCount 2 adds 32 in half 1).
             descriptor.index = "(" + state.Arg(instruction, 1u) + " + (" + addThreadId + " ? " + state.GuestLane() + " : 0u))";
         } else {

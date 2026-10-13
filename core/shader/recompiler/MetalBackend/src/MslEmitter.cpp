@@ -278,7 +278,7 @@ std::string MslEmitterState::GuestLane() {
     }
     // Graphics stages have no threadgroup index: their wave64 programs keep the host SIMD lane, and
     // cross-lane reads past it fail (WaveBallot).
-    if (hostSubgroupSize < program.WaveSize() && program.Resources().stage == IrShaderStage::Compute) return "(" + Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " & " + std::to_string(program.WaveSize() - 1u) + "u)";
+    if (hostSubgroupSize < program.WaveSize() && ThreadgroupStage()) return "(" + Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " & " + std::to_string(program.WaveSize() - 1u) + "u)";
     return Builtin(MslBuiltin::ThreadIndexInSimdgroup);
 }
 
@@ -307,6 +307,8 @@ std::string MslEmitterState::GuestGlobalInvocationId(std::uint32_t component) {
 }
 
 std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
+    // Mesh draws are never split: the grid is (mesh groups, instances, 1), as gl_WorkGroupID.
+    if (program.Resources().stage == IrShaderStage::Mesh) return Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component);
     usesDriverData = true;
     return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "])";
 }
@@ -318,7 +320,7 @@ std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
 // lanes' EXEC bits still guard every effect; operations that need the other half fail (ReadLane of a
 // lane past 31) or see only this group (bit counts of a whole-wave mask: TechnicalDebt).
 bool MslGraphicsHalfWave(const MslEmitterState& state) {
-    return state.laneCount == 1u && state.program.WaveSize() > state.hostSubgroupSize && state.program.Resources().stage != IrShaderStage::Compute;
+    return state.laneCount == 1u && state.program.WaveSize() > state.hostSubgroupSize && !state.ThreadgroupStage();
 }
 
 std::string MslEmitterState::WaveBallot(const IrValue* predicate) {
@@ -404,6 +406,11 @@ std::string MslEmitterState::LoopGuardLimit() {
     return "aps5_loop_limit";
 }
 
+bool MslEmitterState::ThreadgroupStage() const {
+    const auto stage = program.Resources().stage;
+    return stage == IrShaderStage::Compute || stage == IrShaderStage::Mesh;
+}
+
 bool MslEmitterState::LdsInDeviceMemory() const {
     return program.Info().sharedMemoryBytes != 0u;
 }
@@ -432,11 +439,11 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
     // Wave-uniform values: computed once for both lane halves at laneCount 2; at any lane count the
     // stores whose address is wave-uniform keep only the highest active lane's data (MslBufferShared).
-    if (stage == IrShaderStage::Compute) state.waveUniform = WaveUniformValues(program);
+    if (state.ThreadgroupStage()) state.waveUniform = WaveUniformValues(program);
     static const bool survey = std::getenv("APS5_MSL_SURVEY") != nullptr;
     state.survey = survey;
-    if (stage != IrShaderStage::Compute && stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel) state.Fail("only compute, vertex and pixel shaders are implemented in the MSL backend so far (work package B6)");
-    if (stage == IrShaderStage::Vertex && inputInfo.vertex == nullptr) state.Fail("vertex input info is missing (work package B6)");
+    if (stage != IrShaderStage::Compute && stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh) state.Fail("only compute, vertex, pixel and mesh shaders are implemented in the MSL backend so far (tessellation: M3 emulation backlog)");
+    if ((stage == IrShaderStage::Vertex || stage == IrShaderStage::Mesh) && inputInfo.vertex == nullptr) state.Fail("vertex input info is missing (work package B6)");
     state.waveLdsScope = MslWaveLdsScope(state);
     EmitMslFunctionBody(state);
     const auto entry = EmitMslEntryPoint(state);

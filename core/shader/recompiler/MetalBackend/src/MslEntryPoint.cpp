@@ -89,7 +89,102 @@ std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInput
     return {(threads + 63u) / 64u * 32u, 1u, 1u};
 }
 
+namespace {
+
+// Mesh functions (NGG primitive shaders, mirroring EmitMeshEntryPoint on the SPIR-V path): the guest
+// program runs in aps5_body with each lane half's exports staged in aps5_mv / aps5_mprim and the
+// GS_ALLOC_REQ counts in threadgroup memory; after a threadgroup barrier invocation i writes vertex
+// i and primitive i (indices: three 9-bit fields at bits 0, 10 and 20, clamped to the last vertex;
+// bit 31 culls). Threadgroup variables live in the mesh function and reach aps5_body as pointers.
+std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> parameters) {
+    const auto graphics = MslGraphicsInterfaceOf(state);
+    const auto& mesh = state.inputInfo.vertex->mesh;
+    if (state.LdsInDeviceMemory()) state.Fail("mesh functions keep LDS in threadgroup memory; device-memory LDS is not implemented for them");
+    const bool layer = std::any_of(state.program.Info().outputs.begin(), state.program.Info().outputs.end(), [](const StageOutput& output) { return output.kind == StageOutputKind::Layer; });
+    std::string text = graphics.declarations;
+    std::vector<std::string> helperParameters;
+    std::vector<std::string> arguments;
+    for (const auto& parameter : parameters) {
+        const auto attribute = parameter.find(" [[");
+        const auto declaration = parameter.substr(0, attribute);
+        helperParameters.push_back(declaration);
+        arguments.push_back(declaration.substr(declaration.find_last_of(" &*") + 1u));
+    }
+    std::string prologue;
+    std::string hoisted;
+    std::size_t start = 0;
+    while (start < state.prologue.size()) {
+        auto end = state.prologue.find('\n', start);
+        if (end == std::string::npos) end = state.prologue.size() - 1u;
+        const auto line = state.prologue.substr(start, end + 1u - start);
+        start = end + 1u;
+        const auto first = line.find_first_not_of(' ');
+        if (first != std::string::npos && line.compare(first, 12u, "threadgroup ") == 0) {
+            if (line.compare(first, 26u, "threadgroup uint aps5_lds[") != 0) state.Fail("threadgroup declaration in a mesh program's prologue: " + line);
+            hoisted += line;
+            helperParameters.push_back("threadgroup uint* aps5_lds");
+            arguments.push_back("aps5_lds");
+            continue;
+        }
+        prologue += line;
+    }
+    const auto lanes = std::to_string(state.laneCount);
+    helperParameters.push_back("thread Aps5MeshVertex* aps5_mv");
+    helperParameters.push_back("thread uint* aps5_mprim");
+    helperParameters.push_back("threadgroup uint* aps5_malloc");
+    arguments.insert(arguments.end(), {"aps5_mv", "aps5_mprim", "aps5_malloc"});
+    if (layer) {
+        helperParameters.push_back("threadgroup uint* aps5_mlayer");
+        arguments.push_back("aps5_mlayer");
+    }
+    text += "static void aps5_body(";
+    for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
+    text += ")\n{\n" + state.locals + prologue + state.body + "}\n\n";
+    text += "[[mesh]] void " + std::string(MslAbi::EntryPoint) + "(\n    Aps5Mesh aps5_mesh";
+    for (const auto& parameter : parameters) text += ",\n    " + parameter;
+    text += ")\n{\n" + hoisted;
+    text += "    threadgroup uint aps5_malloc[2];\n";
+    if (layer) text += "    threadgroup uint aps5_mlayer[" + std::to_string(mesh.maxVertices) + "];\n";
+    text += "    Aps5MeshVertex aps5_mv[" + lanes + "] = {};\n";
+    text += "    uint aps5_mprim[" + lanes + "] = {" + (state.laneCount == 2u ? std::string("0x80000000u, 0x80000000u") : std::string("0x80000000u")) + "};\n";
+    const auto local = state.Builtin(MslBuiltin::ThreadIndexInThreadgroup);
+    text += "    if (" + local + " == 0u) {\n        aps5_malloc[0] = 0u;\n        aps5_malloc[1] = 0u;\n    }\n";
+    text += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    std::string call = "    aps5_body(";
+    for (std::size_t index = 0; index < arguments.size(); ++index) call += (index == 0u ? "" : ", ") + arguments[index];
+    text += call + ");\n";
+    text += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    text += "    const uint aps5_vertices = min(aps5_malloc[0], " + std::to_string(mesh.maxVertices) + "u);\n";
+    text += "    const uint aps5_primitives = min(aps5_malloc[1], " + std::to_string(mesh.maxPrimitives) + "u);\n";
+    text += "    if (" + local + " == 0u) aps5_mesh.set_primitive_count(aps5_primitives);\n";
+    text += "    const uint aps5_last = max(aps5_vertices, 1u) - 1u;\n";
+    for (std::uint32_t half = 0; half < state.laneCount; ++half) {
+        state.half = half;
+        const auto h = std::to_string(half);
+        text += "    {\n        const uint aps5_i = " + state.GuestInvocationIndex() + ";\n";
+        text += "        if (aps5_i < aps5_vertices) {\n            Aps5MeshVertex aps5_v = aps5_mv[" + h + "];\n";
+        // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w].
+        text += "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n";
+        text += "            aps5_v.aps5_position.z = (aps5_v.aps5_position.z + aps5_v.aps5_position.w) * 0.5f;\n#endif\n";
+        text += "            aps5_mesh.set_vertex(aps5_i, aps5_v);\n        }\n";
+        text += "        if (aps5_i < aps5_primitives) {\n            const uint aps5_packed = aps5_mprim[" + h + "];\n";
+        text += "            uint aps5_k[3];\n";
+        text += "            for (uint c = 0u; c < 3u; ++c) {\n                aps5_k[c] = min(extract_bits(aps5_packed, c * 10u, 9u), aps5_last);\n";
+        text += "                aps5_mesh.set_index(aps5_i * 3u + c, uchar(aps5_k[c]));\n            }\n";
+        text += "            Aps5MeshPrimitive aps5_p = {};\n            aps5_p.aps5_culled = (aps5_packed & 0x80000000u) != 0u;\n";
+        if (layer) text += "            aps5_p.aps5_layer = aps5_mlayer[aps5_k[" + std::to_string(std::min(mesh.provokingVertex, 2u)) + "]];\n";
+        text += "            aps5_mesh.set_primitive(aps5_i, aps5_p);\n        }\n    }\n";
+    }
+    state.half = 0u;
+    text += "}\n";
+    return text;
+}
+
+}
+
 std::string EmitMslEntryPoint(MslEmitterState& state) {
+    // The mesh function's epilogue needs the invocation index whether or not the guest reads it.
+    if (state.reflection.stage == MslAbi::Stage::Mesh) static_cast<void>(state.Builtin(MslBuiltin::ThreadIndexInThreadgroup));
     std::vector<MslAbi::TableBinding> tableBindings;
     for (const auto& descriptor : state.program.Metadata().bindings.descriptors) {
         if (!state.usedKinds.contains(descriptor.kind)) continue;
@@ -139,6 +234,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n";
         return text;
     }
+    if (state.reflection.stage == MslAbi::Stage::Mesh) return text + EmitMeshFunction(state, std::move(parameters));
     if (state.reflection.stage != MslAbi::Stage::Vertex && state.reflection.stage != MslAbi::Stage::Fragment) state.Fail("only kernel, vertex and fragment stage functions are implemented in the MSL backend so far (work package B6)");
     // Vertex and fragment functions (B6): the guest body runs in aps5_body, which takes every stage
     // parameter (without its attribute) and the output struct by reference, so the body's returns

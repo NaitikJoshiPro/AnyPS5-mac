@@ -17,7 +17,7 @@ constexpr std::uint32_t SharedApertureHigh = 0x80000000u;
 constexpr std::uint32_t PrivateApertureHigh = 0x70000000u;
 
 bool RoutesApertures(const MslEmitterState& state, const MemoryInfo& memory) {
-    return memory.kind == ResourceKind::Flat && state.program.Resources().stage == IrShaderStage::Compute;
+    return memory.kind == ResourceKind::Flat && state.ThreadgroupStage();
 }
 
 std::string Active(MslEmitterState& state, const IrValue& instruction) {

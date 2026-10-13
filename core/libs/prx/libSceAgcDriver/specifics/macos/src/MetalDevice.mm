@@ -705,6 +705,11 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // MslAbi: pixel push constants start at byte 128 of the push block (slot 1), whatever the
     // vertex stage uses.
     target.fixedPushSlots = true;
+    // MSL mesh functions (B6 stage 5, NGG primitive shaders): mesh<V, P, ...> holds at most 256
+    // vertices and 512 primitives, a mesh threadgroup as many threads as a compute one, 124 scalar
+    // varyings (Metal Feature Set Tables: mesh shading Apple7+, 1,048,575 mesh threadgroups per grid
+    // on Apple9). Pipelines and draws: M2_DESIGN "SHD4 results".
+    target.mesh = ShaderRecompiler::MeshTargetLimits{{static_cast<std::uint32_t>(threads.width), 1u, 1u}, static_cast<std::uint32_t>(threads.width), threadgroupMemory, 256u, 512u, 124u, threadgroupMemory, 1u, 1u};
     return target;
 }
 

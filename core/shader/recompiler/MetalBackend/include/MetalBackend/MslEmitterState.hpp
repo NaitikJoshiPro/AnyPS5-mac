@@ -213,6 +213,9 @@ public:
     // arena, BufferIndex::WorkgroupMemory), else threadgroup memory. The memory flags workgroup
     // barriers need so the LDS accesses around them are ordered.
     [[nodiscard]] bool LdsInDeviceMemory() const;
+    // Compute and mesh programs run in threadgroups (workgroup LDS, invocation ids, wave64 at two
+    // lanes per invocation); the other graphics stages do not.
+    [[nodiscard]] bool ThreadgroupStage() const;
     [[nodiscard]] std::string LdsMemoryFlags() const;
     MslBarrierScope waveLdsScope = MslBarrierScope::None;
 
