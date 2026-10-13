@@ -41,6 +41,8 @@ extern "C" std::uint32_t* APS5_VABI sceAgcAcbAtomicGds_0900(CommandBuffer* buf, 
 
 namespace {
 
+constexpr int SCE_AGC_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80890001);
+
 void check(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -517,8 +519,10 @@ void testDefaults() {
     expectFailure([] { sceAgcInit_0090(nullptr, 8); });
     expectFailure([&] { sceAgcInit_0090(&state, 14); });
     check(sceAgcInit(8) == 0, "AGC version initialization failed");
-    expectFailure([] { sceAgcInit(14); });
-    expectFailure([] { sceAgcInit(0xffffffffu); });
+    check(sceAgcInit(13) == 0, "AGC version 13 initialization failed");
+    check(sceAgcInit(14) == SCE_AGC_ERROR_INVALID_ARGUMENT, "unsupported AGC version did not return invalid argument");
+    check(sceAgcInit(0xffffffffu) == SCE_AGC_ERROR_INVALID_ARGUMENT, "maximum AGC version did not return invalid argument");
+    check(sceAgcInit(0xffffc278u) == SCE_AGC_ERROR_INVALID_ARGUMENT, "pointer-valued AGC argument did not return invalid argument");
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
