@@ -423,7 +423,7 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     mesh += "    const uint aps5_used = aps5_primitives * " + U32(corners) + ";\n";
     mesh += "    if (aps5_tid < aps5_used) {\n";
     mesh += "        uint aps5_owner = aps5_tid;\n";
-    mesh += "";
+    mesh += "        for (uint s = 0u; s < aps5_tid; ++s) {\n            if (aps5_corners[s] == aps5_corners[aps5_tid]) { aps5_owner = s; break; }\n        }\n";
     mesh += "        aps5_first[aps5_tid] = ushort(aps5_owner);\n";
     mesh += "        if (aps5_owner == aps5_tid) aps5_slot[aps5_tid] = uchar(atomic_fetch_add_explicit(&aps5_vertices[0], 1u, memory_order_relaxed));\n";
     mesh += "    }\n";
