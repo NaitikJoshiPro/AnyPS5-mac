@@ -245,3 +245,4 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - UPSYNC (merge of upstream/main, 937 commits) in progress in .mac-work/wt/sync.
 - Open: windowed audio not confirmed by ear; headless audio capture 578 s vs 680 s run (not investigated); the f16 supervised test still needs the user (auto-mode classifier denied main).
 - Origin: public fork NaitikJoshiPro/AnyPS5. All our commits rewritten to the NaitikJoshiPro identity before the first push.
+- 2026-10-13: the user confirmed the windowed DOOM run by eye and ear: picture correct, all sounds heard. The windowed audio criterion is verified.
