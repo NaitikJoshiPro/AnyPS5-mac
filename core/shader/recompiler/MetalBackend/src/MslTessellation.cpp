@@ -413,7 +413,8 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     mesh += "    if (aps5_tid == 0u) {\n";
     mesh += "        const int aps5_total = int(aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "]);\n";
     mesh += "        const int aps5_begin = int(aps5_slice.x) * " + std::to_string(slice) + ";\n";
-    mesh += "        aps5_count[0] = uint(aps5_tess_window(aps5_patch, aps5_begin, min(" + std::to_string(slice) + ", aps5_total - aps5_begin), aps5_corners));\n";
+    mesh += "        const Aps5TessPatch aps5_window_patch = aps5_patch;\n";
+    mesh += "        aps5_count[0] = uint(aps5_tess_window(aps5_window_patch, aps5_begin, min(" + std::to_string(slice) + ", aps5_total - aps5_begin), aps5_corners));\n";
     mesh += "        atomic_store_explicit(&aps5_vertices[0], 0u, memory_order_relaxed);\n";
     mesh += "        aps5_mesh.set_primitive_count(aps5_count[0]);\n    }\n";
     mesh += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
