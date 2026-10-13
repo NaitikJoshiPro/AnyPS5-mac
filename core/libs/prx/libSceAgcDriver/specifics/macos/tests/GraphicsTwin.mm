@@ -401,7 +401,9 @@ int MetalSparseBufferHoles() {
 // declare EarlyFragmentTests in SPIR-V, except that Metal refuses the attribute on a function returning
 // [[depth]], so DEPTH_BEFORE_SHADER with Z_EXPORT_ENABLE keeps late tests (TechnicalDebt
 // metal-early-depth-export). Each request is also checked after a serializer round trip.
-bool MetalDeclaresEarlyFragmentTests(const ShaderRecompiler::RecompileRequest& request) {
+// upstream's depthExportRequest builds a SPIR-V target; the twin compiles the same request for MSL.
+bool MetalDeclaresEarlyFragmentTests(ShaderRecompiler::RecompileRequest request) {
+    request.target.backend = ShaderRecompiler::ShaderBackend::Msl;
     const auto result = ShaderRecompiler::Recompile(request);
     Require(!result.msl.empty(), "the depth-export pixel program produced no MSL");
     const bool reflected = result.msl.Reflection().earlyFragmentTests;
