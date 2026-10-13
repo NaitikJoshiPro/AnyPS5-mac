@@ -1,6 +1,7 @@
-// INTERIM (M3, until the upstream sync brings File/src/DescriptorControl.cpp): fcntl F_DUPFD / F_DUPFD_CLOEXEC on a
-// host-backed descriptor (a regular file or device node). This branch's fcntl handles guest sockets only and failed
-// these with EBADF, which stops oops-mesa's DRI screen (it duplicates its device fd with F_DUPFD_CLOEXEC). Delete this
+// INTERIM (M3, until the upstream sync brings File/src/DescriptorControl.cpp): fcntl F_DUPFD / F_DUPFD_CLOEXEC and
+// F_GETFD / F_SETFD on a host-backed descriptor (a regular file or device node). This branch's fcntl handles guest
+// sockets only and failed these with EBADF, which stops oops-mesa's DRI screen: it duplicates its device fd with
+// F_DUPFD_CLOEXEC, and its winsys shim serves ioctls on the copy only when fcntl(copy, F_GETFD) succeeds. Delete this
 // file and its call in Socket/src/Udp.cpp when the upstream fcntl lands.
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
@@ -16,13 +17,25 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 
-extern "C" int FileDuplicateFcntl_nid_no_patch(int descriptor, int command, std::int64_t minimum) {
-    constexpr int GuestDuplicate = 0, GuestDuplicateCloseOnExec = 17, GuestEbadf = 9, GuestEinval = 22, GuestEio = 5;
+extern "C" int FileDuplicateFcntl_nid_no_patch(int descriptor, int command, std::int64_t argument) {
+    const std::int64_t minimum = argument;
+    constexpr int GuestDuplicate = 0, GuestGetDescriptorFlags = 1, GuestSetDescriptorFlags = 2, GuestDuplicateCloseOnExec = 17;
+    constexpr int GuestEbadf = 9, GuestEinval = 22, GuestEio = 5;
     const auto fail = [](int error) {
         *__error_nid_postfix() = error;
         return -1;
     };
     if (descriptor < 0 || descriptor >= GuestSockets::FirstDescriptor) return fail(GuestEbadf);
+    if (command == GuestGetDescriptorFlags || command == GuestSetDescriptorFlags) {
+#ifdef _WIN32
+        throw std::runtime_error("fcntl: F_GETFD/F_SETFD on a host descriptor is not implemented on Windows");
+#else
+        // FD_CLOEXEC is 1 on both FreeBSD and Darwin.
+        const int result = command == GuestGetDescriptorFlags ? ::fcntl(descriptor, F_GETFD) : ::fcntl(descriptor, F_SETFD, static_cast<int>(minimum & 1));
+        if (result < 0) return fail(errno > 0 && errno <= 34 ? errno : GuestEio);
+        return result & 1;
+#endif
+    }
     if (minimum < 0 || minimum >= GuestSockets::FirstDescriptor) return fail(GuestEinval);
 #ifdef _WIN32
     (void)command;

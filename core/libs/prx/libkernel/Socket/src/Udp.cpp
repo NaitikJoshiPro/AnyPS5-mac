@@ -456,8 +456,9 @@ extern "C" int FileDuplicateFcntl_nid_no_patch(int descriptor, int command, std:
 
 extern "C" {
 int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
-    // INTERIM until the upstream fcntl (DescriptorControl.cpp): F_DUPFD (0) / F_DUPFD_CLOEXEC (17) on host descriptors.
-    if (descriptor >= 0 && descriptor < GuestSockets::FirstDescriptor && (command == 0 || command == 17)) {
+    // INTERIM until the upstream fcntl (DescriptorControl.cpp): F_DUPFD (0), F_GETFD (1), F_SETFD (2) and
+    // F_DUPFD_CLOEXEC (17) on host descriptors.
+    if (descriptor >= 0 && descriptor < GuestSockets::FirstDescriptor && (command == 0 || command == 1 || command == 2 || command == 17)) {
 #if !APS5_GUEST_VA_LIST_IS_HOST
         APS5_VA_BEGIN(command);
         const auto minimum = LibcDetail::FormatArguments(args).Next<std::int64_t>();
