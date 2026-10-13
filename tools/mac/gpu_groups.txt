@@ -1,5 +1,5 @@
 # M2 GPU test groups (docs/mac/M2_DESIGN.md §8), written by tools/mac/gpu_groups.py --write.
-# <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group (only agc_driver_lds_atomics64; G5 runs headless).
+# <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group (none at present: agc_driver_lds_atomics64 was released 2026-10-13; G5 runs headless).
 agc_branch_patch_tests G0
 agc_cb_cond_write_tests G0
 agc_commands G0

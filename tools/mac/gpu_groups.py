@@ -24,8 +24,9 @@ Groups:
   G6 f64 and 64-bit atomics
   G7 Metal-only tests and the Vulkan-internal tests that Metal twins replace
 
-HOLD lists the tests tools/mac/gpu_suite.sh never runs, whatever the map says: the 64-bit LDS atomics
-test (it can hang the GPU, MISSION §5). PRESENTATION matches the G5 tests (flip, present, video out, libSceVideoOut):
+HOLD matches the tests tools/mac/gpu_suite.sh never runs, whatever the map says. It is empty (HELD_TESTS = ()):
+agc_driver_lds_atomics64, the last held test, was released on 2026-10-13 after supervised passes. The mechanism
+(--rerun-held, the "held" summary column) stays for future use. PRESENTATION matches the G5 tests (flip, present, video out, libSceVideoOut):
 they run in normal suite runs, headless, because gpu_suite forces SDL_VIDEODRIVER=offscreen for every test.
 tools/mac/gpu_quarantine.txt adds tests that took the machine down (kernel panic, GPU hang) until they are cleared;
 a missing or malformed quarantine file stops gpu_suite.sh from running anything (fail closed).
@@ -40,8 +41,17 @@ REPO = Path(__file__).resolve().parents[2]
 MAP = Path(__file__).resolve().parent / "gpu_groups.txt"
 GROUPS = ("G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7")
 
-# Never run by gpu_suite.sh (CLAUDE.md GPU safety): the 64-bit LDS atomics test can hang the GPU.
-HOLD = re.compile(r"^agc_driver_lds_atomics64$")
+# Tests gpu_suite.sh never runs (CLAUDE.md GPU safety). Empty: agc_driver_lds_atomics64 was released on 2026-10-13
+# after supervised passes. GPU_GROUPS_EXTRA_HELD (comma-separated names) adds tests for the unit tests only.
+HELD_TESTS: tuple = ()
+
+
+def hold_pattern(names):
+    names = [name for name in names if name]
+    return re.compile("^(" + "|".join(re.escape(name) for name in names) + ")$") if names else re.compile(r"(?!)")
+
+
+HOLD = hold_pattern(HELD_TESTS + tuple(os.environ.get("GPU_GROUPS_EXTRA_HELD", "").split(",")))
 # G5 presentation tests: run headless by gpu_suite (SDL_VIDEODRIVER=offscreen), no longer held.
 PRESENTATION = re.compile(r"(^|_)(flip|visual|present|presentation|swapchain)(_|$)|^(guest_)?video_out_|^pad_sdl$|^guest_buffer_reuse$")
 PRESENTATION_DIRECTORIES = ("core/libs/prx/libSceVideoOut",)
@@ -208,7 +218,7 @@ def load_map(path=MAP):
 
 def write_map(groups, path=MAP):
     lines = ["# M2 GPU test groups (docs/mac/M2_DESIGN.md §8), written by tools/mac/gpu_groups.py --write.",
-             "# <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group (only agc_driver_lds_atomics64; G5 runs headless)."]
+             "# <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group (none at present: agc_driver_lds_atomics64 was released 2026-10-13; G5 runs headless)."]
     for group in GROUPS:
         lines += [f"{name} {group}" for name in sorted(name for name, found in groups.items() if found == group)]
     Path(path).write_text("\n".join(lines) + "\n")

@@ -10,6 +10,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -106,7 +107,12 @@ def write_build(root, tests, source=None):
 
 class GroupTests(unittest.TestCase):
     def test_held_tests(self):
-        self.assertTrue(gpu_groups.held("agc_driver_lds_atomics64"))
+        self.assertFalse(gpu_groups.held("agc_driver_lds_atomics64"))
+        self.assertEqual(gpu_groups.HELD_TESTS, ())
+        with mock.patch.object(gpu_groups, "HOLD", gpu_groups.hold_pattern(("agc_driver_fake_held",))):
+            self.assertTrue(gpu_groups.held("agc_driver_fake_held"))
+            self.assertFalse(gpu_groups.held("agc_driver_fake_held_too"))
+            self.assertFalse(gpu_groups.held("agc_driver_lds_atomics64"))
         for name in ("agc_driver_flip", "agc_driver_flip_compute", "video_out_flip_lifetime", "video_out_frame_dump_queue",
                      "guest_video_out_output_mode", "pad_sdl", "guest_buffer_reuse"):
             with self.subTest(name=name):
@@ -226,6 +232,9 @@ class SuiteHelperTests(unittest.TestCase):
         self.assertEqual(gpu_suite.outcome("disabled", "Disabled", ""), "skipped")
 
 
+HELD_ENV = {"GPU_GROUPS_EXTRA_HELD": "agc_driver_fake_held"}
+
+
 class SuiteRunTests(unittest.TestCase):
     def run_suite(self, plan, *arguments, tests=None, canaries=(CANARY,), env=None, prepare=None):
         with tempfile.TemporaryDirectory() as directory:
@@ -270,19 +279,19 @@ class SuiteRunTests(unittest.TestCase):
             "agc_driver_ok": ["run", "", "passed"],
             "agc_driver_emission": ["fail", "Failed", "MSL emission failed: hash=0x1 stage=4 opcode=FPMul32 reason=has no MSL emitter"],
             "agc_driver_skip": ["notrun", "SKIP_RETURN_CODE=77", "skipped, the device has no shaderFloat64"],
-            "agc_driver_lds_atomics64": ["run", "", "must never run"],
+            "agc_driver_fake_held": ["run", "", "must never run"],
             "agc_driver_flip": ["run", "", "presentation runs headless"],
         }
-        result, files, log = self.run_suite(plan, "re:^agc_driver_", "--batch-seconds", "60")
+        result, files, log = self.run_suite(plan, "re:^agc_driver_", "--batch-seconds", "60", env=HELD_ENV)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertNotIn("lds_atomics64", log)
+        self.assertNotIn("fake_held", log)
         self.assertIn("agc_driver_flip", log)
         self.assertIn("-j1", log)
         self.assertIn("--timeout 30", log)
         summary = json.loads(files["summary.json"])
         outcomes = {entry["test"]: entry["outcome"] for entry in summary["results"]}
         self.assertEqual(outcomes, {"agc_driver_ok": "passed", "agc_driver_emission": "failed", "agc_driver_skip": "skipped", "agc_driver_flip": "passed"})
-        self.assertEqual(sorted(summary["held"]), ["agc_driver_lds_atomics64"])
+        self.assertEqual(sorted(summary["held"]), ["agc_driver_fake_held"])
         self.assertTrue(any("agc_driver_skip skipped and is not in the allowlist" in error for error in summary["skip_errors"]))
         self.assertIn("opcode=FPMul32", files["summary.txt"])
         self.assertIn("<testcase", files["junit.xml"])
@@ -342,27 +351,27 @@ class SuiteRunTests(unittest.TestCase):
         self.assertEqual(json.loads(files["summary.json"])["meta"]["quarantine_rerun"], ["agc_driver_f16_denormal_flush"])
 
     def test_a_held_test_runs_only_alone_under_validation(self):
-        plan = {"agc_driver_ok": ["run", "", ""], "agc_driver_lds_atomics64": ["run", "", "held rerun"]}
-        result, _, log = self.run_suite(plan, "agc_driver_lds_atomics64", "--rerun-held", "agc_driver_lds_atomics64")
+        plan = {"agc_driver_ok": ["run", "", ""], "agc_driver_fake_held": ["run", "", "held rerun"]}
+        result, _, log = self.run_suite(plan, "agc_driver_fake_held", "--rerun-held", "agc_driver_fake_held")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(log, "")
-        result, _, log = self.run_suite(plan, "re:^agc_driver_", "--rerun-held", "agc_driver_lds_atomics64", "--validation")
+        result, _, log = self.run_suite(plan, "re:^agc_driver_", "--rerun-held", "agc_driver_fake_held", "--validation", env=HELD_ENV)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(log, "")
-        result, _, log = self.run_suite(plan, "agc_driver_ok", "--rerun-held", "agc_driver_ok", "--validation")
+        result, _, log = self.run_suite(plan, "agc_driver_ok", "--rerun-held", "agc_driver_ok", "--validation", env=HELD_ENV)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(log, "")
-        result, files, log = self.run_suite(plan, "agc_driver_lds_atomics64", "--rerun-held", "agc_driver_lds_atomics64", "--validation")
+        result, files, log = self.run_suite(plan, "agc_driver_fake_held", "--rerun-held", "agc_driver_fake_held", "--validation", env=HELD_ENV)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("^agc_driver_lds_atomics64$", log)
+        self.assertIn("^agc_driver_fake_held$", log)
         self.assertNotIn("agc_driver_ok$", log)
-        self.assertEqual(json.loads(files["summary.json"])["meta"]["held_rerun"], ["agc_driver_lds_atomics64"])
-        result, _, log = self.run_suite(plan, "agc_driver_lds_atomics64", "--validation")
+        self.assertEqual(json.loads(files["summary.json"])["meta"]["held_rerun"], ["agc_driver_fake_held"])
+        result, _, log = self.run_suite(plan, "agc_driver_fake_held", "--validation", env=HELD_ENV)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(log, "")
 
     def test_selecting_only_held_tests_runs_nothing(self):
-        result, _, log = self.run_suite({"agc_driver_lds_atomics64": ["run", "", ""]}, "agc_driver_lds_atomics64")
+        result, _, log = self.run_suite({"agc_driver_fake_held": ["run", "", ""]}, "agc_driver_fake_held", env=HELD_ENV)
         self.assertEqual(result.returncode, 1)
         self.assertIn("held back", result.stdout)
         self.assertEqual(log, "")

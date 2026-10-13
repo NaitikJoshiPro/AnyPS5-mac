@@ -9,7 +9,7 @@ matched with re.search) or an exact test name. Selections are unions.
 
 GPU safety (CLAUDE.md, MISSION §5): every ctest invocation runs -j1 with a per-test timeout inside
 tools/mac/buildlock.py <build>, which is also the machine-wide GPU mutex; the tests gpu_groups.HOLD matches
-(agc_driver_lds_atomics64) and the quarantined ones (tools/mac/
+(none now: agc_driver_lds_atomics64 was released on 2026-10-13 after supervised passes) and the quarantined ones (tools/mac/
 gpu_quarantine.txt: tests that panicked or hung the machine; without a readable quarantine file nothing runs) are
 never run, whatever is selected; a batch
 holds the lock for at most --batch-seconds of worst-case test time (sum of the tests' timeouts), so other agents can
@@ -496,7 +496,7 @@ def run_suite():
     parser.add_argument("--canaries", type=Path, default=CANARIES, help="canary list run first (default: tools/mac/gpu_canaries.txt)")
     parser.add_argument("--busy-wait", type=float, default=300.0, help="seconds to wait for load/compilers to go away before refusing (default: 300)")
     parser.add_argument("--quarantine", type=Path, default=gpu_groups.QUARANTINE, help="quarantine list (default: tools/mac/gpu_quarantine.txt); missing or malformed: nothing runs")
-    parser.add_argument("--rerun-held", metavar="NAME", help="the supervised run of ONE test gpu_groups.HOLD holds back (e.g. agc_driver_lds_atomics64, with the coordinator's agreement): NAME must be the only selected test, needs --validation, runs alone after the canaries with a 1-minute load limit of 3; the test stays held for normal runs")
+    parser.add_argument("--rerun-held", metavar="NAME", help="the supervised run of ONE test gpu_groups.HOLD holds back (HOLD is empty now; agc_driver_lds_atomics64 was released on 2026-10-13; use with the coordinator's agreement): NAME must be the only selected test, needs --validation, runs alone after the canaries with a 1-minute load limit of 3; the test stays held for normal runs")
     parser.add_argument("--rerun-quarantined", action="store_true", help="the supervised rerun of ONE quarantined test (D19.4/6): needs exactly one selected test, --validation, and runs it alone after the canaries; the test stays quarantined until the list is edited with this run as evidence")
     parser.add_argument("--pause", type=float, default=PAUSE_SECONDS, help=f"seconds between tests (default and minimum: {PAUSE_SECONDS:g})")
     parser.add_argument("--validation", action="store_true", help="run with MTL_SHADER_VALIDATION=1 (reported to stderr) and MTL_DEBUG_LAYER=1")
