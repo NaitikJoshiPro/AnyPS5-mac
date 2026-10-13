@@ -433,11 +433,12 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     MslEmitterState state(program, inputInfo, bindings, target);
     state.reflection.stage = ReflectedStage(stage);
     state.reflection.group = StageGroup(stage);
-    // Apple SIMD groups are 32 wide whatever width the target claims. A target may claim 64 so the
-    // front end lays a wave64 program out at one lane per invocation (agc_driver_pixel_wave_reduction's
-    // wide layout, APS5_SINGLE_LANE): the emitter still maps it to the 32-lane hardware, so graphics
-    // stages take the half-wave view and compute wave ops across two SIMD groups throw, instead of
-    // shuffling lanes 32-63 that do not exist (undefined in MSL; they read 0 on the M3).
+    // Apple SIMD groups are 32 wide whatever width the target claims, and the front end lays MSL
+    // programs out for 32 lanes (Recompiler.cpp HostSubgroupSize). Only the APS5_SINGLE_LANE debug
+    // aid lays a wave64 program out at one lane per invocation for 64 lanes: the emitter still maps
+    // it to the 32-lane hardware, so graphics stages take the half-wave view and compute wave ops
+    // across two SIMD groups throw, instead of shuffling lanes 32-63 that do not exist (undefined in
+    // MSL; they read 0 on the M3).
     state.hostSubgroupSize = std::min(target.subgroupSize, AppleSimdWidth);
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
