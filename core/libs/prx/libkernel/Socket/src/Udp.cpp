@@ -452,8 +452,24 @@ bool GuestSockets::Ready(int descriptor, bool write, std::int64_t* data, bool* e
     return true;
 }
 
+extern "C" int FileDuplicateFcntl_nid_no_patch(int descriptor, int command, std::int64_t minimum); // File/src/FileDuplicate.cpp
+
 extern "C" {
 int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
+    // INTERIM until the upstream fcntl (DescriptorControl.cpp): F_DUPFD (0) / F_DUPFD_CLOEXEC (17) on host descriptors.
+    if (descriptor >= 0 && descriptor < GuestSockets::FirstDescriptor && (command == 0 || command == 17)) {
+#if !APS5_GUEST_VA_LIST_IS_HOST
+        APS5_VA_BEGIN(command);
+        const auto minimum = LibcDetail::FormatArguments(args).Next<std::int64_t>();
+        APS5_VA_END();
+#else
+        std::va_list arguments;
+        va_start(arguments, command);
+        const auto minimum = va_arg(arguments, std::int64_t);
+        va_end(arguments);
+#endif
+        return FileDuplicateFcntl_nid_no_patch(descriptor, command, minimum);
+    }
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     std::lock_guard lock(socket->modeMutex);

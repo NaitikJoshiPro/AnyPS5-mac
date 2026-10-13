@@ -9,6 +9,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Terminal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Open.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/FcntlAlias.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/FileDuplicate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/OpenFileLimit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/SharedMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/RandomDevice.cpp
@@ -1094,6 +1095,11 @@ if(BUILD_TESTING)
     target_link_libraries(guest_displaced_memory_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_displaced_memory_tests)
     add_test(NAME guest_displaced_memory COMMAND guest_displaced_memory_tests)
+    add_test_executable(guest_fcntl_duplicate_tests ${LIBS_INCLUDE_DIR}/tests/GuestFcntlDuplicate.cpp)
+    target_include_directories(guest_fcntl_duplicate_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_fcntl_duplicate_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_fcntl_duplicate_tests)
+    add_test(NAME guest_fcntl_duplicate COMMAND guest_fcntl_duplicate_tests)
     if(WIN32)
         set_tests_properties(guest_memory PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
