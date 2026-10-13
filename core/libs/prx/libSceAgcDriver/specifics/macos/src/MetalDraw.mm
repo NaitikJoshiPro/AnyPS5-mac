@@ -1242,6 +1242,13 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     state.NoteBindings(fragmentPlan);
     state.NoteBindings(targetPlan);
     state.CheckFaultsOnComplete(true);
+    if (Trace()) {
+        std::fprintf(stderr, "[metal] draw state: render %ux%u viewport (%.1f %.1f %.1f %.1f) scissor (%d %d %u %u) colorOutputs 0x%x\n", graphics.renderExtent.width, graphics.renderExtent.height, graphics.viewport.x, graphics.viewport.y, graphics.viewport.width, graphics.viewport.height, graphics.scissor.offset.x, graphics.scissor.offset.y, graphics.scissor.extent.width, graphics.scissor.extent.height, colorOutputs);
+        for (const auto& attachment : colors) {
+            const auto& target = *attachment.target;
+            std::fprintf(stderr, "[metal]   color %u: 0x%llx %ux%u format %d tile %d element %u bytes 0x%llx mask 0x%x %s\n", target.exportIndex, static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), static_cast<int>(target.tileMode), target.elementBytes, static_cast<unsigned long long>(target.bytes), target.exportIndex < graphics.blends.size() ? graphics.blends[target.exportIndex].colorWriteMask : 0u, attachment.resident != nullptr ? "resident" : "in place");
+        }
+    }
     if (Trace()) std::fprintf(stderr, "[metal] draw %s %zu calls (%llu recorded, %zu pipeline passes), %zu color targets, depth %s, pass %s\n", indexedDraw ? "indexed" : "direct", drawCalls.size(), static_cast<unsigned long long>(recorded), pipelinePasses.size(), colors.size(), depth != nullptr ? "yes" : "no", continued ? "continued" : "begun");
 }
 
