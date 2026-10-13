@@ -1,4 +1,5 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include "IntermediateRepresentation/IrBlock.hpp"
 #include <algorithm>
 #include <array>
 #include <optional>
@@ -165,8 +166,34 @@ struct HalfWaveScan {
     const IrValue* source = nullptr;
 };
 
+// Upstream #4162 (SpirvAluEmitterMath StoredWindowValue): a relatively addressed vector register
+// read (LoadVectorWindow) at an immediate slot stands for the value the same block last stored to
+// that slot, so half-wave scans over v_movrel registers still match.
+const IrValue* StoredWindowValue(const IrValue* load) {
+    const auto* slot = load->Argument(0)->Resolve();
+    const auto* block = load->Parent();
+    if (slot == nullptr || !slot->HasImmediate() || block == nullptr) return nullptr;
+    const auto& instructions = block->Instructions();
+    auto at = std::find(instructions.begin(), instructions.end(), load);
+    if (at == instructions.end()) return nullptr;
+    while (at != instructions.begin()) {
+        const auto* previous = *--at;
+        if (previous->HasImmediate() || previous->Opcode() != IrOpcode::StoreVectorWindow) continue;
+        const auto* stored = previous->Argument(0)->Resolve();
+        if (stored == nullptr || !stored->HasImmediate()) return nullptr;
+        if (stored->ImmediateU32() == slot->ImmediateU32()) return previous->Argument(1)->Resolve();
+    }
+    return nullptr;
+}
+
 const IrValue* Resolved(const IrValue* value) {
-    return value != nullptr ? value->Resolve() : nullptr;
+    value = value != nullptr ? value->Resolve() : nullptr;
+    while (value != nullptr && !value->HasImmediate() && value->Opcode() == IrOpcode::LoadVectorWindow) {
+        const auto* stored = StoredWindowValue(value);
+        if (stored == nullptr) break;
+        value = stored;
+    }
+    return value;
 }
 
 bool Is(const IrValue* value, IrOpcode opcode) {
@@ -495,7 +522,9 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
             // subgroup on the SPIR-V path (TechnicalDebt metal-b6-half-wave).
             const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & 63u", "aps5_rl");
             const auto value = Shuffle(state, instruction, 0u, "(" + lane + " & 31u)");
-            state.Define(instruction, "(" + lane + " < 32u ? " + value + " : " + MslType(instruction.Type()) + "(0))");
+            // One-lane waves: any lane reads the invocation's own value (SpirvSubgroup EmitSubgroupShuffle).
+            if (state.hostSubgroupSize == 1u) state.Define(instruction, value);
+            else state.Define(instruction, "(" + lane + " < 32u ? " + value + " : " + MslType(instruction.Type()) + "(0))");
             return;
         }
         const auto lane = selector->ImmediateU32() & 63u;
@@ -520,7 +549,7 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
             state.Define(instruction, "0u");
             return;
         }
-        if (lane >= 32u) state.Fail(instruction, "v_readlane_b32 of lane " + std::to_string(lane) + " is outside the 32-lane host SIMD group that runs this wave64 graphics program at one lane per invocation (work package B6)");
+        if (lane >= 32u && state.hostSubgroupSize != 1u) state.Fail(instruction, "v_readlane_b32 of lane " + std::to_string(lane) + " is outside the 32-lane host SIMD group that runs this wave64 graphics program at one lane per invocation (work package B6)");
     }
     const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & " + U32(state.program.WaveSize() - 1u), "aps5_rl");
     state.Define(instruction, Shuffle(state, instruction, 0u, lane));

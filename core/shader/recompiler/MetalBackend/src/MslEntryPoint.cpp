@@ -278,6 +278,13 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         helperParameters.push_back("thread uint& aps5_valid");
         arguments.push_back("aps5_valid");
     }
+    // MslAbi Version 10: the guest cull distances of each guest vertex the function runs (rect lists
+    // and triangle-vertices draws run three).
+    const auto culls = fragment ? 0u : MslCullDistanceCount(state);
+    if (culls != 0u) {
+        helperParameters.push_back("thread float* aps5_cull");
+        arguments.push_back("aps5_cull");
+    }
     // Primitive-ordered pixel shaders: the raster order group buffer is a stage-function parameter
     // only (the guest body never touches it).
     const bool rasterOrder = fragment && state.reflection.rasterOrder;
@@ -298,14 +305,15 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     text += ")\n{\n";
     if (!graphics.outputType.empty()) text += "    " + graphics.outputType + " aps5_out = {};\n";
     if (state.usesValidMask) text += "    uint aps5_valid = 1u;\n";
+    if (culls != 0u) text += "    float aps5_cull[3][" + std::to_string(culls) + "] = {};\n";
     // Alpha to coverage starts from full coverage, as the SPIR-V path's StoreCoverage(-1): only a
     // float MRT0 export lowers it, so uint exports keep every sample.
     if (fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) text += "    aps5_out.aps5_sample_mask = 0xffffffffu;\n";
     if (fragment) text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentText() + "#endif\n";
-    const auto call = [&](const std::string& vertexId, const std::string& output) {
+    const auto call = [&](const std::string& vertexId, const std::string& output, std::uint32_t vertex = 0u) {
         std::string line = "aps5_body(";
         for (std::size_t index = 0; index < arguments.size(); ++index) {
-            auto argument = arguments[index] == "aps5_vertex_id" ? vertexId : arguments[index] == "aps5_out" ? output : arguments[index];
+            auto argument = arguments[index] == "aps5_vertex_id" ? vertexId : arguments[index] == "aps5_out" ? output : arguments[index] == "aps5_cull" ? "aps5_cull[" + std::to_string(vertex) + "]" : arguments[index];
             line += (index == 0u ? "" : ", ") + argument;
         }
         return line + ");";
@@ -321,7 +329,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "    const uint aps5_corner = aps5_corners[aps5_vertex_id % 6u];\n";
         text += "    Aps5VertexOut aps5_v[3] = {};\n";
         for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
-            text += "    " + call("aps5_driver.workgroupBase[0] + aps5_rect * 3u + " + std::to_string(vertex) + "u", "aps5_v[" + std::to_string(vertex) + "]") + "\n";
+            text += "    " + call("aps5_driver.workgroupBase[0] + aps5_rect * 3u + " + std::to_string(vertex) + "u", "aps5_v[" + std::to_string(vertex) + "]", vertex) + "\n";
         }
         text += "    bool aps5_edge[3];\n    float aps5_weight[3];\n    uint aps5_edges = 0u;\n";
         text += "    for (uint i = 0u; i < 3u; ++i) {\n";
@@ -352,7 +360,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "    const uint aps5_corner = aps5_vertex_id % 3u;\n";
         text += "    Aps5VertexOut aps5_v[3] = {};\n";
         for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
-            text += "    " + call("aps5_tv_ids[aps5_triangle * 3u + " + std::to_string(vertex) + "u]", "aps5_v[" + std::to_string(vertex) + "]") + "\n";
+            text += "    " + call("aps5_tv_ids[aps5_triangle * 3u + " + std::to_string(vertex) + "u]", "aps5_v[" + std::to_string(vertex) + "]", vertex) + "\n";
         }
         text += "    aps5_out = aps5_v[aps5_corner];\n";
         for (const auto& output : state.program.Info().outputs) {
@@ -366,6 +374,23 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "#if (APS5_BARYCENTRICS & 2)\n    aps5_out.aps5_bwl = aps5_weights;\n#endif\n";
         text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::VertexText() + "#endif\n";
         text += "#else\n    " + call("aps5_vertex_id", "aps5_out") + "\n#endif\n";
+        if (culls != 0u) {
+            // Upstream #423 cull distances (MslAbi Version 10): Metal has none, so the primitive's
+            // verdict becomes its last clip distance, -1 at every vertex of a culled primitive. A
+            // triangle (triangle-vertices draws, and rect lists over their three guest vertices) is
+            // culled when all its vertices have a negative distance on one plane, a point (draws
+            // the driver compiles with APS5_CULL_POINTS) when its vertex has; NaN is not negative.
+            // Lines have no exact emulation: the driver refuses them, and the library does not
+            // compile without one of the modes.
+            const auto count = std::to_string(culls);
+            text += "    bool aps5_culled = false;\n";
+            text += "#if (" + TriangleVerticesCondition() + ") || (defined(APS5_RECT_LIST) && APS5_RECT_LIST)\n";
+            text += "    for (uint i = 0u; i < " + count + "u; ++i) aps5_culled = aps5_culled || (aps5_cull[0][i] < 0.0f && aps5_cull[1][i] < 0.0f && aps5_cull[2][i] < 0.0f);\n";
+            text += "#elif defined(" + std::string(MslAbi::CullPointsMacro) + ") && " + std::string(MslAbi::CullPointsMacro) + "\n";
+            text += "    for (uint i = 0u; i < " + count + "u; ++i) aps5_culled = aps5_culled || aps5_cull[0][i] < 0.0f;\n";
+            text += "#else\n#error \"cull distances need a triangle-vertices, rect-list or APS5_CULL_POINTS draw (MslAbi Version 10)\"\n#endif\n";
+            text += "    aps5_out.aps5_clip[" + std::to_string(MslCullClipSlot(state)) + "] = aps5_culled ? -1.0f : 0.0f;\n";
+        }
     } else if (rasterOrder) {
         // The guest program is the critical section, as the SPIR-V path's Begin/End invocation
         // interlock around it: the read of the pixel's raster-order-group dword waits until every

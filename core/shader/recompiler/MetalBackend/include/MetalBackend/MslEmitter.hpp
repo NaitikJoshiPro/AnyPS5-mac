@@ -23,6 +23,11 @@ struct MslTargetOptions {
     // images are emulated as 2D arrays of layers * samples slices (MslAbi Version 6). Without it they
     // fail as the SPIR-V backend does.
     bool storageImageMultisample = false;
+    // Upstream #3988 (SpirvTarget::float16DenormPreserve): the GPU's half to float conversion keeps
+    // half denormals, so ConvertF32F16 converts in hardware (aps5_f16_to_f32_native: NaN bits rebuilt
+    // from the half) instead of decoding the bits with integer operations. Halves of fields narrower
+    // than 16 bits keep the decode, as on the SPIR-V path.
+    bool float16DenormPreserve = false;
 };
 
 // IR -> Metal Shading Language, the MetalBackend counterpart of SpirvEmitter (same inputs, same

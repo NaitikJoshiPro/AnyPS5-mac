@@ -461,10 +461,13 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     result.variantId = nextVariantId();
     if (msl) {
         MslTargetOptions mslOptions;
-        mslOptions.subgroupSize = request.target.subgroupSize;
+        // Upstream #4470: a vertex or local program of a target without vertexSubgroups is laid out
+        // as one-lane waves (HostSubgroupSize 1) and emitted that way.
+        mslOptions.subgroupSize = HostSubgroupSize(request) == 1u ? 1u : request.target.subgroupSize;
         mslOptions.bdaAbiVersion = request.target.bdaAbiVersion;
         mslOptions.maxThreadgroupMemoryBytes = request.target.maxWorkgroupSharedMemoryBytes;
         mslOptions.keepF32Denormals = request.context.floatMode.has_value() && ((request.context.floatMode->floatMode >> 4u) & 3u) == 3u;
+        mslOptions.float16DenormPreserve = request.target.float16DenormPreserve;
         mslOptions.storageImageMultisample = std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStorageImageMultisample)) != request.target.supportedCapabilities.end();
         constexpr MslEmitter mslEmitter;
         result.msl = SharedMsl(mslEmitter.Emit(program, inputInfo, bindings, mslOptions));

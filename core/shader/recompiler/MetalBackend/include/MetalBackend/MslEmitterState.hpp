@@ -275,6 +275,11 @@ struct MslGraphicsInterface {
 [[nodiscard]] std::string TriangleVertexMacroDefaults();
 [[nodiscard]] std::string TriangleVerticesCondition();
 [[nodiscard]] std::string PerVertexLocationCondition(std::uint32_t location);
+// The guest cull distances a vertex program writes (highest index + 1; MslAbi Version 10).
+[[nodiscard]] std::uint32_t MslCullDistanceCount(const MslEmitterState& state);
+// The clip distance that carries the emulated cull verdict: after the guest clip distances and the
+// all-zero position distance.
+[[nodiscard]] std::uint32_t MslCullClipSlot(const MslEmitterState& state);
 [[nodiscard]] std::string PerVertexField(std::uint32_t location, std::uint32_t vertex);
 // The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
 // laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.

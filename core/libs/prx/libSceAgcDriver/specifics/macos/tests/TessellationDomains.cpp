@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <set>
 #include <span>
@@ -176,13 +177,13 @@ Expectation Expect(const Case& test) {
     else if (test.domain == T::Triangle) factors = {{test.ring[0], test.ring[1], test.ring[2], 0.0f}, {test.ring[3], 0.0f}};
     else factors = {{test.ring[0], test.ring[1], test.ring[2], test.ring[3]}, {test.ring[4], test.ring[5]}};
     Expectation result;
+    // The VGT_HOS level clamps as upstream's hull programs apply them (#4082, MslAbi Version 10): an
+    // outer factor above 0 to [min, max] (others stay and cull), an inner factor above 1 to
+    // [max(min, 1), max] (others become max(min, 1)); then the tessellator's own clamp.
+    const float lowest = std::fmax(test.minLevel, 1.0f);
+    for (auto& f : factors.outer) f = f > 0.0f ? std::fmin(std::fmax(f, test.minLevel), test.maxLevel) : f;
+    for (auto& f : factors.inner) f = f > 1.0f ? std::fmin(std::fmax(f, lowest), test.maxLevel) : lowest;
     result.patch = T::aps5_tess_process(static_cast<int>(test.domain), static_cast<int>(test.partitioning), topology, factors);
-    if (result.patch.culled == 0) {
-        const auto clamp = [&](float f) { return std::isnan(f) ? f : std::fmin(std::fmax(f, test.minLevel), test.maxLevel); };
-        for (auto& f : factors.outer) f = clamp(f);
-        for (auto& f : factors.inner) f = clamp(f);
-        result.patch = T::aps5_tess_process(static_cast<int>(test.domain), static_cast<int>(test.partitioning), topology, factors);
-    }
     result.primitives = T::aps5_tess_primitive_count(result.patch, nullptr);
     const int slice = T::SlicePrimitives(topology);
     const int corners = topology == T::Point ? 1 : topology == T::Line ? 2 : 3;
@@ -407,6 +408,10 @@ int main() {
             {"isoline culled (density 0)", T::Isoline, T::Integer, T::Line, {4, 0, 0, 0, 0, 0}},
             {"quad integer cw, clamped to [2, 3]", T::Quad, T::Integer, T::TriangleCw, {1, 4, 5, 2, 4, 1}, 2.0f, 3.0f},
             {"triangle fractional_odd cw, clamped to [1, 4]", T::Triangle, T::FractionalOdd, T::TriangleCw, {7, 9, 5, 9, 0, 0}, 1.0f, 4.0f},
+            // Upstream #4082's inner rule: an inner factor at or below 1 (or NaN) becomes max(min, 1),
+            // not clamped by the maximum.
+            {"triangle integer cw, inner 0.5 raised to min 3", T::Triangle, T::Integer, T::TriangleCw, {4, 4, 4, 0.5f, 0, 0}, 3.0f, 4.0f},
+            {"quad integer cw, NaN inner raised to min 2", T::Quad, T::Integer, T::TriangleCw, {3, 3, 3, 3, std::numeric_limits<float>::quiet_NaN(), 3}, 2.0f, 5.0f},
         };
         std::size_t runs = 0;
         std::uint32_t corners = 0;

@@ -42,6 +42,22 @@ std::string PerVertexField(std::uint32_t location, std::uint32_t vertex) {
     return "pv" + std::to_string(location) + "_" + std::to_string(vertex);
 }
 
+std::uint32_t MslCullClipSlot(const MslEmitterState& state) {
+    std::uint32_t count = 0u;
+    for (const auto& output : state.program.Info().outputs) {
+        if (output.kind == StageOutputKind::ClipDistance) count = std::max(count, output.index + 1u);
+    }
+    return count + 1u;
+}
+
+std::uint32_t MslCullDistanceCount(const MslEmitterState& state) {
+    std::uint32_t count = 0u;
+    for (const auto& output : state.program.Info().outputs) {
+        if (output.kind == StageOutputKind::CullDistance) count = std::max(count, output.index + 1u);
+    }
+    return count;
+}
+
 namespace {
 
 constexpr std::uint32_t PsInputFlatShade = 0x00000400u;
@@ -179,6 +195,11 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             return "aps5_layer_in";
         case StageInputKind::HelperInvocation:
             return "(simd_is_helper_thread() ? 1u : 0u)";
+        case StageInputKind::RasterPrimitive:
+            // Upstream #4031 (EmitBuiltinU32): the rasterized primitive class of the pipeline
+            // (Recompiler.hpp RasterPrimitive), PipelineSpecialization::RasterPrimitive, default
+            // Triangle; the ancillary word's bits 0-1 (ConstantFolder::ComposePackedAncillary).
+            return state.FunctionConstant(PipelineSpecialization::RasterPrimitive, static_cast<std::uint32_t>(RasterPrimitive::Triangle));
         case StageInputKind::BaryCoordSmooth:
         case StageInputKind::BaryCoordNoPerspective:
             // Exact barycentrics only exist in programs the recompiler translated for the emulated
@@ -404,7 +425,10 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
             continue;
         }
         if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_out.aps5_clip[" + std::to_string(output.clipDistance) + "] = as_type<float>(" + raw + ");");
-        if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) state.Fail("cull distances have no Metal vertex output (work package B6)");
+        // Upstream #423: Metal has no cull distance output. The guest program's distances go to the
+        // vertex function's per-vertex record (aps5_cull, EmitMslEntryPoint), which turns them into
+        // one clip distance per primitive (MslAbi Version 10).
+        if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_cull[" + std::to_string(output.cullDistance) + "] = as_type<float>(" + raw + ");");
     }
 }
 
@@ -644,8 +668,14 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     const auto stage = StageOf(state);
     std::string& text = result.declarations;
     if (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation) {
-        const auto clips = ClipDistanceCount(state) + 1u;
-        if (clips > MaxClipDistances) state.Fail("guest clip distances plus the all-zero clip position distance exceed 8 clip distances");
+        // Guest clip distances, the all-zero position distance, then (cull distances written) the
+        // primitive's cull distance (MslAbi Version 10, EmitMslEntryPoint).
+        const auto culls = MslCullDistanceCount(state);
+        if (culls != 0u && stage == IrShaderStage::TessellationEvaluation) state.Fail("domain programs that write cull distances (the tessellation mesh function has no cull distance emulation; TechnicalDebt metal-tessellation)");
+        if (culls > MaxClipDistances) state.Fail("more than 8 guest cull distances");
+        const auto clips = ClipDistanceCount(state) + 1u + (culls != 0u ? 1u : 0u);
+        if (clips > MaxClipDistances) state.Fail(culls != 0u ? "guest clip distances plus the all-zero clip position distance and the emulated cull distance exceed 8 clip distances" : "guest clip distances plus the all-zero clip position distance exceed 8 clip distances");
+        state.reflection.cullDistances = culls;
         text += "struct Aps5VertexOut {\n    float4 aps5_position [[position]];\n";
         std::uint32_t scalars = 4u;
         for (const auto& output : state.program.Info().outputs) {
@@ -663,7 +693,6 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                 if (stage == IrShaderStage::TessellationEvaluation) state.Fail("domain programs that write the layer or viewport index (Metal mesh vertices have neither; TechnicalDebt metal-tessellation)");
                 text += output.kind == StageOutputKind::Layer ? "    uint aps5_layer [[render_target_array_index]];\n" : "    uint aps5_viewport [[viewport_array_index]];\n";
                 break;
-            case StageOutputKind::CullDistance: state.Fail("cull distances have no Metal vertex output (work package B6)");
             default: break;
             }
         }

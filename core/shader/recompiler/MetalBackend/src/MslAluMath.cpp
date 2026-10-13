@@ -395,6 +395,15 @@ static inline float aps5_f16_to_f32(ushort halfBits) {
     return as_type<float>(sign | magnitude);
 }
 
+// The hardware conversion (MslTargetOptions::float16DenormPreserve, upstream #3988 EmitF16BitsToF32):
+// exact where the GPU keeps half denormals; a NaN's bits are rebuilt from the half (sign at bit 31,
+// payload at bits 22:13) whatever NaN the GPU returns.
+static inline float aps5_f16_to_f32_native(ushort halfBits) {
+    const float value = float(as_type<half>(halfBits));
+    const uint nan = uint(as_type<int>(uint(halfBits) << 16) >> 3) | 0x7f800000u;
+    return isnan(value) ? as_type<float>(nan) : value;
+}
+
 // Round to nearest even (half denormals kept, overflow to infinity); a NaN keeps its sign and the top
 // of its payload and becomes quiet.
 static inline uint aps5_f32_to_f16(float value) {
@@ -414,6 +423,16 @@ static inline uint aps5_f32_to_f16_rtz(float value) {
 )";
 
 constexpr std::array<MslPreludeChunk, 1> OnAlu{MslPreludeChunk::Alu};
+
+// SpirvAluEmitterMath NarrowF16Field (upstream #3988): a half taken from a bit field narrower than 16
+// bits (SDWA byte selects) keeps the integer decode on every target.
+bool NarrowF16Field(const IrValue& half) {
+    const IrValue* value = half.Resolve();
+    while (!value->HasImmediate() && (value->Opcode() == IrOpcode::BitCastF16U16 || value->Opcode() == IrOpcode::ConvertU16U32)) value = value->Argument(0)->Resolve();
+    if (value->HasImmediate() || (value->Opcode() != IrOpcode::BitFieldUExtract && value->Opcode() != IrOpcode::BitFieldSExtract)) return false;
+    const IrValue* count = value->Argument(2)->Resolve();
+    return !count->HasImmediate() || count->ImmediateU32() < 16u;
+}
 
 void Binary(MslEmitterState& state, const IrValue& instruction, std::string_view operation) {
     state.Define(instruction, "(" + state.Arg(instruction, 0u) + " " + std::string(operation) + " " + state.Arg(instruction, 1u) + ")");
@@ -750,7 +769,7 @@ bool EmitMslAluInstruction(MslEmitterState& state, const IrValue& instruction) {
         return true;
     case IrOpcode::ConvertF32F16:
         state.RequirePrelude(MslPreludeChunk::Float16);
-        state.Define(instruction, "aps5_f16_to_f32(as_type<ushort>(" + state.Arg(instruction, 0u) + "))");
+        state.Define(instruction, std::string(state.target.float16DenormPreserve && !NarrowF16Field(*instruction.Argument(0u)) ? "aps5_f16_to_f32_native" : "aps5_f16_to_f32") + "(as_type<ushort>(" + state.Arg(instruction, 0u) + "))");
         return true;
     case IrOpcode::ConvertF16F32:
         state.RequirePrelude(MslPreludeChunk::Float16);

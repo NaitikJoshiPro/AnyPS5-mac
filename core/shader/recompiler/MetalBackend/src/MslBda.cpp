@@ -234,19 +234,15 @@ static void aps5_bda_store(Aps5Bda bda, ulong address, uint value, uint bits, ui
     for (uint byte = 0u; byte < bits / 8u; ++byte) aps5_bda_store_at(bda, address + ulong(byte), 1u, value >> (byte * 8u), pc, glc);
 }
 
-// A write through a V# in GPU memory (EmitBdaWrite): an unaligned dword records an Unaligned fault
-// and is dropped.
+// A write through a V# in GPU memory (EmitBdaWrite): 8- and 16-bit writes and, since upstream #4518,
+// unaligned dwords are stored byte by byte (after the overflow check); aligned dwords at once.
 static void aps5_bda_write(Aps5Bda bda, ulong address, uint value, uint bits, uint pc, bool glc, bool stops, thread bool& stop) {
-    if (bits != 32u) {
+    if (bits != 32u || (address & 3ul) != 0ul) {
         if (aps5_bda_overflows(bda, address, bits / 8u, pc) && stops) {
             stop = true;
             return;
         }
         for (uint byte = 0u; byte < bits / 8u; ++byte) aps5_bda_store_at(bda, address + ulong(byte), 1u, value >> (byte * 8u), pc, glc);
-        return;
-    }
-    if ((address & 3ul) != 0ul) {
-        aps5_bda_fault(bda, 7u, address, 4u, pc);
         return;
     }
     aps5_bda_store_at(bda, address, 4u, value, pc, glc);

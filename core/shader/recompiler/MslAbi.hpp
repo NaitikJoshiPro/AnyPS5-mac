@@ -64,7 +64,23 @@ namespace ShaderRecompiler::MslAbi {
 // Fragment functions take SampleBaseMacro (an 8x target emulated as two 4x halves draws each half
 // with base 0 and 4), interpolate inputs at the location the guest's I/J pair names
 // (center/centroid/sample) and take [[sample_id]] under PS_ITER_SAMPLE.
-inline constexpr std::uint32_t Version = 9u;
+// Version 10 (upstream sync to 0f2683cb7, the SPIR-V backend's behaviour changes mirrored):
+// - vertex functions that write guest cull distances (PA_CL_VS_OUT_CNTL, upstream #423) report
+//   Reflection::cullDistances and emulate them in one more clip distance, after the guest clip
+//   distances and the all-zero position distance: -1 at every vertex of a culled primitive. Their
+//   draws must be triangle-vertices (TriangleVerticesMacro), rect-list (RectListMacro) or point
+//   (CullPointsMacro) draws; the library does not compile otherwise (lines are refused);
+// - the TessellationDraw level clamps follow upstream's hull programs (#4082): outer factors above
+//   0 clamp to [minLevel, maxLevel] (others stay and cull), inner factors above 1 to
+//   [max(minLevel, 1), maxLevel] (others become max(minLevel, 1)), before the tessellator's own
+//   clamp; hull input control points are clamped to the patch (#4727);
+// - new function constants: PipelineSpecialization::RasterPrimitive (pixel functions reading the
+//   ancillary word's primitive type, #4031) and UnnormalizedBaseLevelBase + s (#1418); the MSL-only
+//   ReductionBase moved from 57408 to 57472 to make room;
+// - vertex and local programs of a target without vertexSubgroups (#4470) run as one-lane waves
+//   (the front end's host subgroup size 1): the library maps the SIMD-group functions to their
+//   one-lane values (MslEmitter.cpp SingleLaneDefines).
+inline constexpr std::uint32_t Version = 10u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -255,6 +271,9 @@ inline constexpr const char* PerVertexLocationsHighMacro = "APS5_PER_VERTEX_LOCA
 // - vertex (with TriangleVerticesMacro): the fragment function's Reflection::emulatedBarycentrics
 //   (bit 0 perspective, bit 1 linear): one-hot corner weights interpolated as the barycentrics.
 inline constexpr const char* BarycentricsMacro = "APS5_BARYCENTRICS";
+// Version 10: vertex functions with Reflection::cullDistances drawn as points (not triangle-vertices
+// or rect-list draws): 1, each point is culled when one of its cull distances is negative.
+inline constexpr const char* CullPointsMacro = "APS5_CULL_POINTS";
 
 // Version 5: the buffer at BufferIndex::TriangleVertices. guestVertex follows the header: per guest
 // triangle its 3 guest vertex ids (index buffer, base vertex, strips, fans and restart resolved),
@@ -384,6 +403,11 @@ struct Reflection {
     // the vertex function.
     std::uint64_t perVertexLocations = 0;
     std::uint32_t emulatedBarycentrics = 0;
+    // Version 10, vertex functions: the guest cull distances written (highest index + 1, 0: none).
+    // Nonzero: the driver draws triangles as triangle-vertices draws (or rect lists), points with
+    // CullPointsMacro, and refuses lines (Metal has no cull distances; the emulation needs every
+    // vertex of the primitive).
+    std::uint32_t cullDistances = 0;
 
     bool operator==(const Reflection& other) const = default;
 };
