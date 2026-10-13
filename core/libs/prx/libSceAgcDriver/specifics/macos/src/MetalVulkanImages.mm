@@ -20,6 +20,8 @@ namespace AgcDriver::Graphics::Metal {
 
 namespace {
 
+std::atomic<ImageProbe*> imageProbe{nullptr};
+
 [[noreturn]] void FailImages(const std::string& message) {
     throw std::runtime_error("Metal images (work package D4): " + message);
 }
@@ -234,6 +236,10 @@ PixelFormatInfo PixelFormatOf(VkFormat format) {
     return {entry->metal, entry->bytes, entry->blockWidth, entry->blockHeight};
 }
 
+void SetImageProbe(ImageProbe* probe) {
+    imageProbe.store(probe, std::memory_order_release);
+}
+
 namespace Vk {
 
 VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
@@ -293,11 +299,13 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
     }
     if (auto* cache = ImageCache::For(device)) cache->Track(texture);
     *image = RetainImage(texture);
+    if (auto* probe = imageProbe.load(std::memory_order_acquire)) probe->Created(*image);
     return VK_SUCCESS;
 }
 
 void DestroyImage(VkDevice deviceHandle, VkImage image, const VkAllocationCallbacks*) {
     if (image == VK_NULL_HANDLE) return;
+    if (auto* probe = imageProbe.load(std::memory_order_acquire); probe != nullptr && probe->Destroying(image)) return;
     id<MTLTexture> texture = CFBridgingRelease(reinterpret_cast<CFTypeRef>(image));
     if (auto* cache = ImageCache::For(DeviceOf(deviceHandle))) cache->Untrack(texture);
 }
@@ -324,6 +332,10 @@ VkResult BindImageMemory(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) {
 VkResult CreateImageView(VkDevice, const VkImageViewCreateInfo* info, const VkAllocationCallbacks*, VkImageView* view) {
     id<MTLTexture> texture = TextureOfImage(info->image);
     if (texture == nil) FailImages("CreateImageView of a null image");
+    if (auto* probe = imageProbe.load(std::memory_order_acquire); probe != nullptr && probe->FailView(*info)) {
+        *view = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     MTLTextureType type;
     const bool multisampled = texture.textureType == MTLTextureType2DMultisample || texture.textureType == MTLTextureType2DMultisampleArray;
     switch (info->viewType) {
@@ -595,6 +607,7 @@ void ClearByRenderPass(VkCommandBuffer commands, id<MTLTexture> texture, const V
 }
 
 void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout, const VkClearColorValue* color, std::uint32_t rangeCount, const VkImageSubresourceRange* ranges) {
+    if (auto* probe = imageProbe.load(std::memory_order_acquire)) probe->Cleared(image);
     auto& stream = Stream(commands);
     id<MTLTexture> texture = TextureOfImage(image);
     if ((texture.usage & MTLTextureUsageShaderWrite) == 0u || texture.sampleCount > 1u) {

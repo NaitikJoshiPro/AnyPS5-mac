@@ -94,6 +94,23 @@ void CmdClearDepthStencilImage(VkCommandBuffer commands, VkImage image, VkImageL
 
 }
 
+// Test seam, the twin of upstream's device-function interception (tests/Recorder.cpp
+// StorageUploadProbe, which swaps Context.deviceProc): while a probe is set, CreateImage,
+// CreateImageView, DestroyImage and CmdClearColorImage report to it. Only tests set one
+// (specifics/macos/tests/StorageUploadTwin.mm); one probe at a time.
+class ImageProbe {
+public:
+    virtual ~ImageProbe() = default;
+    virtual void Created(VkImage) {}
+    // True: CreateImageView fails with VK_ERROR_OUT_OF_DEVICE_MEMORY (failure injection).
+    virtual bool FailView(const VkImageViewCreateInfo&) { return false; }
+    // True: the probe keeps the image's reference and destroys it later itself (with no probe set).
+    virtual bool Destroying(VkImage) { return false; }
+    virtual void Cleared(VkImage) {}
+};
+// Sets (or, with nullptr, clears) the probe.
+void SetImageProbe(ImageProbe* probe);
+
 }
 
 #endif
