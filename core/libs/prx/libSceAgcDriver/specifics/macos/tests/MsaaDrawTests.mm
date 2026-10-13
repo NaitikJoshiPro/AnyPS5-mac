@@ -18,6 +18,7 @@
 //   agc_metal_msaa_tests sampled8  (8x type 14 and 4x/8x type 15 T# reads, image_get_resinfo)
 //   agc_metal_msaa_tests interp    (recompiled PERSP_SAMPLE vs PERSP_CENTER pixel programs, per sample)
 //   agc_metal_msaa_tests a2c       (recompiled alpha-to-coverage: the measured proportional rule)
+//   agc_metal_msaa_tests storage   (guest image_store / image_atomic_add on rendered 4x/8x targets)
 #include "../src/MetalDeviceState.h"
 #include "../src/MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
@@ -650,12 +651,13 @@ std::uint32_t Log2(std::uint32_t value) {
 }
 
 // Runs `code` (32 threads) with an 8_8_8_8_UNORM 32x32 MSAA T# over `address`.
-void RunGuest(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint64_t address, std::uint32_t samples, std::uint32_t type) {
+void RunGuest(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint64_t address, std::uint32_t samples, std::uint32_t type, std::uint32_t format = 56u) {
     GuestResults.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto results = reinterpret_cast<std::uint64_t>(GuestResults.data());
     const std::array<std::uint32_t, 4> buffer {static_cast<std::uint32_t>(results), static_cast<std::uint32_t>((results >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(GuestResults)), 0x31016facu};
-    const std::array<std::uint32_t, 8> texture {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Extent - 1u) & 3u) << 30u), ((Extent - 1u) >> 2u) | ((Extent - 1u) << 14u), 0xfacu | (Log2(samples) << 16u) | (type << 28u), 0u, Log2(samples) << 4u, 0u, 0u};
+    std::array<std::uint32_t, 8> texture {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Extent - 1u) & 3u) << 30u), ((Extent - 1u) >> 2u) | ((Extent - 1u) << 14u), 0xfacu | (Log2(samples) << 16u) | (type << 28u), 0u, Log2(samples) << 4u, 0u, 0u};
+    texture[1] = (texture[1] & ~(0x1ffu << 20u)) | (format << 20u);
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory {{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
@@ -817,6 +819,69 @@ void CheckAlphaToCoverage(AgcDriver::VulkanDevice& device) {
     sources.clear();
     std::puts("a2c: proportional alpha-to-coverage at 2x, 4x and emulated 8x (per-sample bits) passed");
 }
+
+// Guest storage access to rendered MSAA targets (DECISIONS D22, D28): stores and atomics go to the
+// target's storage shadow (texture2d_array of every sample), which the host image takes back before
+// its next use. Programs (llvm-mc gfx1030), T# in s[4:11]:
+//   4x: v_and_b32 v6, 2, v0; v_lshrrev_b32 v4, 2, v0  (samples 0 and 2 of pixel (t >> 2, 5))
+//   8x: v_and_b32 v6, 6, v0; v_lshrrev_b32 v4, 3, v0  (samples 0, 2, 4, 6 of pixel (t >> 3, 5))
+//   v_mov_b32 v5, 5; v[8:11] = (0, 1.0, 0, 1.0); image_store v[8:11], v[4:6], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm
+alignas(256) constexpr std::array<std::uint32_t, 10> Store4Code {0x360c0082u, 0x2c080082u, 0x7e0a0285u, 0x7e100280u, 0x7e1202f2u, 0x7e140280u, 0x7e1602f2u, 0xf0201f30u, 0x00010804u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 10> Store8Code {0x360c0086u, 0x2c080083u, 0x7e0a0285u, 0x7e100280u, 0x7e1202f2u, 0x7e140280u, 0x7e1602f2u, 0xf0201f30u, 0x00010804u, 0xbf810000u};
+//   v_and_b32 v6, 3, v0; v_lshrrev_b32 v4, 2, v0; v_mov_b32 v5, 5; v_mov_b32 v8, 1
+//   image_atomic_add v8, v[4:6], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA unorm (every sample of pixels 0-7)
+alignas(256) constexpr std::array<std::uint32_t, 7> AtomicAddCode {0x360c0083u, 0x2c080082u, 0x7e0a0285u, 0x7e100281u, 0xf0441130u, 0x00010804u, 0xbf810000u};
+
+void CheckStorage(AgcDriver::VulkanDevice& device) {
+    GuestBlock vertices(16384);
+    WriteVertices(vertices, FullScreen);
+    GuestBlock destination(DestinationBytes());
+    for (const std::uint32_t samples : {4u, 8u}) {
+        auto& block = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * samples));
+        const auto target = Target(block.Address(), VK_FORMAT_R8G8B8A8_UNORM, samples);
+        // Sample s red (32 s + 16) / 255, then green stores to the even samples of row 5's first pixels.
+        Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0u, "#define SAMPLE_COLOR 1\n"), 0u, 3u);
+        RunGuest(device, samples == 8u ? std::span<const std::uint32_t>(Store8Code) : std::span<const std::uint32_t>(Store4Code), block.Address(), samples, 14u);
+        // The sampled view (host image, after the shadow's samples came back): stored samples green,
+        // the others still the draw's.
+        RunGuest(device, samples == 8u ? std::span<const std::uint32_t>(Load8Code) : std::span<const std::uint32_t>(MsaaLoadCode), block.Address(), samples, 14u);
+        const auto pixels = samples == 8u ? 4u : 8u;
+        for (std::uint32_t thread = 0; thread < 32u; ++thread) {
+            const auto sample = thread % samples;
+            const auto x = thread / samples;
+            const bool stored = sample % 2u == 0u && x < pixels;
+            const float red = stored ? 0.0f : static_cast<float>(sample * 32u + 16u) / 255.0f;
+            const float green = stored ? 1.0f : 0.0f;
+            Require(std::fabs(ResultFloat(thread, 0) - red) < 1e-6f && ResultFloat(thread, 1) == green, std::to_string(samples) + "x storage: sample " + std::to_string(sample) + " of pixel " + std::to_string(x) + " reads " + std::to_string(ResultFloat(thread, 0)) + " " + std::to_string(ResultFloat(thread, 1)) + ", expected " + (stored ? "the stored green" : "the drawn red"));
+        }
+        // The resolve averages the stored samples with the drawn ones.
+        const auto texels = Resolve(device, target, destination);
+        double drawnRed = 0.0;
+        for (std::uint32_t sample = 1; sample < samples; sample += 2u) drawnRed += sample * 32.0 + 16.0;
+        const auto texel = texels[5u * Extent + 0u];
+        Require(Near(Channel(texel, 0), drawnRed / samples) && Near(Channel(texel, 1), 255.0 / 2.0), std::to_string(samples) + "x storage: the resolve of a stored pixel is " + Hex(texel));
+        // Drawing again after the stores: the draw renders over the host image the stores reached.
+        Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0xff0000ffu, "#define MASK 1\n", 0x2u), 0u, 3u);
+        const auto again = Resolve(device, target, destination);
+        Require(Near(Channel(again[5u * Extent + 0u], 1), 255.0 / 2.0), std::to_string(samples) + "x storage: a draw after the stores lost them: " + Hex(again[5u * Extent + 0u]));
+        const auto counts = AgcDriver::Graphics::Metal::MultisampleShadowCounts(block.Address());
+        std::printf("storage %ux: %llu host-to-shadow and %llu shadow-to-host copies\n", samples, static_cast<unsigned long long>(counts.hostToShadow), static_cast<unsigned long long>(counts.shadowToHost));
+        Require(counts.hostToShadow == 1u && counts.shadowToHost == 1u, std::to_string(samples) + "x storage: expected one copy each way");
+    }
+    // 32-bit atomics on every sample of an R32_UINT 4x target (T# format 20).
+    {
+        auto& block = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * 4u));
+        const auto target = Target(block.Address(), VK_FORMAT_R32_UINT, 4u);
+        Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0x10u, "#define UINT_TARGET 1\n"), 0u, 3u);
+        RunGuest(device, AtomicAddCode, block.Address(), 4u, 14u, 20u);
+        RunGuest(device, MsaaLoadCode, block.Address(), 4u, 14u, 20u);
+        for (std::uint32_t thread = 0; thread < 32u; ++thread) Require(GuestResults[thread * 4u] == 0x11u, "4x atomic add: sample " + std::to_string(thread & 3u) + " of pixel " + std::to_string(thread >> 2u) + " is " + Hex(GuestResults[thread * 4u]));
+        const auto texels = Resolve(device, target, destination);
+        Require(texels[5u * Extent + 7u] == 0x11u && texels[5u * Extent + 8u] == 0x10u && texels[6u * Extent] == 0x10u, "4x atomic add: the sample-0 resolve reads " + Hex(texels[5u * Extent + 7u]) + " " + Hex(texels[5u * Extent + 8u]));
+    }
+    sources.clear();
+    std::puts("storage: 4x/8x guest stores and 4x atomics reach the rendered target's samples passed");
+}
 }
 
 int main(int argc, char** argv) {
@@ -838,6 +903,7 @@ int main(int argc, char** argv) {
         else if (mode == "sampled8") CheckSampledEmulated(*device);
         else if (mode == "interp") CheckInterpolation(*device);
         else if (mode == "a2c") CheckAlphaToCoverage(*device);
+        else if (mode == "storage") CheckStorage(*device);
         else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;

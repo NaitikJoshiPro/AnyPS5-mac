@@ -367,6 +367,7 @@ agc_metal_msaa_interp G3
 agc_metal_msaa_masks G3
 agc_metal_msaa_sampled G3
 agc_metal_msaa_sampled8 G3
+agc_metal_msaa_storage G3
 agc_driver G4
 agc_driver_cmask_fast_clear G4
 agc_driver_compute_user_data_calls G4

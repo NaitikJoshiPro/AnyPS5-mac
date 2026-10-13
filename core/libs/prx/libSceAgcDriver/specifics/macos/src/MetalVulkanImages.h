@@ -155,6 +155,16 @@ EmulatedSampleStatistics EmulatedSampleCounts();
 // average of every sample of every slice (integer formats: sample 0 of slice 0), by a fragment pass.
 bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLTexture> destination);
 
+// The storage shadow of a multisampled image (DECISIONS D22, D28): Metal shaders cannot write
+// multisampled textures, so guest storage access goes to a single-sample 2D array of layers * n
+// slices (guest layer l, sample s at slice l * n + s, MslImage.cpp EmulatedMultisampleCoord). The
+// multisampled side is a 2D multisample array holding guest layer l, sample s at slice l * p + s / h,
+// sample s % h (h its sample count, p = n / h slices per layer, HostSamplesOf). These copy every
+// sample one way: a compute kernel to the shadow; render passes (one per slice, per-sample fragment
+// functions) back, since compute cannot write multisampled textures. Recorded into `commands`.
+void CopyMultisampleToStorage(VkCommandBuffer commands, id<MTLTexture> samples, id<MTLTexture> storage, std::uint32_t guestSamples);
+void CopyStorageToMultisample(VkCommandBuffer commands, id<MTLTexture> storage, id<MTLTexture> samples, std::uint32_t guestSamples);
+
 }
 
 namespace AgcDriver::Graphics::Metal {
@@ -164,6 +174,16 @@ namespace AgcDriver::Graphics::Metal {
 // after its pending CMASK fast clear. Throws when no multisampled target of the T#'s address, extent,
 // sample count and format exists (guest-written MSAA memory has no modeled sample layout).
 std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::span<const std::uint32_t> words);
+// The storage view of a guest MSAA T# (DECISIONS D22, D28): the target's storage shadow (a
+// single-sample 2D array of n slices, made on first use), brought up to date from the host image;
+// the host image takes the shadow's samples back before its next use (draw, sampled view, resolve).
+std::shared_ptr<Texture> MultisampleStorageTexture(const Context& context, std::span<const std::uint32_t> words);
+// The copies the target at `address` (on any device) made so far (tests).
+struct MultisampleShadowStatistics {
+    std::uint64_t hostToShadow = 0;
+    std::uint64_t shadowToHost = 0;
+};
+MultisampleShadowStatistics MultisampleShadowCounts(std::uint64_t address);
 
 }
 

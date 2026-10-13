@@ -800,6 +800,108 @@ fragment int4 aps5_resolve_array_sint(float4 position [[position]], constant Res
 }
 )MSL";
 
+// Storage shadows of multisampled images (CopyMultisampleToStorage / CopyStorageToMultisample).
+constexpr const char* ShadowSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+struct ShadowArgs {
+    texture2d_ms_array<float> mf;
+    texture2d_ms_array<uint> mu;
+    texture2d_ms_array<int> mi;
+    texture2d_array<float, access::read_write> sf;
+    texture2d_array<uint, access::read_write> su;
+    texture2d_array<int, access::read_write> si;
+    uint guestSamples;
+    uint hostSamples;
+    uint slicesPerLayer;
+    uint slice;
+};
+// Thread (x, y, l * n + s): guest sample s of layer l.
+kernel void aps5_shadow_store(constant ShadowArgs& a [[buffer(0)]], uint3 id [[thread_position_in_grid]]) {
+    const uint layer = id.z / a.guestSamples;
+    const uint sample = id.z % a.guestSamples;
+    const uint slice = layer * a.slicesPerLayer + sample / a.hostSamples;
+    const uint host = sample % a.hostSamples;
+#if APS5_SHADOW_KIND == 0
+    if (id.x < a.sf.get_width() && id.y < a.sf.get_height()) a.sf.write(a.mf.read(id.xy, slice, host), id.xy, id.z);
+#elif APS5_SHADOW_KIND == 1
+    if (id.x < a.su.get_width() && id.y < a.su.get_height()) a.su.write(a.mu.read(id.xy, slice, host), id.xy, id.z);
+#else
+    if (id.x < a.si.get_width() && id.y < a.si.get_height()) a.si.write(a.mi.read(id.xy, slice, host), id.xy, id.z);
+#endif
+}
+vertex float4 aps5_shadow_vertex(uint id [[vertex_id]]) {
+    const float2 corner = float2(float((id << 1u) & 2u), float(id & 2u));
+    return float4(corner * 2.0f - 1.0f, 0.0f, 1.0f);
+}
+// One pass per multisampled slice: each sample takes its guest sample of the shadow.
+#if APS5_SHADOW_KIND == 0
+#define APS5_SHADOW_TYPE float4
+#define APS5_SHADOW_TEXTURE a.sf
+#elif APS5_SHADOW_KIND == 1
+#define APS5_SHADOW_TYPE uint4
+#define APS5_SHADOW_TEXTURE a.su
+#else
+#define APS5_SHADOW_TYPE int4
+#define APS5_SHADOW_TEXTURE a.si
+#endif
+fragment APS5_SHADOW_TYPE aps5_shadow_load(float4 position [[position]], uint sample [[sample_id]], constant ShadowArgs& a [[buffer(0)]]) {
+    const uint layer = a.slice / a.slicesPerLayer;
+    const uint guest = (a.slice % a.slicesPerLayer) * a.hostSamples + sample;
+    return APS5_SHADOW_TEXTURE.read(uint2(position.xy), layer * a.guestSamples + guest);
+}
+)MSL";
+
+struct ShadowArgs {
+    std::uint64_t textures[6];
+    std::uint32_t guestSamples;
+    std::uint32_t hostSamples;
+    std::uint32_t slicesPerLayer;
+    std::uint32_t slice;
+};
+
+struct ShadowPipelines {
+    std::mutex mutex;
+    std::unordered_map<std::string, id<MTLLibrary>> libraries;
+    std::unordered_map<void*, id<MTL4ArgumentTable>> tables;
+    std::unordered_map<std::string, id<MTLComputePipelineState>> kernels;
+    std::unordered_map<std::string, id<MTLRenderPipelineState>> passes;
+};
+
+ShadowPipelines& Shadows() {
+    static ShadowPipelines pipelines;
+    return pipelines;
+}
+
+id<MTLLibrary> ShadowLibrary(ShadowPipelines& shadows, id<MTLDevice> device, std::uint32_t numeric) {
+    const auto key = std::to_string(reinterpret_cast<std::uintptr_t>((__bridge void*)device)) + ":" + std::to_string(numeric);
+    auto& library = shadows.libraries[key];
+    if (library == nil) {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion3_1;
+        options.preprocessorMacros = @{@"APS5_SHADOW_KIND": @(numeric)};
+        NSError* error = nil;
+        library = [device newLibraryWithSource:@(ShadowSource) options:options error:&error];
+        if (library == nil) FailImages("the multisample storage shadow shaders do not compile: " + Describe(error));
+    }
+    return library;
+}
+
+ShadowArgs ShadowArguments(id<MTLTexture> samples, id<MTLTexture> storage, std::uint32_t guestSamples, std::uint32_t numeric) {
+    if (samples.textureType != MTLTextureType2DMultisampleArray || storage.textureType != MTLTextureType2DArray) FailImages("a multisample storage shadow copy needs a 2D multisample array and a 2D array");
+    const auto host = static_cast<std::uint32_t>(samples.sampleCount);
+    if (guestSamples % host != 0u || samples.pixelFormat != storage.pixelFormat || samples.width != storage.width || samples.height != storage.height) FailImages("a multisample storage shadow disagrees with its multisampled image");
+    const auto perLayer = guestSamples / host;
+    if (samples.arrayLength % perLayer != 0u || storage.arrayLength != samples.arrayLength / perLayer * guestSamples) FailImages("a multisample storage shadow has the wrong number of slices");
+    ShadowArgs args {};
+    args.textures[numeric] = samples.gpuResourceID._impl;
+    args.textures[3u + numeric] = storage.gpuResourceID._impl;
+    args.guestSamples = guestSamples;
+    args.hostSamples = host;
+    args.slicesPerLayer = perLayer;
+    return args;
+}
+
 struct ResolvePipelines {
     std::mutex mutex;
     std::unordered_map<void*, id<MTLLibrary>> libraries;
@@ -812,6 +914,80 @@ ResolvePipelines& Resolves() {
     return pipelines;
 }
 
+}
+
+void CopyMultisampleToStorage(VkCommandBuffer commands, id<MTLTexture> samples, id<MTLTexture> storage, std::uint32_t guestSamples) {
+    const auto numeric = NumericClass(storage.pixelFormat);
+    auto args = ShadowArguments(samples, storage, guestSamples, numeric);
+    id<MTLDevice> device = storage.device;
+    id<MTLComputePipelineState> pipeline = nil;
+    {
+        auto& shadows = Shadows();
+        std::lock_guard lock(shadows.mutex);
+        const auto key = std::to_string(reinterpret_cast<std::uintptr_t>((__bridge void*)device)) + ":" + std::to_string(numeric);
+        auto& made = shadows.kernels[key];
+        if (made == nil) {
+            NSError* error = nil;
+            made = [device newComputePipelineStateWithFunction:[ShadowLibrary(shadows, device, numeric) newFunctionWithName:@"aps5_shadow_store"] error:&error];
+            if (made == nil) FailImages("cannot build the multisample storage shadow kernel: " + Describe(error));
+        }
+        pipeline = made;
+    }
+    Stream(commands).DispatchHelper(pipeline, std::as_bytes(std::span(&args, 1)), MTLSizeMake((storage.width + 7u) / 8u, (storage.height + 7u) / 8u, storage.arrayLength), MTLSizeMake(8, 8, 1));
+}
+
+void CopyStorageToMultisample(VkCommandBuffer commands, id<MTLTexture> storage, id<MTLTexture> samples, std::uint32_t guestSamples) {
+    const auto numeric = NumericClass(storage.pixelFormat);
+    auto args = ShadowArguments(samples, storage, guestSamples, numeric);
+    id<MTLDevice> device = storage.device;
+    id<MTLRenderPipelineState> pipeline = nil;
+    id<MTL4ArgumentTable> table = nil;
+    {
+        auto& shadows = Shadows();
+        std::lock_guard lock(shadows.mutex);
+        NSError* error = nil;
+        auto& argumentTable = shadows.tables[(__bridge void*)device];
+        if (argumentTable == nil) {
+            MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
+            descriptor.maxBufferBindCount = 1;
+            argumentTable = [device newArgumentTableWithDescriptor:descriptor error:&error];
+            if (argumentTable == nil) FailImages("cannot create the multisample storage shadow's argument table: " + Describe(error));
+        }
+        table = argumentTable;
+        const auto key = std::to_string(reinterpret_cast<std::uintptr_t>((__bridge void*)device)) + ":" + std::to_string(static_cast<std::uint64_t>(samples.pixelFormat)) + ":" + std::to_string(samples.sampleCount);
+        auto& made = shadows.passes[key];
+        if (made == nil) {
+            id<MTLLibrary> library = ShadowLibrary(shadows, device, numeric);
+            MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+            descriptor.vertexFunction = [library newFunctionWithName:@"aps5_shadow_vertex"];
+            descriptor.fragmentFunction = [library newFunctionWithName:@"aps5_shadow_load"];
+            descriptor.colorAttachments[0].pixelFormat = samples.pixelFormat;
+            descriptor.rasterSampleCount = samples.sampleCount;
+            made = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            if (made == nil) FailImages("cannot build the multisample storage shadow pass: " + Describe(error));
+        }
+        pipeline = made;
+    }
+    auto& stream = Stream(commands);
+    for (std::uint32_t slice = 0; slice < samples.arrayLength; ++slice) {
+        args.slice = slice;
+        const auto upload = stream.Write(std::as_bytes(std::span(&args, 1)), 16u);
+        MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
+        pass.renderTargetWidth = samples.width;
+        pass.renderTargetHeight = samples.height;
+        pass.colorAttachments[0].texture = samples;
+        pass.colorAttachments[0].slice = slice;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> encoder = stream.BeginRender(pass);
+        [table setAddress:upload.address atIndex:0];
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setArgumentTable:table atStages:MTLRenderStageFragment];
+        [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<double>(samples.width), static_cast<double>(samples.height), 0.0, 1.0}];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        stream.CountCommand();
+        stream.EndEncoder();
+    }
 }
 
 HostSamples HostSamplesOf(id<MTLDevice> device, std::uint32_t guestSamples) {

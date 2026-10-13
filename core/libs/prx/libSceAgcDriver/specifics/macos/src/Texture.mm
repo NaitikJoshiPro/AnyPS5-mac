@@ -690,8 +690,9 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.components = components;
     viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
     // Multisampled images (MultisampleSampledTexture, guest MSAA T#s): MSL reads them as
-    // texture2d_ms_array (MslAbi Version 9), every slice of an emulated sample count (DECISIONS D28).
-    if (id<MTLTexture> texture = Metal::TextureOfImage(depthImage); texture != nil && texture.sampleCount > 1u) {
+    // texture2d_ms_array (MslAbi Version 9), every slice of an emulated sample count; their storage
+    // shadows (MultisampleStorageTexture) as texture2d_array of every sample (DECISIONS D22, D28).
+    if (id<MTLTexture> texture = Metal::TextureOfImage(depthImage); texture != nil && (texture.sampleCount > 1u || texture.textureType == MTLTextureType2DArray)) {
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         viewInfo.subresourceRange.layerCount = static_cast<std::uint32_t>(texture.arrayLength);
     }

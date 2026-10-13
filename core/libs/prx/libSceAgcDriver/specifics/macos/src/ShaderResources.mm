@@ -46,6 +46,10 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+// Storage image allocations tagged so are indexes into `textures`: the storage shadows of guest
+// MSAA T#s (Metal::MultisampleStorageTexture, DECISIONS D22, D28).
+constexpr std::size_t MultisampleStorageTag = std::size_t{1} << 62u;
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -1661,6 +1665,7 @@ void ShaderResources::buildComplete() {
                         write.pImageInfo = images.data() + images.size();
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back(absentImage(binding.layout.binding));
+                            else if ((index & MultisampleStorageTag) != 0u) images.push_back({VK_NULL_HANDLE, textures[index & ~MultisampleStorageTag]->View(), VK_IMAGE_LAYOUT_GENERAL});
                             else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]), VK_IMAGE_LAYOUT_GENERAL});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
@@ -2313,6 +2318,11 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
                 for (std::uint32_t element = 0; element < binding.count; ++element) {
                     const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                     if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+                    // MSAA storage shadows sit with the sampled textures and have no guest surface.
+                    if (Metal::MultisampledDescriptor(words)) {
+                        ++textureIndex;
+                        continue;
+                    }
                     if (storageIndex >= storageTextures.size()) return OwnRefreshFallback::Uncached;
                     const auto index = storageIndex++;
                     if (listed(index, true) == overlapping.end()) continue;
@@ -2370,6 +2380,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                         if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+                        if (Metal::MultisampledDescriptor(words)) {
+                            if (textureIndex >= textures.size() || Metal::MultisampleStorageTexture(context, words) != textures[textureIndex]) return false;
+                            ++textureIndex;
+                            continue;
+                        }
                         if (storageIndex >= storageTextures.size()) return false;
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
@@ -3401,6 +3416,19 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         if (words[0] == 0u && (words[1] & 0xffu) == 0u) {
             item.imageAllocations.push_back(std::numeric_limits<std::size_t>::max());
             --plannedStorageImages;
+            continue;
+        }
+        if (Metal::MultisampledDescriptor(words)) {
+            // A guest MSAA storage T# (DECISIONS D22, D28): the multisampled target's storage shadow,
+            // kept with the sampled textures (it has no guest surface of its own) and tagged.
+            if (element < binding.imageAtomic64.size() && binding.imageAtomic64[element]) throw std::runtime_error("AGC graphics: 64-bit atomics on a multisampled storage image are not implemented (TechnicalDebt metal-ms-storage)");
+            textures.push_back(Metal::MultisampleStorageTexture(context, words));
+            textureFirstLayer.push_back(false);
+            textureBaseLevel.push_back(false);
+            --plannedStorageImages;
+            ++plannedSampledImages;
+            item.imageAllocations.push_back((textures.size() - 1) | MultisampleStorageTag);
+            mipOffset = 0;
             continue;
         }
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);

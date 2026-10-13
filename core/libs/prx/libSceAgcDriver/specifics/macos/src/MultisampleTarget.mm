@@ -116,6 +116,52 @@ public:
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
             if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
         });
+        // The clear covers every sample: the shadow's writes are gone, the host image is newer.
+        shadowNewer = false;
+        hostNewer = true;
+    }
+
+    // Storage shadow coherence (DECISIONS D22, D28), in recording order: guest storage writes and
+    // atomics go to the shadow (a single-sample 2D array of n slices), draws, fast clears and
+    // resolves use the host image. Each side is brought up to date before the other is used.
+    void SyncHost() {
+        if (!shadowNewer) return;
+        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            Metal::CopyStorageToMultisample(commands, Metal::TextureOfImage(shadow), Metal::TextureOfImage(image), target.samples);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+        });
+        shadowNewer = false;
+        ++shadowToHost;
+    }
+
+    void SyncShadow() {
+        if (shadow == VK_NULL_HANDLE) {
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = target.format;
+            info.extent = {target.extent.width, target.extent.height, 1};
+            info.mipLevels = 1;
+            info.arrayLayers = target.samples;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            Check(Metal::Vk::CreateImage(context.device, &info, nullptr, &shadow), "vkCreateImage multisample storage shadow");
+            shadowView = std::make_shared<Texture>(context, shadow, target.format, VK_IMAGE_ASPECT_COLOR_BIT, VkComponentMapping{});
+            hostNewer = true;
+        }
+        if (!hostNewer) return;
+        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            Metal::CopyMultisampleToStorage(commands, Metal::TextureOfImage(image), Metal::TextureOfImage(shadow), target.samples);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+        });
+        hostNewer = false;
+        ++hostToShadow;
     }
 
     Context context;
@@ -127,12 +173,22 @@ public:
     MultisampledCmask cmask;
     // Sampled views for guest MSAA T#s (DECISIONS D27), by component mapping.
     std::map<std::uint32_t, std::shared_ptr<Texture>> sampled;
+    // The storage shadow (made at the first guest storage use) and which side holds the newest
+    // samples; copies made each way (for tests and the cost report).
+    VkImage shadow = VK_NULL_HANDLE;
+    std::shared_ptr<Texture> shadowView;
+    bool shadowNewer = false;
+    bool hostNewer = true;
+    std::uint64_t hostToShadow = 0;
+    std::uint64_t shadowToHost = 0;
 
 private:
     // The image may still be in use by recorded work only at device teardown (targets live for the
     // device's lifetime, ClearMultisampleTargets), after the device has drained its batches.
     void release() noexcept {
         sampled.clear();
+        shadowView.reset();
+        if (shadow) Metal::Vk::DestroyImage(context.device, shadow, nullptr);
         if (view) Metal::Vk::DestroyImageView(context.device, view, nullptr);
         if (image) Metal::Vk::DestroyImage(context.device, image, nullptr);
     }
@@ -188,6 +244,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
         if (target->context.device != context.device || !sameTarget(target->target, use)) continue;
         target->cmask.CheckAddress(use.cmaskAddress);
         target->ApplyFastClear(use);
+        target->SyncHost();
         return *target;
     }
     targets().push_back(std::make_unique<MultisampleTarget>(context, use));
@@ -246,7 +303,10 @@ bool MultisampledCmask::TakeClear() {
 
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target) {
     std::lock_guard lock(targetsMutex());
-    return acquire(context, target).view;
+    // The draw that asks for the view renders into the host image.
+    auto& acquired = acquire(context, target);
+    acquired.hostNewer = true;
+    return acquired.view;
 }
 
 // Upstream records a render pass whose resolve attachment is the destination; on Metal the pass's
@@ -269,8 +329,12 @@ void ResolveMultisampleTarget(const Context& context, const ColorTarget& source,
 
 namespace Metal {
 
-std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
-    Require(MultisampledDescriptor(words), "a sampled multisampled view of a T# that is not 2D MSAA");
+namespace {
+
+// The multisampled color target a guest MSAA T# addresses (DECISIONS D27), after its pending CMASK
+// fast clear; `what` names the use in refusals. Called with targetsMutex held.
+MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const std::uint32_t> words, const char* what) {
+    Require(MultisampledDescriptor(words), std::string("a ") + what + " of a T# that is not 2D MSAA");
     const auto address = ((static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u)) & 0xffffffffffull) << 8u;
     const auto guestFormat = (words[1] >> 20u) & 0x1ffu;
     const auto width = (((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u;
@@ -280,40 +344,65 @@ std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::
     const auto type = (words[3] >> 28u) & 0xfu;
     const auto layers = ((words[4] >> 0u) & 0x1fffu) + 1u;
     const auto baseArray = (words[4] >> 16u) & 0x1fffu;
-    char described[192];
-    std::snprintf(described, sizeof(described), " (T# 0x%llx, %ux%u, %u samples, format %u, type %u)", static_cast<unsigned long long>(address), width, height, samples, guestFormat, type);
+    char described[224];
+    std::snprintf(described, sizeof(described), " (%s, T# 0x%llx, %ux%u, %u samples, format %u, type %u)", what, static_cast<unsigned long long>(address), width, height, samples, guestFormat, type);
     Require(baseLevel == 0u, std::string("AGC graphics: a 2D MSAA T# with a nonzero base level (fragment) is not modeled") + described);
     // Type 15 (2D MSAA array) views of a target's single layer read the same texture2d_ms_array view
     // (MslAbi Version 9); targets have one layer, as upstream's.
     Require(type == 14u || (layers == 1u && baseArray == 0u), std::string("AGC graphics: a 2D MSAA array T# over more than its first layer is not implemented (multisampled color targets have one layer)") + described);
     const auto format = ResolveTextureFormat(guestFormat);
-    std::lock_guard lock(targetsMutex());
     for (const auto& target : targets()) {
         const auto& color = target->target;
         if (target->context.device != context.device || color.address != address) continue;
         Require(color.extent.width == width && color.extent.height == height && color.samples == samples, std::string("AGC graphics: a 2D MSAA T# disagrees with the multisampled color target at its address in extent or sample count") + described);
         Require(color.format == format, std::string("AGC graphics: a 2D MSAA T# reads a multisampled color target in another format, which is not implemented") + described);
         target->ApplyFastClear(color);
-        const auto swizzle = [](std::uint32_t select) {
-            switch (select) {
-            case 0: return VK_COMPONENT_SWIZZLE_ZERO;
-            case 1: return VK_COMPONENT_SWIZZLE_ONE;
-            case 4: return VK_COMPONENT_SWIZZLE_R;
-            case 5: return VK_COMPONENT_SWIZZLE_G;
-            case 6: return VK_COMPONENT_SWIZZLE_B;
-            case 7: return VK_COMPONENT_SWIZZLE_A;
-            default: throw std::runtime_error("AGC graphics: a 2D MSAA T# with a reserved destination select");
-            }
-        };
-        const auto selects = words[3] & 0xfffu;
-        auto& texture = target->sampled[selects];
-        if (texture == nullptr) {
-            const VkComponentMapping components{swizzle(selects & 7u), swizzle((selects >> 3u) & 7u), swizzle((selects >> 6u) & 7u), swizzle((selects >> 9u) & 7u)};
-            texture = std::make_shared<Texture>(target->context, target->image, color.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
-        }
-        return texture;
+        return *target;
     }
     throw std::runtime_error(std::string("AGC graphics: a 2D MSAA T# addresses memory that is no multisampled color target; guest-written MSAA memory (sample layout, FMASK) is not modeled") + described);
+}
+
+}
+
+std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
+    std::lock_guard lock(targetsMutex());
+    auto& target = TargetOfDescriptor(context, words, "sampled view");
+    target.SyncHost();
+    const auto swizzle = [](std::uint32_t select) {
+        switch (select) {
+        case 0: return VK_COMPONENT_SWIZZLE_ZERO;
+        case 1: return VK_COMPONENT_SWIZZLE_ONE;
+        case 4: return VK_COMPONENT_SWIZZLE_R;
+        case 5: return VK_COMPONENT_SWIZZLE_G;
+        case 6: return VK_COMPONENT_SWIZZLE_B;
+        case 7: return VK_COMPONENT_SWIZZLE_A;
+        default: throw std::runtime_error("AGC graphics: a 2D MSAA T# with a reserved destination select");
+        }
+    };
+    const auto selects = words[3] & 0xfffu;
+    auto& texture = target.sampled[selects];
+    if (texture == nullptr) {
+        const VkComponentMapping components{swizzle(selects & 7u), swizzle((selects >> 3u) & 7u), swizzle((selects >> 6u) & 7u), swizzle((selects >> 9u) & 7u)};
+        texture = std::make_shared<Texture>(target.context, target.image, target.target.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
+    }
+    return texture;
+}
+
+std::shared_ptr<Texture> MultisampleStorageTexture(const Context& context, std::span<const std::uint32_t> words) {
+    std::lock_guard lock(targetsMutex());
+    auto& target = TargetOfDescriptor(context, words, "storage view");
+    // Brought up to date before the access; the access (recorded after this) writes the shadow.
+    target.SyncShadow();
+    target.shadowNewer = true;
+    return target.shadowView;
+}
+
+MultisampleShadowStatistics MultisampleShadowCounts(std::uint64_t address) {
+    std::lock_guard lock(targetsMutex());
+    for (const auto& target : targets()) {
+        if (target->target.address == address) return {target->hostToShadow, target->shadowToHost};
+    }
+    return {};
 }
 
 }
