@@ -1,6 +1,7 @@
 // Guest memory in the displaced window (D31: the macOS arm64 GPU carveout, 64-448 GiB, backed at guest |
 // DisplacedFlip) reaches the GPU: the driver wraps the alias, a GPU fill lands in the pages the CPU sees at both the
 // guest address (through the fault handler) and the alias, and the driver's own guest reads and writes translate.
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -81,6 +82,22 @@ int main() {
             device->WaitIdle();
         }
         Require(GuestWord(Base + Bytes / 2, 0) == 7u && HostWord(Base, Bytes / 4 - 1) == 7u, "displaced guest memory: the second fill is not visible");
+
+        // Scan-out decode reads the alias, not the guest address: no fault per load (STK presents from Base).
+        {
+            AgcDriver::DisplayBuffer display{Base, 0x8000000000000000ull, 64, 16, 1};
+            const auto size = AgcDriver::DisplayBufferSize(display);
+            Require(size <= Bytes, "displaced guest memory: the display buffer does not fit");
+            for (std::size_t index = 0; index < size / 4; ++index)
+                reinterpret_cast<volatile std::uint32_t*>(GuestArena::HostAddress(Base))[index] = 0xff000000u | static_cast<std::uint32_t>(index * 2654435761u >> 8);
+            std::uint64_t faultsBefore = 0, patches = 0, faultsAfter = 0;
+            GuestArena::GuestDisplacedStats_nid_no_patch(&faultsBefore, &patches);
+            const auto pixels = AgcDriver::ReadDisplayBuffer(display);
+            GuestArena::GuestDisplacedStats_nid_no_patch(&faultsAfter, &patches);
+            const auto expected = AgcDriver::DecodeDisplayBuffer(display, {reinterpret_cast<const std::byte*>(GuestArena::HostAddress(Base)), size});
+            Require(pixels == expected, "displaced guest memory: the display buffer decode differs from the alias");
+            Require(faultsAfter == faultsBefore, "displaced guest memory: the display buffer decode faulted on the guest address");
+        }
 
         GuestAllocations::Mutation().Remove(guest);
         GuestArena::GuestArenaReset_nid_postfix(guest, Bytes);

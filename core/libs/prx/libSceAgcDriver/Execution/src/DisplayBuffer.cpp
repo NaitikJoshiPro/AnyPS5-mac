@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -235,7 +236,9 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
     }
     GuestMemory::FlushGpuWrites(buffer.address, size);
     GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
-    const auto* source = reinterpret_cast<const std::byte*>(buffer.address);
+    // Through the host alias: a display buffer in the displaced window (D31, oops-sdk titles scan out from
+    // 0x4000000000) would otherwise take the fault handler on every load of the decode.
+    const auto* source = reinterpret_cast<const std::byte*>(GuestArena::HostAddress(buffer.address));
     return DecodeDisplayBuffer(buffer, {source, size});
 }
 
