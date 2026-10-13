@@ -16,12 +16,14 @@ agc_dma_data_tests G0
 agc_dpp_write G0
 agc_driver_depth_plane_guest_layers G0
 agc_driver_depth_storage G0
+agc_driver_register_key G0
 agc_driver_registration_prepare_shutdown G0
 agc_driver_sparse_buffer_holes G0
 agc_embedded_vertex_fetch G0
 agc_embedded_vertex_fetch_aliasing G0
 agc_end_of_shader_action_size_tests G0
 agc_float16_conversion G0
+agc_formatted_buffer_byte_stores G0
 agc_formatted_buffer_once G0
 agc_fragment_barycentric G0
 agc_gs_oversubscription_tests G0
@@ -30,6 +32,7 @@ agc_host_import_retire G0
 agc_initialization G0
 agc_integer_narrowing G0
 agc_interpolant_mapping G0
+agc_ir_reclaim G0
 agc_masked_select G0
 agc_mubuf_lds_decode G0
 agc_packet_info_tests G0
@@ -48,6 +51,7 @@ agc_rdna_truncated_modifier G0
 agc_rect_list_position_invariant G0
 agc_register_command_tests G0
 agc_scalar_select_mask G0
+agc_semaphore_tests G0
 agc_shader_bindless G0
 agc_shader_control_flow G0
 agc_shader_control_flow_iteration_selection_off G0
@@ -191,6 +195,7 @@ agc_driver_fma_rounding G1
 agc_driver_format_d16 G1
 agc_driver_format_d16_store G1
 agc_driver_formatted_store G1
+agc_driver_formatted_store_unaligned G1
 agc_driver_global_atomic_csub G1
 agc_driver_global_atomics G1
 agc_driver_global_load_addtid G1
@@ -303,6 +308,7 @@ agc_shader_fusion G1
 agc_copied_direct_ordering G2
 agc_driver_bindless_images G2
 agc_driver_bvh64_intersect_ray G2
+agc_driver_covered_centroid_state G2
 agc_driver_dcc_keys_first_write G2
 agc_driver_depth_compare_copy G2
 agc_driver_emulated_color_compare G2
@@ -325,6 +331,7 @@ agc_driver_image_plane_address_on_line G2
 agc_driver_image_sample_aniso_override G2
 agc_driver_image_sample_bias_a16 G2
 agc_driver_image_sample_border_color G2
+agc_driver_image_sample_cube_derivatives G2
 agc_driver_image_sample_derivatives G2
 agc_driver_image_sample_force_degamma G2
 agc_driver_image_sample_lod_clamp G2
@@ -390,6 +397,8 @@ agc_driver_uint8x4_color_target G3
 agc_driver_uint8x4_color_target_no_resident G3
 agc_driver_vertex_clip_cull_distances G3
 agc_driver_vertex_fetch G3
+agc_driver_vertex_target_range_copied G3
+agc_driver_vertex_target_range_imported G3
 agc_driver_zero_position_vertex G3
 agc_driver_zero_stride_vertex_fetch G3
 agc_metal_draw_primitives G3
@@ -445,6 +454,7 @@ agc_driver_vertex_clip_cull_draw G4
 agc_driver_vertex_clip_cull_draw_no_key G4
 agc_driver_wait_shutdown G4
 agc_driver_write_data_written_ahead G4
+agc_driver_zero_dword_fill G4
 agc_shared_write G4
 agc_shared_write_partial_collect G4
 guest_rendering_wait G4
@@ -466,6 +476,7 @@ video_out_flip_overlay G5
 video_out_flip_reopen G5
 video_out_flip_unopened G5
 video_out_frame_dump_queue G5
+video_out_mouse G5
 video_out_output_mode_policy G5
 agc_driver_buffer_atomics G6
 agc_driver_buffer_atomics_float G6
