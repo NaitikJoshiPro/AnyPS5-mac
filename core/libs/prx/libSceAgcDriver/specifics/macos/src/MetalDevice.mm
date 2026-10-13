@@ -1396,10 +1396,23 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     NoteBindings(plan);
     CheckFaultsOnComplete();
     if (Trace() && std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::Gds; })) {
-        // After the dispatch completes: what the CPU sees in GDS dwords 4-7.
-        recorder.OnComplete([] {
+        // After the dispatch completes: what the CPU sees in GDS dwords 4-7, and what the GPU sees
+        // through the bound mapping (copied into a fresh buffer behind the dispatch).
+        std::uint64_t offset = 0;
+        id<MTLBuffer> mapping = ImportOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
+        if (mapping == nil) mapping = WrapperOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
+        id<MTLBuffer> probe = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        if (mapping != nil && probe != nil) {
+            [residency addAllocation:probe];
+            [residency commit];
+            stream.Barrier();
+            [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + 16u toBuffer:probe destinationOffset:0 size:16];
+            stream.Barrier();
+        }
+        recorder.OnComplete([probe] {
             const auto* first = reinterpret_cast<const std::uint32_t*>(Pm4::GdsAddress());
-            std::fprintf(stderr, "[metal] GDS after the batch: dwords 4-7 %u %u %u %u\n", first[4], first[5], first[6], first[7]);
+            const auto* gpu = probe != nil ? static_cast<const std::uint32_t*>(probe.contents) : first;
+            std::fprintf(stderr, "[metal] GDS after the batch: CPU dwords 4-7 %u %u %u %u, GPU copy %u %u %u %u\n", first[4], first[5], first[6], first[7], gpu[0], gpu[1], gpu[2], gpu[3]);
         });
     }
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", plan.reads.size(), plan.writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
