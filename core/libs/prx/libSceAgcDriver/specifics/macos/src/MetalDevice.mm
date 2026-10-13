@@ -607,6 +607,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT, spv::CapabilityStencilExportEXT, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
+            // Multisampled storage images are emulated as 2D arrays of layers * samples slices (DECISIONS D22, MslAbi v6).
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityStorageImageMultisample));
             // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityFloat64));
             // half arithmetic rounds to nearest even and keeps f16 denormals on Apple GPUs (probe_float_b2),
