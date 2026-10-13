@@ -99,7 +99,7 @@ struct Aps5TessCase {
 // windows the slice into threadgroup memory, then every corner thread places its point.
 kernel void aps5_tess_gpu_sliced(device const Aps5TessCase* cases [[buffer(0)]], device uint* corners [[buffer(1)]], constant uint& total [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
 {
-    threadgroup int window[255];
+    threadgroup int window[256];
     threadgroup uint used[1];
     threadgroup int none[1];
     const uint id = group.x;
