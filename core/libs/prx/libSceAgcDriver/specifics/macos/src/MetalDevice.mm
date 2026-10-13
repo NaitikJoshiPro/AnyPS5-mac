@@ -13,6 +13,7 @@
 #include "MetalCommandStream.h"
 #include "MetalPipelineCache.h"
 #include "MetalImages.h"
+#include "MetalVmTrace.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1210,6 +1211,7 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
                 id<MTLBuffer> import = ImportOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
                 id<MTLBuffer> wrapper = WrapperOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
                 const auto* first = reinterpret_cast<const std::uint32_t*>(Pm4::GdsAddress());
+                std::fprintf(stderr, "[metal] GDS pages: %s\n", Metal::VmRegionInfo(Pm4::GdsAddress()).c_str());
                 std::fprintf(stderr, "[metal] GDS 0x%llx bound at 0x%llx (%s, buffer contents %p), dwords 4-7 now %u %u %u %u\n", static_cast<unsigned long long>(Pm4::GdsAddress()), static_cast<unsigned long long>(entries[0].address), import != nil ? "host import" : wrapper != nil ? "page wrapper" : "neither", import != nil ? import.contents : wrapper != nil ? wrapper.contents : nullptr, first[4], first[5], first[6], first[7]);
             }
             break;
@@ -1412,6 +1414,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         recorder.OnComplete([probe] {
             const auto* first = reinterpret_cast<const std::uint32_t*>(Pm4::GdsAddress());
             const auto* gpu = probe != nil ? static_cast<const std::uint32_t*>(probe.contents) : first;
+            std::fprintf(stderr, "[metal] GDS pages after: %s\n", Metal::VmRegionInfo(Pm4::GdsAddress()).c_str());
             std::fprintf(stderr, "[metal] GDS after the batch: CPU dwords 4-7 %u %u %u %u, GPU copy %u %u %u %u\n", first[4], first[5], first[6], first[7], gpu[0], gpu[1], gpu[2], gpu[3]);
         });
     }
