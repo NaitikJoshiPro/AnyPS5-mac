@@ -19,6 +19,9 @@ import gpu_groups  # noqa: E402
 import buildlock  # noqa: E402
 import gpu_suite  # noqa: E402
 
+# Never touch the real machine-wide GPU lock from tests.
+os.environ[buildlock.GPU_LOCK_ENV] = os.path.join(tempfile.mkdtemp(prefix="aps5-gpulock-test-"), "locks", "gpu.lock")
+
 FAKE_CTEST = r'''#!/usr/bin/env python3
 import json, os, re, sys
 arguments = sys.argv[1:]
@@ -577,6 +580,101 @@ class LeaseTests(unittest.TestCase):
             gpu_suite.run_suite = original
         self.assertFalse((self.build / buildlock.LEASE_NAME).exists())
         self.assertEqual(gpu_suite.held_leases, [])
+
+
+HOLDER = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import buildlock
+with buildlock.gpu_lock(label="holder-cmd"):
+    print("held", flush=True)
+    time.sleep(float(sys.argv[2]))
+"""
+
+
+class GpuLockTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "locks", "gpu.lock")
+        self.env = dict(os.environ, **{buildlock.GPU_LOCK_ENV: self.path})
+        self.env.pop(buildlock.GPU_HELD_ENV, None)
+        self.patch = mock.patch.dict(os.environ, {buildlock.GPU_LOCK_ENV: self.path})
+        self.patch.start()
+        os.environ.pop(buildlock.GPU_HELD_ENV, None)
+
+    def tearDown(self):
+        self.patch.stop()
+        self.dir.cleanup()
+
+    def start_holder(self, seconds):
+        process = subprocess.Popen([sys.executable, "-c", HOLDER, str(HERE), str(seconds)], env=self.env,
+                                   stdout=subprocess.PIPE, text=True)
+        self.assertEqual(process.stdout.readline().strip(), "held")
+        return process
+
+    def test_second_process_waits_and_prints_holder(self):
+        import io
+        holder = self.start_holder(1.5)
+        out = io.StringIO()
+        start = time.monotonic()
+        with buildlock.gpu_lock(label="second", out=out, poll=0.05):
+            waited = time.monotonic() - start
+        holder.wait()
+        self.assertGreater(waited, 0.5)
+        text = out.getvalue()
+        self.assertIn("waiting for", text)
+        self.assertIn(f"pid {holder.pid}", text)
+        self.assertIn("holder-cmd", text)
+        self.assertIn("since 20", text)
+        self.assertIn("acquired after", text)
+
+    def test_dead_holder_does_not_block(self):
+        import io
+        holder = self.start_holder(60)
+        holder.kill()
+        holder.wait()
+        self.assertTrue(os.path.exists(self.path + ".info"))  # stale sidecar left behind
+        out = io.StringIO()
+        start = time.monotonic()
+        with buildlock.gpu_lock(label="next", out=out, poll=0.05):
+            self.assertEqual(buildlock.read_gpu_holder()["pid"], os.getpid())
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse(os.path.exists(self.path + ".info"))
+
+    def test_nested_in_holder_environment_is_a_no_op(self):
+        with buildlock.gpu_lock(label="outer"):
+            self.assertEqual(os.environ[buildlock.GPU_HELD_ENV], str(os.getpid()))
+            with buildlock.gpu_lock(label="inner"):  # would deadlock if it re-took the flock
+                pass
+        self.assertNotIn(buildlock.GPU_HELD_ENV, os.environ)
+
+    def test_run_test_takes_the_gpu_lock_per_test(self):
+        build = Path(self.dir.name) / "build"
+        build.mkdir()
+        seen = []
+        real = subprocess.Popen
+
+        def fake_popen(command, **kwargs):
+            seen.append(buildlock.read_gpu_holder())
+            return real([sys.executable, "-c", "pass"], **kwargs)
+
+        with mock.patch.object(gpu_suite.subprocess, "Popen", fake_popen):
+            gpu_suite.run_test(build, "some_test", 10, build / "j.xml", build / "t.log", dict(os.environ))
+        self.assertEqual(seen[0]["pid"], os.getpid())
+        self.assertIn("some_test", seen[0]["command"])
+        self.assertIsNone(buildlock.read_gpu_holder())  # released between tests
+
+    def test_buildlock_gpu_option_waits_for_the_gpu_lock(self):
+        holder = self.start_holder(1.5)
+        build = os.path.join(self.dir.name, "b")
+        start = time.monotonic()
+        result = subprocess.run([sys.executable, str(HERE / "buildlock.py"), "--gpu", build, "--", "true"], env=self.env,
+                                capture_output=True, text=True)
+        holder.wait()
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(time.monotonic() - start, 0.5)
+        self.assertIn(f"pid {holder.pid}", result.stderr)
 
 
 if __name__ == "__main__":
