@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
@@ -57,8 +56,8 @@ std::vector<std::uint32_t> DrawBoth() {
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
-        {0x2d5, std::getenv("APS5_TEST_W32") ? 0x402000u : 0x2000u},
-        {0x1b6, std::getenv("APS5_TEST_W32") ? 0x8000u : 0u}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x2d5, 0x2000},
+        {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
         {0x2dc, 0xaa00}, {0x2f8, 0}, {0x293, 0},
         {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
         {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
