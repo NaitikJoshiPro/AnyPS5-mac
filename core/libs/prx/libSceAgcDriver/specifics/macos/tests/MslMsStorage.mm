@@ -143,10 +143,13 @@ id<MTLFunction> Compile(id<MTLDevice> device, const std::string& name, const Sha
         std::cerr << source << '\n';
         throw std::runtime_error(name + ": MSL does not compile: " + Describe(error));
     }
-    // The recompile-time constants, then image mode 0 of resource 0 and its sample count.
+    // The recompile-time constants (from the all-zero user data T#), then what a 2D MSAA T# with an
+    // identity DST_SEL and `samples` samples would supply: image mode 0 of resource 0, the X/Y/Z/W
+    // selectors and the sample count.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> values;
     for (const auto& constant : result.specialization) values.emplace_back(constant.id, constant.value);
     values.emplace_back(ShaderRecompiler::PipelineSpecialization::ImageBase, 0u);
+    for (std::uint32_t component = 0; component < 4u; ++component) values.emplace_back(ShaderRecompiler::PipelineSpecialization::ImageBase + 1u + component, 4u + component);
     values.emplace_back(ShaderRecompiler::PipelineSpecialization::SampleCountBase, samples);
     MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
     for (const auto& [id, value] : values) {
