@@ -511,7 +511,11 @@ void ProtectPage(std::uint64_t address, bool readable) {
 #else
     // The host page holding the address (16 KiB on Apple silicon, where mprotect refuses a 4 KiB range).
     const auto page = static_cast<std::uint64_t>(::getpagesize());
-    Require(mprotect(reinterpret_cast<void*>(address & ~(page - 1u)), static_cast<std::size_t>(page), readable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0, "cannot change the protection of a test page");
+    const int protection = readable ? PROT_READ | PROT_WRITE : PROT_NONE;
+    Require(mprotect(reinterpret_cast<void*>(address & ~(page - 1u)), static_cast<std::size_t>(page), protection) == 0, "cannot change the protection of a test page");
+    // macOS: the write watch write-protects watched pages itself and answers protection queries from its logical
+    // protection, which a guest mprotect updates; tell it as the guest path does.
+    GuestWriteWatch::GuestWriteWatchProtectionChanged_nid_postfix(reinterpret_cast<const void*>(address & ~(page - 1u)), static_cast<std::size_t>(page), protection);
 #endif
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(address), 4096);
 }
