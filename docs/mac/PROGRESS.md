@@ -305,3 +305,11 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - D19 slip: FINALFIX ran the compile-only corpus binary directly once (under the machine-wide GPU lock, validation env) after two 30 s gpu_suite timeouts on a cold Metal compiler cache (70 s cold, <1 s warm). Then it passed via gpu_suite (20261013T190104Z).
 - Disk 10.7 GB of 100 GB.
 - Next: main fast-forwards mac-native(-metal) to mac-native-upsync; M3 titles.
+
+## 2026-10-14 night — ASTRO BOT (PPSA21564, the user's own-console dump) first bring-up; displaced-memory work
+- ASTRO: unwrapped with upstream tools/unself.py (D36; matches the .esbak ELFs). Run dir .mac-work/titles/PPSA21564 (symlinked data, nothing copied). Import audit: 1944 imports, 0 absent, 7 throwing stubs. Boot stops at the first call: sceKernelMapNamedDirectMemory MAP_FIXED 1.9 GiB at 0x300000000, inside the arm64 dyld shared cache (readable, so D31/D33 can't serve it). A local hint-relocation experiment reached main(), threads and 890 shaders compiled, then SIGBUS (stub unaligned STLURH).
+- Blocker map split: VA6 (fixed maps in the dyld range + stub unaligned case), SHD5 (multi-location interpolation, interpolant<>), LIBS4 (7 stubs incl. __tls_get_addr). Later: driver host-import budget (6 GiB vs a 7.8 GiB import, 16 GB machine); perf of 129k displaced faults in 8 s (103k from a shared-cache memcpy routine).
+- VA3: D31/D33 alias audit (a9cabe02e, de5d3dad5, beb31c77b, 2cd1c9e2d). EFAULT bugs in read/write/iovec/AIO/sockets/entropy/stdio/savedata fixed; write-watch import bug fixed. CPU 5211/5211, G1 190/190, G4 44/45.
+- VA4: D35, a host-syscall shim at the libSystem import boundary (prototype b12fe6a82, off by default). VA5 is completing it and switching it on.
+- PR #5262: a community member (simonbronk) verified it on Windows at runtime; replied.
+- Machine: Amphetamine session plus caffeinate keep the Mac awake overnight; 77 GB free.
