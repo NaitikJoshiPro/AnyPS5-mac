@@ -11,6 +11,7 @@
 #include "MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -1762,6 +1763,12 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                     recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
                     ++barriers;
                     storeWawBarriers.fetch_add(1, std::memory_order_relaxed);
+                }
+                static const bool traceLanding = std::getenv("APS5_TRACE_LABEL_LANDING") != nullptr;
+                if (traceLanding && store.address != 0) {
+                    auto target = Metal::BufferOf(store.buffer);
+                    const auto host = reinterpret_cast<std::uint64_t>(target.contents) + store.offset;
+                    std::fprintf(stderr, "[landing] store run: guest 0x%llx+0x%zx into buffer %p (contents %p, length 0x%llx) offset 0x%llx = host 0x%llx%s\n", static_cast<unsigned long long>(store.address), store.bytes.size(), (__bridge void*)target, target.contents, static_cast<unsigned long long>(target.length), static_cast<unsigned long long>(store.offset), static_cast<unsigned long long>(host), host == ::GuestArena::HostAddress(store.address) ? "" : " (NOT the guest's host address)");
                 }
                 stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
                 run.recorded.emplace_back(store.buffer, store.offset, storeEnd);
