@@ -19,6 +19,8 @@
 //   agc_metal_msaa_tests interp    (recompiled PERSP_SAMPLE vs PERSP_CENTER pixel programs, per sample)
 //   agc_metal_msaa_tests a2c       (recompiled alpha-to-coverage: the measured proportional rule)
 //   agc_metal_msaa_tests storage   (guest image_store / image_atomic_add on rendered 4x/8x targets)
+//   agc_metal_msaa_tests ranges    (a build binding an MSAA T# before single-sample T#s: each surface
+//                                   range keeps its own texture, so the pre-sync list is right)
 #include "../src/MetalDeviceState.h"
 #include "../src/MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
@@ -31,7 +33,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -43,6 +49,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -882,6 +896,96 @@ void CheckStorage(AgcDriver::VulkanDevice& device) {
     sources.clear();
     std::puts("storage: 4x/8x guest stores and 4x atomics reach the rendered target's samples passed");
 }
+
+// Surface ranges and textures of a build (TechnicalDebt metal-msaa gap 6): an MSAA view is kept in
+// the build's textures without a surface range, so pairing "texture" ranges with textures by
+// position shifted every later range onto the previous texture. Bound here: an MSAA T#, then an
+// R32_UINT surface in host-imported memory (a view of its storage image, served GPU-direct) and a
+// BC1 surface in the same import (a CPU snapshot). The pre-sync list (PresyncSurfaces, the
+// surfaces the build's lookups read on the CPU) must hold the BC1 surface and not the R32 one;
+// by position the BC1 range took the R32 view's texture and was left out.
+class ImportedSurfaces {
+public:
+    static constexpr std::uint32_t Side = 256u;
+    static constexpr std::size_t SurfaceBytes = std::size_t{Side} * Side * 4u;
+    explicit ImportedSurfaces(const AgcDriver::Graphics::Context& context) : context(context) {
+        memory = std::aligned_alloc(65536, 2u * SurfaceBytes);
+        Require(memory != nullptr, "cannot allocate the imported surfaces");
+        std::memset(memory, 0x5a, 2u * SurfaceBytes);
+        GuestAllocations::Mutation().Add(memory, 2u * SurfaceBytes, true, true, true);
+    }
+    ~ImportedSurfaces() {
+        AgcDriver::Graphics::ClearCachedTextures(context.device);
+        GuestAllocations::Mutation().Remove(memory);
+        // Reconciles the import away before the memory goes.
+        AgcDriver::Graphics::HostImportFor(context, Surface(0), 2u * SurfaceBytes);
+        std::free(memory);
+    }
+    ImportedSurfaces(const ImportedSurfaces&) = delete;
+    ImportedSurfaces& operator=(const ImportedSurfaces&) = delete;
+    std::uint64_t Surface(std::size_t index) const { return reinterpret_cast<std::uint64_t>(memory) + index * SurfaceBytes; }
+
+private:
+    const AgcDriver::Graphics::Context& context;
+    void* memory = nullptr;
+};
+
+// A 2D single-sample T# (R64KB_X tiling) of `side` x `side` texels of guest format `format`.
+std::array<std::uint32_t, 8> SingleSampleDescriptor(std::uint64_t address, std::uint32_t format, std::uint32_t side) {
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((side - 1u) & 3u) << 30u), ((side - 1u) >> 2u) | ((side - 1u) << 14u), 0xfacu | (0x1bu << 20u) | (9u << 28u), 0u, 0u, 0u, 0u};
+}
+
+ShaderRecompiler::DescriptorBinding SampledBinding(std::uint32_t slot, ShaderRecompiler::DescriptorImageShape shape, std::span<const std::array<std::uint32_t, 8>> elements) {
+    ShaderRecompiler::DescriptorBinding binding {};
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = RuntimeAbi::FirstImageBinding + AgcDriver::Graphics::PlaceholderDimensionsPerClass + slot;
+    binding.count = static_cast<std::uint32_t>(elements.size());
+    binding.imageShape = shape;
+    binding.imageWritten.assign(elements.size(), false);
+    binding.imageSamplers.assign(elements.size(), 0u);
+    for (const auto& words : elements) binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+    return binding;
+}
+
+void CheckRanges(AgcDriver::VulkanDevice& device) {
+    GuestBlock vertices(16384);
+    WriteVertices(vertices, FullScreen);
+    GuestBlock source(Extent * Extent * 4u * Samples);
+    const auto target = Target(source.Address(), VK_FORMAT_R8G8B8A8_UNORM, Samples);
+    Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0u, "#define SAMPLE_COLOR 1\n"), 0u, 3u);
+    device.WaitIdle();
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    Require(context.hostImportAlignment != 0u, "the Metal device's Context has no host imports");
+    {
+        ImportedSurfaces surfaces(context);
+        Require(AgcDriver::Graphics::HostImportFor(context, surfaces.Surface(0), 2u * ImportedSurfaces::SurfaceBytes) != nullptr, "the Metal device refused the host import of the test surfaces");
+        const auto viewed = surfaces.Surface(0);
+        const auto compressed = surfaces.Surface(1);
+        // The MSAA T# as agc_metal_msaa_sampled's (8_8_8_8_UNORM 32x32, 4x, type 14).
+        const auto address = source.Address();
+        const std::array<std::array<std::uint32_t, 8>, 1> msaa {{{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Extent - 1u) & 3u) << 30u), ((Extent - 1u) >> 2u) | ((Extent - 1u) << 14u), 0xfacu | (2u << 16u) | (14u << 28u), 0u, 2u << 4u, 0u, 0u}}};
+        const std::array<std::array<std::uint32_t, 8>, 2> plain {SingleSampleDescriptor(viewed, 20u, ImportedSurfaces::Side), SingleSampleDescriptor(compressed, 169u, ImportedSurfaces::Side)};
+        ShaderRecompiler::RecompileResult program;
+        program.bindings.push_back(SampledBinding(3u, ShaderRecompiler::DescriptorImageShape::Image2DMultisample, msaa));
+        program.bindings.push_back(SampledBinding(2u, ShaderRecompiler::DescriptorImageShape::Image2D, plain));
+        const AgcDriver::Graphics::CompiledShader shader {ShaderRecompiler::ShaderStage::Compute, &program, 0u};
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Graphics::ShaderResources resources(context, shader);
+        Require(resources.Completed(), "the test build did not complete");
+        const auto& textures = resources.SampledTextures();
+        Require(textures.size() == 3u, "the build holds " + std::to_string(textures.size()) + " sampled textures, not the MSAA view and two single-sample textures");
+        Require(textures[1]->ViewsStorageImage(), "the R32_UINT surface in host-imported memory is not a view of its storage image");
+        Require(!textures[2]->ViewsStorageImage(), "the BC1 surface is not a CPU snapshot");
+        const auto presync = resources.PresyncSurfaces();
+        const auto listed = [&](std::uint64_t surface) { return std::any_of(presync.begin(), presync.end(), [&](const auto& range) { return range.first == surface; }); };
+        Require(listed(compressed), "the pre-sync list leaves out the BC1 snapshot surface (its range paired with another texture)");
+        Require(!listed(viewed), "the pre-sync list holds the R32_UINT surface its storage image serves GPU-direct");
+        Require(presync.size() == 1u, "the pre-sync list holds " + std::to_string(presync.size()) + " surfaces, not the BC1 one alone");
+    }
+    std::puts("ranges: an MSAA T# before single-sample T#s keeps each surface range on its texture passed");
+}
 }
 
 int main(int argc, char** argv) {
@@ -904,6 +1008,7 @@ int main(int argc, char** argv) {
         else if (mode == "interp") CheckInterpolation(*device);
         else if (mode == "a2c") CheckAlphaToCoverage(*device);
         else if (mode == "storage") CheckStorage(*device);
+        else if (mode == "ranges") CheckRanges(*device);
         else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;
