@@ -459,6 +459,7 @@ agc_driver_sampled_cache_budget_memory G7
 agc_host_import_unmap G7
 agc_metal_alu_helpers G7
 agc_metal_device_bindings G7
+agc_metal_device_imports G7
 agc_metal_device_profile G7
 agc_metal_device_submission G7
 agc_metal_device_teardown G7

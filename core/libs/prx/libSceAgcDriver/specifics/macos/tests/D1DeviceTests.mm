@@ -19,6 +19,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <sys/mman.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -264,6 +268,86 @@ void CheckGds(AgcDriver::VulkanDevice& device) {
     for (std::uint32_t index = 0; index < 128u; ++index) Require(values[index] == 1000u + index, "gds: the returned values are not 1000..1127");
     Require(output[128] == AgcDriver::Pm4::GdsBytes, "gds: the binding has " + std::to_string(output[128]) + " bytes");
     std::puts("gds binding: 128 atomics on the guest GDS words");
+}
+
+// D3 host imports: a CPU seed, GPU atomics through the import of registered guest memory, the CPU
+// reads the results after WaitIdle. Round 0 makes the import while the guest write watch has the
+// page write-protected (agc_driver_gds_append_consume: the GPU's stores never reached the CPU's
+// pages); rounds 1-2 re-arm the watch on the imported page between batches. The last block is
+// imported while the CPU maps it read-only (a GPU-writable, CPU read-only guest mapping).
+int PageProtection(const void* page) {
+    mach_vm_address_t region = reinterpret_cast<std::uintptr_t>(page);
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info {};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS) return -1;
+    return info.protection;
+}
+
+class MappedGuestBlock {
+public:
+    explicit MappedGuestBlock(std::size_t bytes) : size(bytes) {
+        void* mapped = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        Require(mapped != MAP_FAILED, "imports: cannot map a guest block");
+        block = static_cast<std::uint32_t*>(mapped);
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
+    }
+    ~MappedGuestBlock() {
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, size);
+        GuestAllocations::Mutation().Remove(block);
+        munmap(block, size);
+    }
+    MappedGuestBlock(const MappedGuestBlock&) = delete;
+    MappedGuestBlock& operator=(const MappedGuestBlock&) = delete;
+    std::uint32_t* Words() const { return block; }
+    void Arm() const {
+        // The watch re-arms every page it reports as written (Collect), as it does between batches.
+        GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(reinterpret_cast<std::uintptr_t>(block), size, [](void*, std::uintptr_t, std::uintptr_t) {}, nullptr);
+    }
+
+private:
+    std::uint32_t* block = nullptr;
+    std::size_t size = 0;
+};
+
+void RunImportAtomics(AgcDriver::VulkanDevice& device, std::uint32_t* words, std::uint32_t seed, const std::string& what) {
+    const auto kernel = Kernel(R"(
+    device atomic_uint* counter = reinterpret_cast<device atomic_uint*>(out(0));
+    const uint index = group.x * 64u + local;
+    out(0)[16u + index] = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);)",
+        {{RuntimeAbi::Binding::Buffers, DescriptorRole::GuestBuffers, 1, Buffer(words, 4096)}}, {64, 1, 1});
+    device.Dispatch(kernel, 2, 1, 1);
+    device.WaitIdle();
+    Require(words[0] == seed + 128u, "imports: " + what + ": the CPU reads the counter as " + std::to_string(words[0]) + " after WaitIdle, expected " + std::to_string(seed + 128u));
+    std::vector<std::uint32_t> values(words + 16, words + 16 + 128);
+    std::sort(values.begin(), values.end());
+    for (std::uint32_t index = 0; index < 128u; ++index) Require(values[index] == seed + index, "imports: " + what + ": the atomics returned " + std::to_string(values[index]) + " at rank " + std::to_string(index) + ", expected " + std::to_string(seed + index));
+}
+
+void CheckImports(AgcDriver::VulkanDevice& device) {
+    Require(GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix(), "imports: the guest write watch is not available");
+    {
+        MappedGuestBlock block(65536);
+        for (std::uint32_t round = 0; round < 3; ++round) {
+            const std::uint32_t seed = 1000u * (round + 1u);
+            block.Words()[0] = seed;
+            block.Arm();
+            Require((PageProtection(block.Words()) & VM_PROT_WRITE) == 0, "imports: the write watch did not write-protect the page in round " + std::to_string(round));
+            RunImportAtomics(device, block.Words(), seed, "write-watched round " + std::to_string(round));
+        }
+    }
+    {
+        MappedGuestBlock block(65536);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block.Words(), 65536);
+        block.Words()[0] = 7000u;
+        Require(mprotect(block.Words(), 65536, PROT_READ) == 0, "imports: cannot map the block read-only");
+        RunImportAtomics(device, block.Words(), 7000u, "CPU read-only block");
+        Require(PageProtection(block.Words()) == VM_PROT_READ, "imports: the CPU read-only block did not keep its protection");
+        Require(mprotect(block.Words(), 65536, PROT_READ | PROT_WRITE) == 0, "imports: cannot restore the block");
+    }
+    std::puts("host imports: GPU atomics reach the CPU's pages (write-watched, re-armed, CPU read-only)");
 }
 
 // BDA page table: BdaAbi::Header + Range[] over the registered guest allocations, translated in
@@ -621,6 +705,8 @@ int main(int argc, char** argv) {
             CheckWorkgroupArena(*device);
             CheckAtomicLocks(*device);
             CheckOverlappingBuffers(*device);
+        } else if (mode == "imports") {
+            CheckImports(*device);
         } else if (mode == "submission") {
             CheckSplit(*device);
             CheckIndirect(*device);
