@@ -470,6 +470,7 @@ agc_metal_msl_mesh G7
 agc_metal_msl_tessellation G7
 agc_metal_tessellation_domains G7
 agc_metal_tessellator G7
+agc_metal_tessellator_gpu G7
 agc_metal_msl_corpus G7
 agc_metal_recorder G7
 agc_metal_recorder_logic G7
