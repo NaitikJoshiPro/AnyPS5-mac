@@ -278,7 +278,7 @@ void hostImportRetirementTests(const Device& device) {
             recorder.Commands();
             recorder.Submit();
             device.WaitQueue();
-            Require(!recorder.Recording() && recorder.InFlightBatches() == 1, "host import retirement requires a submitted batch without an open batch");
+            Require(!recorder.Recording() && recorder.InFlightBatches() == 1, ("host import retirement requires a submitted batch without an open batch (shape " + std::to_string(shape) + ", recording " + std::to_string(recorder.Recording()) + ", in flight " + std::to_string(recorder.InFlightBatches()) + ")").c_str());
             std::size_t changed = 0;
             if (shape == 0) {
                 changed = 1;
