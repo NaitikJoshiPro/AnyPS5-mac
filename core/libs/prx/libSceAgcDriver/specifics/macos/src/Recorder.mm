@@ -3194,7 +3194,10 @@ void Recorder::Submit() {
     MTL4CommitOptions* options = [MTL4CommitOptions new];
     std::shared_ptr<BatchFeedback> feedback = batch->metal->feedback;
     std::shared_ptr<FeedbackSink> sink = metal->sink;
+    static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
+    if (traceGpu) std::fprintf(stderr, "[gpu] recorder commits batch %llu\n", static_cast<unsigned long long>(serial));
     [options addFeedbackHandler:^(MetalFeedback commitFeedback) {
+        if (traceGpu) std::fprintf(stderr, "[gpu] recorder batch %llu completed on the GPU (%.2f ms)%s%s\n", static_cast<unsigned long long>(serial), (commitFeedback.GPUEndTime - commitFeedback.GPUStartTime) * 1e3, commitFeedback.error != nil ? ": " : "", commitFeedback.error != nil ? Metal::Describe(commitFeedback.error).c_str() : "");
         feedback->gpuStartSeconds = commitFeedback.GPUStartTime;
         feedback->gpuEndSeconds = commitFeedback.GPUEndTime;
         if (commitFeedback.error != nil) {
