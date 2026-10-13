@@ -276,6 +276,8 @@ void MslEmitterState::Define(const IrValue& instruction, std::string_view expres
 }
 
 std::string MslEmitterState::GuestLane() {
+    // One-lane waves (upstream #4470, SingleLaneDefines): every invocation is lane 0.
+    if (hostSubgroupSize == 1u) return "0u";
     if (laneCount == 2u) {
         const auto lane = Builtin(MslBuiltin::ThreadIndexInSimdgroup);
         return half == 0u ? lane : "(" + lane + " + 32u)";
@@ -423,6 +425,57 @@ std::string MslEmitterState::LdsMemoryFlags() const {
     return LdsInDeviceMemory() ? "mem_flags::mem_device | mem_flags::mem_threadgroup" : "mem_flags::mem_threadgroup";
 }
 
+// Upstream #4470: vertex and local programs of a target without vertexSubgroups are laid out as
+// one-lane waves (Recompiler.cpp HostSubgroupSize 1), as SpirvSubgroup.cpp's single-lane helpers
+// emit them: a ballot is the invocation's own bit, a shuffle, broadcast or reduction its own value,
+// an election true, the lane 0. The library maps the SIMD-group functions it calls to those values
+// (prelude helpers included) and drops the mapping at its end, so a linked tessellation library's
+// other programs keep the real functions (MslAbi Version 10).
+constexpr std::string_view SingleLaneDefines = R"(// One-lane waves (MslAbi Version 10): SIMD-group functions over this invocation alone.
+#define simd_ballot(p) simd_vote(simd_vote::vote_t((p) ? 1u : 0u))
+#define simd_any(p) bool(p)
+#define simd_all(p) bool(p)
+#define simd_is_first() true
+#define simd_broadcast_first(v) (v)
+#define simd_broadcast(v, l) (v)
+#define simd_shuffle(v, l) (v)
+#define simd_shuffle_xor(v, m) (v)
+#define simd_shuffle_up(v, d) (v)
+#define simd_shuffle_down(v, d) (v)
+#define simd_min(v) (v)
+#define simd_max(v) (v)
+#define simd_sum(v) (v)
+#define simd_product(v) (v)
+#define simd_and(v) (v)
+#define simd_or(v) (v)
+#define simd_xor(v) (v)
+#define simd_prefix_inclusive_sum(v) (v)
+#define simd_prefix_exclusive_sum(v) (decltype(v)(0))
+
+)";
+
+constexpr std::string_view SingleLaneUndefines = R"(
+#undef simd_ballot
+#undef simd_any
+#undef simd_all
+#undef simd_is_first
+#undef simd_broadcast_first
+#undef simd_broadcast
+#undef simd_shuffle
+#undef simd_shuffle_xor
+#undef simd_shuffle_up
+#undef simd_shuffle_down
+#undef simd_min
+#undef simd_max
+#undef simd_sum
+#undef simd_product
+#undef simd_and
+#undef simd_or
+#undef simd_xor
+#undef simd_prefix_inclusive_sum
+#undef simd_prefix_exclusive_sum
+)";
+
 MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo& inputInfo, const CompiledBindingLayout& bindings, const MslTargetOptions& target) const {
     const auto stage = program.Resources().stage;
     if (!program.Resources().srtPlanComplete || !program.Resources().resourceTrackingComplete || !program.Metadata().shaderInfoComplete || !program.Metadata().bindingLayoutComplete) {
@@ -440,6 +493,7 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     // across two SIMD groups throw, instead of shuffling lanes 32-63 that do not exist (undefined in
     // MSL; they read 0 on the M3).
     state.hostSubgroupSize = std::min(target.subgroupSize, AppleSimdWidth);
+    if (state.hostSubgroupSize == 1u && stage != IrShaderStage::Vertex && stage != IrShaderStage::Local) state.Fail("one-lane waves are only laid out for vertex and local programs (a target without vertexSubgroups)");
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
     // Wave-uniform values: computed once for both lane halves at laneCount 2; at any lane count the
@@ -462,7 +516,8 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     shader.reflection.usesPushData = state.usesPushData;
     shader.reflection.usesDriverData = state.usesDriverData;
     for (const auto& [id, value] : state.functionConstants) shader.reflection.functionConstants.push_back(id);
-    shader.source = "#include <metal_stdlib>\nusing namespace metal;\n\n" + state.Prelude() + entry;
+    const bool singleLane = state.hostSubgroupSize == 1u;
+    shader.source = "#include <metal_stdlib>\nusing namespace metal;\n\n" + (singleLane ? std::string(SingleLaneDefines) : std::string()) + state.Prelude() + entry + (singleLane ? std::string(SingleLaneUndefines) : std::string());
     static const bool dump = std::getenv("APS5_MSL_DUMP") != nullptr;
     if (dump) std::fprintf(stderr, "[msl] shader 0x%llx:\n%s\n[msl] IR:\n%s\n", static_cast<unsigned long long>(program.Resources().shaderHash), shader.source.c_str(), ProgramToString(program).c_str());
     return shader;

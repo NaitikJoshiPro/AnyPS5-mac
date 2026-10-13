@@ -37,6 +37,9 @@ constexpr Mode Modes[] = {
     {"--settled-baseline-only", "agc_storage_baseline_settled", "D3 (guest memory imports and write tracking)", nullptr},
     {"--host-import-unmap-only", "agc_host_import_unmap", "D3 (host imports)", nullptr},
     {"--unit-shadow-only", "agc_unit_shadow", "D3 (unit shadows)", nullptr},
+    // Upstream 0f2683cb7 modes: --integer-clear-only, --written-buffer-order-only, --parked-import-unmap-only and
+    // --host-import-retirement-only are ported in UpsyncRecorderModes.mm, --copied-direct-only in
+    // CopiedDirectOrderingTwin.mm.
 };
 
 }

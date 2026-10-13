@@ -4,6 +4,8 @@
 #include "SceTypes.hpp"
 #include "X87Extended.hpp"
 #include <array>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <climits>
@@ -13,6 +15,8 @@
 #include <string>
 #include <vector>
 #include <type_traits>
+
+extern "C" int APS5_VABI strerror_r_nid_postfix(int error, char* buffer, std::size_t length);
 
 namespace LibcDetail {
 
@@ -152,6 +156,15 @@ inline void AppendUtf8(std::string& utf8, char32_t code) {
     }
 }
 
+inline std::string NanSpec(const std::string& spec) {
+    std::string result = "%";
+    std::size_t index = 1;
+    for (; index < spec.size() && std::strchr("-+ #0", spec[index]); ++index)
+        if (spec[index] == '-' && result.size() == 1) result += '-';
+    for (; index < spec.size() && spec[index] >= '0' && spec[index] <= '9'; ++index) result += spec[index];
+    return result + 's';
+}
+
 inline std::string FormatPointer(const std::string& spec, const void* pointer) {
     std::size_t index = 1;
     bool left = false;
@@ -241,6 +254,7 @@ inline std::vector<ArgumentClass> NumberedArgumentClasses(const char* format) {
 
 inline int FormatWindows(char* buffer, size_t size, const char* format, const void* source, std::string* complete = nullptr) {
     if (!format || !source) throw std::invalid_argument("Null formatting argument");
+    const int savedError = errno;
     const char* const formatStart = format;
     FormatArguments args(source);
     args.Number(NumberedArgumentClasses(format));
@@ -324,18 +338,23 @@ inline int FormatWindows(char* buffer, size_t size, const char* format, const vo
                 spec = spec.substr(0, spec.find('.')) + ".1";
             output.Value(spec + "ll" + conversion, value);
         } else if (std::strchr("aAeEfFgG", conversion)) {
+            const char* nan = conversion >= 'a' ? "nan" : "NAN";
             if (length == "L") {
 #if defined(__x86_64__)
                 static_assert(sizeof(long double) == 16);
                 static_assert(std::numeric_limits<long double>::digits == 64);
-                output.Value(spec + "L" + conversion, args.Next<long double>());
+                const long double value = args.Next<long double>();
+                if (std::isnan(value)) output.Value(NanSpec(spec), nan);
+                else output.Value(spec + "L" + conversion, value);
 #else
                 const std::string text = FormatX87(args.Next<X87Extended>(), spec, conversion);
                 output.Append(text.data(), text.size());
 #endif
             } else {
                 if (!length.empty() && length != "l") throw std::invalid_argument("Invalid floating length");
-                output.Value(spec + conversion, args.Next<double>());
+                const double value = args.Next<double>();
+                if (std::isnan(value)) output.Value(NanSpec(spec), nan);
+                else output.Value(spec + conversion, value);
             }
         } else if (conversion == 'c' && (length.empty() || length == "h")) {
             output.Value(spec + conversion, args.Next<int>());
@@ -366,6 +385,10 @@ inline int FormatWindows(char* buffer, size_t size, const char* format, const vo
         } else if (conversion == 'p' && length.empty()) {
             const std::string text = FormatPointer(spec, args.Next<void*>());
             output.Append(text.data(), text.size());
+        } else if (conversion == 'm') {
+            char message[128];
+            strerror_r_nid_postfix(savedError, message, sizeof(message));
+            output.Value(spec + 's', static_cast<const char*>(message));
         } else if (conversion == 'n' && integerLength && spec == "%") {
             void* pointer = args.Next<void*>();
             if (!pointer) throw std::invalid_argument("Null format count pointer");

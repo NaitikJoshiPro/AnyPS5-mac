@@ -171,6 +171,20 @@ std::string AtomicPointer(const Shared& shared, const std::string& index) {
     return "(reinterpret_cast<" + shared.space + " atomic_uint*>(" + shared.words + ") + (" + index + "))";
 }
 
+// Upstream #4279 (SpirvEmitterHelpers DefineDescriptors: the gds buffer is Coherent): GDS is one
+// memory for the whole GPU, so a plain ds_read / ds_write on GDS sees other threadgroups' writes.
+// Plain device loads may hit a stale cache line (MslRuntimeBuffer.cpp, GLC reads), so GDS words go
+// through relaxed atomic loads and stores; LDS words stay plain.
+std::string ReadWord(const Shared& shared, const std::string& index) {
+    if (!shared.lds) return "atomic_load_explicit(" + AtomicPointer(shared, index) + ", memory_order_relaxed)";
+    return shared.words + "[" + index + "]";
+}
+
+std::string WriteWord(const Shared& shared, const std::string& index, const std::string& value) {
+    if (!shared.lds) return "atomic_store_explicit(" + AtomicPointer(shared, index) + ", uint(" + value + "), memory_order_relaxed);";
+    return shared.words + "[" + index + "] = " + value + ";";
+}
+
 // ByteAddress: the address register plus the instruction offset (function-LDS addresses are
 // constants).
 std::string ByteAddress(MslEmitterState& state, const IrValue& instruction) {
@@ -194,17 +208,17 @@ void Load(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits
     if (bits < 32u) {
         const auto index = state.Temporary("aps5_di");
         state.Line("const uint " + index + " = " + address + " >> 2u;");
-        state.Line("if (" + index + " < " + shared.length + ") " + result + " = " + type + "((" + shared.words + "[" + index + "] >> ((" + address + " & 3u) << 3u)) & " + (bits == 8u ? "0xffu" : "0xffffu") + ");");
+        state.Line("if (" + index + " < " + shared.length + ") " + result + " = " + type + "((" + ReadWord(shared, index) + " >> ((" + address + " & 3u) << 3u)) & " + (bits == 8u ? "0xffu" : "0xffffu") + ");");
     } else if (components == 1u) {
         const auto index = state.Temporary("aps5_di");
         state.Line("const uint " + index + " = " + address + " >> 2u;");
-        state.Line("if (" + index + " < " + shared.length + ") " + result + " = " + shared.words + "[" + index + "];");
+        state.Line("if (" + index + " < " + shared.length + ") " + result + " = " + ReadWord(shared, index) + ";");
     } else {
         static constexpr const char* Components[] = {".x", ".y", ".z", ".w"};
         for (std::uint32_t component = 0; component < components; ++component) {
             const auto index = state.Temporary("aps5_di");
             state.Line("const uint " + index + " = (" + address + " + " + U32(component * 4u) + ") >> 2u;");
-            state.Line("if (" + index + " < " + shared.length + ") " + result + Components[component] + " = " + shared.words + "[" + index + "];");
+            state.Line("if (" + index + " < " + shared.length + ") " + result + Components[component] + " = " + ReadWord(shared, index) + ";");
         }
     }
     state.Outdent();
@@ -242,12 +256,12 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bit
     } else if (components == 1u) {
         const auto index = state.Temporary("aps5_di");
         state.Line("const uint " + index + " = " + address + " >> 2u;");
-        state.Line("if (" + index + " < " + shared.length + ") " + shared.words + "[" + index + "] = " + state.Arg(instruction, instruction.ArgumentCount() - 2u) + ";");
+        state.Line("if (" + index + " < " + shared.length + ") " + WriteWord(shared, index, state.Arg(instruction, instruction.ArgumentCount() - 2u)));
     } else {
         for (std::uint32_t component = 0; component < components; ++component) {
             const auto index = state.Temporary("aps5_di");
             state.Line("const uint " + index + " = (" + address + " + " + U32(component * 4u) + ") >> 2u;");
-            state.Line("if (" + index + " < " + shared.length + ") " + shared.words + "[" + index + "] = " + state.Arg(instruction, component + 1u) + ";");
+            state.Line("if (" + index + " < " + shared.length + ") " + WriteWord(shared, index, state.Arg(instruction, component + 1u)));
         }
     }
     state.Outdent();

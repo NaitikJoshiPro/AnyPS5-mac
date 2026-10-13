@@ -7,6 +7,11 @@ list(APPEND agcMetalTwins
         "tests/Recorder.cpp=specifics/macos/tests/DrawSnapshotCapTwin.mm"
         "tests/Recorder.cpp=specifics/macos/tests/DrawInputsInPlaceTwin.mm"
         "tests/Recorder.cpp=specifics/macos/tests/MultisampleGuestAccessTwin.mm"
+        # Recorder.cpp modes upstream added by v0.1.2 (0f2683cb7; D29).
+        "tests/Recorder.cpp=specifics/macos/tests/UpsyncRecorderModes.mm"
+        "tests/Recorder.cpp=specifics/macos/tests/CopiedDirectOrderingTwin.mm"
+        # Recorder.cpp modes upstream added by fdefd7660.
+        "tests/Recorder.cpp=specifics/macos/tests/VertexTargetRangeTwin.mm"
         "tests/execution/PooledBufferRange.cpp=specifics/macos/tests/PooledBufferRangeTwin.mm"
         "Graphics/src/MultisampleTarget.cpp=specifics/macos/src/MultisampleTarget.mm"
 )

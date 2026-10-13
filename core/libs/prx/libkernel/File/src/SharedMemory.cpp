@@ -483,6 +483,7 @@ extern "C" int APS5_VABI shm_unlink_nid_postfix(const char* path) {
 #if defined(_WIN32) || defined(__APPLE__)
     (void)path;
     NotImplemented_nid_no_patch("shm_unlink of a named object");
+    return 0;
 #else
     int validationError = 0;
     const auto hostName = NamedHostPath(path, validationError);

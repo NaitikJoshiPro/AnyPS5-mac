@@ -184,6 +184,28 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     });
 }
 
+std::uint32_t byteBuffers(SpirvEmitterState& state) {
+    if (state.storageBufferU8Variable != 0u) return state.storageBufferU8Variable;
+    if (state.program.Resources().stage != IrShaderStage::Compute) return 0u;
+    if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityStorageBuffer8BitAccess)) == state.supportedCapabilities.end()) return 0u;
+    const IrBindingLayout& layout = state.program.Metadata().bindings;
+    const auto binding = std::find_if(layout.descriptors.begin(), layout.descriptors.end(), [](const IrDescriptorBinding& descriptor) { return descriptor.kind == DescriptorBindingKind::Buffers; });
+    if (binding == layout.descriptors.end() || state.storageBufferVariable == 0u) return 0u;
+    state.module.EmitCapability(spv::CapabilityStorageBuffer8BitAccess);
+    state.module.EmitExtension("SPV_KHR_8bit_storage");
+    const auto count = ConstantU32(state, static_cast<std::uint32_t>(binding->resources.size()));
+    const auto type = state.module.Type(spv::OpTypeArray, TypeStorageBufferU8Block(state), count);
+    const auto variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, type), spv::StorageClassStorageBuffer);
+    state.module.AddName(variable, "buffers_u8");
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, NativeBinding(state.program.Resources().stage, DescriptorBindingKind::Buffers));
+    state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+    if (state.storageBufferU64Variable == 0u && state.storageBufferCoherentVariable == 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferVariable, spv::DecorationAliased);
+    if (state.requirements.coherentBuffers) state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
+    state.storageBufferU8Variable = variable;
+    return variable;
+}
+
 void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u) {
     if (context.Memory(instruction).gpuDescriptor) {
         EmitBdaWrite(context, instruction, address, value, bits);
@@ -197,6 +219,24 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
     const auto unaligned = nonzero(state, misalignment);
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, u32, unaligned, next, index);
+    const auto bytes = bits != 32u ? byteBuffers(state) : 0u;
+    if (bytes != 0u) {
+        const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, context.Memory(instruction).resource);
+        const auto block = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferU8Pointer(state), block, bytes, ConstantU32(state, element));
+        EmitIfCondition(state, EmitMemoryElementInBounds(state, access, last), [&] {
+            const auto first = EmitAddU32(state, EmitAddU32(state, Binary(state, spv::OpShiftLeftLogical, u32, index, ConstantU32(state, 2u)), misalignment), EmitAndConstant(state, address, 3u));
+            for (std::uint32_t byte = 0; byte < bits / 8u; ++byte) {
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferU8ElementPointer(state), pointer, block, ConstantU32(state, 0u), EmitAddU32(state, first, ConstantU32(state, byte)));
+                const auto shifted = byte == 0u ? value : Binary(state, spv::OpShiftRightLogical, u32, value, ConstantU32(state, byte * 8u));
+                const auto stored = Unary(state, spv::OpUConvert, TypeU8(state), shifted);
+                if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, pointer, stored, access.memoryAccess);
+                else state.module.AddFunction(spv::OpStore, pointer, stored);
+            }
+        });
+        return;
+    }
     EmitIfCondition(state, EmitMemoryElementInBounds(state, access, last), [&] {
         auto mask = ConstantU32(state, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
         auto masked = Binary(state, spv::OpBitwiseAnd, u32, value, mask);
@@ -601,6 +641,11 @@ std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrVa
     auto& state = context.state;
     if (bits != 32u && bits != 64u) context.Fail(instruction, "unsupported runtime buffer atomic width");
     if (context.Memory(instruction).gpuDescriptor && (state.bdaAtomicPointerFunction == 0u || state.bdaNoteWriteFunction == 0u)) context.Fail(instruction, "BDA atomic functions are missing");
+    if (!context.Memory(instruction).gpuDescriptor) {
+        if (state.program.Resources().stage == IrShaderStage::TessellationControl) context.Fail(instruction, "BDA fault termination requires a barrier-safe tessellation-control execution protocol");
+        if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "buffer atomic fault addresses require shaderInt64");
+        state.module.EmitCapability(spv::CapabilityInt64);
+    }
     const auto type = bits == 64u ? TypeU64(state) : TypeU32(state);
     const auto scalar = bits == 64u ? TypeScalarU64(state) : TypeU32(state);
     const auto zero = bits == 64u ? ConstantU64(state, 0u) : ConstantU32(state, 0u);
@@ -613,7 +658,11 @@ std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrVa
                 const auto byte = EmitAddU32(state, access.guest, storage.byteOffset);
                 const auto unaligned = nonzero(state, EmitAndConstant(state, byte, bits / 8u - 1u));
                 const auto guest = Binary(state, spv::OpIAdd, TypeScalarU64(state), resource.base, Unary(state, spv::OpUConvert, TypeScalarU64(state), access.guest));
-                faultIf(context, instruction, unaligned, guest, bits / 8u, BdaAbi::FaultReason::Unaligned);
+                EmitIfCondition(state, unaligned, [&] {
+                    const auto high = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), guest, BdaConstant(state, 32u)));
+                    RecordBdaFaultWords(state, Unary(state, spv::OpUConvert, TypeU32(state), guest), high, ConstantU32(state, bits / 8u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::Unaligned);
+                });
+                StopBdaInvocationIf(state, unaligned);
                 const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte, ConstantU32(state, bits == 64u ? 3u : 2u));
                 return EmitValueOrDefaultIfCondition(state, both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), EmitMemoryElementInBounds(state, storage, index)), type, zero, [&] {
                     const auto pointer = EmitStorageBufferElementPointer(state, storage, index, bits == 64u ? TypeStorageBufferU64ElementPointer(state) : TypeStorageBufferElementPointer(state));

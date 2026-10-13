@@ -3,7 +3,8 @@
 //                             the color-target tile modes, and retile/detile round trips of the
 //                             texture tile modes and element sizes (no Metal device)
 //   agc_metal_images          guest textures uploaded into Metal textures read back equal, heap views
-//                             of every image class, placeholders, and samplers from S# words
+//                             of every image class, placeholders, samplers from S# words, and the
+//                             R16Uint images of packed 16-bit surfaces with their attachment views
 //                             (Metal objects only, no GPU work)
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -18,6 +19,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "RuntimeAbi.hpp"
 
 #include <cstdio>
@@ -26,6 +28,11 @@
 #include <random>
 #include <string>
 #include <vector>
+
+namespace AgcDriver::Graphics {
+// Texture.mm (declared where it is used, ShaderResources.mm).
+VkFormat ImageFormatForGuest(const Context& context, std::uint32_t guestFormat);
+}
 
 namespace {
 
@@ -296,6 +303,42 @@ int Images() {
         for (std::uint32_t heap = ShaderRecompiler::RuntimeAbi::FirstImageBinding; heap < static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers); ++heap) {
             id<MTLTexture> view = Metal::TextureOfView(context->placeholderImages->View(heap));
             Check(view != nil, "PlaceholderImages view of heap " + std::to_string(heap));
+        }
+        // Packed 16-bit surfaces (TechnicalDebt metal-color-1555-target): no shader-writable form,
+        // so their resident images are R16Uint textures that render through a view of the
+        // guest format; guest format 134 is A1R5G5B5.
+        Check(!StorageFormatAvailable(*context, 134u), "A1R5G5B5 has no storage form on Metal");
+        Check(ImageFormatForGuest(*context, 134u) == VK_FORMAT_R16_UINT, "an A1R5G5B5 surface's image is R16Uint");
+        Check(ImageFormatForGuest(*context, 56u) == StorageFormatForGuest(*context, 56u), "a storable format's image is its storage format");
+        {
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = VK_FORMAT_R16_UINT;
+            info.extent = {16u, 16u, 1u};
+            info.mipLevels = 1;
+            info.arrayLayers = 1;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            VkImage image = VK_NULL_HANDLE;
+            Check(Vk::CreateImage(context->device, &info, nullptr, &image) == VK_SUCCESS, "an R16Uint image of a packed 16-bit surface");
+            for (const auto& [format, metal] : {std::pair{VK_FORMAT_A1R5G5B5_UNORM_PACK16, MTLPixelFormatBGR5A1Unorm}, std::pair{VK_FORMAT_R5G6B5_UNORM_PACK16, MTLPixelFormatB5G6R5Unorm}}) {
+                VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+                usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                viewInfo.pNext = &usage;
+                viewInfo.image = image;
+                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                viewInfo.format = format;
+                viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+                VkImageView view = VK_NULL_HANDLE;
+                Check(Vk::CreateImageView(context->device, &viewInfo, nullptr, &view) == VK_SUCCESS, "an attachment view of a packed 16-bit format over R16Uint");
+                id<MTLTexture> texture = Metal::TextureOfView(view);
+                Check(texture != nil && texture.pixelFormat == metal && (texture.usage & MTLTextureUsageRenderTarget) != 0u && texture.parentTexture.pixelFormat == MTLPixelFormatR16Uint, "the packed 16-bit attachment view renders in its Metal format over the R16Uint texture");
+                if (view != VK_NULL_HANDLE) Vk::DestroyImageView(context->device, view, nullptr);
+            }
+            if (image != VK_NULL_HANDLE) Vk::DestroyImage(context->device, image, nullptr);
         }
         recorder.Sync();
         attached.Teardown();

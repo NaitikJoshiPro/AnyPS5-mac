@@ -26,6 +26,8 @@ inline constexpr std::uint32_t PushDataOffset = 8188u;
 inline constexpr std::uint32_t ExportBase = 8192u;
 inline constexpr std::uint32_t ExportPackingBase = 8224u;
 inline constexpr std::uint32_t DualSourceBlend = 8232u;
+inline constexpr std::uint32_t RasterPrimitive = 8233u;
+inline constexpr std::uint32_t LayerExported = 8234u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 // Multisampled storage images on MSL backends (MslAbi Version 6): Metal shaders cannot write
@@ -39,11 +41,14 @@ inline constexpr std::uint32_t DescriptorIndexStride = 128u;
 inline constexpr std::uint32_t ImageModeBase = 32768u;
 inline constexpr std::uint32_t ImageModeStride = 256u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
+// Unnormalized samplers that take the base level for implicit-LOD sampling, per sampler s at
+// UnnormalizedBaseLevelBase + s (upstream #1418).
+inline constexpr std::uint32_t UnnormalizedBaseLevelBase = 57408u;
 // Min/max reduction samplers (Metal ignores MTLSamplerDescriptor.reductionMode): per sampler s,
 // word 0 = reduction | mip filter << 2 | min LOD raw << 4 | max LOD raw << 16 and word 1 = the raw
 // LOD bias | XY mag filter << 16 | XY min filter << 18, at ReductionBase + s * ReductionWords; supplied only for reducing samplers (MSL
 // backends emulate the reduction, SPIR-V modules have no such constants).
-inline constexpr std::uint32_t ReductionBase = 57408u;
+inline constexpr std::uint32_t ReductionBase = 57472u;
 inline constexpr std::uint32_t ReductionWords = 2u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {

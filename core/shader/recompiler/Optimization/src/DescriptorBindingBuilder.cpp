@@ -182,7 +182,7 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             continue;
         }
         const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod);
-        if (unsupported != 0u) {
+        if (unsupported != 0u && !SamplesBaseLevelIfUnnormalized(sampler)) {
             failUnnormalized(UnnormalizedUseReason(unsupported));
         }
         if (sampler.depthCompare) {
@@ -266,6 +266,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     const auto unnormalized = ProveUnnormalized(info, snapshot);
     for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
         if (FoldsTexelOffsets(info.samplers[index])) plan.specialization.push_back({PipelineSpecialization::FoldOffsetBase + index, unnormalized.samplers[index] ? 1u : 0u});
+        if (SamplesBaseLevelIfUnnormalized(info.samplers[index])) plan.specialization.push_back({PipelineSpecialization::UnnormalizedBaseLevelBase + index, unnormalized.samplers[index] ? 1u : 0u});
     }
     for (std::uint32_t index = 0; index < info.samplers.size() && index < snapshot.samplers.size(); ++index) {
         if ((info.samplers[index].uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) == 0u) continue;

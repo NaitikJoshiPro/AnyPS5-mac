@@ -44,6 +44,7 @@ long double Aps5AbiCallLongDouble(long double (*function)(long double, int), int
 void Aps5AbiStore(int (*function)(int));
 int (*Aps5AbiLoad())(int);
 int Aps5AbiCallStored(int value);
+int Aps5AbiMainThreadProbe();
 [[noreturn]] void exit(int);
 }
 

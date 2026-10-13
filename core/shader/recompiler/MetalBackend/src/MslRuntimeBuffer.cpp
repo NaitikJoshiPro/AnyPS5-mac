@@ -65,11 +65,13 @@ static inline uint aps5_buffer_read(Aps5Buffer buffer, uint byteOffset, uint mis
     const uint index = (byte >> 2u) + (byteOffset >> 2u);
     const bool unaligned = misalignment != 0u;
     if ((unaligned ? index + 1u : index) >= (buffer.bytes >> 2u)) return 0u;
-    const uint shift = misalignment << 3u;
-    uint value = aps5_buffer_word(buffer, index, glc) >> shift;
-    if (unaligned) value |= aps5_buffer_word(buffer, index + 1u, glc) << (32u - shift);
-    if (bits == 32u) return value;
-    return (value >> ((byte & 3u) << 3u)) & ((1u << bits) - 1u);
+    const uint shift = (misalignment << 3u) + (bits == 32u ? 0u : (byte & 3u) << 3u);
+    // A narrow component may end in the next dword (see aps5_buffer_write); past the buffer it reads 0.
+    const bool crosses = shift + bits > 32u;
+    ulong window = aps5_buffer_word(buffer, index, glc);
+    if (crosses && index + 1u < (buffer.bytes >> 2u)) window |= ulong(aps5_buffer_word(buffer, index + 1u, glc)) << 32u;
+    const uint value = uint(window >> shift);
+    return bits == 32u ? value : value & ((1u << bits) - 1u);
 }
 
 // A masked store as one compare-exchange (AtomicUpdate): two lanes storing the same byte must leave
@@ -81,26 +83,35 @@ static inline void aps5_update_bits(device uint* word, uint mask, uint value) {
     }
 }
 
+// An 8- or 16-bit component lands at byte (byte & 3) of its dword plus the base misalignment, so it
+// can cross into the next dword (a 16-bit store at byte 3, or at byte 2 of a base misaligned by 1..3):
+// the mask is built 64 bits wide over the two dwords. Plain (non-GLC) narrow stores are byte stores
+// (upstream 066a8fbe3 stores them through an 8-bit view in compute); Apple GPUs store bytes without
+// touching the neighbours, and a concurrent compare-exchange on the same dword retries.
 static inline void aps5_buffer_write(Aps5Buffer buffer, uint byteOffset, uint misalignment, uint byte, uint value, uint bits, bool glc) {
     device uint* words = reinterpret_cast<device uint*>(buffer.address);
+    const uint count = buffer.bytes >> 2u;
     const uint index = (byte >> 2u) + (byteOffset >> 2u);
     const bool unaligned = misalignment != 0u;
-    if ((unaligned ? index + 1u : index) >= (buffer.bytes >> 2u)) return;
+    if ((unaligned ? index + 1u : index) >= count) return;
     if (bits == 32u && !unaligned) {
         if (glc) atomic_store_explicit(reinterpret_cast<device atomic_uint*>(words + index), value, memory_order_relaxed);
         else words[index] = value;
         return;
     }
-    uint mask = bits == 32u ? 0xffffffffu : (1u << bits) - 1u;
-    uint masked = value & mask;
-    if (bits != 32u) {
-        const uint subword = (byte & 3u) << 3u;
-        mask <<= subword;
-        masked <<= subword;
+    const uint shift = (misalignment << 3u) + (bits == 32u ? 0u : (byte & 3u) << 3u);
+    if (bits != 32u && !glc) {
+        device uchar* bytes = reinterpret_cast<device uchar*>(words + index);
+        for (uint part = 0u; part < bits / 8u; ++part) {
+            const uint at = (shift >> 3u) + part;
+            if (index + (at >> 2u) < count) bytes[at] = uchar(value >> (part * 8u));
+        }
+        return;
     }
-    const uint shift = misalignment << 3u;
-    aps5_update_bits(words + index, mask << shift, masked << shift);
-    if (unaligned) aps5_update_bits(words + index + 1u, mask >> (32u - shift), masked >> (32u - shift));
+    const ulong mask = (bits == 32u ? 0xfffffffful : ((1ul << bits) - 1ul)) << shift;
+    const ulong masked = (ulong(value) << shift) & mask;
+    aps5_update_bits(words + index, uint(mask), uint(masked));
+    if (uint(mask >> 32u) != 0u && index + 1u < count) aps5_update_bits(words + index + 1u, uint(mask >> 32u), uint(masked >> 32u));
 }
 
 // Memory of a V# the driver bound in the descriptor table (byte offsets from the V# base).

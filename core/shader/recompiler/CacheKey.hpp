@@ -106,6 +106,8 @@ private:
         append(key, tessellation != nullptr);
         if (tessellation == nullptr) return;
         for (const auto value : {tessellation->inputControlPoints, tessellation->outputControlPoints, tessellation->domain, tessellation->partitioning, tessellation->outputTopology}) append(key, value);
+        if (request.shader.stage == ShaderStage::Local) return;
+        append(key, tessellation->patchesPerGroup);
     }
 
     template<typename TValue>
@@ -192,6 +194,7 @@ private:
         append(key, value.fetchAttribReg);
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
+        append(key, value.paClVsOutCntl);
         if (value.resourcesNum > value.resources.size()) throw std::runtime_error("Shader cache: invalid vertex resource count");
         append(key, value.resourcesNum);
         for (std::uint32_t i = 0; i < value.resourcesNum; ++i) {
@@ -244,6 +247,8 @@ private:
         append(key, value.registrationModules);
         append(key, value.registrationWordLimit);
         append(key, static_cast<std::uint32_t>(value.backend));
+        append(key, value.vertexSubgroups);
+        append(key, value.float16DenormPreserve);
     }
 };
 

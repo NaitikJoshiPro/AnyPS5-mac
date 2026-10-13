@@ -178,6 +178,8 @@ int main() {
             }
             Require(Has(hull.msl.Source(), "aps5_tess_payload[4u] =") || Has(hull.msl.Source(), "aps5_tess_payload[4u]"), "the hull program does not store the triangle's inner factor in payload word 4");
             Require(domain.msl.Reflection().outputLocations != 0u, "the domain program writes no parameter");
+            // Upstream #4727: hull input reads clamp the control point to the patch's last one.
+            Require(!Has(hull.msl.Source(), "aps5_tess_local[") || Has(hull.msl.Source(), "min(aps5_ta"), "the hull program reads control inputs without clamping the control point to the patch");
 
             struct Case {
                 std::uint32_t domain;
@@ -197,6 +199,9 @@ int main() {
                 Require(Has(linked.object.source, "[[object]] void aps5_main(") && Has(linked.mesh.source, "[[mesh]] void aps5_main("), name + ": no object or mesh function");
                 Require(!Has(linked.object.source, "[[function_constant(") && !Has(linked.mesh.source, "[[function_constant("), name + ": a linked library still declares function constants");
                 Require(linked.objectThreads == 3u && linked.meshThreads == 256u && linked.payloadBytes <= Abi::TessellationPayloadBytes, name + ": unexpected launch shape");
+                // MslAbi Version 10 (upstream #4082): inner factors at or below 1 become max(minLevel, 1),
+                // before the tessellator processes the clamped payload once.
+                Require(Has(linked.object.source, "fmax(aps5_draw.minLevel, 1.0f)") && !Has(linked.object.source, "aps5_patch.culled == 0"), name + ": the object stage does not clamp the factors as upstream's hull programs do");
                 id<MTLFunction> objectFunction = Function(metal, name + " object", linked.object.source, @{}, {});
                 id<MTLFunction> meshFunction = Function(metal, name + " mesh", linked.mesh.source, @{@(Abi::DepthNegativeOneToOneMacro): @"1"}, {});
                 std::vector<std::pair<std::uint32_t, std::uint32_t>> fragmentConstants;

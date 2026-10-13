@@ -20,7 +20,7 @@ struct Linked {
     std::shared_ptr<const ShaderRecompiler::MslTessellationPipeline> pipeline;
 };
 
-using Key = std::tuple<const void*, const void*, const void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
+using Key = std::tuple<const void*, const void*, const void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
 
 ShaderRecompiler::MslTessellationProgram Program(const Graphics::CompiledShader& stage) {
     if (stage.program == nullptr || stage.program->msl.empty()) throw std::runtime_error("Metal device: a tessellation stage has no MSL form");
@@ -36,7 +36,7 @@ std::shared_ptr<const ShaderRecompiler::MslTessellationPipeline> LinkTessellatio
     if (stages.local == nullptr || stages.hull == nullptr || stages.domain == nullptr) throw std::runtime_error("Metal device: a tessellated draw needs local, hull and domain stages");
     static std::mutex mutex;
     static std::map<Key, Linked> cache;
-    const Key key{&stages.local->program->msl.Shader(), &stages.hull->program->msl.Shader(), &stages.domain->program->msl.Shader(), config.inputControlPoints, config.outputControlPoints, config.domain, config.partitioning, config.outputTopology};
+    const Key key{&stages.local->program->msl.Shader(), &stages.hull->program->msl.Shader(), &stages.domain->program->msl.Shader(), config.inputControlPoints, config.outputControlPoints, config.domain, config.partitioning, config.outputTopology, config.patchesPerGroup};
     std::lock_guard lock(mutex);
     if (const auto found = cache.find(key); found != cache.end()) return found->second.pipeline;
     const auto local = Program(*stages.local);

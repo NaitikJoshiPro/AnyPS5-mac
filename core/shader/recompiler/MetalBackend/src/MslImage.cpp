@@ -1439,6 +1439,7 @@ void EmitSample(MslEmitterState& state, const Access& access, const ImageSampleL
         return "(" + coord.coord + " + " + (spatial == 1u ? "float2(float(" + offset + ".x), 0.0f)" : offsetF) + ")";
     };
     const bool reducible = !dref && access.image.numericClass == IrTextureNumericClass::Float && explicitLod && !HasFlag(mem, RdnaImageSampleFlagDerivative) && spatial == 2u && (image.dimension == RdnaImageDimension::Dim1D || image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim2DArray);
+    std::string expression;
     if (reducible && !foldOffset) {
         // A min/max reduction sampler (PipelineSpecialization::ReductionBase, supplied only for those).
         const auto first = PipelineSpecialization::ReductionBase + mem.sampler * PipelineSpecialization::ReductionWords;
@@ -1447,13 +1448,22 @@ void EmitSample(MslEmitterState& state, const Access& access, const ImageSampleL
         auto lod = HasFlag(mem, RdnaImageSampleFlagLod) ? AddressF32(state, access, layout.lod) : std::string("0.0f");
         if (!clamp.empty()) lod = "max(" + lod + ", " + clamp + ")";
         const auto offset2 = offset.empty() ? std::string("int2(0)") : "int2(" + offset + ".xy)";
-        state.Line("const " + type + " " + sample + " = (" + packed + " & 3u) != 0u ? aps5_reduce_sample(" + texture + ", " + sampler + ", " + coord.coord + ", " + (coord.slice.empty() ? std::string("0u") : coord.slice) + ", " + lod + ", " + offset2 + ", " + packed + ", " + filters + ") : " + call(coord.coord, offset) + ";");
+        expression = "(" + packed + " & 3u) != 0u ? aps5_reduce_sample(" + texture + ", " + sampler + ", " + coord.coord + ", " + (coord.slice.empty() ? std::string("0u") : coord.slice) + ", " + lod + ", " + offset2 + ", " + packed + ", " + filters + ") : " + call(coord.coord, offset);
     } else if (!foldOffset) {
-        state.Line("const " + type + " " + sample + " = " + call(coord.coord, offset) + ";");
+        expression = call(coord.coord, offset);
     } else {
         const auto selector = state.FunctionConstant(PipelineSpecialization::FoldOffsetBase + mem.sampler, 0u);
-        state.Line("const " + type + " " + sample + " = " + selector + " != 0u ? " + call(folded(), "") + " : " + call(coord.coord, offset) + ";");
+        expression = selector + " != 0u ? " + call(folded(), "") + " : " + call(coord.coord, offset);
     }
+    // Upstream #1418 (SpirvImageEmitter EmitSampleOp): a sampler that only samples with implicit LODs
+    // or gradients (SamplesBaseLevelIfUnnormalized) and that the binding plan proves unnormalized
+    // (function constant UnnormalizedBaseLevelBase + s, 1) samples the base level: an explicit LOD 0
+    // and no other operand, as the console's unnormalized samplers do.
+    if (!dref && SamplesBaseLevelIfUnnormalized(state.program.Info().samplers.at(mem.sampler))) {
+        const auto selector = state.FunctionConstant(PipelineSpecialization::UnnormalizedBaseLevelBase + mem.sampler, 0u);
+        expression = selector + " != 0u ? " + texture + ".sample(" + sampler + ", " + coord.coord + slice + ", level(0.0f)) : " + expression;
+    }
+    state.Line("const " + type + " " + sample + " = " + expression + ";");
     const auto result = dref ? sample : UnpackImageTexel(state, access, sample);
     state.Define(access.inst, ResultVector(state, access, result, access.image.numericClass, dref, false));
 }

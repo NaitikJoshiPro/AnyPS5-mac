@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -572,6 +573,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             clearThroughKeys = true;
         }
     }
+    if (source != nullptr && resource.dccAddress != 0 && (keys.has_value() ? *keys : scanKeys()) == DccKeys::ClearSingle) source.reset();
 
     // Otherwise a surface in host-imported memory is viewed through its cached storage image (made
     // here when there is none): its refresh after a CPU or GPU write is a GPU-direct detile from the
@@ -657,7 +659,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
-            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -837,11 +839,7 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     RequireNoMultisampleTarget(viewed.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a storage image access");
-    if (DepthSurfaceAt(viewed.baseAddress)) {
-        char text[112];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented", static_cast<unsigned long long>(viewed.baseAddress));
-        throw std::runtime_error(text);
-    }
+    if (auto depth = DepthSurfaceStorage(context, words, viewed, mip)) return depth;
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return StorageTexture::Create(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
@@ -1717,6 +1715,7 @@ void ShaderResources::noteReusable() {
     reusable = false;
     directRegions.clear();
     if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
     if (!regions.has_value()) return;
@@ -2290,13 +2289,39 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
+void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || Recorder::InCompletion()) return;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return;
+    const auto drawWriters = DrawCopiedWriters();
+    const bool labels = Recorder::PendingCompletionLabels() != 0;
+    if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return;
+    if (!recorder->PendingWriteOverlaps(address, bytes)) return;
+    const auto overlaps = [&](const auto& writers) {
+        return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
+    };
+    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+        Recorder::CountSync(4);
+        recorder->SyncThrough(address, bytes);
+    }
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    for (const auto& range : describedRanges) {
+        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
+        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
-    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
@@ -2430,11 +2455,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         return true;
     };
     if (EpochRevalidate()) {
-        if (!directRegions.empty() && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
+        if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
             auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
             regions.clear();
             for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
+            for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
@@ -2450,6 +2476,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     } else {
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
@@ -3194,7 +3221,7 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
-    if (record.texture == nullptr) return nullptr;
+    if (record.texture == nullptr || record.texture->RefreshedPerUse()) return nullptr;
     struct Outcome {
         bool profile;
         std::chrono::steady_clock::time_point start;
@@ -3233,7 +3260,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
         if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;
-    } else if (keys == DccKeys::Uncompressed && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {
+    } else if ((keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {
         return nullptr;
     }
     // The entry must still be the cache's, holding this object (an evicted object is not reused: the
@@ -3287,6 +3314,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+            CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
             std::shared_ptr<Texture> texture;
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
             if (previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
@@ -3351,6 +3380,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+        CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+        if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
@@ -3612,7 +3643,9 @@ void ShaderResources::WriteBack() {
     WriteBackBuffers();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (storageWritten[index]) storageTextures[index]->MarkDirty();
+        if (!storageWritten[index]) continue;
+        storageTextures[index]->MarkDirty();
+        static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
 }
 
@@ -3623,7 +3656,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (storageWritten[index]) storageTextures[index]->MarkDirty();
+        if (!storageWritten[index]) continue;
+        storageTextures[index]->MarkDirty();
+        static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),

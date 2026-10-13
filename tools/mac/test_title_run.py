@@ -1,0 +1,181 @@
+"""Pure-Python tests for tools/mac/title_run.py (no title, GPU or subprocess)."""
+import itertools
+import os
+import tempfile
+from pathlib import Path
+import struct
+import sys
+import unittest
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import title_run  # noqa: E402
+import buildlock  # noqa: E402
+
+
+class PadScriptTests(unittest.TestCase):
+    def test_intro_and_loop(self):
+        intro, loop = title_run.parse_pad_script(
+            "# comment\nwait 2\npress cross 300  # start\nloop\npress release 1500 128 0 128 128\nwait 0.5\n")
+        self.assertEqual(intro, [("wait", 2.0), ("press", "cross", 300, None)])
+        self.assertEqual(loop, [("press", "release", 1500, (128, 0, 128, 128)), ("wait", 0.5)])
+
+    def test_default_hold(self):
+        intro, _ = title_run.parse_pad_script("press r2\n")
+        self.assertEqual(intro, [("press", "r2", 300, None)])
+
+    def test_errors(self):
+        for text in ("press nope\n", "press cross 0\n", "press cross 6000\n", "press r2 100 1 2 3 256\n",
+                     "jump\n", "wait -1\n", "loop\nloop\n", "loop\nwait 0\n", "press r2 100 1 2\n"):
+            with self.subTest(text=text), self.assertRaises(title_run.PadScriptError):
+                title_run.parse_pad_script(text)
+
+    def test_iter_repeats_loop(self):
+        steps = list(itertools.islice(title_run.iter_pad_steps([("wait", 1.0)], [("press", "r2", 10, None)]), 4))
+        self.assertEqual(steps, [("wait", 1.0)] + [("press", "r2", 10, None)] * 3)
+
+    def test_iter_without_loop_ends(self):
+        self.assertEqual(list(title_run.iter_pad_steps([("wait", 1.0)], [])), [("wait", 1.0)])
+
+    def test_pad_line_matches_pad_input(self):
+        self.assertEqual(title_run.pad_line("cross", 300, None, 5), "5 16384 300\n")
+        self.assertEqual(title_run.pad_line("release", 900, (128, 0, 255, 128), 7), "7 0 900 128 0 255 128\n")
+
+    def test_shipped_scripts_parse(self):
+        scripts = sorted((HERE / "pads").glob("*.txt"))
+        self.assertTrue(scripts)
+        for script in scripts:
+            with self.subTest(script=script.name):
+                intro, loop = title_run.parse_pad_script(script.read_text())
+                self.assertTrue(intro or loop)
+
+
+class ProcessTests(unittest.TestCase):
+    PS = """  1     0 /sbin/launchd
+  100     1 /usr/bin/python3
+  101   100 /usr/bin/perl
+  102   101 /Users/x/build-metal/core/fex/aps5-fex
+  200     1 /other/aps5-fex
+"""
+
+    def test_find_descendant(self):
+        table = title_run.parse_ps_table(self.PS)
+        self.assertEqual(table[102], (101, "/Users/x/build-metal/core/fex/aps5-fex"))
+        self.assertEqual(title_run.find_descendant(table, 100, "aps5-fex"), 102)
+        self.assertIsNone(title_run.find_descendant(table, 101 + 1000, "aps5-fex"))
+
+    def test_cputime(self):
+        self.assertAlmostEqual(title_run.parse_cputime("1:02.50"), 62.5)
+        self.assertAlmostEqual(title_run.parse_cputime("1:00:01.00"), 3601.0)
+        self.assertAlmostEqual(title_run.parse_cputime("2-00:00:00.00"), 172800.0)
+
+    def test_sample_and_translation_flag(self):
+        rss, cpu, flags = title_run.parse_sample("  524288   3:10.25     4004")
+        self.assertEqual((rss, cpu, flags), (524288, 190.25, 0x4004))
+        self.assertFalse(title_run.is_translated(flags))
+        self.assertTrue(title_run.is_translated(0x24004))
+        self.assertIsNone(title_run.parse_sample("garbage"))
+
+    def test_leak_slope(self):
+        flat = [(t, 1000) for t in range(0, 600, 30)]
+        self.assertEqual(title_run.leak_slope_mib_per_min(flat), 0.0)
+        growing = [(t, 1024 * t / 60) for t in range(0, 600, 30)]  # 1 MiB per minute
+        self.assertAlmostEqual(title_run.leak_slope_mib_per_min(growing), 1.0)
+        self.assertEqual(title_run.leak_slope_mib_per_min([(0, 5)]), 0.0)
+
+    def test_run_verdict(self):
+        self.assertEqual(title_run.run_verdict(242), "alive")
+        self.assertEqual(title_run.run_verdict(142), "alive")
+        self.assertEqual(title_run.run_verdict(0), "exited")
+        self.assertEqual(title_run.run_verdict(1), "failed")
+        self.assertEqual(title_run.run_verdict(-11), "failed")
+
+
+class NativeProofTests(unittest.TestCase):
+    VMMAP = """Process:         aps5-fex [4242]
+Path:            /Users/x/build-metal/core/fex/aps5-fex
+Code Type:       ARM64
+__TEXT                      100000000-100400000    [ 4096K  4096K     0K     0K] r-x/r-x SM=COW          /Users/x/build-metal/core/fex/aps5-fex
+__TEXT                      101000000-101100000    [ 1024K  1024K     0K     0K] r-x/r-x SM=COW          /Users/x/libs/libSceAgcDriver.dylib
+__TEXT                      101000000-101100000    [ 1024K  1024K     0K     0K] r-x/r-x SM=COW          /Users/x/libs/libSceAgcDriver.dylib
+MALLOC_SMALL                600000000-600800000    [ 8192K   512K   512K     0K] rw-/rwx SM=PRV
+"""
+
+    def test_images_and_code_type(self):
+        self.assertEqual(title_run.vmmap_images(self.VMMAP),
+                         ["/Users/x/build-metal/core/fex/aps5-fex", "/Users/x/libs/libSceAgcDriver.dylib"])
+        self.assertEqual(title_run.vmmap_code_type(self.VMMAP), "ARM64")
+        self.assertEqual(title_run.vmmap_x86_findings(self.VMMAP), [])
+
+    def test_rosetta_found(self):
+        text = self.VMMAP + "__TEXT  7ff000-7ff100 [ 1K ] r-x/r-x SM=COW  /Library/Apple/usr/libexec/oah/libRosettaRuntime\n"
+        self.assertEqual(len(title_run.vmmap_x86_findings(text)), 1)
+        self.assertEqual(title_run.vmmap_code_type("Code Type: X86-64 (translated)\n"), "X86-64 (translated)")
+
+    def test_baseline_stub_is_not_rosetta(self):
+        stub = "__TEXT   2b756a000-2b7571000 [ 28K 12K 0K 0K] r-x/r-x SM=COW          /usr/lib/libRosetta.dylib"
+        runtime = "__TEXT   7ff000-7ff100 [ 1K ] r-x/r-x SM=COW  /Library/Apple/usr/libexec/oah/libRosettaRuntime"
+        new, baseline = title_run.split_findings([stub, runtime], stub + "\n" + runtime + "\n")
+        self.assertEqual((new, baseline), ([runtime], [stub]))
+        new, baseline = title_run.split_findings([stub], "")
+        self.assertEqual((new, baseline), ([stub], []))
+
+    def test_file_verdict(self):
+        self.assertEqual(title_run.file_verdict("Mach-O 64-bit executable arm64"), "arm64")
+        self.assertEqual(title_run.file_verdict("Mach-O universal binary with 2 architectures: [x86_64] [arm64]"), "universal")
+        self.assertEqual(title_run.file_verdict("Mach-O 64-bit executable x86_64"), "x86")
+        self.assertEqual(title_run.file_verdict("ELF 64-bit LSB executable, x86-64"), "other")
+        self.assertEqual(title_run.file_verdict("data"), "other")
+
+
+class EnvAndAudioTests(unittest.TestCase):
+    def test_env_headless(self):
+        env = title_run.build_env({"A": "1"}, windowed=False, frames=6, every=30, validation=True,
+                                  pad_file=Path("/r/pad"), audio_file=Path("/r/a.raw"))
+        self.assertEqual(env["SDL_VIDEODRIVER"], "offscreen")
+        self.assertEqual((env["APS5_DUMP_FRAMES"], env["APS5_DUMP_FRAMES_EVERY"]), ("6", "30"))
+        self.assertEqual((env["MTL_DEBUG_LAYER"], env["MTL_SHADER_VALIDATION"]), ("1", "1"))
+        self.assertEqual(env["APS5_PAD_INPUT_FILE"], "/r/pad")
+        self.assertEqual((env["SDL_AUDIODRIVER"], env["SDL_DISKAUDIOFILE"]), ("disk", "/r/a.raw"))
+        self.assertEqual(env["A"], "1")
+
+    def test_env_windowed_plain(self):
+        env = title_run.build_env({"SDL_VIDEODRIVER": "cocoa"}, windowed=True, frames=0, every=1,
+                                  validation=False, pad_file=None, audio_file=None)
+        self.assertEqual(env["SDL_VIDEODRIVER"], "cocoa")
+        for key in ("MTL_DEBUG_LAYER", "APS5_PAD_INPUT_FILE", "SDL_AUDIODRIVER"):
+            self.assertNotIn(key, env)
+
+    def test_load(self):
+        self.assertTrue(title_run.load_ok(5.9, 6))
+        self.assertFalse(title_run.load_ok(6.0, 6))
+
+    def test_pcm_windows(self):
+        silence = struct.pack("<4h", 0, 0, 0, 0)
+        loud = struct.pack("<4h", 16384, -16384, 16384, -16384)
+        rms = title_run.pcm_windows(silence + loud, "s16", 2, 2, 1.0)
+        self.assertEqual(len(rms), 2)
+        self.assertEqual(rms[0], 0.0)
+        self.assertAlmostEqual(rms[1], 0.5)
+        f32 = struct.pack("<2f", 0.25, -0.25)
+        self.assertAlmostEqual(title_run.pcm_windows(f32, "f32", 2, 1, 1.0)[0], 0.25)
+
+
+class GpuLockTests(unittest.TestCase):
+    def test_cmd_run_holds_the_gpu_lock_for_the_whole_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "locks", "gpu.lock")
+            seen = []
+            args = mock.Mock(id="T1", tag="x")
+            with mock.patch.dict(os.environ, {buildlock.GPU_LOCK_ENV: path}), \
+                    mock.patch.object(title_run, "run_locked", lambda a: seen.append(buildlock.read_gpu_holder(path)) or 7):
+                os.environ.pop(buildlock.GPU_HELD_ENV, None)
+                self.assertEqual(title_run.cmd_run(args), 7)
+                self.assertIsNone(buildlock.read_gpu_holder(path))
+            self.assertEqual(seen[0]["pid"], os.getpid())
+            self.assertIn("title_run T1", seen[0]["command"])
+
+
+if __name__ == "__main__":
+    unittest.main()

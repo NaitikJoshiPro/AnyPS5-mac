@@ -6,14 +6,24 @@
 // no Metal counterpart here and the work package that owns its port; listed checks are not run. `--probe` runs every
 // upstream check in its own process and prints which pass: the owner of a twin that breaks a check moves it to
 // MetalTwins or VulkanOnly with a reason, or ports it.
-// Flag modes: --descriptor-layout-flags (agc_compute_descriptor_layout_flags) runs the Metal twin of
+// Flag modes: --covered-centroid-state (agc_driver_covered_centroid_state) runs upstream's multisampleTests;
+// --descriptor-layout-flags (agc_compute_descriptor_layout_flags) runs the Metal twin of
 // descriptorLayoutFlagTests; --descriptor-pool-reset-failure (agc_descriptor_pool_reset_failure) skips: Metal
-// descriptor pools are tokens whose reset cannot fail (TechnicalDebt metal-vulkan-internal-tests).
+// descriptor pools are tokens whose reset cannot fail (TechnicalDebt metal-vulkan-internal-tests);
+// --sparse-buffer-holes (agc_sparse_buffer_holes) runs upstream's RunSparseBufferHoleTests over the Metal device's
+// Context, reading the copied bytes through the MTLBuffer the descriptor names.
 
 #define main AgcDriverGraphicsVulkanMain
 #include "../../../tests/Graphics.cpp"
 #undef main
 
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include "MetalTestDevice.h"
+#include "../src/MetalImages.h"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <sys/wait.h>
 #include <set>
 #include <unistd.h>
@@ -65,6 +75,7 @@ std::vector<Check> Checks() {
         {"drawValidation", DrawValidationChecks},
         {"RunGuestLeaseWaitTests", RunGuestLeaseWaitTests},
         {"stateTests", stateTests},
+        {"pipelineLibrarySetTests", pipelineLibrarySetTests},
         {"hdrComponentSwapTests", hdrComponentSwapTests},
         {"depthMaintenanceTests", depthMaintenanceTests},
         {"hardwareScreenOffsetTests", hardwareScreenOffsetTests},
@@ -73,17 +84,22 @@ std::vector<Check> Checks() {
         {"DepthStencilTests", DepthStencilTests},
         {"OneDimensionalColorTests", OneDimensionalColorTests},
         {"htileDepthClearTests", htileDepthClearTests},
+        {"memoryValueFillTests", memoryValueFillTests},
         {"ZExportTests", ZExportTests},
         {"unorm10_11_11TargetTests", unorm10_11_11TargetTests},
         {"DepthBoundsBiasTests", DepthBoundsBiasTests},
         {"conservativeZExportTests", conservativeZExportTests},
+        {"earlyFragmentTestsTests", earlyFragmentTestsTests},
         {"orderedPixelShaderTests", orderedPixelShaderTests},
         {"stencilRefExportTests", stencilRefExportTests},
+        {"aliasedBufferViewTests", aliasedBufferViewTests},
+        {"LineStripTests", LineStripTests},
         {"ProvokingVertexTests", ProvokingVertexTests},
         {"ProvokingVertexRenderPassTests", ProvokingVertexRenderPassTests},
         {"ConservativeRasterizationTests", ConservativeRasterizationTests},
         {"DisabledColorTests", DisabledColorTests},
         {"OpaqueDestinationAlphaTests", OpaqueDestinationAlphaTests},
+        {"Color1555TargetTests", Color1555TargetTests},
         {"CompactedExportTests", CompactedExportTests},
         {"ReversedComponentOrderTests", ReversedComponentOrderTests},
         {"ShadersWriteMemoryTests", ShadersWriteMemoryTests},
@@ -94,6 +110,8 @@ std::vector<Check> Checks() {
         {"uint8x4TargetTests", uint8x4TargetTests},
         {"multisampleTests", multisampleTests},
         {"MsaaEnableSingleSampleTests", MsaaEnableSingleSampleTests},
+        {"clipDistanceTests", clipDistanceTests},
+        {"framebufferLayerTests", framebufferLayerTests},
         {"ShaderStageTests", ShaderStageTests},
         {"NggVertexWorkgroupTests", NggVertexWorkgroupTests},
         {"TuningFieldTests", TuningFieldTests},
@@ -131,6 +149,7 @@ std::vector<Check> Checks() {
         {"rectListTests", rectListTests},
         {"floatControlsModeTests", floatControlsModeTests},
         {"barycentricEmulationTests", barycentricEmulationTests},
+        {"copiedWriterIndirectOverlapTests", copiedWriterIndirectOverlapTests},
         {"RunGuestAllocationTests", RunGuestAllocationTests},
         {"RunUnmappedGapTests", RunUnmappedGapTests},
         {"RunColorTargetLayoutTests", RunColorTargetLayoutTests},
@@ -249,6 +268,177 @@ void MetalDescriptorLayoutFlagTests() {
     }
 }
 
+// The Metal test device with the image cache attached as device creation attaches it, and the Context limits the
+// device's setup gives (MetalDevice.mm), for the twins below that need guest memory on a real Metal device.
+class MetalGraphicsDevice {
+public:
+    MetalGraphicsDevice() : cache(test.device, test.queue) {
+        auto& limits = test.context.limits;
+        const auto bufferLength = static_cast<std::uint64_t>(test.device.maxBufferLength);
+        limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
+        limits.maxUniformBufferRange = limits.maxStorageBufferRange;
+        limits.minStorageBufferOffsetAlignment = 4u;
+        limits.nonCoherentAtomSize = 1u;
+        limits.maxBoundDescriptorSets = 4u;
+        limits.maxPerStageDescriptorStorageBuffers = 16;
+        limits.maxPerStageResources = 128;
+        limits.maxDescriptorSetStorageBuffers = 32;
+        test.context.nullDescriptors = true;
+    }
+    // Attaches the image cache once the test has set its Context fields; the Context it returns is the one
+    // image and buffer builds use.
+    const AgcDriver::Graphics::Context& Attach(const std::function<void(AgcDriver::Graphics::Context&)>& adjust = {}) {
+        if (adjust) adjust(test.context);
+        cache.Attach(test.context);
+        return *cache.ImageContext();
+    }
+
+private:
+    AgcDriver::Graphics::MetalTest::Device test;
+    AgcDriver::Graphics::Metal::ImageCache cache;
+};
+
+// copiedWriterIndirectOverlapTests on Metal (upstream 0f2683cb7): the same guest blocks and checks over the Metal
+// device's Context instead of MockVulkan's; the copied region is staged in a Metal buffer, the registered one is
+// a Metal host import (no-copy buffer over its 16 KiB pages).
+void MetalCopiedWriterIndirectOverlapTests() {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::Graphics;
+    constexpr std::size_t half = 65536;
+    void* directBlock = ::operator new(half, std::align_val_t{half});
+    std::memset(directBlock, 0xaa, half);
+    const auto directAddress = reinterpret_cast<std::uintptr_t>(directBlock);
+    void* copiedBlock = ::operator new(half, std::align_val_t{half});
+    std::memset(copiedBlock, 0xbb, half);
+    const auto copiedAddress = reinterpret_cast<std::uintptr_t>(copiedBlock);
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, directBlock, half, true, true, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    {
+        MetalGraphicsDevice device;
+        const auto& context = device.Attach([](Context& context) {
+            context.hostImportAlignment = half;
+            context.limits.minStorageBufferOffsetAlignment = 16;
+            context.limits.maxStorageBufferRange = 1u << 27;
+        });
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        {
+            GuestBufferMemory memory(context);
+            memory.AcquireRegistered();
+            Require(HostImportCovers(context, directAddress, half), "direct registered range must be covered by host import");
+            Require(!HostImportCovers(context, copiedAddress, half), "copied unregistered range must NOT be covered by host import");
+            memory.AddWritable(copiedAddress, 1024);
+            memory.AddWritable(directAddress, 1024);
+            memory.Upload(false);
+            Require(memory.HasCopiedWrites(), "writer with one copied region must report HasCopiedWrites() == true");
+            Require(memory.WritesOverlap(directAddress, 16), "WritesOverlap must return true for direct written region");
+            Require(memory.WritesOverlap(copiedAddress, 16), "WritesOverlap must return true for copied written region");
+            Require(!memory.WritesOverlap(directAddress + 2048, 16), "WritesOverlap must return false for unwritten range");
+            Require(!memory.CopiedWritesOverlap(directAddress, 16), "CopiedWritesOverlap must return false for direct written region");
+            Require(memory.CopiedWritesOverlap(copiedAddress, 16), "CopiedWritesOverlap must return true for copied written region");
+            Require(!memory.CopiedWritesOverlap(directAddress + 2048, 16), "CopiedWritesOverlap must return false for unwritten range");
+            memory.WriteBack();
+        }
+        {
+            RecompileResult shader;
+            shader.runtimeAbiVersion = RuntimeAbi::Version;
+            auto copiedBinding = makeBinding(Role::GuestBuffers, 0, 1, vsharp(copiedBlock, 1024));
+            copiedBinding.bufferWritten = {true};
+            auto directBinding = makeBinding(Role::GuestBuffers, 1, 1, vsharp(directBlock, 1024));
+            directBinding.bufferWritten = {true};
+            shader.bindings = {copiedBinding, directBinding};
+            CompiledShader compiled{ShaderStage::Compute, &shader, 0};
+            auto writer = std::make_shared<ShaderResources>(context, compiled);
+            Require(writer->HasCopiedWrites(), "ShaderResources with copied region must report HasCopiedWrites() == true");
+            Require(writer->WritesOverlap(directAddress, 16), "ShaderResources must report WritesOverlap for direct region");
+            Require(!writer->CopiedWritesOverlap(directAddress, 16), "ShaderResources must NOT report CopiedWritesOverlap for direct region");
+            Require(writer->CopiedWritesOverlap(copiedAddress, 16), "ShaderResources must report CopiedWritesOverlap for copied region");
+            auto copiedWriters = DrawCopiedWriters();
+            copiedWriters->push_back(writer);
+            const bool mainOverlaps = std::any_of(copiedWriters->begin(), copiedWriters->end(), [&](const auto& w) { return w->WritesOverlap(directAddress, 16); });
+            const bool prOverlaps = std::any_of(copiedWriters->begin(), copiedWriters->end(), [&](const auto& w) { return w->CopiedWritesOverlap(directAddress, 16); });
+            Require(mainOverlaps, "main's check (WritesOverlap) must flag an overlap over direct arguments");
+            Require(!prOverlaps, "PR's check (CopiedWritesOverlap) must disambiguate and NOT flag an overlap over direct arguments");
+            Require(std::any_of(copiedWriters->begin(), copiedWriters->end(), [&](const auto& w) { return w->CopiedWritesOverlap(copiedAddress, 16); }), "PR's check must flag an overlap over copied arguments");
+            copiedWriters->erase(std::remove(copiedWriters->begin(), copiedWriters->end(), writer), copiedWriters->end());
+            writer->WriteBack();
+        }
+        ClearHostImports(context.device);
+    }
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, directBlock);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    ::operator delete(directBlock, std::align_val_t{half});
+    ::operator delete(copiedBlock, std::align_val_t{half});
+}
+
+// agc_sparse_buffer_holes on Metal: upstream's RunSparseBufferHoleTests (tests/BdaResources.cpp) over the Metal
+// device's Context; the bytes of a copy are the contents of the shared MTLBuffer its descriptor names.
+int MetalSparseBufferHoles() {
+    bool passed = false;
+    @autoreleasepool {
+        MetalGraphicsDevice device;
+        const auto& context = device.Attach([](AgcDriver::Graphics::Context& context) { context.limits.maxStorageBufferRange = 1u << 27; });
+        passed = RunSparseBufferHoleTests(context, {
+            [](VkBuffer buffer) -> std::span<std::byte> {
+                const id<MTLBuffer> metal = AgcDriver::Graphics::Metal::BufferOf(buffer);
+                Require(metal != nil && metal.contents != nullptr, "a sparse buffer copy is not a CPU-visible Metal buffer");
+                return {static_cast<std::byte*>(metal.contents), static_cast<std::size_t>(metal.length)};
+            },
+            {}, {}, {}, {}
+        });
+    }
+    std::cout << "sparse buffer hole tests " << (passed ? "passed" : "failed") << '\n';
+    return passed ? 0 : 1;
+}
+
+// earlyFragmentTestsTests on Metal (upstream fdefd7660): the MSL fragment function carries
+// [[early_fragment_tests]] (reflection earlyFragmentTests) for the same DB_SHADER_CONTROL values that
+// declare EarlyFragmentTests in SPIR-V, except that Metal refuses the attribute on a function returning
+// [[depth]], so DEPTH_BEFORE_SHADER with Z_EXPORT_ENABLE keeps late tests (TechnicalDebt
+// metal-early-depth-export). Each request is also checked after a serializer round trip.
+// upstream's depthExportRequest builds a SPIR-V target; the twin compiles the same request for MSL.
+bool MetalDeclaresEarlyFragmentTests(ShaderRecompiler::RecompileRequest request) {
+    request.target.backend = ShaderRecompiler::ShaderBackend::Msl;
+    const auto result = ShaderRecompiler::Recompile(request);
+    Require(!result.msl.empty(), "the depth-export pixel program produced no MSL");
+    const bool reflected = result.msl.Reflection().earlyFragmentTests;
+    const bool attributed = std::string(result.msl.Source()).find("[[early_fragment_tests]]") != std::string::npos;
+    Require(reflected == attributed, "the MSL reflection and the stage function disagree on early fragment tests");
+    return reflected;
+}
+
+void MetalEarlyFragmentTestsTests() {
+    const std::array<std::pair<std::uint32_t, bool>, 9> cases{{
+        {0x0000u, false},
+        {0x0020u, false},
+        {0x0010u, true},
+        {0x0030u, true},
+        {0x0050u, false},
+        {0x0011u, false},
+        {0x1000u, true},
+        {0x1050u, true},
+        {0x1031u, false},  // upstream: true; Z_EXPORT_ENABLE keeps late tests on Metal
+    }};
+    const ShaderRecompiler::RequestSerializer serializer;
+    for (const auto& [shaderControl, expected] : cases) {
+        const auto request = depthExportRequest(shaderControl);
+        const auto replayed = serializer.Deserialize(serializer.Serialize(request));
+        Require(MetalDeclaresEarlyFragmentTests(request) == expected && MetalDeclaresEarlyFragmentTests(replayed.request) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + (expected ? " did not declare" : " declared") + " early fragment tests");
+    }
+    Require(depthExportRequest(0x1031u).context.pixel->earlyZ, "DEPTH_BEFORE_SHADER with a depth export did not decode early tests (only the Metal stage function keeps them late)");
+    for (const auto shaderControl : {0x0010u, 0x1000u}) {
+        auto request = depthExportRequest(shaderControl);
+        request.context.pixel->alphaToCoverage = true;
+        const auto replayed = serializer.Deserialize(serializer.Serialize(request));
+        Require(!MetalDeclaresEarlyFragmentTests(request) && !MetalDeclaresEarlyFragmentTests(replayed.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with alpha-to-coverage declared early fragment tests");
+    }
+}
+
 struct Twin {
     const char* name;
     const char* what;
@@ -259,6 +449,8 @@ struct Twin {
 const std::vector<Twin> MetalTwins{
     {"descriptorPoolTests", "pools never exhaust, one chain pool is recycled", MetalDescriptorPoolTests},
     {"descriptorCacheTests", "dedicated pools for oversized sets, per-set limits", MetalDescriptorCacheTests},
+    {"copiedWriterIndirectOverlapTests", "copied vs direct written ranges over a Metal host import", MetalCopiedWriterIndirectOverlapTests},
+    {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export", MetalEarlyFragmentTestsTests},
 };
 
 const Twin* TwinOf(const std::string& name) {
@@ -278,6 +470,7 @@ const std::vector<std::pair<std::string, std::string>> VulkanOnly{
     {"RunBdaResourceTests", "BDA buffers and descriptors on MockVulkan: D3 (BdaResources twin)"},
     {"RunDepthSurfaceReuseTests", "depth surface copies recorded into Vulkan command batches: D6 (DepthSurface twin), D2"},
     {"RunTextureDetilerTests", "detile dispatch descriptors on MockVulkan: D4 (TextureDetiler twin)"},
+    {"pipelineLibrarySetTests", "graphics pipeline library layouts through MockVulkan: Metal has no pipeline libraries (TechnicalDebt metal-graphics-pipeline-libraries)"},
     {"RunGuestSamplerResourceTests", "checks the VkSamplerCreateInfo chain through a captured vkCreateSampler (Context.deviceProc); Sampler.mm builds MTLSamplerDescriptors instead, checked by agc_metal_sampler_reduction and agc_metal_images: D5"},
 };
 
@@ -330,15 +523,35 @@ int main(int argc, char** argv) {
         std::cout << "Descriptor layout cache and exported binding flags passed on Metal\n";
         return 0;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
+        setenv("APS5_PIN_WAIT_MS", "200", 1);
+        setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
+        try {
+            return MetalSparseBufferHoles();
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
         std::cout << "skipped, the device has no Vulkan descriptor pools: Metal descriptor pools are tokens whose reset cannot fail, so the termination on a failed reset is unreachable\n";
         return 77;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--covered-centroid-state") {
+        // agc_driver_covered_centroid_state (upstream fdefd7660): register decoding only, as upstream.
+        const auto error = Run({"multisampleTests", multisampleTests});
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cout << "Covered-centroid and multisample state checks passed\n";
+        return 0;
     }
     setenv("APS5_PIN_WAIT_MS", "200", 1);
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
     if (argc == 2 && std::string_view(argv[1]) == "--probe") return Probe();
     if (argc != 1) {
-        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure]\n";
+        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state]\n";
         return 2;
     }
     std::size_t ran = 0;

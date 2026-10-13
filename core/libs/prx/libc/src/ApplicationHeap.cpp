@@ -77,8 +77,40 @@ TValue read(const void* pointer, std::size_t offset) {
     return value;
 }
 
+// The libc replacement table in the process parameters, or null when the title has none.
+const void* replacementTable(const void* processParameters) {
+    if (processParameters == nullptr || read<std::uint64_t>(processParameters, 0) < 0x40 || read<std::uint32_t>(processParameters, 8) != 0x4942524f) return nullptr;
+    const auto* libcParameters = read<const void*>(processParameters, 0x38);
+    if (libcParameters == nullptr || read<std::uint64_t>(libcParameters, 0) < 0x38) return nullptr;
+    return read<const void*>(libcParameters, 0x30);
+}
+
+// malloc before _init_env: titles built without Sony's crt (the oops-sdk's SuperTuxKart) never call
+// _init_env, and libSceLibcInternal's malloc still works for them on the console. The first heap call
+// then sets the heap up as _init_env would: the title's replacement table when its process parameters
+// carry one, the default heap otherwise.
+void ensureRegistered() {
+    {
+        std::lock_guard lock(heapMutex);
+        if (heapApi[0] != nullptr || heapFailure || heapFinalized) return;
+    }
+    const void* processParameters = nullptr;
+    try {
+        processParameters = ApplicationProcessParameters_nid_no_patch();
+    } catch (const std::runtime_error&) {
+        processParameters = nullptr;
+    }
+    if (replacementTable(processParameters) != nullptr) {
+        ApplicationHeapInitialize_nid_no_patch(processParameters);
+        return;
+    }
+    std::lock_guard lock(heapMutex);
+    if (heapApi[0] == nullptr && !heapFailure && !heapFinalized) heapApi = defaultApi();
+}
+
 template<typename TCallback>
 TCallback callback(std::size_t index) {
+    ensureRegistered();
     std::lock_guard lock(heapMutex);
     if (heapFailure) std::rethrow_exception(heapFailure);
     if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
@@ -196,6 +228,7 @@ void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes
 }
 
 void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std::size_t alignment) {
+    ensureRegistered();
     if (bytes == 0) {
         ApplicationHeapFree_nid_no_patch(pointer);
         return nullptr;

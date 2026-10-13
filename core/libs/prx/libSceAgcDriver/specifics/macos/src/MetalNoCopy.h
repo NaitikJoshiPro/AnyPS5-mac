@@ -20,6 +20,12 @@
 #include <vector>
 
 namespace AgcDriver::Metal {
+// Test seam (specifics/macos/tests/HostImportRetireTwin.mm, the Metal twin of tests/HostImportRetireHold.cpp,
+// whose MockVulkan counts vkDestroyBuffer): while set, the probe is told each host import's buffer handle (the
+// VkBuffer the import carries) as the import is destroyed, before its no-copy MTLBuffer is released. One probe at
+// a time; nullptr clears it. GuestBufferMemory.mm defines it.
+using ImportReleaseProbe = void (*)(const void* buffer);
+void SetImportReleaseProbe(ImportReleaseProbe probe);
 
 inline id<MTLBuffer> NewNoCopyBuffer(id<MTLDevice> device, std::uint64_t begin, std::uint64_t bytes, MTLResourceOptions options) {
     const auto end = begin + bytes;

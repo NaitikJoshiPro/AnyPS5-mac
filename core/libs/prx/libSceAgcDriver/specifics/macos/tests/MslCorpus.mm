@@ -239,6 +239,16 @@ private:
         MTL4LibraryDescriptor* libraryDescriptor = [MTL4LibraryDescriptor new];
         libraryDescriptor.source = [NSString stringWithUTF8String:shader.source.c_str()];
         libraryDescriptor.options = options;
+        // A vertex function that writes cull distances (MslAbi Version 10) compiles only for the draws
+        // MetalDraw.mm can emulate them in: as the driver does for triangle topologies, compile it as a
+        // triangle-vertices draw (TriangleVerticesMacro).
+        if (shader.reflection.stage == ShaderRecompiler::MslAbi::Stage::Vertex && shader.reflection.cullDistances != 0u) {
+            MTLCompileOptions* cull = [options copy];
+            NSMutableDictionary* macros = [NSMutableDictionary dictionaryWithDictionary:cull.preprocessorMacros ?: @{}];
+            macros[@(ShaderRecompiler::MslAbi::TriangleVerticesMacro)] = @"1";
+            cull.preprocessorMacros = macros;
+            libraryDescriptor.options = cull;
+        }
         NSError* error = nil;
         id<MTLLibrary> library = [compiler newLibraryWithDescriptor:libraryDescriptor error:&error];
         if (library == nil) {

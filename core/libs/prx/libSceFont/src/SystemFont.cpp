@@ -6,6 +6,8 @@
 #include <system_error>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 
 #include "prx/libSceFont/include/FontInternal.hpp"

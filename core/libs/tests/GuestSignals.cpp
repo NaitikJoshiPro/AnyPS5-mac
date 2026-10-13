@@ -14,6 +14,7 @@ int APS5_VABI raise_nid_postfix(int);
 int APS5_VABI pthread_kill_nid_postfix(void*, int);
 void* APS5_VABI scePthreadSelf();
 int APS5_VABI sigaction_nid_postfix(int, const void*, void*);
+int APS5_VABI _sigaction_nid_postfix(int, const void*, void*);
 int APS5_VABI sigprocmask_nid_postfix(int, const void*, void*);
 int APS5_VABI pthread_sigmask_nid_postfix(int, const void*, void*);
 int* APS5_VABI __error_nid_postfix();
@@ -61,10 +62,8 @@ int main() {
     Require(pthread_kill_nid_postfix(nullptr, 15) == 3);
     Require(pthread_kill_nid_postfix(nullptr, 128) == 3);
     Require(pthread_kill_nid_postfix(nullptr, 129) == 22);
-    bool threw = false;
-    try { pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15); }
-    catch (const std::runtime_error&) { threw = true; }
-    Require(threw && received == 0);
+    Require(pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15) == 3);
+    Require(received == 0);
     Require(signal_nid_postfix(15, ignore) != invalid);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 0);
@@ -102,6 +101,8 @@ int main() {
     Require(raise_nid_postfix(15) == 0 && received == 15);
     Require(sigaction_nid_postfix(15, nullptr, &current) == 0);
     Require(Same(current, term));
+    GuestSigaction aliased{};
+    Require(_sigaction_nid_postfix(15, nullptr, &aliased) == 0 && Same(aliased, term)); // the FreeBSD libc name
     const GuestSigaction defaults{0, 0, {}};
     Require(sigaction_nid_postfix(15, &defaults, nullptr) == 0);
     Require(signal_nid_postfix(15, Callback) == nullptr);

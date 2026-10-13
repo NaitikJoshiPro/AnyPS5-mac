@@ -363,7 +363,9 @@ def run_test(build, name, timeout, junit, log, environment):
     command = ["ctest", "--test-dir", str(build), "-j1", "--timeout", str(timeout), "-R", "^" + re.escape(name) + "$",
                "--output-junit", str(junit), "--no-tests=error"]
     lock_path = Path(build) / ".aps5-build.lock"
-    with open(lock_path, "a+") as lock, open(log, "w", encoding="utf-8") as stream:
+    # GPU lock first (machine-wide, per test), then the per-build lock: the same order everywhere.
+    with buildlock.gpu_lock(label=f"gpu_suite test {name} ({build})", out=sys.stdout), \
+            open(lock_path, "a+") as lock, open(log, "w", encoding="utf-8") as stream:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

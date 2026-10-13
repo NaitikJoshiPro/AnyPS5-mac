@@ -495,7 +495,7 @@ bool Texture::CanDepthCopyFrom(const StorageTexture& source, const GuestTextureR
     return geometry.imageDepth == 1 && source.ImageDepth() == 1 && source.ImageLayers() >= geometry.imageLayers && source.Descriptor().mipCount >= descriptor.mipCount;
 }
 
-Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), depthCopy(true) {
+Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), perUseCopy(PerUseCopy::RefreshedOnReuse) {
     try {
         Require(source != nullptr && CanDepthCopyFrom(*source, descriptor), "storage image cannot serve a depth copy of the sampled texture");
         const auto colorFormat = ResolveTextureFormat(descriptor.format);
@@ -555,7 +555,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 }
 
 bool Texture::RefreshDepthCopy() {
-    if (!depthCopy || storageSource == nullptr) return false;
+    if (perUseCopy != PerUseCopy::RefreshedOnReuse || storageSource == nullptr) return false;
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;
     std::uint64_t linearBytes = 0;
     for (std::uint32_t level = 0; level < copyLevels; ++level) linearBytes += static_cast<std::uint64_t>(std::max(copyWidth >> level, 1u)) * std::max(copyHeight >> level, 1u) * copyElementBytes * copyLayers;
@@ -680,24 +680,39 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {aspect, 0, 1, 0, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
     // Multisampled images (MultisampleSampledTexture, guest MSAA T#s): MSL reads them as
     // texture2d_ms_array (MslAbi Version 9), every slice of an emulated sample count; their storage
     // shadows (MultisampleStorageTexture) as texture2d_array of every sample (DECISIONS D22, D28).
-    if (id<MTLTexture> texture = Metal::TextureOfImage(depthImage); texture != nil && (texture.sampleCount > 1u || texture.textureType == MTLTextureType2DArray)) {
+    // A caller that names an array or cube view (upstream 086f7d509, depth planes sampled as 2D
+    // arrays and cubes) keeps it.
+    if (id<MTLTexture> texture = Metal::TextureOfImage(depthImage); viewType == VK_IMAGE_VIEW_TYPE_2D && texture != nil && (texture.sampleCount > 1u || texture.textureType == MTLTextureType2DArray)) {
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        viewInfo.subresourceRange.layerCount = static_cast<std::uint32_t>(texture.arrayLength);
+    }
+    if (viewInfo.subresourceRange.layerCount == VK_REMAINING_ARRAY_LAYERS) {
+        id<MTLTexture> texture = Metal::TextureOfImage(depthImage);
+        Require(texture != nil, "depth plane view of a null image");
         viewInfo.subresourceRange.layerCount = static_cast<std::uint32_t>(texture.arrayLength);
     }
     Check(Metal::Vk::CreateImageView(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
+    // Upstream 90d899d98: a 2D-array view of the depth planes also has a first-slice view (shaders
+    // that declare a 2D image read layer 0). Not for the multisampled upgrade above, whose readers
+    // always take the array.
+    if (viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.subresourceRange.layerCount = 1;
+    Check(Metal::Vk::CreateImageView(context.device, &viewInfo, nullptr, &firstLayerView), "vkCreateImageView depth plane first layer");
+    firstLayerRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
 
 Texture::~Texture() {
@@ -824,6 +839,17 @@ VkFormat StorageFormatFor(const Context& context, VkFormat format) {
     return storage;
 }
 
+// The format of a resident image's own texture. Metal's packed 16-bit formats (B5G6R5Unorm,
+// BGR5A1Unorm) cannot be shader-written, so images of R5G6B5 and A1R5G5B5 surfaces are R16Uint
+// textures holding the guest bits unchanged (uploads, write-backs and clears move raw 16-bit
+// elements) and render through a view in the target's format (MTLTextureUsagePixelFormatView,
+// AttachmentView). Guest storage bindings of these formats still ask StorageFormatFor and throw:
+// a shader store would need the unorm packing done in the shader.
+VkFormat ImageFormatFor(const Context& context, VkFormat format) {
+    if (StorageFormatOrUndefined(context, format) == VK_FORMAT_UNDEFINED && (format == VK_FORMAT_A1R5G5B5_UNORM_PACK16 || format == VK_FORMAT_R5G6B5_UNORM_PACK16)) return VK_FORMAT_R16_UINT;
+    return StorageFormatFor(context, format);
+}
+
 }
 
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat) {
@@ -835,7 +861,6 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat) {
     }
 }
 
-// Integer formats take integer clear values; the DCC clear codes are only mapped for the others.
 bool IntegerFormat(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
@@ -850,9 +875,12 @@ bool IntegerFormat(VkFormat format) {
     }
 }
 
-// The clear value a DCC clear code stands for, for non-integer formats.
 bool ClearColorFor(VkFormat format, DccKeys keys, VkClearColorValue& clear) {
-    if (IntegerFormat(format)) return false;
+    if (IntegerFormat(format)) {
+        if (keys != DccKeys::Clear0000) return false;
+        clear.uint32[0] = clear.uint32[1] = clear.uint32[2] = clear.uint32[3] = 0u;
+        return true;
+    }
     switch (keys) {
         case DccKeys::Clear0000: clear.float32[0] = clear.float32[1] = clear.float32[2] = clear.float32[3] = 0.0f; return true;
         case DccKeys::Clear0001: clear.float32[0] = clear.float32[1] = clear.float32[2] = 0.0f; clear.float32[3] = 1.0f; return true;
@@ -864,6 +892,10 @@ bool ClearColorFor(VkFormat format, DccKeys keys, VkClearColorValue& clear) {
 
 VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat) {
     return StorageFormatFor(context, ResolveTextureFormat(guestFormat));
+}
+
+VkFormat ImageFormatForGuest(const Context& context, std::uint32_t guestFormat) {
+    return ImageFormatFor(context, ResolveTextureFormat(guestFormat));
 }
 
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys) {
@@ -921,7 +953,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
-        const auto vkFormat = StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
+        const auto vkFormat = ImageFormatFor(context, ResolveTextureFormat(descriptor.format));
         storageFormat = vkFormat;
         APS5_LOG_OUT("StorageTexture address=0x%llx %ux%u mips=%u mip=%u layers=%u base=%u dim=%d tile=%d format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, mipLevel,
                      descriptor.depthOrLastArray, descriptor.baseArray, static_cast<int>(descriptor.dimension), static_cast<int>(descriptor.tileMode), descriptor.format, static_cast<int>(vkFormat));
@@ -941,6 +973,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPending.assign(trackedLayers, false);
+        layerOriginal.assign(trackedLayers, true);
         sliceLinearBytes = geometry.sliceLinearBytes;
         const auto linearBytes = sliceLinearBytes * arrayLayers;
 
@@ -1357,26 +1390,33 @@ VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t 
     return created;
 }
 
-VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layer) {
+// Metal cannot view a 3D texture as 2D slices (texture views keep the 3D type), so the attachment
+// view of a volume is a 3D view of the mip holding every depth plane: the render pass picks the
+// plane with the color attachment's depthPlane (depthSlice) and a layered draw (upstream 105561775,
+// `layers` > 1) addresses planes through renderTargetArrayLength and [[render_target_array_index]].
+// An array (non-volume) target gets a 2D view of one layer, or a 2D-array view of `layers` layers.
+VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) {
     Require(attachable, "storage image cannot be a color attachment");
     Require(mip < descriptor.mipCount, "attachment mip exceeds the storage image");
     const bool volume = descriptor.dimension == TextureDimension::k3D;
-    Require(depthSlice == 0 || (volume && mip == 0 && depthSlice <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
+    Require((depthSlice == 0 && layers == 1) || (volume && mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
     Require(layer == 0 || (!volume && descriptor.dimension == TextureDimension::k2DArray && descriptor.baseArray + layer <= descriptor.depthOrLastArray), "attachment layer is outside the storage image");
-    const auto found = attachmentViews.find({format, mip, depthSlice, layer});
+    // One 3D view serves every slice range of a volume mip.
+    const std::tuple key{format, mip, volume ? 0u : depthSlice, volume ? 0u : layers, layer};
+    const auto found = attachmentViews.find(key);
     if (found != attachmentViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = &usage;
     viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = volume ? VK_IMAGE_VIEW_TYPE_3D : layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray + layer, 1u};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? 0u : descriptor.baseArray + layer, volume ? 1u : layers};
     VkImageView created = VK_NULL_HANDLE;
     Check(Metal::Vk::CreateImageView(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
-    attachmentViews.emplace(std::tuple{format, mip, depthSlice, layer}, created);
+    attachmentViews.emplace(key, created);
     return created;
 }
 
@@ -1487,6 +1527,9 @@ VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
 }
 
 VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer) {
+    // An R16Uint image of a packed 16-bit surface (ImageFormatFor) has no shader-writable form of
+    // the guest format: a store would need its unorm packing.
+    if (storageFormat == VK_FORMAT_R16_UINT) StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
     const auto format = UintFormatOfSint(storageFormat);
     if (format == VK_FORMAT_UNDEFINED) return firstLayer ? FirstLayerView(mip) : View(mip);
     if (format == VK_FORMAT_R32_UINT) return AtomicView(mip, firstLayer);
@@ -1554,6 +1597,8 @@ LookupOutcomes& ThreadLookupOutcomes() {
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     if (refreshProved()) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
@@ -1583,7 +1628,7 @@ bool StorageTexture::Refresh() {
         if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || aliasStamped[unit] == GuestMemory::BlockMaybeWritten || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
+            if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
                 alias = nullptr;
                 break;
             }
@@ -1624,13 +1669,6 @@ bool StorageTexture::Refresh() {
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
-            for (std::uint32_t unit = 0; tracked && blockUnits && unit < trackedLayers; ++unit) {
-                if (stampedBlocks[unit] != GuestMemory::BlockMaybeWritten) continue;
-                std::array<std::uint8_t, 1> block{};
-                if (!compareUntracked(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit)), block) || block[0] != GuestMemory::BlockUnchanged) continue;
-                stampedBlocks[unit] = GuestMemory::BlockUnchanged;
-                cpuBlocks[unit] = 0;
-            }
             compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
             if (compared) cpuBlocks = stampedBlocks;
         };
@@ -1686,7 +1724,7 @@ bool StorageTexture::Refresh() {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
-        if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
+        if (!unchanged && !keysChanged && !pendingChanged && originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && equalsOriginal()) {
             unchanged = true;
             stamped = false;
         }
@@ -1729,7 +1767,7 @@ bool StorageTexture::Refresh() {
     static const bool traceUpload = std::getenv("APS5_TRACE_UPLOAD") != nullptr;
     if (traceUpload) {
         const auto keys = TextureClearKeys(descriptor, guestBytes);
-        std::fprintf(stderr, "[upload] 0x%llx+0x%llx %ux%u mips %u: %s (keys %s -> %s, originalValid %d, dirty %d)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, keys != uploadedKeys ? "DCC keys changed" : "guest memory changed", DccKeysName(uploadedKeys), DccKeysName(keys), originalValid ? 1 : 0, dirty ? 1 : 0);
+        std::fprintf(stderr, "[upload] 0x%llx+0x%llx %ux%u mips %u: %s (keys %s -> %s, originalValid %d, dirty %d)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, keys != uploadedKeys ? "DCC keys changed" : "guest memory changed", DccKeysName(uploadedKeys), DccKeysName(keys), originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0, dirty ? 1 : 0);
     }
     // Changed layers with results pending: the CPU wrote this memory while GPU results were
     // pending, so as with an immediate write-back followed by the CPU write, its blocks win and the
@@ -1761,7 +1799,7 @@ bool StorageTexture::Refresh() {
     // drop rule. Debug aid: APS5_KEYFLIP_DROP=1 drops as before.
     static const bool keyFlipDrop = std::getenv("APS5_KEYFLIP_DROP") != nullptr;
     static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
-    const bool keyFlip = keysChanged && blockUnits && !keyFlipDrop && IsDccClear(uploadedKeys) && keys == DccKeys::Uncompressed && stampedBlocks.size() >= trackedLayers;
+    const bool keyFlip = keysChanged && blockUnits && !keyFlipDrop && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && keys == DccKeys::Uncompressed && stampedBlocks.size() >= trackedLayers;
     if (traceKeys && keysChanged) {
         std::size_t pendingUnits = 0, stampedUnits = 0;
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
@@ -1794,7 +1832,7 @@ bool StorageTexture::Refresh() {
         stored[layer] = true;
         anyStored = true;
     }
-    if (anyStored && !keysChanged && descriptor.dccAddress != 0 && IsDccClear(uploadedKeys)) stored.assign(trackedLayers, true);
+    if (anyStored && !keysChanged && descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
@@ -1915,17 +1953,26 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
-    const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
+    std::vector<bool> selected(trackedLayers, true);
+    if (layers != nullptr) selected = *layers;
+    for (const auto& [begin, end] : unitRuns(selected)) GuestMemory::FlushGpuWrites(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (layers != nullptr && !(*layers)[layer]) continue;
+        if (!selected[layer]) continue;
         const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
-        GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+        GuestMemory::ReadCommittedUnsynced(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+        layerOriginal[layer] = true;
     }
-    originalValid = originalValid || complete;
+}
+
+bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) const {
+    for (auto layer = (address - descriptor.baseAddress) / trackedLayerBytes; layer < trackedLayers && layer * trackedLayerBytes < address - descriptor.baseAddress + bytes; ++layer) {
+        if (!layerOriginal[static_cast<std::size_t>(layer)]) return false;
+    }
+    return true;
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
-    if (!originalValid) return false;
+    if (!originalHolds(address, bytes)) return false;
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -1934,13 +1981,13 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     Require(address >= descriptor.baseAddress && bytes <= guestBytes && address - descriptor.baseAddress <= guestBytes - bytes, "texture comparison exceeds its snapshot");
     Require(original.size() == guestBytes, "texture comparison has no complete snapshot");
     GuestMemory::FlushGpuWrites(address, bytes);
-    if (!originalValid) return false;
+    if (!originalHolds(address, bytes)) return false;
     constexpr std::uint64_t blockBytes = 65536;
     const auto end = address + bytes;
     const auto first = address / blockBytes;
     Require(changed.size() == (end - 1) / blockBytes - first + 1, "texture comparison block count differs");
     const auto* recorder = Recorder::Active();
-    const std::array<std::uint64_t, 4> stamp{GuestMemory::CollectEpoch(), GuestMemory::TrackerGeneration(), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    const std::array<std::uint64_t, 4> stamp{GuestMemory::CollectEpoch(), GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
     const bool cacheable = memoize && stamp[0] != 0 && (stamp[2] & 1u) == 0 && address == descriptor.baseAddress && bytes == guestBytes;
     if (cacheable && comparedGuestBytes == stamp) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
@@ -1965,9 +2012,11 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
 constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
-    CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     original.resize(static_cast<std::size_t>(guestBytes));
@@ -1999,10 +2048,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
-        // Watched memory needs no copy unless an import window can stamp it: Refresh then compares
-        // the stamped units with the copy (WatchedImportsStampPages).
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && !WatchedImportsStampPages(context)) originalValid = false;
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
         else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
@@ -2027,7 +2074,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             ++Profile().storageWaitedClears;
         }
         VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2039,7 +2086,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         Metal::Vk::CmdClearColorImage(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
         VkImageMemoryBarrier toGeneral = toClear;
         toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         Metal::Vk::CmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
@@ -2051,7 +2098,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
         else captureGuestBytes(layers);
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
@@ -2173,7 +2220,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
     }
-    originalValid = true;
+    layerOriginal.assign(trackedLayers, true);
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
@@ -2818,7 +2865,7 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
-    if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
+    if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
         uploadedKeys = DccKeys::Uncompressed;
@@ -3005,6 +3052,51 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
+}
+
+namespace {
+
+struct StorageDumpSelector {
+    std::uint64_t address = 0;
+    std::uint32_t width = 0, height = 0, layers = 0, format = 0;
+    bool anyFormat = true;
+};
+
+const StorageDumpSelector& StorageDumpSelection() {
+    static const StorageDumpSelector selector = [] {
+        StorageDumpSelector parsed;
+        const char* text = std::getenv("APS5_DUMP_STORAGE");
+        if (text == nullptr) return parsed;
+        if (const int fields = std::sscanf(text, "%ux%ux%u:%u", &parsed.width, &parsed.height, &parsed.layers, &parsed.format); fields >= 3) {
+            parsed.anyFormat = fields < 4;
+            return parsed;
+        }
+        parsed.address = std::strtoull(text, nullptr, 16);
+        return parsed;
+    }();
+    return selector;
+}
+
+bool StorageDumpSelects(const GuestTextureResource& descriptor) {
+    const auto& selector = StorageDumpSelection();
+    if (selector.address != 0) return descriptor.baseAddress == selector.address;
+    return selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && descriptor.depthOrLastArray + 1 == selector.layers && (selector.anyFormat || descriptor.format == selector.format);
+}
+
+}
+
+void StorageTexture::FlushDumpSelected(const char* reason) {
+    const auto& selector = StorageDumpSelection();
+    if (selector.address == 0 && selector.width == 0) return;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (const auto* texture : pending.textures) {
+            if (StorageDumpSelects(texture->descriptor)) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+        }
+    }
+    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
 }
 
 void StorageTexture::FlushAllPending(const char* reason) {
@@ -3208,9 +3300,10 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
     // As the empty write-back leaves the layers: no results pending, the generation unchanged (the
     // stamps make their next Refresh re-upload), `original` no longer vouching for the bytes.
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (selected(layer)) layerPending[layer] = false;
+        if (!selected(layer)) continue;
+        layerPending[layer] = false;
+        layerOriginal[layer] = false;
     }
-    originalValid = false;
     if (!anyLayerPending()) {
         ++dropped;
         staleEvicted.fetch_add(1, std::memory_order_relaxed);
@@ -3270,7 +3363,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             // touched the bytes a CPU-path upload copied).
             texture->dirty = false;
             texture->layerPending.assign(texture->trackedLayers, false);
-            texture->originalValid = false;
+            texture->layerOriginal.assign(texture->trackedLayers, false);
             it = pending.textures.erase(it);
             ++discarded;
         } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
@@ -3282,13 +3375,11 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 const auto unitBegin = texture->layerBegin(unit);
                 if (!texture->layerPending[unit] || unitBegin < address || unitBegin + texture->layerBytes(unit) > end) continue;
                 texture->layerPending[unit] = false;
+                texture->layerOriginal[unit] = false;
                 unitsDropped.fetch_add(1, std::memory_order_relaxed);
                 dropped = true;
             }
-            if (dropped) {
-                texture->originalValid = false;
-                ++discarded;
-            }
+            if (dropped) ++discarded;
             if (dropped && !texture->anyLayerPending()) {
                 texture->dirty = false;
                 it = pending.textures.erase(it);
@@ -3486,7 +3577,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     Metal::Vk::CmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
     recorder->EndGpuTiming(timing, guestBytes);
-    originalValid = false;
+    layerOriginal.assign(trackedLayers, false);
     uploadedKeys = keys;
     filledKeys = DccKeys::Uncompressed;
     keyProof = {};
@@ -3579,7 +3670,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
             if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
-            texture->originalValid = false;
+            texture->layerOriginal.assign(texture->trackedLayers, false);
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
     }
@@ -3628,13 +3719,19 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // memo hit of this submission's epoch would not consume pages the game dirtied since that
     // walk, the write-back's own walk would stamp them above this generation and keep their
     // blocks, and the fill's pattern would be lost in them.
-    originalValid = false;
+    const bool watched = GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (watched) layerOriginal.assign(trackedLayers, false);
     uploadedKeys = DccKeys::Uncompressed;
     if (layer != WholeImage && trackedLayers > 1) {
         // The cleared layer's units alone: their stamps above lie below this generation, the other
         // units keep theirs (their pages are consumed by their own collects).
         const auto first = blockUnits ? static_cast<std::uint32_t>((begin - descriptor.baseAddress) / trackedLayerBytes) : layer;
         const auto count = blockUnits ? static_cast<std::uint32_t>(bytes / trackedLayerBytes) : 1u;
+        if (!watched) {
+            std::vector<bool> filled(trackedLayers, false);
+            std::fill_n(filled.begin() + first, count, true);
+            captureGuestBytes(&filled);
+        }
         const auto now = GuestMemory::CollectWritesUncached(begin, bytes);
         for (auto unit = first; unit < first + count; ++unit) layerGeneration[unit] = now;
         refreshGeneration();
@@ -3642,6 +3739,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         markLayersPending(first, count);
         return true;
     }
+    if (!watched) captureGuestBytes(nullptr);
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
     refreshGeneration();
     forgetBorrowed(0, trackedLayers);
@@ -3706,7 +3804,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
-            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->originalValid = false;
+            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->layerOriginal.assign(texture->trackedLayers, false);
         }
     }
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -3757,7 +3855,8 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // As after a clear: the image holds the surface, guest memory follows at the write-back (which
     // keeps the 64 KiB blocks the CPU writes from now on; the collect is uncached for the reason
     // given in FillClear).
-    originalValid = false;
+    if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
+    else captureGuestBytes(nullptr);
     uploadedKeys = DccKeys::Uncompressed;
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
     refreshGeneration();
@@ -3984,7 +4083,7 @@ bool StorageTexture::guestBytesSettled() const {
 }
 
 bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const {
-    const auto& baseline = originalValid ? original : generationBaseline;
+    const auto& baseline = originalHolds(from, static_cast<std::size_t>(to - from)) ? original : generationBaseline;
     if (baseline.size() != guestBytes) return false;
     const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
     return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
@@ -4037,12 +4136,29 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     std::vector<std::uint8_t> changedBlocks(spanBlocks);
     const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
-    const bool compared = !tracked && compareUntracked(firstStored, static_cast<std::size_t>(lastStored - firstStored), changedBlocks);
+    std::vector<bool> compared(trackedLayers, false);
+    if (!tracked) {
+        std::vector<bool> saved(trackedLayers, false);
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) saved[layer] = layers[layer] && layerOriginal[layer];
+        for (const auto& [begin, end] : unitRuns(saved)) {
+            const auto from = descriptor.baseAddress + begin;
+            const auto last = descriptor.baseAddress + end - 1;
+            if (!compareUntracked(from, static_cast<std::size_t>(end - begin), std::span(changedBlocks).subspan(static_cast<std::size_t>((from - spanBegin) / block), static_cast<std::size_t>(last / block - from / block + 1)))) continue;
+            for (auto layer = static_cast<std::uint32_t>(begin / trackedLayerBytes); layer < trackedLayers && layerBegin(layer) <= last; ++layer) compared[layer] = true;
+        }
+    }
+    const auto forgetStored = [&] {
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (layers[layer]) layerOriginal[layer] = false;
+        }
+    };
+    bool unsavedOutsideWatch = false;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
         const auto begin = layerBegin(layer);
         const auto end = begin + layerBytes(layer);
-        if (!compared && (!tracked || layerGeneration[layer] == 0)) {
+        if (tracked ? layerGeneration[layer] == 0 : !compared[layer]) {
+            unsavedOutsideWatch = unsavedOutsideWatch || !tracked;
             keep.emplace_back(begin, end);
             continue;
         }
@@ -4051,7 +4167,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
             const bool edge = from != at || to != at + block;
-            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to)) {
+            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to)) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
@@ -4103,18 +4219,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // store, the keys stay as they are, and the image is stale there (re-uploaded at its next
         // use, never from a matching `original`).
         emptyWriteBacks.fetch_add(1, std::memory_order_relaxed);
-        originalValid = false;
+        forgetStored();
         settle(true);
         return;
     }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             shadowImport = import;
             const auto storedBytes = writeBackWindows(*import, keep, firstStored, lastStored, shadowed, imported);
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
-            originalValid = false;
+            forgetStored();
             traceKeyStore("block write-back", descriptor, guestBytes);
             if (!IsDccClear(filledKeys) && uploadedKeys != DccKeys::Uncompressed) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
             uploadedKeys = DccKeys::Uncompressed;
@@ -4219,7 +4336,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
-        originalValid = false;
+        forgetStored();
         // The keys go the same way as the texels: a fill recorded behind the retile when the
         // metadata is host-imported (no CPU wait for the title's key-writing kernels), else a CPU
         // store (APS5_CPU_DCC_KEYS=1 keeps the CPU store; see DccMetadata.hpp).
@@ -4243,7 +4360,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: memory no longer registered; %zu pending ranges dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), keep.size());
         unregisteredDropped.fetch_add(1, std::memory_order_relaxed);
-        originalValid = false;
+        forgetStored();
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
@@ -4253,8 +4370,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
-    const bool wasValid = originalValid;
-    if (!wasValid) GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+    std::vector<bool> unsaved = layerOriginal;
+    unsaved.flip();
+    for (const auto& [begin, end] : unitRuns(unsaved)) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer host(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4288,15 +4407,15 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
         }
     }
-    // Debug aid: APS5_DUMP_STORAGE=<hex address> saves that storage image's first mip after each of
-    // its first 8 write-backs as storage_<address>_<n>.raw (u32 width, height, VkFormat, then rows).
-    static const std::uint64_t dumpAddress = [] { const char* text = std::getenv("APS5_DUMP_STORAGE"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    const bool dumpSelected = StorageDumpSelects(descriptor);
     static int dumps = 0;
     std::unique_ptr<Buffer> dump;
-    if (dumpAddress != 0 && descriptor.baseAddress == dumpAddress && dumps < 8) {
-        dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (dumpSelected && dumps < 8) {
+        dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize * arrayLayers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        CopyBuffer(context, commands, linear.Handle(), mips[0].linearOffset, dump->Handle(), 0, mips[0].linearSize);
+        for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+            if (geometry.HasLayer(0, layer)) CopyBuffer(context, commands, linear.Handle(), geometry.LinearLayerOffset(layer) + mips[0].linearOffset, dump->Handle(), layer * mips[0].linearSize, mips[0].linearSize);
+        }
     }
     const auto toCopy = WholeBufferBarrier(tiled.Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     VkImageMemoryBarrier backToGeneral = toSource;
@@ -4338,7 +4457,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     uploadedKeys = DccKeys::Uncompressed;
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.
-    originalValid = !skippedAny && (wasValid || std::all_of(layers.begin(), layers.end(), [](bool selected) { return selected; }));
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (layers[layer]) layerOriginal[layer] = !skippedLayer[layer];
+    }
     // As in the GPU-direct path, but the store's memcpy dirtied this surface's pages in the write
     // watch: a memoized collect would leave them for the next walk to stamp newer than this value
     // (the shared edge block included, undoing the advance), so the walk is made here and

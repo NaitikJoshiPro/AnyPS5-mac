@@ -903,7 +903,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
   std::optional<uint64_t> DiskCacheGuestCodeKey;
-  {
+  bool IsCustomIREntrypoint = false;
+  if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+    std::shared_lock CustomLock(CustomIRMutex);
+    IsCustomIREntrypoint = CustomIRHandlers.contains(GuestRIP);
+  }
+  // Custom IR entrypoints may have no guest code behind them, so the disk cache must not hash their memory.
+  if (!IsCustomIREntrypoint) {
     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
     Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
     if (Hit && !DiskCache.IsValidating()) {

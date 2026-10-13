@@ -86,7 +86,7 @@ std::string BdaPrelude() {
 
 // --- 2. Execution: the prelude helpers against hand-built page tables -------------------------------
 
-enum class Mode : std::uint32_t { Read, DwordRead, SpanRead, DwordWrite, Store };
+enum class Mode : std::uint32_t { Read, DwordRead, SpanRead, DwordWrite, Store, Write };
 
 struct Parameters {
     std::uint64_t table;
@@ -161,6 +161,10 @@ kernel void aps5_bda_check(constant Parameters& p [[buffer(0)]], uint local [[th
         for (uint dword = 0u; dword < 4u; ++dword) output[dword] = values[dword];
     } else if (p.mode == 3u) {
         aps5_bda_store_dwords(bda, address, 0u, p.dwords, p.values, pc, glc, stops, stop);
+        if (stop) return;
+        output[0] = 1u;
+    } else if (p.mode == 5u) {
+        aps5_bda_write(bda, address, p.values.x, p.bits, pc, glc, stops, stop);
         if (stop) return;
         output[0] = 1u;
     } else {
@@ -455,7 +459,9 @@ void ReadChecks(Gpu& gpu) {
     run(guest, 8, 0, Abi::FaultReason::Permission);
 }
 
-// RunBdaStoreExecutionTests (BdaExecution.cpp): 8/16/32-bit stores across ranges, permissions, holes.
+// RunBdaStoreExecutionTests (BdaExecution.cpp): 8/16/32-bit stores across ranges, permissions, holes; each case
+// also as a runtime write through a V# in GPU memory (upstream 0f2683cb7 MakeBdaWriteTestShader, EmitBdaWrite:
+// aps5_bda_write, stopping), with the same expected bytes, faults and written pages.
 void StoreChecks(Gpu& gpu) {
     id<MTLBuffer> first = gpu.Allocate(2);
     id<MTLBuffer> second = gpu.Allocate(3);
@@ -465,14 +471,15 @@ void StoreChecks(Gpu& gpu) {
     constexpr std::uint64_t guest = 0x7fff1235fffdULL;
     constexpr std::uint32_t writable = Abi::Read | Abi::Write;
     std::array<Abi::Range, 2> ranges {};
+    bool runtime = false;
     const auto run = [&](const char* name, std::uint64_t address, std::uint32_t bits, bool coherent, const std::array<std::uint8_t, 5>& expected, std::initializer_list<std::uint64_t> writtenAddresses, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
-        const std::string label = std::string("BDA store ") + name + (coherent ? " coherent: " : ": ");
+        const std::string label = std::string(runtime ? "BDA runtime write " : "BDA store ") + name + (coherent ? " coherent: " : ": ");
         std::memset(first.contents, 0xcd, first.length);
         std::memset(second.contents, 0xcd, second.length);
         WriteTable(table, 2, ranges);
         std::memset(fault.contents, 0, fault.length);
         std::memset(output.contents, 0, output.length);
-        auto parameters = Base(table, TableBytes<2>(), fault, output, Mode::Store, address);
+        auto parameters = Base(table, TableBytes<2>(), fault, output, runtime ? Mode::Write : Mode::Store, address);
         parameters.bits = bits;
         parameters.glcAccess = coherent ? 1u : 0u;
         parameters.values[0] = 0xa1b2c3d4u;
@@ -508,7 +515,8 @@ void StoreChecks(Gpu& gpu) {
         std::memcpy(&completed, output.contents, sizeof(completed));
         Check(completed == 1, label + "store did not finish its per-byte accesses");
     };
-    for (const bool coherent : {false, true}) {
+    for (const auto& [coherent, writes] : std::initializer_list<std::pair<bool, bool>>{{false, false}, {false, true}, {true, false}, {true, true}}) {
+        runtime = writes;
         ranges = {{{guest, guest + 2, first.gpuAddress, writable, 0}, {guest + 2, guest + 5, second.gpuAddress, writable, 0}}};
         run("byte", guest + 1, 8, coherent, {0xcd, 0xd4, 0xcd, 0xcd, 0xcd}, {guest + 1});
         run("split short", guest + 1, 16, coherent, {0xcd, 0xd4, 0xc3, 0xcd, 0xcd}, {guest + 1, guest + 2});

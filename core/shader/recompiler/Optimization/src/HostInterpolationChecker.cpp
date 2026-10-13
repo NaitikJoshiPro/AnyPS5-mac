@@ -76,7 +76,9 @@ bool exact(const IrValue& inst, const IrProgram& program, const ShaderPixelInput
     }
     if (inst.Opcode() == IrOpcode::GetInterpolationParameter) {
         const auto input = inst.Argument(0)->Resolve()->ImmediateU32();
-        return pixel.InputIsDefault(input) || (inst.Argument(2)->Resolve()->ImmediateU32() == 2u && pixel.InputIsFlat(input));
+        // P0 of a flat input, and since upstream #4030 its P10 too (ShaderInfoCollector: the
+        // provoking vertex's value), is the host's flat value; P20 needs the per-vertex values.
+        return pixel.InputIsDefault(input) || (inst.Argument(2)->Resolve()->ImmediateU32() != 1u && pixel.InputIsFlat(input));
     }
     if (inst.Opcode() != IrOpcode::InterpolateHostP2) return true;
     const auto* partial = partialOf(inst);

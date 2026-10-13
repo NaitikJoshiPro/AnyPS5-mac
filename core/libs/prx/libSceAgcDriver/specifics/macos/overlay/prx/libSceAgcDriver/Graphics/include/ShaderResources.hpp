@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
 #include <chrono>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -41,6 +42,7 @@ TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
+void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -175,10 +177,15 @@ public:
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
+    // Test seam (specifics/macos/tests/CopiedDirectOrderingTwin.mm): Bind is a no-op on Metal (guest buffers are
+    // bound by address at dispatch), so a test kernel standing in for a SPIR-V pipeline addresses the Metal buffer
+    // this object's guest-buffer Descriptor names.
+    const GuestBufferMemory& BufferMemory() const { return guestMemory; }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
+    bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest
@@ -284,6 +291,10 @@ private:
         std::uint32_t format = 0;
         int tileMode = 0;
         std::uint64_t dccAddress = 0;
+        // A "texture" range: the index into `textures` of the texture it describes. MSAA views
+        // (sampled and storage) are kept in `textures` without a range of their own, so ranges and
+        // textures do not pair by position (TechnicalDebt metal-msaa).
+        std::size_t textureIndex = std::numeric_limits<std::size_t>::max();
     };
     std::vector<DescribedRange> describedRanges;
     struct Allocation {

@@ -1,0 +1,15 @@
+add_library(libSceAppInstUtil SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceAppInstUtil PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceAppInstUtil)
+
+if(BUILD_TESTING)
+    add_test_executable(guest_app_inst_util_gnm_tests ${LIBS_INCLUDE_DIR}/tests/GuestAppInstUtilGnm.cpp)
+    target_include_directories(guest_app_inst_util_gnm_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_app_inst_util_gnm_tests PRIVATE libSceAppInstUtil libSceGnmDriver libc)
+    configure_windows_unwind(guest_app_inst_util_gnm_tests)
+    add_test(NAME guest_app_inst_util_gnm COMMAND guest_app_inst_util_gnm_tests)
+    if(WIN32)
+        set_tests_properties(guest_app_inst_util_gnm PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

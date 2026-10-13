@@ -5,7 +5,7 @@
 //   f32/i32/u32 conversions both ways, trunc/floor/ceil/round-even/fract, ldexp, frexp, min/max;
 // - f32: the exact fma behind the denormal/tininess paths, the flush- and keep-mode mul/add/sub/fma
 //   helpers, min/max/med3, class masks, saturate, bit compares, floor/ceil with denormals;
-// - f16 <-> f32 on bits, round toward zero.
+// - f16 <-> f32 on bits, round toward zero; the hardware half to float conversion (denormals kept?).
 // The CPU (Apple arm64) computes IEEE binary32/64 with denormals; NaN results follow the SpirvBackend
 // rules (first NaN operand quieted, else the RDNA default NaN). One dispatch per operation, each with a
 // 10 s watchdog. Usage: agc_metal_alu_helpers_tests [cases-per-operation] [seed].
@@ -83,6 +83,7 @@ kernel void aps5_alu_check(device const ulong* a [[buffer(0)]], device const ulo
     case 38: r = as_type<uint>(aps5_f16_to_f32(ushort(x))); break;
     case 39: r = aps5_f32_to_f16(fx); break;
     case 40: r = aps5_f32_to_f16_rtz(fx); break;
+    case 41: r = as_type<uint>(aps5_f16_to_f32_native(ushort(x))); break;
     }
     result[i] = r;
 }
@@ -397,6 +398,14 @@ std::vector<Operation> Operations() {
             return Expect::Of(half);
         }});
     }
+    // Upstream #3988: the hardware half to float conversion with the NaN bits rebuilt
+    // (MslTargetOptions::float16DenormPreserve). Every half, denormals included, must convert exactly:
+    // this is the measurement behind the Metal target's float16DenormPreserve.
+    ops.push_back({"f16->f32 (native)", [=](Random& r, auto& x, auto& y, auto& z) {
+        x = r.Below(4) == 0 ? (r.Next() & 0x83ffu) : (r.Next() & 0xffffu); y = z = 0;
+        if ((x & 0x7fffu) > 0x7c00u) return Expect::Of(((x & 0x8000u) << 16) | 0x7f800000u | ((x & 0x3ffu) << 13));
+        return Expect::Of(B32(static_cast<float>(std::bit_cast<_Float16>(static_cast<std::uint16_t>(x)))));
+    }});
     return ops;
 }
 

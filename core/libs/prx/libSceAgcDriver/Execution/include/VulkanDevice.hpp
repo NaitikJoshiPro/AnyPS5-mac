@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -39,6 +40,8 @@ public:
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
     std::string DeviceName() const;
+    std::string DriverInfo() const;
+    bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
     std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;
     const std::uint32_t* WorkGroupCountLimit() const;
@@ -219,7 +222,7 @@ public:
     // blit-submit times after the flip packet; noted in-place reads checked
     // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
     struct PresentStatistics {
-        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten;
+        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
     };
     static PresentStatistics PresentCounts();

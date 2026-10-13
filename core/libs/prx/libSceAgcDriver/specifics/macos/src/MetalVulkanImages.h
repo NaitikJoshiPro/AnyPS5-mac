@@ -114,7 +114,13 @@ public:
     // True: the probe keeps the image's reference and destroys it later itself (with no probe set).
     virtual bool Destroying(VkImage) { return false; }
     virtual void Cleared(VkImage) {}
+    // Image-to-buffer and buffer-to-image copies (CmdCopyImageToBuffer, CmdCopyBufferToImage and the depth
+    // plane copies of DepthSurface.mm, NoteImageCopy): the twin of counting vkCmdCopy* through deviceProc.
+    virtual void CopiedToBuffer(VkImage) {}
+    virtual void CopiedFromBuffer(VkImage) {}
 };
+// Reports an image copy recorded outside CmdCopyImageToBuffer/CmdCopyBufferToImage to the probe.
+void NoteImageCopy(VkImage image, bool toBuffer);
 // Sets (or, with nullptr, clears) the probe.
 void SetImageProbe(ImageProbe* probe);
 

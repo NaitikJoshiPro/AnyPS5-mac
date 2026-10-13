@@ -1,0 +1,3 @@
+add_library(libSceVideoRecording SHARED EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/prx/libSceVideoRecordingP/Export.cpp)
+target_include_directories(libSceVideoRecording PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceVideoRecording)

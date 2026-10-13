@@ -11,6 +11,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 #include "ShaderCacheVersion.hpp"
 #ifdef __APPLE__
@@ -337,6 +339,7 @@ void encodeMsl(Writer& writer, const SharedMsl& msl) {
     writer.Value(reflection.rasterOrder);
     writer.Value(reflection.perVertexLocations);
     writer.Value(reflection.emulatedBarycentrics);
+    writer.Value(reflection.cullDistances);
 }
 
 void decodeMsl(Reader& reader, SharedMsl& msl) {
@@ -378,6 +381,7 @@ void decodeMsl(Reader& reader, SharedMsl& msl) {
     reader.Value(reflection.rasterOrder);
     reader.Value(reflection.perVertexLocations);
     reader.Value(reflection.emulatedBarycentrics);
+    reader.Value(reflection.cullDistances);
     msl = SharedMsl(std::move(shader));
 }
 
@@ -417,6 +421,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(parameter.flat);
         out.Value(parameter.perVertex);
         out.Value(parameter.custom);
+        out.Value(parameter.flatP10);
     });
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
@@ -461,6 +466,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.flat);
         in.Value(parameter.perVertex);
         in.Value(parameter.custom);
+        in.Value(parameter.flatP10);
     });
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
@@ -639,6 +645,8 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
     writer.Value(info.bdaWrites);
     writer.Value(info.usesFaultBuffer);
     writer.Value(info.dispatchThreadLimit);
+    writer.Value(info.rasterPrimitive);
+    writer.Value(info.layerExported);
     encodeLayout(writer, compiled.bindings);
 }
 
@@ -748,6 +756,8 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     reader.Value(info.bdaWrites);
     reader.Value(info.usesFaultBuffer);
     reader.Value(info.dispatchThreadLimit);
+    reader.Value(info.rasterPrimitive);
+    reader.Value(info.layerExported);
     decodeLayout(reader, compiled.bindings);
 }
 

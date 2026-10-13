@@ -1,4 +1,5 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -97,12 +98,6 @@ static inline bool aps5_f32_class(float value, uint mask) {
 static inline float aps5_fsat(float value) {
     const uint bits = as_type<uint>(value);
     return as_type<float>(bits - 1u < 0x7f800000u ? min(bits, 0x3f800000u) : 0u);
-}
-
-static inline float aps5_flush_denormal(float value) {
-    const uint bits = as_type<uint>(value);
-    const uint magnitude = bits & 0x7fffffffu;
-    return magnitude != 0u && magnitude < 0x00800000u ? as_type<float>(bits & 0x80000000u) : value;
 }
 
 static inline float aps5_fabs(float value) {
@@ -294,9 +289,10 @@ static inline float aps5_fract_keep(float value) {
 }
 
 // v_log_f32 near 1 (SpirvAluEmitterMath EmitFPLog2): the host log2 loses accuracy there, a series in
-// (x - 1) replaces it when the two differ by more than 4 ulp.
+// (x - 1) replaces it when the two differ by more than 4 ulp. No denormal flush of the input (upstream
+// #4705): the front end's unaryFloatSpecials replaces the result of every input below 2^-126.
 static inline float aps5_log2(float value) {
-    const float source = aps5_flush_denormal(value);
+    const float source = value;
     const float result = log2(source);
     const float difference = source - 1.0f;
     float polynomial = as_type<float>(0xbe000000u);
@@ -395,6 +391,21 @@ static inline float aps5_f16_to_f32(ushort halfBits) {
     return as_type<float>(sign | magnitude);
 }
 
+// The hardware conversion (MslTargetOptions::float16DenormPreserve, upstream #3988 EmitF16BitsToF32):
+// exact where the GPU keeps half denormals; a NaN's bits are rebuilt from the half (sign at bit 31,
+// payload at bits 22:13) whatever NaN the GPU returns.
+static inline float aps5_f16_to_f32_native(ushort halfBits) {
+    const float value = float(as_type<half>(halfBits));
+    const uint nan = uint(as_type<int>(uint(halfBits) << 16) >> 3) | 0x7f800000u;
+    return isnan(value) ? as_type<float>(nan) : value;
+}
+
+// The hardware conversion for operands that are only compared (OnlyCompared, upstream #4011): any
+// NaN will do, so the payload is not rebuilt.
+static inline float aps5_f16_to_f32_any_nan(ushort halfBits) {
+    return float(as_type<half>(halfBits));
+}
+
 // Round to nearest even (half denormals kept, overflow to infinity); a NaN keeps its sign and the top
 // of its payload and becomes quiet.
 static inline uint aps5_f32_to_f16(float value) {
@@ -414,6 +425,46 @@ static inline uint aps5_f32_to_f16_rtz(float value) {
 )";
 
 constexpr std::array<MslPreludeChunk, 1> OnAlu{MslPreludeChunk::Alu};
+
+// SpirvAluEmitterMath NarrowF16Field (upstream #3988): a half taken from a bit field narrower than 16
+// bits (SDWA byte selects) keeps the integer decode on every target.
+bool NarrowF16Field(const IrValue& half) {
+    const IrValue* value = half.Resolve();
+    while (!value->HasImmediate() && (value->Opcode() == IrOpcode::BitCastF16U16 || value->Opcode() == IrOpcode::ConvertU16U32)) value = value->Argument(0)->Resolve();
+    if (value->HasImmediate() || (value->Opcode() != IrOpcode::BitFieldUExtract && value->Opcode() != IrOpcode::BitFieldSExtract)) return false;
+    const IrValue* count = value->Argument(2)->Resolve();
+    return !count->HasImmediate() || count->ImmediateU32() < 16u;
+}
+
+// SpirvAluEmitterMath OnlyCompared (upstream #4011): a converted half whose every
+// use is an f32 compare or NaN test (directly or through abs, neg and Identity) only needs to be NaN
+// or not, so the hardware conversion skips the NaN payload rebuild.
+bool OnlyCompared(const IrValue& value) {
+    return std::ranges::all_of(value.Uses(), [](const IrValue* user) {
+        switch (user->Opcode()) {
+        case IrOpcode::FPOrdEqual32:
+        case IrOpcode::FPUnordEqual32:
+        case IrOpcode::FPOrdNotEqual32:
+        case IrOpcode::FPUnordNotEqual32:
+        case IrOpcode::FPOrdLessThan32:
+        case IrOpcode::FPUnordLessThan32:
+        case IrOpcode::FPOrdGreaterThan32:
+        case IrOpcode::FPUnordGreaterThan32:
+        case IrOpcode::FPOrdLessThanEqual32:
+        case IrOpcode::FPUnordLessThanEqual32:
+        case IrOpcode::FPOrdGreaterThanEqual32:
+        case IrOpcode::FPUnordGreaterThanEqual32:
+        case IrOpcode::FPIsNan32:
+            return true;
+        case IrOpcode::FPAbs32:
+        case IrOpcode::FPNeg32:
+        case IrOpcode::Identity:
+            return OnlyCompared(*user);
+        default:
+            return false;
+        }
+    });
+}
 
 void Binary(MslEmitterState& state, const IrValue& instruction, std::string_view operation) {
     state.Define(instruction, "(" + state.Arg(instruction, 0u) + " " + std::string(operation) + " " + state.Arg(instruction, 1u) + ")");
@@ -750,7 +801,11 @@ bool EmitMslAluInstruction(MslEmitterState& state, const IrValue& instruction) {
         return true;
     case IrOpcode::ConvertF32F16:
         state.RequirePrelude(MslPreludeChunk::Float16);
-        state.Define(instruction, "aps5_f16_to_f32(as_type<ushort>(" + state.Arg(instruction, 0u) + "))");
+        {
+            const bool native = state.target.float16DenormPreserve && !NarrowF16Field(*instruction.Argument(0u));
+            const char* function = !native ? "aps5_f16_to_f32" : OnlyCompared(instruction) ? "aps5_f16_to_f32_any_nan" : "aps5_f16_to_f32_native";
+            state.Define(instruction, std::string(function) + "(as_type<ushort>(" + state.Arg(instruction, 0u) + "))");
+        }
         return true;
     case IrOpcode::ConvertF16F32:
         state.RequirePrelude(MslPreludeChunk::Float16);
@@ -847,8 +902,8 @@ bool EmitMslAluInstruction(MslEmitterState& state, const IrValue& instruction) {
         FloatCall(state, instruction, "aps5_fmed3");
         return true;
 
-    // f32 transcendentals. The SPIR-V path flushes denormal sources to signed zero first; Apple GPUs
-    // do that in hardware.
+    // f32 transcendentals. No denormal flush of the source (upstream #4705, as the SPIR-V path): the
+    // front end's unaryFloatSpecials replaces the result of every input below 2^-126.
     case IrOpcode::FPRecip32:
     case IrOpcode::FPRecipIFlag32:
         FloatExpression(state, instruction, "(1.0f / " + state.Arg(instruction, 0u) + ")");

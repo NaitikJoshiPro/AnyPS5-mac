@@ -17,3 +17,4 @@ agc_driver_pipeline_optimized_readback_d16 | graphics pipeline libraries are una
 agc_driver_pipeline_optimized_readback_d16_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_d32 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_d32_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
+guest_video_out_high_frame_rate | current display does not provide 120 Hz | metal-display-120hz

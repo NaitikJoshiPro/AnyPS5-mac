@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -20,24 +21,129 @@ MESSAGE_NID = "wTpfglkmv34"
 MESSAGE_NAME = "sceMsgDialogProgressBarSetValue"
 
 
-def build_elf(symbols):
+def build_elf(symbols, needed=()):
     strings = b"\0"
     entries = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
     for name, index, info in symbols:
         entries.append(struct.pack("<IBBHQQ", len(strings), info, 0, index, 0, 0))
         strings += name.encode() + b"\0"
+    libraries = []
+    for library in needed:
+        libraries.append(len(strings))
+        strings += library.encode() + b"\0"
     table = b"".join(entries)
     table_offset = 64 + len(strings)
     table_offset += -table_offset % 8
-    sections_offset = table_offset + len(table)
+    dynamic_offset = table_offset + len(table)
+    dynamic_offset += -dynamic_offset % 8
+    pairs = [(1, offset) for offset in libraries]
+    if pairs:
+        pairs.append((0, 0))
+    dynamic = b"".join(struct.pack("<qQ", tag, value) for tag, value in pairs)
+    sections_offset = dynamic_offset + len(dynamic)
     sections_offset += -sections_offset % 8
-    image = bytearray(sections_offset + 3 * 64)
+    image = bytearray(sections_offset + (4 if dynamic else 3) * 64)
     image[64:64 + len(strings)] = strings
     image[table_offset:table_offset + len(table)] = table
+    if dynamic:
+        image[dynamic_offset:dynamic_offset + len(dynamic)] = dynamic
+        image[sections_offset + 192:sections_offset + 256] = struct.pack("<IIQQQQIIQQ", 0, 6, 2, 0, dynamic_offset, len(dynamic), 2, 0, 8, 16)
     image[sections_offset + 64:sections_offset + 128] = struct.pack("<IIQQQQIIQQ", 0, 11, 2, 0, table_offset, len(table), 2, 1, 8, 24)
     image[sections_offset + 128:sections_offset + 192] = struct.pack("<IIQQQQIIQQ", 0, 3, 2, 0, 64, len(strings), 0, 0, 1, 0)
-    image[:64] = struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01" + bytes(9), 3, 0x3e, 1, 0, 0, sections_offset, 0, 64, 0, 0, 64, 3, 0)
+    image[:64] = struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01" + bytes(9), 3, 0x3e, 1, 0, 0, sections_offset, 0, 64, 0, 0, 64, 4 if dynamic else 3, 0)
     return bytes(image)
+
+
+def build_sectionless_elf(symbols, needed=(), gnu_hash=False):
+    strings = b"\0"
+    entries = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
+    for name, index, info in symbols:
+        entries.append(struct.pack("<IBBHQQ", len(strings), info, 0, index, 0, 0))
+        strings += name.encode() + b"\0"
+    libraries = []
+    for library in needed:
+        libraries.append(len(strings))
+        strings += library.encode() + b"\0"
+    program_offset = 64
+    content_offset = program_offset + 2 * 56
+    strings_offset = content_offset
+    symbols_offset = (strings_offset + len(strings) + 7) & ~7
+    symbol_table = b"".join(entries)
+    hash_offset = (symbols_offset + len(symbol_table) + 3) & ~3
+    if gnu_hash:
+        hash_table = struct.pack("<IIII", 1, 1, 1, 0) + bytes(8)
+        hash_table += struct.pack("<I", 1) + b"".join(struct.pack("<I", 1 if index == len(entries) - 1 else 0) for index in range(1, len(entries)))
+        hash_tag = 0x6ffffef5
+    else:
+        hash_table = struct.pack("<II", 1, len(entries)) + struct.pack("<I", 0) + bytes(4 * len(entries))
+        hash_tag = 4
+    dynamic_offset = (hash_offset + len(hash_table) + 7) & ~7
+    dynamic = b"".join(struct.pack("<qQ", 1, value) for value in libraries)
+    dynamic += b"".join(struct.pack("<qQ", tag, value) for tag, value in (
+        (5, 0x400000 + strings_offset),
+        (10, len(strings)),
+        (6, 0x400000 + symbols_offset),
+        (11, 24),
+        (hash_tag, 0x400000 + hash_offset),
+        (0, 0),
+    ))
+    image = bytearray(dynamic_offset + len(dynamic))
+    image[strings_offset:strings_offset + len(strings)] = strings
+    image[symbols_offset:symbols_offset + len(symbol_table)] = symbol_table
+    image[hash_offset:hash_offset + len(hash_table)] = hash_table
+    image[dynamic_offset:dynamic_offset + len(dynamic)] = dynamic
+    image[program_offset:program_offset + 56] = struct.pack("<IIQQQQQQ", 1, 7, 0, 0x400000, 0x400000, len(image), len(image), 0x1000)
+    image[program_offset + 56:program_offset + 112] = struct.pack("<IIQQQQQQ", 2, 6, dynamic_offset, 0x400000 + dynamic_offset, 0x400000 + dynamic_offset, len(dynamic), len(dynamic), 8)
+    image[:64] = struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01" + bytes(9), 3, 0x3e, 1, 0, program_offset, 0, 0, 64, 56, 2, 64, 0, 0)
+    return bytes(image)
+
+
+def build_macho(symbols, cpu=0x0100000c):
+    """A minimal 64-bit Mach-O dylib: a header, one LC_SYMTAB, nlist_64 entries (name, n_type) and strings."""
+    strings = b"\0"
+    entries = []
+    for name, kind in symbols:
+        entries.append(struct.pack("<IBBHQ", len(strings), kind, 1, 0, 0))
+        strings += name.encode() + b"\0"
+    table_offset = 32 + 24
+    strings_offset = table_offset + 16 * len(entries)
+    header = struct.pack("<IiiIIIII", 0xfeedfacf, cpu, 0, 6, 1, 24, 0, 0)
+    symtab = struct.pack("<IIIIII", 0x2, 24, table_offset, len(entries), strings_offset, len(strings))
+    return header + symtab + b"".join(entries) + strings
+
+
+def build_macho_trie(names, symbols=()):
+    """A Mach-O whose LC_DYLD_EXPORTS_TRIE exports names (one edge per name from the root; offsets < 128) next to
+    an LC_SYMTAB with symbols, which the trie must take precedence over."""
+    leaves, root_size = [], 2 + sum(len(name) + 2 + 1 for name in names)
+    trie = bytearray([0, len(names)])
+    offset = root_size
+    for name in names:
+        trie += b"_" + name.encode() + b"\0" + bytes([offset])
+        leaves.append(bytes([2, 0, 0x10, 0]))  # terminal size 2: flags 0, address 0x10; no children
+        offset += 4
+    trie += b"".join(leaves)
+    base = build_macho(list(symbols))
+    commands = struct.unpack_from("<IiiIIIII", base)
+    trie_offset = len(base) + 16
+    header = struct.pack("<IiiIIIII", commands[0], commands[1], 0, 6, 2, 24 + 16, 0, 0)
+    symtab = bytearray(base[32:56])
+    for field in (8, 16):  # symbol and string offsets move by the extra 16-byte load command
+        struct.pack_into("<I", symtab, field, struct.unpack_from("<I", symtab, field)[0] + 16)
+    command = struct.pack("<IIII", 0x80000033, 16, trie_offset, len(trie))
+    return header + bytes(symtab) + command + base[56:] + bytes(trie)
+
+
+def universal(slices):
+    """A 32-bit universal (fat) file holding (cputype, image) slices at 4 KiB alignment."""
+    header = struct.pack(">II", 0xcafebabe, len(slices))
+    offset = 4096
+    body = bytearray()
+    for cpu, image in slices:
+        header += struct.pack(">iiIII", cpu, 0, offset, len(image), 12)
+        body += bytes(offset - 4096 - len(body)) + image
+        offset += -(-len(image) // 4096) * 4096
+    return header + bytes(4096 - len(header)) + bytes(body)
 
 
 def exporting(*names):
@@ -111,7 +217,7 @@ class ImportAuditTests(unittest.TestCase):
             (MESSAGE_NID, 1, GLOBAL_FUNCTION), ("AAAAAAAAAAA", 1, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION),
             ("UNDEFINED11", 0, GLOBAL_FUNCTION), ("LOCALLOCAL1", 1, LOCAL_FUNCTION)]))
         (work.libs / "libc.prx").write_bytes(exporting("CCCCCCCCCCC"))
-        (work.modules / "libSceNpCppWebApi.prx").write_bytes(b"\x7fELF")
+        (work.modules / "libSceNpCppWebApi.prx").write_bytes(exporting())
         write_source(work.source, "libSceMsgDialog", STUB_SOURCE.format(name=MESSAGE_NAME) + 'APS5_EXPORT("BBBBBBBBBBB", sceFooUnknown_B);\n' + STUB_SOURCE.format(name="sceFooUnknown_B"))
         registry = work.root / "game.registry.json"
         write_registry(registry, [
@@ -139,6 +245,100 @@ class ImportAuditTests(unittest.TestCase):
         self.assertIn(f"{MESSAGE_NID}  {MESSAGE_NAME}", out)
         self.assertIn("DDDDDDDDDDD", out)
 
+    def test_module_imports_are_audited(self):
+        work = self.work
+        stub = nid_names.compute_nid("sceModuleStub")
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        (work.libs / "libSceB.prx").write_bytes(exporting(stub))
+        write_source(work.source, "libSceB", STUB_SOURCE.format(name="sceModuleStub"))
+        (work.modules / "sibling.prx").write_bytes(exporting("BBBBBBBBBBB"))
+        (work.modules / "main.prx").write_bytes(build_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 0, GLOBAL_FUNCTION),
+            (stub, 0, GLOBAL_FUNCTION), ("EEEEEEEEEEE", 0, GLOBAL_FUNCTION)], ["libSceA.prx", "sibling.prx"]))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["references"], 4)
+        self.assertEqual(data["unique_by_class"], {"implemented": 2, "stub": 1, "absent": 1, "module": 0})
+        self.assertEqual(data["missing_libraries"], {})
+        records = {(record["nid"], record["module"]): record for record in data["imports"]}
+        self.assertEqual(records[("AAAAAAAAAAA", "main.prx")]["class"], "implemented")
+        self.assertEqual(records[("AAAAAAAAAAA", "main.prx")]["providers"], ["libSceA.prx"])
+        self.assertEqual(records[("BBBBBBBBBBB", "main.prx")]["class"], "implemented")
+        self.assertEqual(records[("BBBBBBBBBBB", "main.prx")]["providers"], ["sibling.prx"])
+        self.assertEqual(records[(stub, "main.prx")]["class"], "stub")
+        self.assertEqual(records[(stub, "main.prx")]["name"], "sceModuleStub")
+        self.assertEqual(records[("EEEEEEEEEEE", "main.prx")]["class"], "absent")
+        self.assertIn("[library not named]", out)
+        self.assertIn("EEEEEEEEEEE  (imported by main.prx)", out)
+
+    def test_module_needed_library_without_a_file_is_missing(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (work.modules / "main.prx").write_bytes(build_elf([], ["libSceMissing.prx"]))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual((data["references"], data["imports"]), (0, []))
+        self.assertEqual(data["missing_libraries"], {"libSceMissing.prx": 1})
+        self.assertIn("libSceMissing.prx", out)
+
+    def test_module_files_must_be_elf(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (work.modules / "guest.prx").write_bytes(build_pe(["alpha"]))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        code, out, err = work.run(registry)
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("guest.prx", err)
+        self.assertIn("ELF", err)
+
+    def test_sectionless_module_imports_and_exports_are_audited(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        (work.modules / "stripped.prx").write_bytes(build_sectionless_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)], ["libSceA.prx"]))
+        (work.modules / "main.prx").write_bytes(build_elf([("BBBBBBBBBBB", 0, GLOBAL_FUNCTION)], []))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["references"], 2)
+        records = {(record["nid"], record["module"]): record for record in data["imports"]}
+        self.assertEqual(records[("AAAAAAAAAAA", "stripped.prx")]["class"], "implemented")
+        self.assertEqual(records[("BBBBBBBBBBB", "main.prx")]["class"], "implemented")
+
+    def test_sectionless_elf_gnu_hash(self):
+        image = build_sectionless_elf([
+            ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION), ("BBBBBBBBBBB", 1, GLOBAL_FUNCTION)],
+            ["libSceA.prx"], gnu_hash=True)
+        self.assertEqual(import_audit.elf_program_dynamic_symbols(Path("module.prx"), image),
+                         ({"AAAAAAAAAAA"}, {"BBBBBBBBBBB"}, {"libSceA.prx"}))
+
+    def test_module_symbol_suffix_is_stripped(self):
+        work = self.work
+        exported = nid_names.compute_nid("sceRealName")
+        (work.libs / "libSceA.prx").write_bytes(exporting(exported))
+        (work.modules / "main.prx").write_bytes(build_elf([
+            (exported + "#lib#mod", 0, GLOBAL_FUNCTION)], []))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["unique_by_class"], {"implemented": 1, "stub": 0, "absent": 0, "module": 0})
+        self.assertEqual(data["references"], 1)
+
     def test_clean_audit_exits_zero_and_empty_registry_is_empty(self):
         work = self.work
         (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
@@ -151,6 +351,31 @@ class ImportAuditTests(unittest.TestCase):
         data = json.loads(result.read_text())
         self.assertEqual((code, data["references"], data["unique_imports"], data["imports"]), (0, 0, 0, []))
         self.assertIn("0 references, 0 unique imports", out)
+
+    def test_current_stop_is_the_first_unresolved_import(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx"), ("BBBBBBBBBBB", "libSceA.prx"), ("CCCCCCCCCCC", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["stops"], [{"registry": str(registry), "nid": "BBBBBBBBBBB", "library": "libSceA.prx", "name": None}])
+        self.assertIn("Current stop (first unresolved import, in registry order)", out)
+        self.assertIn("BBBBBBBBBBB", out)
+
+    def test_current_stop_is_none_when_every_import_resolves(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "clean.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, _ = work.run(registry, "--json", str(result))
+        self.assertEqual(code, 0)
+        data = json.loads(result.read_text())
+        self.assertEqual(data["stops"], [{"registry": str(registry), "nid": None, "library": None, "name": None}])
+        self.assertIn(f"  {registry}: none", out)
 
     def test_removing_an_export_flips_the_class(self):
         work = self.work
@@ -260,6 +485,65 @@ class ImportAuditTests(unittest.TestCase):
         for cut in (10, 64, len(image) - 5):
             with self.assertRaisesRegex(import_audit.AuditError, "lib.prx"):
                 import_audit.elf_exports(path, image[:cut])
+
+    def test_elf_imports_reader(self):
+        image = build_elf([("one", 1, GLOBAL_FUNCTION), ("two", 0, GLOBAL_FUNCTION), ("three", 0, 0x22)], ["libc.prx", "libSceZip.prx"])
+        path = Path("mod.prx")
+        self.assertEqual(import_audit.elf_imports(path, image), ({"two", "three"}, {"libc.prx", "libSceZip.prx"}))
+        self.assertEqual(import_audit.elf_imports(path, exporting()), (set(), set()))
+        for cut in (10, 64, len(image) - 5):
+            with self.assertRaisesRegex(import_audit.AuditError, "mod.prx"):
+                import_audit.elf_imports(path, image[:cut])
+
+    def test_macho_export_trie_is_what_dlsym_sees(self):
+        path = Path("lib.prx")
+        image = build_macho_trie(["JfEPXVxhFqA", "sce+Name-1"], [("_onlyInSymtab", 0x0f)])
+        self.assertEqual(import_audit.read_exports(path, image), {"JfEPXVxhFqA", "sce+Name-1"})
+        self.assertEqual(import_audit.read_exports(path, build_macho_trie([])), set())
+        for cut in (len(image) - 1, len(image) - 6):
+            with self.subTest(cut=cut), self.assertRaisesRegex(import_audit.AuditError, "lib.prx"):
+                import_audit.read_exports(path, image[:cut])
+        looped = bytearray(image)
+        looped[-4 * 2 - 1] = 0  # last edge's child offset → the root again
+        with self.assertRaisesRegex(import_audit.AuditError, "reached twice|outside"):
+            import_audit.read_exports(path, bytes(looped))
+
+    def test_macho_reader(self):
+        external, private, undefined, local, debug, absolute = 0x0f, 0x1f, 0x01, 0x0e, 0x24, 0x03
+        image = build_macho([("_sceFoo", external), ("_hidden", private), ("_sceUndef", undefined), ("_local", local),
+                             ("_debug", debug), ("_sceAbs", absolute), ("noUnderscore", external)])
+        path = Path("lib.prx")
+        self.assertEqual(import_audit.macho_exports(path, image), {"sceFoo", "sceAbs", "noUnderscore"})
+        self.assertEqual(import_audit.read_exports(path, image), {"sceFoo", "sceAbs", "noUnderscore"})
+        self.assertEqual(import_audit.macho_exports(path, build_macho([])), set())
+        for cut in (3, 20, 40, len(image) - 3):
+            with self.subTest(cut=cut), self.assertRaisesRegex(import_audit.AuditError, "lib.prx"):
+                import_audit.read_exports(path, image[:cut])
+
+    def test_macho_universal_uses_the_arm64_slice(self):
+        path = Path("lib.prx")
+        fat = universal([(0x01000007, build_macho([("_x86only", 0x0f)], cpu=0x01000007)), (0x0100000c, build_macho([("_armOnly", 0x0f)]))])
+        self.assertEqual(import_audit.read_exports(path, fat), {"armOnly"})
+        x86 = universal([(0x01000007, build_macho([("_x86only", 0x0f)], cpu=0x01000007))])
+        with self.assertRaisesRegex(import_audit.AuditError, "without an arm64 slice"):
+            import_audit.read_exports(path, x86)
+
+    def test_macho_rejects_32_bit_and_missing_symtab(self):
+        path = Path("lib.prx")
+        thin32 = struct.pack("<IiiIIIII", 0xfeedface, 7, 0, 6, 0, 0, 0, 0)
+        with self.assertRaisesRegex(import_audit.AuditError, "neither ELF nor PE nor Mach-O"):
+            import_audit.read_exports(path, thin32)
+        no_symtab = struct.pack("<IiiIIIII", 0xfeedfacf, 0x0100000c, 0, 6, 0, 0, 0, 0)
+        with self.assertRaisesRegex(import_audit.AuditError, "expected one LC_SYMTAB"):
+            import_audit.read_exports(path, no_symtab)
+
+    def test_macho_libraries_join_the_audit(self):
+        work = self.work
+        (work.libs / "libSceM.prx").write_bytes(build_macho([("_AAAAAAAAAAA", 0x0f)]))
+        (work.libs / "libSceE.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        exports, libraries = import_audit.built_libraries([work.libs])
+        self.assertEqual(exports, {"AAAAAAAAAAA": ["libSceE.prx", "libSceM.prx"]})
+        self.assertEqual(libraries, {"libSceE.prx", "libSceM.prx"})
 
     def test_pe_reader(self):
         path = Path("lib.prx")
@@ -421,7 +705,7 @@ class ImportAuditTests(unittest.TestCase):
         registry = work.root / "game.json"
         write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
         output = work.root / "hard-link.json"
-        output.hardlink_to(registry)
+        os.link(registry, output)
         before = registry.read_bytes()
         code, out, err = work.run(registry, "--json", str(output))
         self.assertEqual((code, out), (2, ""))

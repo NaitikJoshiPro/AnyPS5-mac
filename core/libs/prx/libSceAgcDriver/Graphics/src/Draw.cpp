@@ -61,38 +61,6 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 namespace {
 
-std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
-    if (const auto guest = FindGuestColorTargetFormat(format, elementBytes)) return *guest;
-    throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
-}
-
-// The color buffer as a single-mip 2D surface descriptor (tile mode SW_64KB_R_X).
-GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    Require(color.tileMode != ColorTileMode::Linear, "linear color targets are not resident");
-    const bool chain = color.mipCount > 1;
-    GuestTextureResource surface{};
-    surface.baseAddress = chain ? color.surfaceAddress : color.address;
-    surface.pipeBankXor = color.pipeBankXor;
-    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
-    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
-    surface.depthOrLastArray = color.depth - 1u;
-    surface.baseArray = 0;
-    surface.mipCount = color.mipCount;
-    surface.baseLevel = 0;
-    surface.lastLevel = color.mipCount - 1;
-    surface.tileMode = ColorTextureTileMode(color.tileMode);
-    surface.dimension = color.depth > 1 ? TextureDimension::k3D : TextureDimension::k2D;
-    surface.format = GuestFormatFor(color.format, color.elementBytes);
-    surface.dstSelX = 4;
-    surface.dstSelY = 5;
-    surface.dstSelZ = 6;
-    surface.dstSelW = 7;
-    surface.dccAddress = color.dccAddress;
-    surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
-    surface.dccPipeAligned = color.dccPipeAligned;
-    return surface;
-}
-
 GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color) {
     Require(color.arrayLastSlice != 0, "the color target is not a view of a 2D array");
     auto surface = SurfaceForTarget(color);
@@ -221,20 +189,8 @@ void proveCmask(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     else cmaskProofs()[address] = {bytes, generation};
 }
 
-std::string hexAddress(std::uint64_t address) {
-    char text[24];
-    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
-    return text;
-}
-
 void requireCmaskCodes(std::uint32_t codes) {
-    if (codes == 0) return;
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
-    std::string listed;
-    for (std::uint32_t code = 1; code < 15; ++code) {
-        if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
-    }
-    Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
 }
 
 CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
@@ -264,7 +220,6 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
             const auto nibble = layout.Nibble(tileX, tileY);
             const auto code = (std::to_integer<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
             if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
-            else Require(code == 0xfu, "CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded)");
         }
     }
     if (cleared.empty()) return CmaskState::Expanded;
@@ -686,6 +641,10 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
         add(context.fragmentShaderBarycentric);
+        add(context.shaderClipDistance);
+        add(context.shaderCullDistance);
+        add(context.viewportIndexLayer);
+        add(state.paClVsOutCntl);
         add(state.stages.mesh.has_value());
         if (state.stages.mesh) {
             const auto& mesh = *state.stages.mesh;
@@ -706,6 +665,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(tessellation.domain);
             add(tessellation.partitioning);
             add(tessellation.outputTopology);
+            add(tessellation.patchesPerGroup);
         }
     }
     return keyed;
@@ -737,7 +697,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderCullDistance, context.viewportIndexLayer);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
@@ -1115,6 +1075,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+            const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+            if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
+                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
+                GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+                highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                import = nullptr;
+                copy = DrawInputCopy{};
+                copy.buffer = std::move(clamped);
+                if (!highest) {
+                    inputs.nothing = true;
+                    return inputs;
+                }
+            }
+        }
         Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         Require(!fanGeometry || !state.primitiveRestart || *highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
         inputs.maxIndex = *highest;
@@ -1158,7 +1136,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
-        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
+        const auto firstByte = args == nullptr ? VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance) : 0;
+        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
         fetchOf[i] = fetches.size();
         fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
@@ -1569,6 +1548,12 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
     }
+    if (state.stages.tessellation) {
+        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
+        const std::array<float, ShaderRecompiler::TessellationLevelPushBytes / 4> levels{state.stages.minTessellationLevel, state.stages.maxTessellationLevel};
+        static_assert(ShaderRecompiler::TessellationLevelPushOffsetBytes + ShaderRecompiler::TessellationLevelPushBytes == PipelinePushSlotBytes);
+        std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
+    }
     if (!state.stages.mesh) {
         pipeline.PushConstants(commands, stages, block);
         return;
@@ -1947,15 +1932,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice));
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
-        Require(!color.mipTail, "rendering into a packed mip tail needs the resident image of its surface");
+        Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
         Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
         if (binding.gpuTiling) {
-            binding.mip = ColorTargetMip(color, colorLayout);
+            binding.mip = color.mipTail ? ComputeColorTargetMipLayout(color.tileMode, color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount, color.mip) : ColorTargetMip(color, colorLayout);
             binding.tiled = std::make_unique<Buffer>(context, colorLayout.Bytes(), copies);
             binding.tiledDevice = std::make_unique<DeviceBuffer>(context, colorLayout.Bytes(), copies | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             binding.linearDevice = std::make_unique<DeviceBuffer>(context, colorLayout.LinearBytes(), copies | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -2019,7 +2004,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 return IndirectDrawPath::PendingImage;
             }
             if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
-            const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+            const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
             if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
             if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
             if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
@@ -2135,7 +2120,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         owners.push_back(binding.resident);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent);
+    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2511,7 +2496,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     auto framebuffer = recipe.framebuffer.lock();
-    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent);
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;

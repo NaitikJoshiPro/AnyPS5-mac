@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -91,6 +92,15 @@ void ForgetDirectoryDescriptor(int fd) {
     g_directoryCount = g_directories.size();
 }
 
+void DuplicateDirectoryDescriptor(int from, int to) {
+    if (g_directoryCount == 0) return;
+    std::lock_guard lock(g_mutex);
+    const auto found = g_directories.find(from);
+    if (found == g_directories.end()) return;
+    g_directories[to] = found->second;
+    g_directoryCount = g_directories.size();
+}
+
 std::optional<std::int64_t> SeekDirectoryDescriptor(int fd, std::int64_t offset, int whence) {
     constexpr int SeekSet = 0;
     constexpr int SeekCurrent = 1;
@@ -132,8 +142,7 @@ int ReadDirectoryDescriptor(int fd, char* buf, int nbytes) {
     while (state.cursor < state.entries.size()) {
         const auto& [name, type] = state.entries[state.cursor];
         if (name.size() > 255) {
-            if (used == 0) return SCE_KERNEL_ERROR_ENAMETOOLONG;
-            break;
+            throw std::runtime_error("Directory entry name exceeds the guest 255-byte limit");
         }
         const std::size_t record = (8 + name.size() + 1 + 3) & ~std::size_t{3};
         if (used + record > static_cast<std::size_t>(nbytes)) {

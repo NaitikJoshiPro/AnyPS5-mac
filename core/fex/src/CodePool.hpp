@@ -30,6 +30,12 @@ public:
     bool Free(void* address, std::size_t length);
 
     bool Contains(const void* address) const;
+    // Replaces one instruction word of JIT code at its executable address in any live pool (async-signal-safe;
+    // used to backpatch displaced guest accesses, GuestDisplaced.hpp). False outside every pool.
+    static bool WriteInstruction(std::uintptr_t pc, std::uint32_t instruction);
+    // Allocates bytes from the pool that contains pc (never freed); returns the executable address and stores the
+    // writable one, or 0 when pc is in no pool or the pool is full.
+    static std::uintptr_t AllocateBeside(std::uintptr_t pc, std::size_t bytes, std::uintptr_t* writable);
     std::uint8_t* Code() const { return code; }
     std::int64_t WriteOffset() const { return writeOffset; }
     std::size_t Size() const { return size; }

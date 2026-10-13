@@ -243,6 +243,14 @@ ColorExportPacking readColorExportPacking(Reader& reader) {
     return static_cast<ColorExportPacking>(value);
 }
 
+RasterPrimitive readRasterPrimitive(Reader& reader) {
+    const auto value = reader.ReadU8();
+    if (value > static_cast<std::uint8_t>(RasterPrimitive::Rectangle)) {
+        throw std::runtime_error("RequestSerializer: invalid RasterPrimitive value");
+    }
+    return static_cast<RasterPrimitive>(value);
+}
+
 void writeShaderBinary(Writer& writer, const ShaderBinary& binary) {
     writer.WriteU8(static_cast<std::uint8_t>(binary.stage));
     writer.WriteU64(binary.codeAddress);
@@ -326,6 +334,8 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteBool(info.dualSourceBlend);
     writer.WriteBool(info.alphaToCoverage);
     writer.WriteBool(info.stencilRefExportEnable);
+    writer.WriteU8(static_cast<std::uint8_t>(info.rasterPrimitive));
+    writer.WriteBool(info.layerExported);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
@@ -375,6 +385,8 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
     if (version >= 15u) info.dualSourceBlend = reader.ReadBool();
     if (version >= 16u) info.alphaToCoverage = reader.ReadBool();
     if (version >= 17u) info.stencilRefExportEnable = reader.ReadBool();
+    if (version >= 19u) info.rasterPrimitive = readRasterPrimitive(reader);
+    if (version >= 23u) info.layerExported = reader.ReadBool();
     if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };
         info.inputAddr = input(PixelInput::PerspectiveSample, info.hasPerspectiveCenterVgpr && inputAddrOrCenterVgpr == 2u) | input(PixelInput::PerspectiveCenter, info.hasPerspectiveCenterVgpr) |
@@ -402,9 +414,10 @@ void writeVertexInfo(Writer& writer, const ShaderVertexStageInfo& info) {
     writer.WriteU32(info.fetchAttribReg);
     writer.WriteU32(info.fetchBufferReg);
     writer.WriteBool(info.fetchEmbedded);
+    writer.WriteU32(info.paClVsOutCntl);
 }
 
-ShaderVertexStageInfo readVertexInfo(Reader& reader) {
+ShaderVertexStageInfo readVertexInfo(Reader& reader, std::uint32_t version) {
     ShaderVertexStageInfo info{};
     for (auto& resource : info.resources) {
         for (std::uint32_t& value : resource.fields) {
@@ -421,6 +434,7 @@ ShaderVertexStageInfo readVertexInfo(Reader& reader) {
     info.fetchAttribReg = reader.ReadU32();
     info.fetchBufferReg = reader.ReadU32();
     info.fetchEmbedded = reader.ReadBool();
+    if (version >= 20u) info.paClVsOutCntl = reader.ReadU32();
     return info;
 }
 
@@ -508,15 +522,17 @@ void writeTessellationConfiguration(Writer& writer, const TessellationConfigurat
     writer.WriteU32(configuration.domain);
     writer.WriteU32(configuration.partitioning);
     writer.WriteU32(configuration.outputTopology);
+    writer.WriteU32(configuration.patchesPerGroup);
 }
 
-TessellationConfiguration readTessellationConfiguration(Reader& reader) {
+TessellationConfiguration readTessellationConfiguration(Reader& reader, std::uint32_t version) {
     TessellationConfiguration configuration{};
     configuration.inputControlPoints = reader.ReadU32();
     configuration.outputControlPoints = reader.ReadU32();
     configuration.domain = reader.ReadU32();
     configuration.partitioning = reader.ReadU32();
     configuration.outputTopology = reader.ReadU32();
+    if (version >= 22u) configuration.patchesPerGroup = reader.ReadU32();
     return configuration;
 }
 
@@ -565,7 +581,7 @@ GuestContext readGuestContext(Reader& reader, DeserializedRequest& result, std::
         context.pixel = result.pixel;
     }
     if (reader.ReadBool()) {
-        result.vertex = readVertexInfo(reader);
+        result.vertex = readVertexInfo(reader, version);
         context.vertex = result.vertex;
     }
     const auto regionCount = reader.ReadU64();
@@ -719,7 +735,7 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
         graphics.mesh = storage.mesh;
     }
     if (reader.ReadBool()) {
-        storage.tessellation = readTessellationConfiguration(reader);
+        storage.tessellation = readTessellationConfiguration(reader, version);
         graphics.tessellation = storage.tessellation;
     }
     storage.draw.indexAddress = reader.ReadU64();
@@ -736,7 +752,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(17u);
+    writer.WriteU32(23u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -758,6 +774,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.float64DenormPreserve);
     writer.WriteBool(request.target.registrationModules);
     writer.WriteU32(request.target.registrationWordLimit);
+    writer.WriteBool(request.target.vertexSubgroups);
+    writer.WriteBool(request.target.float16DenormPreserve);
     return base64Encode(buffer);
 }
 
@@ -766,7 +784,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 17u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 23u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -789,6 +807,8 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 16u) result.request.target.float64DenormPreserve = reader.ReadBool();
     if (version >= 17u) result.request.target.registrationModules = reader.ReadBool();
     if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
+    if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
+    if (version >= 21u) result.request.target.float16DenormPreserve = reader.ReadBool();
     return result;
 }
 

@@ -1,5 +1,5 @@
 // Metal twin of tests/Recorder.cpp's --multisample-only mode (agc_multisample_guest_access). The test function
-// (multisampleGuestAccessTests, Recorder.cpp:4504-4605) is copied unchanged but for its first check: a
+// (multisampleGuestAccessTests, Recorder.cpp at upstream 0f2683cb7) is copied unchanged but for its first check: a
 // multisampled color target's samples live only in a host image (here a Metal 2D multisample texture made by
 // the MultisampleTarget twin, specifics/macos/src/MultisampleTarget.mm), so a CPU read (the GuestMemory read
 // guard), a DMA copy and a texture read through the Metal ShaderResources twin of its memory must throw, also
@@ -94,6 +94,8 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     }
     std::array<std::byte, 64> texels{};
     refused([&] { AgcDriver::GuestMemory::Read(address + 256u, texels); }, "a CPU read", "a CPU read");
+    refused([&] { AgcDriver::GuestMemory::ReadCommitted(address + 256u, texels); }, "a CPU read", "a committed CPU read");
+    refused([&] { AgcDriver::GuestMemory::ReadCommittedUnsynced(address + 256u, texels); }, "a CPU read", "a committed CPU read without the flush hook");
     refused([&] { RequireNoMultisampleTarget(address, 64u, "a DMA copy"); }, "a DMA copy", "a DMA copy");
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
@@ -123,6 +125,49 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     refused([&] { AgcDriver::GuestMemory::Read(address + 3u * 65536u + 256u, texels); }, "a CPU read", "a CPU read in the padding of a later sample plane");
     AgcDriver::GuestMemory::Read(address + 4u * 65536u, texels);
     ClearMultisampleTargets(context.device);
+    // Upstream 0f2683cb7: a tiled (RenderTarget) multisampled target guards its whole surface, including the
+    // tile-height padding of 2x and 8x targets.
+    target.tileMode = ColorTileMode::RenderTarget;
+    {
+        std::lock_guard gpu(GpuMutex());
+        Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "the tiled multisampled target has no view");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
+    refused([&] { AgcDriver::GuestMemory::Read(address + targetBytes - texels.size(), texels); }, "a CPU read", "a CPU read inside the tiled multisampled target");
+    AgcDriver::GuestMemory::Read(address + targetBytes, texels);
+    ClearMultisampleTargets(context.device);
+    if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_2_BIT) != 0) {
+        target.extent = {128, 64};
+        target.surfaceExtent = target.extent;
+        target.samples = 2;
+        {
+            std::lock_guard gpu(GpuMutex());
+            Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "the 2x tiled multisampled target has no view");
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+        }
+        refused([&] { AgcDriver::GuestMemory::Read(address + 2u * targetBytes - texels.size(), texels); }, "a CPU read", "a CPU read inside the 2x tile-height padding");
+        AgcDriver::GuestMemory::Read(address + 2u * targetBytes, texels);
+        ClearMultisampleTargets(context.device);
+    }
+    if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_8_BIT) != 0) {
+        target.extent = {64, 32};
+        target.surfaceExtent = target.extent;
+        target.samples = 8;
+        {
+            std::lock_guard gpu(GpuMutex());
+            Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "the 8x tiled multisampled target has no view");
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+        }
+        refused([&] { AgcDriver::GuestMemory::Read(address + 2u * targetBytes - texels.size(), texels); }, "a CPU read", "a CPU read inside the 8x tile-height padding");
+        AgcDriver::GuestMemory::Read(address + 2u * targetBytes, texels);
+        ClearMultisampleTargets(context.device);
+    }
     AgcDriver::GuestMemory::Read(address + 256u, texels);
     std::cout << "Multisampled target guest access tests passed\n";
 }

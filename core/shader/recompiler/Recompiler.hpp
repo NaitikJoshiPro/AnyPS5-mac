@@ -116,6 +116,13 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm10_11_11
 };
 
+enum class RasterPrimitive : std::uint8_t {
+    Point,
+    Line,
+    Triangle,
+    Rectangle
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -145,6 +152,8 @@ struct ShaderPixelStageInfo {
     bool dualSourceBlend;
     bool alphaToCoverage;
     bool stencilRefExportEnable;
+    RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
+    bool layerExported = false;
 };
 
 struct ShaderVertexBufferResource {
@@ -166,6 +175,7 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchAttribReg;
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 struct ShaderFloatMode {
@@ -260,6 +270,8 @@ struct SpirvTarget {
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
     ShaderBackend backend = ShaderBackend::Spirv;
+    bool vertexSubgroups = true;
+    bool float16DenormPreserve = false;
 };
 
 struct BindingLayout {
@@ -304,10 +316,13 @@ struct TessellationConfiguration {
     std::uint32_t domain;
     std::uint32_t partitioning;
     std::uint32_t outputTopology;
+    std::uint32_t patchesPerGroup = 256;
 };
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
 inline constexpr std::uint32_t MeshDrawPushBytes = 24;
+inline constexpr std::uint32_t TessellationLevelPushOffsetBytes = 120;
+inline constexpr std::uint32_t TessellationLevelPushBytes = 8;
 inline constexpr std::uint32_t MeshArgumentAddressDword = 4;
 inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
@@ -422,6 +437,7 @@ struct FragmentParameter {
     bool flat;
     bool perVertex;
     bool custom = false;
+    bool flatP10 = false;
 };
 
 struct BarycentricEmulation {

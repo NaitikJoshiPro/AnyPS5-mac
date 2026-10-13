@@ -241,6 +241,13 @@ void SetImageProbe(ImageProbe* probe) {
     imageProbe.store(probe, std::memory_order_release);
 }
 
+void NoteImageCopy(VkImage image, bool toBuffer) {
+    auto* probe = imageProbe.load(std::memory_order_acquire);
+    if (probe == nullptr) return;
+    if (toBuffer) probe->CopiedToBuffer(image);
+    else probe->CopiedFromBuffer(image);
+}
+
 namespace Vk {
 
 VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
@@ -538,6 +545,7 @@ std::uint32_t BytesPerRow(id<MTLTexture> texture, std::uint32_t texels, std::uin
 }
 
 void CmdCopyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    NoteImageCopy(destination, false);
     auto& stream = Stream(commands);
     id<MTLBuffer> buffer = BufferOf(source);
     id<MTLTexture> texture = TextureOfImage(destination);
@@ -559,6 +567,7 @@ void CmdCopyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage des
 }
 
 void CmdCopyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
+    NoteImageCopy(source, true);
     auto& stream = Stream(commands);
     id<MTLBuffer> buffer = BufferOf(destination);
     id<MTLTexture> texture = TextureOfImage(source);

@@ -18,4 +18,11 @@ list(APPEND agcMetalTwins
         "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextures.mm"
         "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextureFormat.mm"
         "tests/execution/PipelineOptimizedReadback.cpp=specifics/macos/tests/PendingTwins.mm"
+        # Upstream v0.1.2 (0f2683cb7) tests that build their own Vulkan instance or a MockVulkan recorder.
+        # Depth surface storage and depth plane copies on Metal (DepthSurface.mm; the copy count through Metal::ImageProbe).
+        "tests/execution/DepthStorage.cpp=specifics/macos/tests/DepthStorageTwin.mm"
+        "tests/execution/DepthPlaneGuestLayers.cpp=specifics/macos/tests/DepthPlaneGuestLayersTwin.mm"
+        # Their Metal twins (UPSYNC round 2): the copy is an MSL kernel over the descriptor's Metal buffer.
+        "tests/execution/SparseBufferHoles.cpp=specifics/macos/tests/SparseBufferHolesTwin.mm"
+        "tests/HostImportRetireHold.cpp=specifics/macos/tests/HostImportRetireTwin.mm"
 )
