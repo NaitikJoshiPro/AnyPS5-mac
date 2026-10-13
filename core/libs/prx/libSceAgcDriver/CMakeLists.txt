@@ -1070,6 +1070,11 @@ file(GLOB agcExecutionTestSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/
 set(agcExecutionTests)
 foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     get_filename_component(agcExecutionTestName ${agcExecutionTestSource} NAME_WE)
+    # Guest fibers on arm64 switch through the FEX runner's bridge, so a native arm64 test binary cannot
+    # run one (libSceFiber's own fiber_tests are not built there either; TechnicalDebt "macos-native-fiber-tests").
+    if(agcExecutionTestName STREQUAL "GpuMapOnFiber" AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" OR CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+        continue()
+    endif()
     if(ANYPS5_AGC_EXECUTION_TESTS AND NOT agcExecutionTestName IN_LIST ANYPS5_AGC_EXECUTION_TESTS)
         set(agcExecutionTestSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/ExecutionTestNotBuilt.cpp)
     endif()
@@ -1093,7 +1098,9 @@ foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
     endif()
 endforeach()
 
-target_link_libraries(agc_driver_gpu_map_on_fiber_tests PRIVATE libSceFiber)
+if(TARGET agc_driver_gpu_map_on_fiber_tests)
+    target_link_libraries(agc_driver_gpu_map_on_fiber_tests PRIVATE libSceFiber)
+endif()
 
 target_include_directories(agc_driver_alpha_to_coverage_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
