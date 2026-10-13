@@ -174,6 +174,13 @@ DepthSurfaceUse AcquireDepthSurface(id<MTLDevice> device, const DepthTarget& tar
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:target.extent.width height:target.extent.height mipmapped:NO];
     descriptor.storageMode = MTLStorageModePrivate;
     descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    // Multisampled depth (DECISIONS D27): a 2D multisample texture, GPU-only like every surface
+    // (upstream's sampling of a multisampled depth surface is not implemented either).
+    if (target.samples > 1u) {
+        if (![device supportsTextureSampleCount:target.samples]) Fail(std::to_string(target.samples) + "-sample depth targets: the device renders 1, 2 and 4 samples (TechnicalDebt metal-msaa-8x)");
+        descriptor.textureType = MTLTextureType2DMultisample;
+        descriptor.sampleCount = target.samples;
+    }
     id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
     if (texture == nil) Fail("cannot create a depth surface");
     // Made cleared to the target's clear values, as upstream clears a new surface.

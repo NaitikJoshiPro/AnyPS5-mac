@@ -19,6 +19,13 @@
 #endif
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <memory>
+#include <span>
+
+namespace AgcDriver::Graphics {
+struct Context;
+class Texture;
+}
 
 namespace AgcDriver::Graphics::Metal {
 
@@ -110,6 +117,30 @@ public:
 };
 // Sets (or, with nullptr, clears) the probe.
 void SetImageProbe(ImageProbe* probe);
+
+// Guest MSAA T#s (types 14 and 15, DECISIONS D27): whether `words` (a T#) is one.
+inline bool MultisampledDescriptor(std::span<const std::uint32_t> words) {
+    if (words.size() != 8u) return false;
+    const auto type = (words[3] >> 28u) & 0xfu;
+    return type == 14u || type == 15u;
+}
+
+// A CB resolve (DECISIONS D27): every pixel of `destination` (single-sample, the same pixel format
+// and extent) becomes the box-filtered average of `source`'s samples, through a render pass whose
+// store action is MTLStoreActionMultisampleResolve; integer formats, which Metal does not resolve,
+// take sample 0 (VK_RESOLVE_MODE_SAMPLE_ZERO) through a fragment pass that reads the
+// texture2d_ms. Recorded into `commands`' stream; returns true when the sample-0 pass was used.
+bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLTexture> destination);
+
+}
+
+namespace AgcDriver::Graphics::Metal {
+
+// The sampled view of a guest MSAA T# (DECISIONS D27): the host image of the multisampled color
+// target the T# addresses (MultisampleTarget.mm; samples exist only there), with the T#'s swizzle,
+// after its pending CMASK fast clear. Throws when no multisampled target of the T#'s address, extent,
+// sample count and format exists (guest-written MSAA memory has no modeled sample layout).
+std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 
 }
 

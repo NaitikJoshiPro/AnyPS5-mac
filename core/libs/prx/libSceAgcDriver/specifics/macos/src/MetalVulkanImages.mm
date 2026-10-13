@@ -754,4 +754,112 @@ void CmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destinati
 
 }
 
+namespace {
+
+constexpr const char* ResolveSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+struct ResolveArgs {
+    texture2d_ms<float> f;
+    texture2d_ms<uint> u;
+    texture2d_ms<int> i;
+};
+vertex float4 aps5_resolve_vertex(uint id [[vertex_id]]) {
+    const float2 corner = float2(float((id << 1u) & 2u), float(id & 2u));
+    return float4(corner * 2.0f - 1.0f, 0.0f, 1.0f);
+}
+fragment uint4 aps5_resolve_uint(float4 position [[position]], constant ResolveArgs& args [[buffer(0)]]) {
+    return args.u.read(uint2(position.xy), 0);
+}
+fragment int4 aps5_resolve_sint(float4 position [[position]], constant ResolveArgs& args [[buffer(0)]]) {
+    return args.i.read(uint2(position.xy), 0);
+}
+)MSL";
+
+struct ResolvePipelines {
+    std::mutex mutex;
+    std::unordered_map<void*, id<MTLLibrary>> libraries;
+    std::unordered_map<void*, id<MTL4ArgumentTable>> tables;
+    std::unordered_map<std::string, id<MTLRenderPipelineState>> pipelines;
+};
+
+ResolvePipelines& Resolves() {
+    static ResolvePipelines pipelines;
+    return pipelines;
+}
+
+}
+
+bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLTexture> destination) {
+    if (source == nil || destination == nil) FailImages("a resolve without its source or destination");
+    if (source.sampleCount < 2u || destination.sampleCount != 1u) FailImages("a resolve needs a multisampled source and a single-sample destination");
+    if (source.pixelFormat != destination.pixelFormat || source.width != destination.width || source.height != destination.height) FailImages("a resolve between different formats or extents");
+    auto& stream = Stream(commands);
+    MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
+    pass.renderTargetWidth = destination.width;
+    pass.renderTargetHeight = destination.height;
+    const auto numeric = NumericClass(source.pixelFormat);
+    if (numeric == 0u) {
+        pass.colorAttachments[0].texture = source;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        pass.colorAttachments[0].resolveTexture = destination;
+        stream.BeginRender(pass);
+        stream.EndEncoder();
+        return false;
+    }
+    id<MTLDevice> device = destination.device;
+    id<MTLRenderPipelineState> pipeline = nil;
+    id<MTL4ArgumentTable> table = nil;
+    {
+        auto& resolves = Resolves();
+        std::lock_guard lock(resolves.mutex);
+        void* key = (__bridge void*)device;
+        auto& library = resolves.libraries[key];
+        NSError* error = nil;
+        if (library == nil) {
+            MTLCompileOptions* options = [MTLCompileOptions new];
+            options.languageVersion = MTLLanguageVersion3_1;
+            library = [device newLibraryWithSource:@(ResolveSource) options:options error:&error];
+            if (library == nil) FailImages("the sample-0 resolve does not compile: " + Describe(error));
+        }
+        auto& argumentTable = resolves.tables[key];
+        if (argumentTable == nil) {
+            MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
+            descriptor.maxBufferBindCount = 1;
+            argumentTable = [device newArgumentTableWithDescriptor:descriptor error:&error];
+            if (argumentTable == nil) FailImages("cannot create the sample-0 resolve's argument table: " + Describe(error));
+        }
+        table = argumentTable;
+        const auto name = std::to_string(reinterpret_cast<std::uintptr_t>(key)) + ":" + std::to_string(static_cast<std::uint64_t>(destination.pixelFormat));
+        auto& made = resolves.pipelines[name];
+        if (made == nil) {
+            MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+            descriptor.vertexFunction = [library newFunctionWithName:@"aps5_resolve_vertex"];
+            descriptor.fragmentFunction = [library newFunctionWithName:numeric == 1u ? @"aps5_resolve_uint" : @"aps5_resolve_sint"];
+            descriptor.colorAttachments[0].pixelFormat = destination.pixelFormat;
+            made = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            if (made == nil) FailImages("cannot build the sample-0 resolve pipeline: " + Describe(error));
+        }
+        pipeline = made;
+    }
+    struct Args {
+        std::uint64_t textures[3];
+    } args{};
+    args.textures[numeric] = source.gpuResourceID._impl;
+    const auto upload = stream.Write(std::as_bytes(std::span(&args, 1)), 16u);
+    pass.colorAttachments[0].texture = destination;
+    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> encoder = stream.BeginRender(pass);
+    [table setAddress:upload.address atIndex:0];
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setArgumentTable:table atStages:MTLRenderStageFragment];
+    [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<double>(destination.width), static_cast<double>(destination.height), 0.0, 1.0}];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    stream.CountCommand();
+    stream.EndEncoder();
+    return true;
+}
+
 }

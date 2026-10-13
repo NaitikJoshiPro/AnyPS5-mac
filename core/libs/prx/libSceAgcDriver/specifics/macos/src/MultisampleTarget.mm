@@ -16,12 +16,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -116,11 +118,14 @@ public:
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     MultisampledCmask cmask;
+    // Sampled views for guest MSAA T#s (DECISIONS D27), by component mapping.
+    std::map<std::uint32_t, std::shared_ptr<Texture>> sampled;
 
 private:
     // The image may still be in use by recorded work only at device teardown (targets live for the
     // device's lifetime, ClearMultisampleTargets), after the device has drained its batches.
     void release() noexcept {
+        sampled.clear();
         if (view) Metal::Vk::DestroyImageView(context.device, view, nullptr);
         if (image) Metal::Vk::DestroyImage(context.device, image, nullptr);
     }
@@ -237,8 +242,72 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
     return acquire(context, target).view;
 }
 
-void ResolveMultisampleTarget(const Context&, const ColorTarget&, StorageTexture&, VkImageView) {
-    throw std::runtime_error("AGC graphics: a CB resolve of a multisampled color target is not implemented on Metal (work package D6, TechnicalDebt metal-d6-targets)");
+// Upstream records a render pass whose resolve attachment is the destination; on Metal the pass's
+// store action is MTLStoreActionMultisampleResolve, or, for the integer formats Metal does not
+// resolve, a fragment pass that takes sample 0 (Metal::ResolveMultisample, DECISIONS D27).
+void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView) {
+    std::lock_guard lock(targetsMutex());
+    auto& target = acquire(context, source);
+    id<MTLTexture> samples = Metal::TextureOfView(target.view);
+    id<MTLTexture> resolved = Metal::TextureOfView(destinationView);
+    Require(resolved != nil, "a CB resolve destination without an attachment view");
+    recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        Metal::ResolveMultisample(commands, samples, resolved);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    });
+    destination.MarkDirty();
+}
+
+namespace Metal {
+
+std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
+    Require(MultisampledDescriptor(words), "a sampled multisampled view of a T# that is not 2D MSAA");
+    const auto address = ((static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u)) & 0xffffffffffull) << 8u;
+    const auto guestFormat = (words[1] >> 20u) & 0x1ffu;
+    const auto width = (((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u;
+    const auto height = ((words[2] >> 14u) & 0x3fffu) + 1u;
+    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    const auto samples = 1u << ((words[3] >> 16u) & 0xfu);
+    const auto type = (words[3] >> 28u) & 0xfu;
+    const auto layers = ((words[4] >> 0u) & 0x1fffu) + 1u;
+    const auto baseArray = (words[4] >> 16u) & 0x1fffu;
+    char described[192];
+    std::snprintf(described, sizeof(described), " (T# 0x%llx, %ux%u, %u samples, format %u, type %u)", static_cast<unsigned long long>(address), width, height, samples, guestFormat, type);
+    Require(baseLevel == 0u, std::string("AGC graphics: a 2D MSAA T# with a nonzero base level (fragment) is not modeled") + described);
+    Require(type == 14u || (layers == 1u && baseArray == 0u), std::string("AGC graphics: a 2D MSAA array T# over more than its first layer is not implemented (multisampled color targets have one layer)") + described);
+    const auto format = ResolveTextureFormat(guestFormat);
+    std::lock_guard lock(targetsMutex());
+    for (const auto& target : targets()) {
+        const auto& color = target->target;
+        if (target->context.device != context.device || color.address != address) continue;
+        Require(color.extent.width == width && color.extent.height == height && color.samples == samples, std::string("AGC graphics: a 2D MSAA T# disagrees with the multisampled color target at its address in extent or sample count") + described);
+        Require(color.format == format, std::string("AGC graphics: a 2D MSAA T# reads a multisampled color target in another format, which is not implemented") + described);
+        Require(type == 14u, std::string("AGC graphics: a 2D MSAA array T# (texture2d_ms_array view of a single-layer target) is not implemented") + described);
+        target->ApplyFastClear(color);
+        const auto swizzle = [](std::uint32_t select) {
+            switch (select) {
+            case 0: return VK_COMPONENT_SWIZZLE_ZERO;
+            case 1: return VK_COMPONENT_SWIZZLE_ONE;
+            case 4: return VK_COMPONENT_SWIZZLE_R;
+            case 5: return VK_COMPONENT_SWIZZLE_G;
+            case 6: return VK_COMPONENT_SWIZZLE_B;
+            case 7: return VK_COMPONENT_SWIZZLE_A;
+            default: throw std::runtime_error("AGC graphics: a 2D MSAA T# with a reserved destination select");
+            }
+        };
+        const auto selects = words[3] & 0xfffu;
+        auto& texture = target->sampled[selects];
+        if (texture == nullptr) {
+            const VkComponentMapping components{swizzle(selects & 7u), swizzle((selects >> 3u) & 7u), swizzle((selects >> 6u) & 7u), swizzle((selects >> 9u) & 7u)};
+            texture = std::make_shared<Texture>(target->context, target->image, color.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
+        }
+        return texture;
+    }
+    throw std::runtime_error(std::string("AGC graphics: a 2D MSAA T# addresses memory that is no multisampled color target; guest-written MSAA memory (sample layout, FMASK) is not modeled") + described);
+}
+
 }
 
 void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {

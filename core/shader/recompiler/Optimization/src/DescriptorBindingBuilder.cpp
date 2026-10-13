@@ -81,6 +81,10 @@ DescriptorImageShape ImageShapeForResource(const ImageResource& image, bool msl)
     // MSL backends (MslAbi Version 6) bind storage views of multisampled images as 2D arrays of
     // layers * samples slices: Metal shaders cannot write multisampled textures.
     if (info.multisampled != 0u && msl && image.resourceClass == ImageResourceClass::Storage) return DescriptorImageShape::Image2DArray;
+    // MSL backends (DECISIONS D27) read sampled-class multisampled images (image_load with a sample
+    // index, image_msaa_load, size queries) through texture2d_ms(_array) heaps; the SPIR-V target
+    // keeps refusing them (no descriptor shape), as upstream.
+    if (info.multisampled != 0u && msl) return info.arrayed != 0u ? DescriptorImageShape::Image2DMultisampleArray : DescriptorImageShape::Image2DMultisample;
     if (info.multisampled != 0u) {
         fail("DescriptorBindingBuilder::Populate multisampled image resources have no descriptor image shape");
     }

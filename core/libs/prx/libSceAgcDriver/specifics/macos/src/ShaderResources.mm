@@ -2356,6 +2356,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+                        if (Metal::MultisampledDescriptor(words)) {
+                            if (textureIndex >= textures.size() || Metal::MultisampleSampledTexture(context, words) != textures[textureIndex]) return false;
+                            ++textureIndex;
+                            continue;
+                        }
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components = ViewComponents(resource);
                         if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) return false;
@@ -3200,6 +3205,12 @@ bool ShaderResources::precollectImages() {
             }
             ImageRecord record;
             record.sampled = sampled;
+            // Guest MSAA T#s are bound from their multisampled color target (DECISIONS D27), not
+            // decoded here (record.decoded stays false).
+            if (Metal::MultisampledDescriptor(words)) {
+                imageRecords.push_back(std::move(record));
+                continue;
+            }
             if (words[0] != 0u || (words[1] & 0xffu) != 0u) {
                 const auto* memo = words.size() == 8 ? &decodedImage(context.device, words) : nullptr;
                 record.resource = memo != nullptr ? memo->resource : DecodeTextureResource(words);
@@ -3312,6 +3323,19 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (words[0] == 0u && (words[1] & 0xffu) == 0u) {
                 item.imageAllocations.push_back(std::numeric_limits<std::size_t>::max());
                 --plannedSampledImages;
+                continue;
+            }
+            if (Metal::MultisampledDescriptor(words)) {
+                // A guest MSAA T# (DECISIONS D27): the sampled view of the multisampled color
+                // target's host image; MSL reads it as texture2d_ms with the guest's sample index.
+                if (binding.imageShape != ShaderRecompiler::DescriptorImageShape::Image2DMultisample && binding.imageShape != ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray) throw std::runtime_error("AGC graphics: a 2D MSAA T# is bound where the shader declares a single-sample image");
+                if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) throw std::runtime_error("AGC graphics: a 2D MSAA T# sampled with unnormalized coordinates");
+                auto texture = Metal::MultisampleSampledTexture(context, words);
+                previousSampled = {};
+                textures.push_back(std::move(texture));
+                textureFirstLayer.push_back(false);
+                textureBaseLevel.push_back(false);
+                item.imageAllocations.push_back(textures.size() - 1);
                 continue;
             }
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
@@ -3442,7 +3466,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     // Stage A has not run (an address-based build, or the pass is off): decoded from the shader.
     if (deferredCompute.program == nullptr) return surfaces;
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
-        if (words[0] == 0u && (words[1] & 0xffu) == 0u) return;
+        if ((words[0] == 0u && (words[1] & 0xffu) == 0u) || Metal::MultisampledDescriptor(words)) return;
         const auto resource = DecodeTextureResource(words);
         consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
     });

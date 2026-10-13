@@ -27,6 +27,7 @@
 #include "MetalMesh.h"
 #include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -317,6 +318,9 @@ struct ColorAttachment {
     std::shared_ptr<DrawCache::TiledTarget> tiled;
     bool load = false;
     std::shared_ptr<Graphics::StorageTexture> resident;
+    // Multisampled targets: the MultisampleTarget host image (samples live only on the host, the
+    // guest memory is guarded, as upstream's MultisampleTarget.cpp).
+    id<MTLTexture> multisample = nil;
 };
 
 // The color buffer as a single-mip 2D surface descriptor (upstream Draw.cpp SurfaceForTarget).
@@ -519,7 +523,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (vertexReflection.stage != Abi::Stage::Vertex && !mesh && !tess) Fail("the vertex stage's MSL is not a vertex function");
     if (fragmentReflection != nullptr && fragmentReflection->stage != Abi::Stage::Fragment) Fail("the pixel stage's MSL is not a fragment function");
     if (vertexReflection.workgroupMemoryStrideDwords != 0u || (fragmentReflection != nullptr && fragmentReflection->workgroupMemoryStrideDwords != 0u)) Fail("device-memory LDS in a draw stage");
-    if (graphics.samples > 1u) Fail("multisampled draws (" + std::to_string(graphics.samples) + " samples)");
+    // Multisampled draws (DECISIONS D27): the pipeline rasterizes graphics.samples samples into
+    // MultisampleTarget host images and multisampled depth surfaces, at the guest's sample positions.
+    if (graphics.samples > 1u && ![state.device supportsTextureSampleCount:graphics.samples]) Fail(std::to_string(graphics.samples) + "-sample draws: the device renders 1, 2 and 4 samples (TechnicalDebt metal-msaa-8x)");
     // Conservative rasterization is emulated (MslConservative.hpp, DECISIONS "conservative
     // rasterization emulated"), and so are per-vertex fragment inputs and barycentrics (B6): both
     // need every triangle's three vertices in the vertex function (the triangle-vertices mode).
@@ -633,7 +639,20 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     StageBindings targetPlan;
     for (const auto& target : graphics.colors) {
         if (target.exportIndex >= 8u) Fail("color target location " + std::to_string(target.exportIndex));
-        if (target.samples > 1u) Fail("multisampled color targets");
+        if (target.samples > 1u) {
+            // Upstream Draw.cpp: a multisampled target is its host image (MultisampleTargetView,
+            // which also applies a pending CMASK fast clear); its guest memory is not read or written.
+            const auto* imageContext = state.images->ImageContext();
+            if (imageContext == nullptr) Fail("a multisampled color target without the device's image context");
+            if (target.samples != graphics.samples) Fail("a color target's sample count differs from the rasterizer's");
+            const auto format = Graphics::Metal::PixelFormatOf(target.format);
+            if (format.format == MTLPixelFormatInvalid) Fail("color target format " + std::to_string(target.format) + " has no Metal pixel format");
+            ColorAttachment attachment {&target, format.format, target.address, target.address, nullptr, false, nullptr};
+            attachment.multisample = Graphics::Metal::TextureOfView(Graphics::MultisampleTargetView(*imageContext, target));
+            if (attachment.multisample == nil || attachment.multisample.sampleCount != target.samples) Fail("the multisampled color target has no host image of its sample count");
+            colors.push_back(attachment);
+            continue;
+        }
         // Tiled targets are the image cache's resident images (upstream image path): their writes
         // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
         std::shared_ptr<Graphics::StorageTexture> resident;
@@ -673,7 +692,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
 
     // CMASK fast clears land in guest memory before the targets load from it.
     for (const auto& attachment : colors) {
-        if (attachment.resident != nullptr) continue;
+        if (attachment.resident != nullptr || attachment.multisample != nil) continue;
         state.MaterializeDcc(*attachment.target, nullptr);
         state.MaterializeCmask(*attachment.target, nullptr);
     }
@@ -694,6 +713,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     for (auto& attachment : colors) {
         const auto& target = *attachment.target;
         passKey = Mix(Mix(Mix(passKey, target.address), target.format | (static_cast<std::uint64_t>(target.exportIndex) << 32u)), static_cast<std::uint64_t>(target.tileMode) | (static_cast<std::uint64_t>(target.extent.width) << 16u) | (static_cast<std::uint64_t>(target.extent.height) << 40u));
+        if (attachment.multisample != nil) {
+            passKey = Mix(passKey, reinterpret_cast<std::uint64_t>((__bridge void*)attachment.multisample));
+            continue;
+        }
         if (attachment.resident != nullptr) {
             passKey = Mix(passKey, reinterpret_cast<std::uint64_t>(attachment.resident.get()) ^ (static_cast<std::uint64_t>(target.mip) << 48u) ^ (static_cast<std::uint64_t>(target.arraySlice | target.depthSlice) << 32u));
             continue;
@@ -725,7 +748,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     DrawCache::DepthSurface* depth = nullptr;
     if (graphics.depth) {
         const auto& target = *graphics.depth;
-        if (target.samples > 1u) Fail("multisampled depth targets");
+        if (target.samples != graphics.samples) Fail("the depth target's sample count differs from the rasterizer's");
         const auto format = DepthFormat(target);
         bool created = false;
         const auto use = Graphics::Metal::AcquireDepthSurface(state.device, target, format, &created);
@@ -736,6 +759,16 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         depthSurface = DrawCache::DepthSurface{target, format, use.texture, use.clearDepth, use.clearStencil};
         depth = &*depthSurface;
         passKey = Mix(Mix(passKey, target.address), static_cast<std::uint64_t>(format));
+    }
+    // The sample count and positions are pass state.
+    std::array<MTLSamplePosition, 8> samplePositions {};
+    if (graphics.samples > 1u) {
+        const auto locations = Graphics::SampleLocations(graphics);
+        passKey = Mix(passKey, graphics.samples);
+        for (std::uint32_t sample = 0; sample < graphics.samples; ++sample) {
+            samplePositions[sample] = MTLSamplePositionMake(locations[sample].x, locations[sample].y);
+            passKey = Mix(passKey, static_cast<std::uint64_t>(locations[sample].x * 16.0f) | (static_cast<std::uint64_t>(locations[sample].y * 16.0f) << 8u));
+        }
     }
 
     // Pipelines: a second channel pass for alternate-alpha 8_8 targets, a back-face pass for
@@ -806,7 +839,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (HasDepth(depth->format)) request.depthFormat = depth->format;
         if (HasStencil(depth->format)) request.stencilFormat = depth->format;
     }
-    request.rasterSampleCount = 1u;
+    request.rasterSampleCount = graphics.samples;
     // B6 emulates alpha-to-coverage in the fragment function's [[sample_mask]] (the guest's rule);
     // Metal's own would apply on top.
     request.alphaToCoverage = graphics.alphaToCoverage && !(fragmentReflection != nullptr && fragmentReflection->exportsSampleMask);
@@ -1000,7 +1033,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         for (auto& attachment : colors) {
             const auto& target = *attachment.target;
             id<MTLTexture> texture = nil;
-            if (attachment.resident != nullptr) {
+            if (attachment.multisample != nil) {
+                texture = attachment.multisample;
+            } else if (attachment.resident != nullptr) {
                 texture = Graphics::Metal::TextureOfView(attachment.resident->AttachmentView(target.format, target.mip, target.depthSlice, target.arraySlice));
                 if (texture == nil) Fail("the resident color target has no attachment view");
             } else if (attachment.tiled != nullptr) {
@@ -1060,7 +1095,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (width == 0u || height == 0u) Fail("a render pass without an extent");
         pass.renderTargetWidth = width;
         pass.renderTargetHeight = height;
-        if (colors.empty() && depth == nullptr) pass.defaultRasterSampleCount = 1u;
+        if (colors.empty() && depth == nullptr) pass.defaultRasterSampleCount = graphics.samples;
+        // The guest's sample positions (standard or PA_SC_AA_SAMPLE_LOCS custom ones), as upstream's
+        // VK_EXT_sample_locations: Metal's are in [0, 1) from the pixel's top-left corner in 1/16
+        // steps, the same grid (Graphics::SampleLocations).
+        if (graphics.samples > 1u) {
+            if (!state.device.programmableSamplePositionsSupported) Fail("the device has no programmable sample positions");
+            [pass setSamplePositions:samplePositions.data() count:graphics.samples];
+        }
         if (void* visibility = recorder.SampleVisibilityBuffer()) {
             pass.visibilityResultBuffer = (__bridge id<MTLBuffer>)visibility;
             pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
@@ -1464,15 +1506,26 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
         const bool tessellationStage = stage == ShaderRecompiler::ShaderStage::Local || stage == ShaderRecompiler::ShaderStage::TessellationControl || stage == ShaderRecompiler::ShaderStage::TessellationEvaluation;
         if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh && !(tessellationPath && tessellationStage)) return std::string("Metal draw (work package D6): only vertex, mesh, tessellation and pixel stages are implemented");
     }
-    if (graphics.samples > 1u) return std::string("Metal draw (work package D6): multisampled draws are not implemented");
+    if (graphics.samples > 1u && state->queue != nil && ![state->device supportsTextureSampleCount:graphics.samples]) return std::string("Metal draw (work package D6): ") + std::to_string(graphics.samples) + "-sample draws: the device renders 1, 2 and 4 samples (TechnicalDebt metal-msaa-8x)";
     return std::nullopt;
 }
 
 // CB metadata passes: a fast-clear eliminate (or a DCC decompress of a target without DCC) expands
-// the CMASK into guest memory as a draw would; DCC and MSAA resolves are not implemented.
+// the CMASK into guest memory as a draw would; a CB resolve is a resolve pass (DECISIONS D27).
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device has no color metadata passes");
-    if (pass.mode == Graphics::ColorMetadataPass::Mode::Resolve) Fail("CB resolves (multisampled targets)");
+    if (pass.mode == Graphics::ColorMetadataPass::Mode::Resolve) {
+        // Upstream Draw.cpp RunColorMetadataPass: the destination is the image cache's resident image
+        // of the surface, written by a resolve pass from the source's MultisampleTarget host image.
+        if (!pass.source.has_value() || pass.targets.size() != 1u) Fail("a CB resolve without its source and destination");
+        const auto& destination = pass.targets.front();
+        const auto* imageContext = state->images->ImageContext();
+        if (destination.tileMode == Graphics::ColorTileMode::Linear || imageContext == nullptr) Fail("a CB resolve into a linear target (upstream resolves into resident images only)");
+        const auto resident = Graphics::CachedStorageSurface(*imageContext, SurfaceForTarget(destination));
+        if (resident == nullptr || !resident->Attachable()) Fail("a CB resolve into a storage format that cannot be a color attachment");
+        Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, destination.arraySlice));
+        return;
+    }
     for (const auto& color : pass.targets) {
         if (color.dccAddress != 0u) Fail("CB metadata passes over DCC-compressed targets");
         state->MaterializeCmask(color, nullptr);
