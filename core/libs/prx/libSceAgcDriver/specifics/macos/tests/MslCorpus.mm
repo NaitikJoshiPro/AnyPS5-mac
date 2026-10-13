@@ -5,6 +5,9 @@
 // the compute pipeline with the result's function constants. No GPU work is submitted.
 // A request whose recompile throws on the MSL path is replayed through SpirvBackend as well: when that throws too,
 // the front end rejected it (a test that checks a rejection) and it does not count against MetalBackend.
+// Likewise an MSL emission failure whose request SpirvBackend refuses too (spirv-rejected): the corpus is
+// every shader SpirvBackend accepts. A request recorded for a 64-lane host that SpirvBackend refuses on a
+// host as wide as the Metal device's (32 lanes) is host-width-rejected: reported, not counted.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -38,6 +41,8 @@ enum class Outcome {
     Compiled,
     FunctionOnly,
     FrontEndRejected,
+    SpirvRejected,
+    HostWidthRejected,
     EmissionFailed,
     MslPathFailed,
     LibraryFailed,
@@ -50,6 +55,8 @@ constexpr const char* OutcomeName(Outcome outcome) {
     case Outcome::Compiled: return "compiled";
     case Outcome::FunctionOnly: return "function-only";
     case Outcome::FrontEndRejected: return "front-end-rejected";
+    case Outcome::SpirvRejected: return "spirv-rejected";
+    case Outcome::HostWidthRejected: return "host-width-rejected";
     case Outcome::EmissionFailed: return "emission-failed";
     case Outcome::MslPathFailed: return "msl-path-failed";
     case Outcome::LibraryFailed: return "library-failed";
@@ -60,7 +67,7 @@ constexpr const char* OutcomeName(Outcome outcome) {
 }
 
 constexpr bool Counts(Outcome outcome) {
-    return outcome != Outcome::Compiled && outcome != Outcome::FunctionOnly && outcome != Outcome::FrontEndRejected;
+    return outcome != Outcome::Compiled && outcome != Outcome::FunctionOnly && outcome != Outcome::FrontEndRejected && outcome != Outcome::SpirvRejected && outcome != Outcome::HostWidthRejected;
 }
 
 struct Result {
@@ -78,6 +85,7 @@ struct Options {
     std::size_t limit = 0;
     bool includeSpirv = false;
     bool verbose = false;
+    std::uint32_t replayWidth = 0;
 };
 
 std::string Describe(NSError* error) {
@@ -128,7 +136,7 @@ std::string ReadFile(const fs::path& path) {
 
 class Checker {
 public:
-    explicit Checker(id<MTLDevice> metal) : device(metal) {
+    Checker(id<MTLDevice> metal, std::uint32_t hostSubgroupSize, std::uint32_t replayWidth) : device(metal), hostSubgroupSize(hostSubgroupSize), replayWidth(replayWidth) {
         NSError* error = nil;
         compiler = [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
         if (compiler == nil) throw std::runtime_error("agc_metal_msl_corpus (T1): cannot create an MTL4Compiler: " + Describe(error));
@@ -167,6 +175,8 @@ private:
         result.stage = StageName(request.shader.stage);
         request.useCache = false;
         request.target.backend = ShaderRecompiler::ShaderBackend::Msl;
+        // Debug aid: --replay-width replays every request as if recorded for that host subgroup width.
+        if (replayWidth != 0u) request.target.subgroupSize = replayWidth;
         ShaderRecompiler::RecompileResult compiled;
         try {
             compiled = ShaderRecompiler::Recompile(request);
@@ -175,6 +185,30 @@ private:
             if (message.find("MSL emission failed") != std::string::npos) {
                 result.outcome = Outcome::EmissionFailed;
                 result.detail = FirstLines(message.substr(message.find("MSL emission failed")), 1);
+                // The shader is in the corpus only when SpirvBackend accepts it: a request both
+                // backends refuse (VertexBarrier's LDS case, host-width limits) is a rejection the
+                // test that recorded it checks, not a MetalBackend gap.
+                request.target.backend = ShaderRecompiler::ShaderBackend::Spirv;
+                try {
+                    static_cast<void>(ShaderRecompiler::Recompile(request));
+                } catch (const std::exception& reference) {
+                    result.outcome = Outcome::SpirvRejected;
+                    result.detail += " (SpirvBackend: " + FirstLines(reference.what(), 1) + ")";
+                    return;
+                }
+                // A request recorded for a host subgroup wider than the Metal device's (a 64-lane
+                // Vulkan target) that SpirvBackend refuses on a host as wide as Metal's: the shader
+                // needs a 64-lane graphics wave, which no 32-lane host forms (TechnicalDebt
+                // metal-b6-half-wave). Reported, not counted.
+                if (request.target.subgroupSize > hostSubgroupSize) {
+                    request.target.subgroupSize = hostSubgroupSize;
+                    try {
+                        static_cast<void>(ShaderRecompiler::Recompile(request));
+                    } catch (const std::exception& reference) {
+                        result.outcome = Outcome::HostWidthRejected;
+                        result.detail += " (SpirvBackend on a " + std::to_string(hostSubgroupSize) + "-lane host: " + FirstLines(reference.what(), 1) + ")";
+                    }
+                }
                 return;
             }
             request.target.backend = ShaderRecompiler::ShaderBackend::Spirv;
@@ -250,6 +284,8 @@ private:
     }
 
     id<MTLDevice> device;
+    std::uint32_t hostSubgroupSize;
+    std::uint32_t replayWidth;
     id<MTL4Compiler> compiler;
     MTLCompileOptions* options;
 };
@@ -294,7 +330,8 @@ Options Parse(int argc, char** argv) {
         else if (argument == "--limit") options.limit = std::stoull(value());
         else if (argument == "--include-spirv") options.includeSpirv = true;
         else if (argument == "--verbose") options.verbose = true;
-        else throw std::runtime_error("unknown argument " + argument + " (--corpus DIR... --report FILE --workers N --limit N --include-spirv --verbose)");
+        else if (argument == "--replay-width") options.replayWidth = static_cast<std::uint32_t>(std::stoul(value()));
+        else throw std::runtime_error("unknown argument " + argument + " (--corpus DIR... --report FILE --workers N --limit N --include-spirv --verbose --replay-width LANES)");
     }
     if (const char* list = std::getenv("APS5_MSL_CORPUS"); list != nullptr && *list != '\0') {
         std::stringstream stream(list);
@@ -324,7 +361,7 @@ int main(int argc, char** argv) {
             const auto files = CorpusFiles(options, notes);
             for (const auto& note : notes) std::printf("%s\n", note.c_str());
             if (files.empty()) throw std::runtime_error("agc_metal_msl_corpus (T1): the corpus is empty; collect one with tools/mac/gpu_suite.sh all --dump-requests build-metal/msl-corpus");
-            const Checker checker(metal);
+            const Checker checker(metal, device.Target().subgroupSize, options.replayWidth);
             std::vector<Result> results(files.size());
             std::atomic<std::size_t> next{0};
             const unsigned workers = std::max(1u, std::min<unsigned>(options.workers != 0 ? options.workers : std::min(8u, std::max(1u, std::thread::hardware_concurrency())), static_cast<unsigned>(files.size())));
@@ -352,7 +389,7 @@ int main(int argc, char** argv) {
             }
             std::size_t failing = 0;
             for (const auto& result : results) {
-                if (!Counts(result.outcome) && !options.verbose) continue;
+                if (!Counts(result.outcome) && result.outcome != Outcome::HostWidthRejected && !options.verbose) continue;
                 failing += Counts(result.outcome) ? 1u : 0u;
                 std::printf("%s %s %s: %s\n", result.file.filename().c_str(), result.stage.c_str(), OutcomeName(result.outcome), result.detail.c_str());
             }
@@ -372,7 +409,7 @@ int main(int argc, char** argv) {
             for (const auto& [outcome, count] : counts) std::printf(" %s %zu", OutcomeName(outcome), count);
             std::printf("\n");
             const std::size_t valid = counts[Outcome::Compiled] + counts[Outcome::FunctionOnly];
-            const std::size_t applicable = results.size() - counts[Outcome::FrontEndRejected];
+            const std::size_t applicable = results.size() - counts[Outcome::FrontEndRejected] - counts[Outcome::SpirvRejected] - counts[Outcome::HostWidthRejected];
             std::printf("MetalBackend produced valid MSL for %zu of %zu request(s) the front end accepts (%zu not valid)\n", valid, applicable, failing);
             if (failing != 0) return 1;
         }
