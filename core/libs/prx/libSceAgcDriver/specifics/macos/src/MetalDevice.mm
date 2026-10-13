@@ -772,9 +772,10 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // has no profile and keeps 32-lane vertex programs (DECISIONS D25).
     target.vertexSubgroups = state->queue == nil || Metal::Profile(state->device).vertexSimdGroups;
     // Upstream e4f212b2e: float16DenormPreserve converts f16 operands in hardware (MSL
-    // aps5_f16_to_f32_native). Left false (exact decode) until agc_metal_alu_helpers' "f16->f32
-    // (native)" op has passed on the GPU (SHADERPORT, .mac-work/coord/upsync.md).
-    target.float16DenormPreserve = false;
+    // aps5_f16_to_f32_native). Apple GPUs keep f16 denormals in the conversion: agc_metal_alu_helpers'
+    // "f16->f32 (native)" op matched the exact decode for 20000 halves, a quarter of them denormal
+    // (gpu-suite 20261013T140350Z).
+    target.float16DenormPreserve = true;
     return target;
 }
 
