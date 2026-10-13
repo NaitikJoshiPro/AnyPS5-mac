@@ -102,7 +102,10 @@ std::string Check(const Variant& variant, const ShaderRecompiler::RecompileResul
     Require(!result.msl.empty(), name + ": no MSL");
     Require(result.msl.Reflection().abiVersion == Abi::Version && Abi::Version >= 6u, name + ": not an MslAbi v6 library");
     const std::string source(result.msl.Source());
-    if (std::getenv("APS5_MS_STORAGE_DUMP") != nullptr) std::cout << "=== " << name << "\n" << source << '\n';
+    if (std::getenv("APS5_MS_STORAGE_DUMP") != nullptr) {
+        std::cout << "=== " << name << "\n" << source << '\n';
+        for (const auto& constant : result.specialization) std::cout << "constant " << constant.id << " = " << constant.value << '\n';
+    }
     // The storage heap of the MSAA dimension is a writable 2D array; no texture2d_ms is declared
     // for a storage heap (sampled heaps may still be texture2d_ms).
     const std::string scalar = variant.atomic64 ? "ulong" : variant.atomic ? "uint" : "float";
@@ -186,6 +189,52 @@ constexpr std::uint32_t Samples = 4u;
 
 // Runs mode 0 of the store / 32-bit atomic program on one 8x8 workgroup over 2D arrays of
 // Layers * Samples slices and checks that exactly the addressed sample's slice holds the data.
+// Control: texture atomics on an R32Uint 2D array, through an argument buffer (slice 7) and a
+// direct texture binding (slice 6), with the same texture setup as Run. Returns the two texels.
+std::pair<std::uint32_t, std::uint32_t> AtomicControl(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+    const char* source = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct T { array<texture2d_array<uint, access::read_write>, 1> a; };
+kernel void control(device const T& t [[buffer(0)]], texture2d_array<uint, access::read_write> d [[texture(0)]], uint3 id [[thread_position_in_threadgroup]]) {
+    t.a[0].atomic_exchange(id.xy, 7u, 0x1234u);
+    d.atomic_exchange(id.xy, 6u, 0x5678u);
+}
+)";
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(source) options:nil error:&error];
+    Require(library != nil, "control: " + Describe(error));
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"control"] error:&error];
+    Require(pipeline != nil, "control pipeline: " + Describe(error));
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.pixelFormat = MTLPixelFormatR32Uint;
+    descriptor.width = 8;
+    descriptor.height = 8;
+    descriptor.arrayLength = 8;
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    const std::uint64_t handle = texture.gpuResourceID._impl;
+    id<MTLBuffer> table = [device newBufferWithBytes:&handle length:sizeof(handle) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> readback = [device newBufferWithLength:8 * 8 * 4 * 8 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> commands = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:table offset:0 atIndex:0];
+    [encoder setTexture:texture atIndex:0];
+    [encoder useResource:texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
+    id<MTLBlitCommandEncoder> copy = [commands blitCommandEncoder];
+    for (std::uint32_t slice = 0; slice < 8u; ++slice) [copy copyFromTexture:texture sourceSlice:slice sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(8, 8, 1) toBuffer:readback destinationOffset:slice * 256u destinationBytesPerRow:32 destinationBytesPerImage:256];
+    [copy endEncoding];
+    [commands commit];
+    [commands waitUntilCompleted];
+    const auto* words = static_cast<const std::uint32_t*>(readback.contents);
+    return {words[7u * 64u], words[6u * 64u]};
+}
+
 void Run(id<MTLDevice> device, id<MTLCommandQueue> queue, const Variant& variant, const ShaderRecompiler::RecompileResult& result) {
     const std::string name(variant.name);
     const std::string source(result.msl.Source());
@@ -311,6 +360,8 @@ int main() {
             std::puts("multisampled storage MSL compiles with Metal (4 samples)");
             id<MTLCommandQueue> queue = [device newCommandQueue];
             Require(queue != nil, "no command queue");
+            const auto [tableAtomic, directAtomic] = AtomicControl(device, queue);
+            std::printf("control: texture2d_array atomic_exchange through an argument buffer 0x%x (expected 0x1234), direct binding 0x%x (expected 0x5678)\n", tableAtomic, directAtomic);
             // The 64-bit atomic needs the driver's lock table: covered by the compile above only.
             for (std::size_t index = 0; index < variants.size(); ++index) {
                 if (!variants[index].atomic64) Run(device, queue, variants[index], results[index]);
