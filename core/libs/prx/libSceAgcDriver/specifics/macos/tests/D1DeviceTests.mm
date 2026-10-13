@@ -273,7 +273,8 @@ void CheckGds(AgcDriver::VulkanDevice& device) {
 // D3 host imports: a CPU seed, GPU atomics through the import of registered guest memory, the CPU
 // reads the results after WaitIdle. Round 0 makes the import while the guest write watch has the
 // page write-protected (agc_driver_gds_append_consume: the GPU's stores never reached the CPU's
-// pages); rounds 1-2 re-arm the watch on the imported page between batches. The last block is
+// pages); rounds 1-2 reseed from the CPU once the import exists (the import is no longer watched).
+// The last block is
 // imported while the CPU maps it read-only (a GPU-writable, CPU read-only guest mapping).
 int PageProtection(const void* page) {
     mach_vm_address_t region = reinterpret_cast<std::uintptr_t>(page);
@@ -333,8 +334,13 @@ void CheckImports(AgcDriver::VulkanDevice& device) {
         for (std::uint32_t round = 0; round < 3; ++round) {
             const std::uint32_t seed = 1000u * (round + 1u);
             block.Words()[0] = seed;
-            block.Arm();
-            Require((PageProtection(block.Words()) & VM_PROT_WRITE) == 0, "imports: the write watch did not write-protect the page in round " + std::to_string(round));
+            if (round == 0u) {
+                block.Arm();
+                Require((PageProtection(block.Words()) & VM_PROT_WRITE) == 0, "imports: the write watch did not write-protect the page before the import");
+            } else {
+                // Metal imports are compared, not watched (GuestBufferMemory decideImportWatch).
+                Require(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(reinterpret_cast<std::uintptr_t>(block.Words()), 65536), "imports: the imported block is still write-watched");
+            }
             RunImportAtomics(device, block.Words(), seed, "write-watched round " + std::to_string(round));
         }
     }
@@ -347,7 +353,7 @@ void CheckImports(AgcDriver::VulkanDevice& device) {
         Require(PageProtection(block.Words()) == VM_PROT_READ, "imports: the CPU read-only block did not keep its protection");
         Require(mprotect(block.Words(), 65536, PROT_READ | PROT_WRITE) == 0, "imports: cannot restore the block");
     }
-    std::puts("host imports: GPU atomics reach the CPU's pages (write-watched, re-armed, CPU read-only)");
+    std::puts("host imports: GPU atomics reach the CPU's pages (made over write-watched pages, reseeded, CPU read-only)");
 }
 
 // BDA page table: BdaAbi::Header + Range[] over the registered guest allocations, translated in
