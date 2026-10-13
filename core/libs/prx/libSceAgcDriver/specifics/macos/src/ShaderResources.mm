@@ -3396,7 +3396,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             textures.push_back(std::move(texture));
             textureFirstLayer.push_back(firstLayer);
             textureBaseLevel.push_back(baseLevel);
-            describedRanges.push_back({"texture", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
+            describedRanges.push_back({"texture", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress, textures.size() - 1});
             item.imageAllocations.push_back(textures.size() - 1);
         }
         // The line is due even when every element took the fast path (cachedTexture reports too).
@@ -3470,13 +3470,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
         // over an eligible surface is replaced by a view without reading. Storage images are
         // checked on their own surface (a mip chain can exceed the element's descriptor). Read
         // without the device lock: these members are fixed once the build completed.
-        std::size_t textureIndex = 0;
+        // Each "texture" range names its texture: MSAA views have none, so pairing by position
+        // would shift every later range onto the wrong texture.
         for (const auto& range : describedRanges) {
-            if (std::strcmp(range.kind, "texture") == 0 && textureIndex < textures.size()) {
-                const auto& texture = textures[textureIndex++];
-                if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false);
-                else consider(range.format, range.address, range.bytes, true);
-            }
+            if (std::strcmp(range.kind, "texture") != 0) continue;
+            Require(range.textureIndex < textures.size(), "a sampled image range names no texture of the build");
+            consider(range.format, range.address, range.bytes, !textures[range.textureIndex]->ViewsStorageImage());
         }
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (index != 0 && storageTextures[index] == storageTextures[index - 1]) continue;

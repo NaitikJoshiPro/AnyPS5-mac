@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
 #include <chrono>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -284,6 +285,10 @@ private:
         std::uint32_t format = 0;
         int tileMode = 0;
         std::uint64_t dccAddress = 0;
+        // A "texture" range: the index into `textures` of the texture it describes. MSAA views
+        // (sampled and storage) are kept in `textures` without a range of their own, so ranges and
+        // textures do not pair by position (TechnicalDebt metal-msaa).
+        std::size_t textureIndex = std::numeric_limits<std::size_t>::max();
     };
     std::vector<DescribedRange> describedRanges;
     struct Allocation {
