@@ -171,3 +171,14 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - GDS bug narrowed down: GPU atomics land in the D3 host import's pages, but the CPU still reads the seed after WaitIdle. The VM object is unchanged. Owned by D3, now DRAW2.
 - Agents: DRAW handed off (context full). Now running: DRAW2 (D3 GDS, 9 driver G3/G4 failures, SDL options, windowed-run prep, which needs approval) and SHD3 (per-vertex emulation, alpha_to_coverage, dst_sel, interp param, wave64 ReadLane, MSAA ImageWrite, upstream image-path verification, pixel_interlock one-shot).
 - Next: collect the results, then M2 exit verification.
+
+## 2026-10-13 ~08:30 — M2: SHD3 done, bring-up image path deleted
+- Clean runs at b91753d6a (--validation): upstream image path 293/303 (G1 181/182, G2 43/43, G3 33/33, G4 30/39, G7 6/6), bring-up path 285/303. Bring-up path deleted (d2a2b0827).
+- Per-vertex fragment values emulated (D20, 3f14bf8ad): interpolation_f16 + pixel_barycentric_emulation pass and are off the allowlist.
+- DRAW2 fixes:
+  - GDS / no-copy over write-watched read-only pages (1497d1225, test agc_metal_device_imports) fixed most "destination unchanged" G3 failures.
+  - Offscreen VideoOut segfault fixed (b8395ffb9).
+  - First windowed run passed.
+  - G5 headless pass: 12/13. frame_dump_queue still HOLD: the hang is fixed (frame dump worker) and the remaining FIFO write is being debugged.
+- Agents now: DRAW2 (frame_dump_queue, windowed decode/overlay, msaa_enable_single_sample), SHD4 (pixel_interlock fault stop, conservative raster verification, G7 unbuilt tests, MSL mesh functions), MSIMG (multisampled storage-write emulation, 4 prepared_shaders tests).
+- Remaining to emulate: mesh (SHD4), tessellation (design pending), MS storage writes (MSIMG).
