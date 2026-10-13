@@ -31,6 +31,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <io.h>
+#include <sys/stat.h>
 #ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
 #define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
 #endif
@@ -54,6 +56,7 @@ constexpr int GuestEnametoolong = 63;
 constexpr int GuestEnotempty = 66;
 constexpr int GuestEoverflow = 84;
 constexpr int GuestAtFdcwd = -100;
+constexpr int GuestAtRemovedir = 0x800;
 constexpr std::size_t GuestPathMax = 1024;
 constexpr std::size_t GuestNameMax = 255;
 
@@ -187,6 +190,13 @@ bool HasNonDirectoryPrefix(const std::filesystem::path& native) {
         if (std::filesystem::exists(status)) return !std::filesystem::is_directory(status);
     }
     return false;
+}
+
+bool IsDotOrDotDot(std::string_view path) {
+    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) path.remove_suffix(1);
+    const auto separator = path.find_last_of("/\\");
+    const auto component = path.substr(separator == std::string_view::npos ? 0 : separator + 1);
+    return component == "." || component == "..";
 }
 }
 
@@ -400,6 +410,80 @@ int APS5_VABI mkdirat_nid_postfix(int fd, const char* path, std::uint16_t mode) 
         return static_cast<int>(Fail(GuestError(std::error_code(nativeError, std::generic_category()))));
     }
 #endif
+    RecordWrittenPath_nid_no_patch(native);
+    return 0;
+}
+
+int APS5_VABI unlink_nid_postfix(const char* path);
+int APS5_VABI rmdir_nid_postfix(const char* path);
+
+int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
+    if (flag & ~GuestAtRemovedir) return static_cast<int>(Fail(GuestEinval));
+    if (path == nullptr) return static_cast<int>(Fail(GuestEfault));
+    if (*path == '\0') return static_cast<int>(Fail(GuestEnoent));
+    if (fd == GuestAtFdcwd || *path == '/') return (flag & GuestAtRemovedir) ? rmdir_nid_postfix(path) : unlink_nid_postfix(path);
+    if (std::strlen(path) >= GuestPathMax || HasLongComponent(path)) return static_cast<int>(Fail(GuestEnametoolong));
+    int error = 0;
+    const char* base = GetDirectoryDescriptorPath_nid_no_patch(fd, &error);
+    if (base == nullptr) return static_cast<int>(Fail(error));
+    auto native = std::filesystem::path(reinterpret_cast<const char8_t*>(base)) /
+                  std::filesystem::path(reinterpret_cast<const char8_t*>(path));
+    const bool trailingSlash = !native.has_filename() && native.has_relative_path();
+    while (!native.has_filename() && native.has_relative_path()) native = native.parent_path();
+    std::error_code statusError;
+    const auto symlinkStatus = std::filesystem::symlink_status(native, statusError);
+    if (flag & GuestAtRemovedir) {
+        if (IsDotOrDotDot(path)) return static_cast<int>(Fail(GuestEinval));
+        if (std::filesystem::is_symlink(symlinkStatus)) return static_cast<int>(Fail(GuestEnotdir));
+        if (!std::filesystem::is_directory(symlinkStatus)) {
+            if (HasNonDirectoryPrefix(native) || std::filesystem::exists(symlinkStatus))
+                return static_cast<int>(Fail(GuestEnotdir));
+            return static_cast<int>(Fail(GuestEnoent));
+        }
+        if (!std::filesystem::is_empty(native, statusError)) return static_cast<int>(Fail(GuestEnotempty));
+#ifdef _WIN32
+        struct _stat64 status{};
+        const bool unlocked = ::_wstat64(native.c_str(), &status) == 0 && !(status.st_mode & _S_IWRITE) &&
+            ::_wchmod(native.c_str(), _S_IREAD | _S_IWRITE) == 0;
+        if (!std::filesystem::remove(native, statusError)) {
+            if (unlocked) ::_wchmod(native.c_str(), _S_IREAD);
+            return static_cast<int>(Fail(GuestEio));
+        }
+#else
+        if (::rmdir(native.c_str()) != 0) {
+            const int nativeError = errno;
+            if ((nativeError == ENOENT || nativeError == ENOTDIR) && HasNonDirectoryPrefix(native))
+                return static_cast<int>(Fail(GuestEnotdir));
+            return static_cast<int>(Fail(GuestError(std::error_code(nativeError, std::generic_category()))));
+        }
+#endif
+    } else {
+        if (trailingSlash) {
+            if (std::filesystem::is_directory(symlinkStatus)) return static_cast<int>(Fail(GuestEperm));
+            if (std::filesystem::exists(symlinkStatus) || HasNonDirectoryPrefix(native))
+                return static_cast<int>(Fail(GuestEnotdir));
+            return static_cast<int>(Fail(GuestEnoent));
+        }
+        if (std::filesystem::is_directory(symlinkStatus)) return static_cast<int>(Fail(GuestEperm));
+#ifdef _WIN32
+        struct _stat64 status{};
+        const bool unlocked = ::_wstat64(native.c_str(), &status) == 0 && (status.st_mode & _S_IFMT) == _S_IFREG &&
+            !(status.st_mode & _S_IWRITE) && ::_wchmod(native.c_str(), _S_IREAD | _S_IWRITE) == 0;
+        if (::_wunlink(native.c_str()) != 0) {
+            const int nativeError = errno;
+            if (unlocked) ::_wchmod(native.c_str(), _S_IREAD);
+            if (HasNonDirectoryPrefix(native)) return static_cast<int>(Fail(GuestEnotdir));
+            return static_cast<int>(Fail(GuestError(std::error_code(nativeError, std::generic_category()))));
+        }
+#else
+        if (::unlink(native.c_str()) != 0) {
+            const int nativeError = errno;
+            if ((nativeError == ENOENT || nativeError == ENOTDIR) && HasNonDirectoryPrefix(native))
+                return static_cast<int>(Fail(GuestEnotdir));
+            return static_cast<int>(Fail(GuestError(std::error_code(nativeError, std::generic_category()))));
+        }
+#endif
+    }
     RecordWrittenPath_nid_no_patch(native);
     return 0;
 }
