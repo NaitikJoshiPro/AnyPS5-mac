@@ -368,6 +368,7 @@ int main() {
             for (const bool clear : {false, true}) {
                 const auto [tableAtomic, directAtomic] = AtomicControl(device, queue, clear);
                 std::printf("control%s: texture2d_array atomic_exchange through an argument buffer 0x%x (expected 0x1234), direct binding 0x%x (expected 0x5678)\n", clear ? " after a blit clear" : "", tableAtomic, directAtomic);
+                Require(tableAtomic == 0x1234u && directAtomic == 0x5678u, "control: texture atomics on a 2D array do not land (harness or driver problem, not the emulation)");
             }
             // The 64-bit atomic needs the driver's lock table: covered by the compile above only.
             for (std::size_t index = 0; index < variants.size(); ++index) {
