@@ -177,6 +177,10 @@ public:
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
+    // Test seam (specifics/macos/tests/CopiedDirectOrderingTwin.mm): Bind is a no-op on Metal (guest buffers are
+    // bound by address at dispatch), so a test kernel standing in for a SPIR-V pipeline addresses the Metal buffer
+    // this object's guest-buffer Descriptor names.
+    const GuestBufferMemory& BufferMemory() const { return guestMemory; }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }

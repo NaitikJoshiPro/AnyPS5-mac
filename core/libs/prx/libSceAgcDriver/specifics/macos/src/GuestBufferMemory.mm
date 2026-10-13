@@ -227,8 +227,11 @@ id<MTLResidencySet> residencySetFor(const Context& context) {
 // vkDestroyBuffer/vkFreeMemory of an import: the no-copy buffer leaves the residency set and its
 // bridge reference is dropped (the GPU work using it completed: retireImport keeps the holder in
 // the recorder's batch). Same signatures, so RetiredImport and the parked lists stay upstream's.
+std::atomic<::AgcDriver::Metal::ImportReleaseProbe> importReleaseProbe{nullptr};
+
 void VKAPI_CALL MetalDestroyImportBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks*) {
     if (buffer == VK_NULL_HANDLE) return;
+    if (const auto probe = importReleaseProbe.load(std::memory_order_acquire)) probe(buffer);
     id<MTLBuffer> released = (__bridge_transfer id<MTLBuffer>)reinterpret_cast<void*>(buffer);
     auto& residency = Residency();
     std::lock_guard lock(residency.mutex);
@@ -3793,6 +3796,14 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     std::lock_guard lock(state.mutex);
     if (importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
+}
+
+}
+
+namespace AgcDriver::Metal {
+
+void SetImportReleaseProbe(ImportReleaseProbe probe) {
+    ::AgcDriver::Graphics::importReleaseProbe.store(probe, std::memory_order_release);
 }
 
 }

@@ -10,9 +10,8 @@
 //   replacement's Context names the same device handle and its imports are the first device's; the test then
 //   checks that a guest unmap of a range two device generations imported still runs, which is the property
 //   upstream guards (the parked import must not block the unmap).
-// - --copied-direct-only (copiedDirectOrderingTests) dispatches a SPIR-V compute pipeline through the descriptor
-//   set ShaderResources binds; the Metal twin has no such pipeline for a test-made program (guest buffers are bound
-//   by address through MslAbi tables at dispatch), so that mode is listed as pending in RecorderTwin.mm.
+// - --copied-direct-only (copiedDirectOrderingTests) is ported in CopiedDirectOrderingTwin.mm (an MSL kernel stands
+//   in for its SPIR-V pipeline).
 
 #include "RecorderTwinHarness.h"
 #include "RecorderTwins.h"

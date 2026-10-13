@@ -1,0 +1,271 @@
+// Metal twin of tests/HostImportRetireHold.cpp (agc_host_import_retire, upstream #4291), swapped in by
+// twins/T1-tests.cmake. Upstream drives the recorder and the host imports over MockVulkan: its fences say when a
+// batch is complete and its vkDestroyBuffer says when a retired import is gone. Here both run on the Metal test
+// device with the image cache attached (as the device makes its Context): the imports are no-copy MTLBuffers,
+// the batches are real MTL4 command buffers, and
+// - "destroyed" is the import's buffer handle reaching Metal::SetImportReleaseProbe (MetalNoCopy.h), which
+//   GuestBufferMemory.mm's import destroy reports before it releases the buffer;
+// - a batch upstream keeps in flight by leaving its mock fence unsignaled is held on the GPU queue: the test
+//   queues a wait on a shared event of its own before the batch is committed (MTL4CommandQueue waitForEvent)
+//   and signals it from the CPU when upstream signals the fence (a scope guard signals it on every exit, so no
+//   batch is left waiting); a batch upstream completes by signaling its fence is waited for with
+//   Recorder::WaitSerial, which does not reap, as upstream's mock signal does not.
+// The checks and their messages are upstream's.
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include "MetalTestDevice.h"
+#include "../src/MetalImages.h"
+#include "../src/MetalNoCopy.h"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <string>
+
+using namespace AgcDriver::Graphics;
+
+namespace {
+
+int failures = 0;
+
+void Expect(bool condition, const std::string& what) {
+    if (condition) return;
+    std::fprintf(stderr, "FAIL: %s\n", what.c_str());
+    ++failures;
+}
+
+constexpr std::size_t Alignment = 65536;
+constexpr std::size_t RangeBytes = std::size_t{1} << 20u;
+
+std::mutex destroyedMutex;
+std::set<const void*> destroyed;
+
+void NoteDestroyed(const void* buffer) {
+    std::lock_guard lock(destroyedMutex);
+    destroyed.insert(buffer);
+}
+
+bool Live(VkBuffer buffer) {
+    std::lock_guard lock(destroyedMutex);
+    return buffer != VK_NULL_HANDLE && !destroyed.contains(buffer);
+}
+
+// The Metal device of the test, with the image cache attached as the device's setup attaches it.
+class Device {
+public:
+    Device() : cache(test.device, test.queue) {
+        auto& limits = test.context.limits;
+        limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(test.device.maxBufferLength, 0xffffffffu));
+        limits.maxUniformBufferRange = limits.maxStorageBufferRange;
+        limits.minStorageBufferOffsetAlignment = 4u;
+        limits.nonCoherentAtomSize = 1u;
+        test.context.hostImportAlignment = Alignment;
+        cache.Attach(test.context);
+    }
+    ~Device() {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ClearHostImports(GetContext().device);
+        cache.Teardown();
+    }
+    const Context& GetContext() const { return *cache.ImageContext(); }
+    id<MTLDevice> MetalDevice() const { return test.device; }
+
+private:
+    MetalTest::Device test;
+    mutable Metal::ImageCache cache;
+};
+
+// A GPU-queue gate: Hold() makes every batch committed after it wait on the GPU until Open().
+class QueueGate {
+public:
+    explicit QueueGate(const Device& device) : queue(Metal::QueueOf(device.GetContext())), event([device.MetalDevice() newSharedEvent]) {
+        if (queue == nil || event == nil) throw std::runtime_error("cannot make the queue gate");
+    }
+    ~QueueGate() { Open(); }
+    QueueGate(const QueueGate&) = delete;
+    QueueGate& operator=(const QueueGate&) = delete;
+    void Hold() {
+        ++value;
+        [queue waitForEvent:event value:value];
+    }
+    void Open() {
+        if (event.signaledValue < value) event.signaledValue = value;
+    }
+
+private:
+    id<MTL4CommandQueue> queue;
+    id<MTLSharedEvent> event;
+    std::uint64_t value = 0;
+};
+
+struct Heap {
+    std::byte* base = nullptr;
+    bool first = false;
+    bool second = false;
+
+    Heap() {
+        base = static_cast<std::byte*>(std::aligned_alloc(Alignment, 2 * RangeBytes));
+        if (base == nullptr) throw std::runtime_error("cannot allocate the test heap");
+        GuestAllocations::Mutation mutation;
+        mutation.Add(base, RangeBytes, true, true, true);
+        first = true;
+    }
+
+    void Grow() {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(base + RangeBytes, RangeBytes, true, true, true);
+        second = true;
+    }
+
+    std::uint64_t Address(std::size_t offset = 0) const {
+        return reinterpret_cast<std::uint64_t>(base) + offset;
+    }
+
+    ~Heap() {
+        try {
+            GuestAllocations::Mutation mutation;
+            if (second) mutation.Remove(base + RangeBytes);
+            if (first) mutation.Remove(base);
+        } catch (...) {
+        }
+        std::free(base);
+    }
+};
+
+struct ActiveRecorder {
+    std::unique_ptr<Recorder> recorder;
+
+    explicit ActiveRecorder(const Context& context) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder = std::make_unique<Recorder>(context);
+        recorder->Activate();
+    }
+
+    ~ActiveRecorder() {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder->Sync();
+        recorder.reset();
+    }
+};
+
+void IdleRetireOutlivesTheHold(const Device& device) {
+    Heap heap;
+    ActiveRecorder active(device.GetContext());
+    auto& recorder = *active.recorder;
+    const auto& context = device.GetContext();
+    QueueGate gate(device);
+    VkBuffer retired = VK_NULL_HANDLE;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto* taken = HostImportFor(context, heap.Address(), 4096);
+        Expect(taken != nullptr, "the first range was not imported");
+        if (taken == nullptr) return;
+        retired = taken->buffer;
+        Expect(recorder.Idle(), "the recorder is not idle before the drop");
+        heap.Grow();
+        const auto* grown = HostImportFor(context, heap.Address(RangeBytes), 4096);
+        Expect(grown != nullptr && grown->buffer != retired && grown->base == heap.Address() && grown->bytes == 2 * RangeBytes, "the grown run was not imported as one import replacing the first");
+        Expect(Live(retired), "an import dropped with the recorder idle was destroyed at once, while the hold that took it can still record with it");
+        if (!Live(retired)) return;
+        Expect(taken->buffer == retired && taken->base == heap.Address(), "the dropped import's entry changed under the hold that took it");
+        recorder.Commands();
+        recorder.Submit();
+        recorder.Sync();
+        Expect(Live(retired), "an import dropped in this hold was destroyed by a Sync inside the same hold");
+        recorder.Commands();
+        // Upstream leaves this batch's fence unsignaled: it stays in flight until the gate opens.
+        gate.Hold();
+        recorder.Submit();
+        Expect(Live(retired), "an import dropped in this hold was destroyed while a batch the hold recorded afterwards is in flight");
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Expect(Live(retired), "an import dropped in a hold was destroyed at the hold's unlock while a batch of that hold is in flight");
+    }
+    gate.Open();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    Expect(!Live(retired), "the dropped import outlived every batch of its hold");
+}
+
+void BusyRetireOutlivesALaterBatch(const Device& device) {
+    Heap heap;
+    ActiveRecorder active(device.GetContext());
+    auto& recorder = *active.recorder;
+    const auto& context = device.GetContext();
+    QueueGate gate(device);
+    VkBuffer retired = VK_NULL_HANDLE;
+    std::uint64_t first = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Keep(std::make_shared<int>(0));
+        const auto* taken = HostImportFor(context, heap.Address(), 4096);
+        Expect(taken != nullptr, "the first range was not imported");
+        if (taken == nullptr) return;
+        retired = taken->buffer;
+        heap.Grow();
+        Expect(HostImportFor(context, heap.Address(RangeBytes), 4096) != nullptr, "the grown run was not imported");
+        first = recorder.Submissions();
+        recorder.Submit();
+        recorder.Commands();
+        // Upstream signals only the first batch's fence: the later batch stays in flight until the gate opens.
+        gate.Hold();
+        recorder.Submit();
+        Expect(recorder.Submissions() == first + 2, "the hold did not submit the keeping batch and the later one apart");
+        if (recorder.Submissions() != first + 2) return;
+        recorder.WaitSerial(first + 1);
+        recorder.Reap();
+        Expect(Live(retired), "the dropped import was destroyed when the batch open at the drop completed, while a later batch of the hold that may use it is in flight");
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Expect(Live(retired), "the dropped import was destroyed at the hold's unlock, while a later batch of the hold that may use it is in flight");
+        gate.Open();
+        recorder.WaitSerial(first + 2);
+        recorder.Reap();
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Commands();
+        recorder.Sync();
+    }
+    Expect(!Live(retired), "the dropped import outlived every batch of its hold");
+}
+
+}
+
+int main() {
+    setenv("APS5_RELEASE_ON_UNLOCK", "1", 1);
+    setenv("APS5_WRITE_WATCH_IMPORTS", "unwatch", 1);
+    AgcDriver::Metal::SetImportReleaseProbe(NoteDestroyed);
+    try {
+        @autoreleasepool {
+            Device device;
+            IdleRetireOutlivesTheHold(device);
+            BusyRetireOutlivesALaterBatch(device);
+        }
+    } catch (const std::exception& error) {
+        AgcDriver::Metal::SetImportReleaseProbe(nullptr);
+        std::fprintf(stderr, "%s\n", error.what());
+        return 1;
+    }
+    AgcDriver::Metal::SetImportReleaseProbe(nullptr);
+    if (failures != 0) {
+        std::fprintf(stderr, "%d host import retire checks failed\n", failures);
+        return 1;
+    }
+    std::printf("host import retire tests passed\n");
+    return 0;
+}

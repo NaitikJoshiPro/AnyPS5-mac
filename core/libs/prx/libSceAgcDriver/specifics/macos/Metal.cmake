@@ -84,12 +84,6 @@ if(TARGET agc_driver_bda_device_tests)
     target_link_libraries(agc_driver_bda_device_tests PRIVATE libSceAgcDriver)
 endif()
 
-# Upstream tests swapped for PendingTwins.mm (twins/T1-tests.cmake) report "not ported yet" as a skip (77); the
-# upstream registration of agc_host_import_retire sets no skip code.
-if(BUILD_TESTING AND TEST agc_host_import_retire)
-    set_tests_properties(agc_host_import_retire PROPERTIES SKIP_RETURN_CODE 77)
-endif()
-
 # libSceAudioIn/libSceAudioOut/libSceVideoOut take SDL from the driver on macOS (one SDL per process, see
 # libSceAudioOut/CMakeLists.txt). The Vulkan driver pulls SDL's core in through SDL_Init; the Metal driver does
 # not call SDL yet (presentation is D6), so keep SDL_Init (and through it the audio/video subsystems) linked.
