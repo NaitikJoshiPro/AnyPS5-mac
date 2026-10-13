@@ -453,35 +453,39 @@ So discovery must combine all the seeds, and libraries without unwind tables dep
   - `python3 core/fex/tests/run_fex_bench.py build-arm64/core/relinker/relinker build-arm64/core/fex/aps5-fex build-arm64/core/libs/libs [--variants avx2] [--config "" --config TSOEnabled=0] [--qos background]`
   - `--compare <json>...`
   - ctest `fex_bench_smoke`: 3 s.
-- **Conditions:** other agents' builds kept the load average between 40 and 99 all session; there was no idle window.
-  - With `APS5_FEX_QOS=user-interactive`, both programs still ran at priority 31 (default QoS, `ps -M`). macOS has no core affinity, so threads also ran on E-cores.
-  - Clock times were noisy. The CPU-time speeds of one-thread kernels repeated between runs (avx2 integer 0.58 and 0.58, SIMD 0.56 and 0.57), so the numbers below are CPU time.
-  - Runs: `.mac-work/bench/20261012-192209-loaded.json` (all targets) and `-192403-loaded-tso.json` (avx2, TSO on and off, interleaved).
-- **Speed, native time / guest time, geometric means** (run 1: all targets; run 2: avx2 with TSO on and off):
+- **Conditions:**
+  - Other agents' builds kept the load average at 40-99 for an hour. The main run started when it fell to 5.9 and saw 6.6-11 (`.mac-work/bench/20261012-201230-idle.json`: three targets, TSO on and off, interleaved per kernel).
+  - With `APS5_FEX_QOS=user-interactive`, both programs still ran at priority 31 (default QoS, `ps -M`). macOS has no core affinity.
+  - The table uses CPU time, which held under load: the integer, memory and SIMD means of the two runs at load 40-99 (`-192209-loaded.json`, `-192403-loaded-tso.json`) are within 0.02 of it, the one-thread atomics within 0.13. Clock speeds in the idle run differ from it by up to 40% for single kernels.
+- **Speed, native time / guest time, CPU time, geometric means:**
 
-| group | sse2 | sse4 | avx2 | avx2, run 2 | avx2, `TSOEnabled=0`, run 2 |
-|---|---|---|---|---|---|
-| integer (10) | 0.62 | 0.62 | 0.58 | 0.58 | 0.73 |
-| memory (6) | 0.46 | 0.47 | 0.46 | 0.45 | 0.54 |
-| SIMD (6) | 0.41 | 0.59 | 0.56 | 0.57 | 0.56 |
-| atomics, one thread (4) | 1.06 | 1.06 | 1.07 | 0.94 | 1.14 |
+| group | sse2 | sse4 | avx2 | avx2, `TSOEnabled=0` |
+|---|---|---|---|---|
+| integer (10) | 0.60 | 0.60 | 0.57 | 0.71 |
+| memory (6) | 0.45 | 0.46 | 0.44 | 0.56 |
+| SIMD (6) | 0.42 | 0.60 | 0.57 | 0.57 |
+| atomics, one thread (4) | 0.96 | 0.93 | 0.97 | 1.24 |
 
-- **Gate: not met** under FEX's default TSO: integer 0.58, SIMD 0.56 on avx2.
-  - At or above 0.8: int_hash 0.99, int_mix 0.90, int_sort 0.87, int_crc32 0.83, simd_saxpy 0.83, simd_dot 0.79, libc `memcpy`/`memset` 1.0, `rep movsb` 0.80, atomics about 1.0.
-- **Costs, avx2:**
-  - **TSO.** Every guest GPR load becomes `ldapur` plus `nop`, every store `nop` plus `stlur` (FEXOpt/MultiInst_TSO.json). With `TSOEnabled=0`: int_histogram 0.34→1.00, mem_copy_scalar 0.35→1.09, int_interp 0.39→0.57, int_sum 0.36→0.59. But the spinlock on 2 and 4 threads then loses updates, so TSO stays on (D10).
-  - **Indirect control flow**, with TSO off: int_interp (jump-table dispatch) 0.57, int_sort_fnptr (indirect calls) 0.59, int_fib (calls and returns) 0.62, int_lexer (branches) 0.50.
-  - **VEX.** Every VEX.128 instruction also zeroes the upper YMM half in the context (`stp xzr, xzr, [x28, #off]`, AVX128/VEX_map*.json). Results: simd_mat4 0.32, simd_blur 0.37, simd_memchr 0.55 (`vpmovmskb` is 7 instructions). avx2 trails sse2/sse4 on simd_dot (0.79 against 1.02) and mem_copy_vector (0.85 against 1.03).
-  - **Scalar SSE.** The sse2 simd_pcm16 is 0.09: clang emits `maxss`/`minss`/`cvttss2si`/`pinsrw` per element. sse4 and avx2 vectorise it (0.73, 0.66).
-  - **Tuning.** With `-march=znver2` clang does not unroll int_sum's loop (5 instructions per element), unlike the x86-64 and arm64 builds: avx2 0.38 against sse2 0.67.
-- **Bridge, CPU time, every target:**
-  - guest→native call 107 ns (a native call is 2 ns);
-  - native→guest callback through libc's `qsort` 125-134 ns (native 5 ns);
-  - thread create+join 230-375 µs by the clock (native 26-82 µs);
-  - 64-byte `memcpy` through the bridge (mem_memcpy_small) at 0.04.
+- **Gate: not met** under FEX's default TSO: integer 0.57, SIMD 0.57 on avx2.
+  - At or above 0.8 on avx2: int_hash 0.99, int_mix 0.81, int_sort 0.87, simd_saxpy 0.88, simd_dot 0.85, libc `memcpy`/`memset` 1.0. Atomics: 0.70-1.15 on one thread, 0.80-2.27 by the clock on two and four.
+- **Costs, avx2** (TSO off in parentheses):
+  - **TSO.** Every guest GPR load becomes `ldapur` plus `nop`, every store `nop` plus `stlur` (FEXOpt/MultiInst_TSO.json).
+    - Affected: int_histogram 0.32 (1.00), mem_copy_scalar 0.25 (1.04), int_interp 0.40 (0.56), int_sum 0.38 (0.60), int_crc32 0.74 (0.84).
+    - The spinlock on 2 and 4 threads gives wrong counts with TSO off, so TSO stays on (D10).
+  - **Indirect control flow**, with TSO off: int_interp (jump-table dispatch) 0.56, int_sort_fnptr (indirect calls) 0.55, int_fib (calls and returns) 0.60, int_lexer (branches) 0.50.
+  - **VEX.** Every VEX.128 instruction also zeroes the upper YMM half in the context (`stp xzr, xzr, [x28, #off]`, AVX128/VEX_map*.json).
+    - Results: simd_mat4 0.32, simd_blur 0.38, simd_memchr 0.55 (`vpmovmskb` is 7 instructions).
+    - avx2 trails sse2/sse4 on simd_dot (0.85 against 1.0) and mem_copy_vector (0.85 against 1.01).
+  - **Scalar SSE.** The sse2 simd_pcm16 is 0.10: clang emits `maxss`/`minss`/`cvttss2si`/`pinsrw` per element. sse4 and avx2 vectorise it (0.77, 0.69).
+  - **Tuning.** With `-march=znver2` clang does not unroll int_sum's loop (5 instructions per element), unlike the x86-64 and arm64 builds: avx2 0.38 against sse2 0.66.
+- **Bridge, every target:**
+  - guest→native call 105 ns (a native call is 1.3 ns);
+  - native→guest callback through libc's `qsort` 124-129 ns (native 5.5 ns);
+  - thread create+join 175-206 µs by the clock (native 33 µs);
+  - 64-byte `memcpy` through the bridge (mem_memcpy_small) at 0.05.
   - FEXCore's log shows a 16 MB lookup cache allocated per guest thread.
 - **Found:** int_lexer's text generator died with SIGBUS under the default TSO (package B). Clang had merged two byte stores into a `movw`, which crossed a 16-byte boundary. The generator now writes single bytes.
-- **Not done:** an idle-machine run, E-core runs (`--qos background`) and the 10-minute sustained run. Cold times (the first repetition, including translation) are only in the JSON.
+- **Not done:** E-core runs (`--qos background`) and the 10-minute sustained run. Cold times (the first repetition, including translation) are only in the JSON.
 
 ## Schedule
 
