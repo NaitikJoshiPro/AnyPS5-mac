@@ -34,6 +34,20 @@ std::string TriangleVerticesCondition() {
     return "defined(APS5_TRIANGLE_VERTICES) && APS5_TRIANGLE_VERTICES";
 }
 
+std::string WindowSpaceEpilogue(const std::string& position, const std::string& indent) {
+    // PA_CL_VTE_CNTL 0x300: x and y are pixels, z is depth, nothing divides them by w, and w is only
+    // the perspective term of attribute interpolation. Multiplying the NDC of a (0, 0, width, height,
+    // 0, 1) viewport by w lands on the same pixel and depth after the host's divide and keeps w.
+    const std::string condition = std::string("defined(") + MslAbi::WindowSpaceMacro + ") && " + MslAbi::WindowSpaceMacro;
+    std::string text = "#if " + condition + "\n";
+    text += indent + "{\n";
+    text += indent + "    const float4 aps5_ws = " + position + ";\n";
+    text += indent + "    " + position + " = float4((2.0f * aps5_ws.x / float(" + MslAbi::WindowSpaceWidthMacro + ") - 1.0f) * aps5_ws.w, (2.0f * aps5_ws.y / float(" + MslAbi::WindowSpaceHeightMacro + ") - 1.0f) * aps5_ws.w, aps5_ws.z * aps5_ws.w, aps5_ws.w);\n";
+    text += indent + "}\n";
+    text += "#endif\n";
+    return text;
+}
+
 std::string PerVertexLocationCondition(std::uint32_t location) {
     return std::string("((") + (location < 32u ? "APS5_PER_VERTEX_LOCATIONS" : "APS5_PER_VERTEX_LOCATIONS_HI") + " >> " + std::to_string(location % 32u) + ") & 1)";
 }
@@ -730,7 +744,8 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w]. The y
         // flip between Vulkan and Metal lives in the driver's viewport (MetalDraw.mm); APS5_FLIP_Y is
         // a debug aid the driver never defines.
-        result.epilogue = "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n"
+        result.epilogue = WindowSpaceEpilogue("aps5_out.aps5_position", "    ") +
+                          "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n"
                           "    aps5_out.aps5_position.z = (aps5_out.aps5_position.z + aps5_out.aps5_position.w) * 0.5f;\n"
                           "#endif\n"
                           "#if defined(APS5_FLIP_Y) && APS5_FLIP_Y\n"

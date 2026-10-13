@@ -2491,6 +2491,29 @@ void InitialContextTests() {
         queue.context[0x206] = control;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
     }
+    // Window-space positions (radeonsi window_space_position shaders): VTX_XY_FMT | VTX_Z_FMT, no
+    // viewport transform; the viewport becomes the render area with depth [0, 1] and clipping may be off.
+    queue.context[0x206] = 0x300;
+    const auto clipControl = queue.context.at(0x204);
+    for (const auto clip : {clipControl, clipControl | 0x10000u}) {
+        queue.context[0x204] = clip;
+        const auto window = AgcDriver::Graphics::DecodeState(queue);
+        Require(window.windowSpacePosition && !window.negativeOneToOne, "window-space positions were not decoded");
+        Require(window.viewport.x == 0.0f && window.viewport.y == 0.0f && window.viewport.width == static_cast<float>(window.renderExtent.width) && window.viewport.height == static_cast<float>(window.renderExtent.height), "window-space viewport does not cover the render area");
+        Require(window.viewport.minDepth == 0.0f && window.viewport.maxDepth == 1.0f, "window-space depth range is not [0, 1]");
+        Require(window.depthClamp == ((clip & 0x10000u) != 0 || (clip & 0x0c000000u) != 0), "disabled clipping must clamp depth");
+    }
+    queue.context[0x204] = clipControl;
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_CL_VTE_CNTL") == std::string::npos, "the draw pre-check refused window-space positions");
+    queue.context[0x206] = 0x43f;
+    Require(!AgcDriver::Graphics::DecodeState(queue).windowSpacePosition, "homogeneous positions decoded as window space");
+    queue.context[0x204] = clipControl | 0x10000u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_CLIP_CNTL");
+    queue.context[0x204] = clipControl;
+    for (const auto control : {0x100u, 0x200u, 0x700u, 0x301u, 0x33fu}) {
+        queue.context[0x206] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
+    }
     queue.context[0x206] = 0x43f;
     queue.context[0x2dc] |= 1;
     Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "undithered alpha-to-coverage was not decoded");

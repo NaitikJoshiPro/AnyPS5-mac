@@ -166,6 +166,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         text += "    {\n        const uint aps5_i = " + state.GuestInvocationIndex() + ";\n";
         text += "        if (aps5_i < aps5_vertices) {\n            Aps5MeshVertex aps5_v = aps5_mv[" + h + "];\n";
         // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w].
+        text += WindowSpaceEpilogue("aps5_v.aps5_position", "            ");
         text += "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n";
         text += "            aps5_v.aps5_position.z = (aps5_v.aps5_position.z + aps5_v.aps5_position.w) * 0.5f;\n#endif\n";
         text += "            aps5_mesh.set_vertex(aps5_i, aps5_v);\n        }\n";

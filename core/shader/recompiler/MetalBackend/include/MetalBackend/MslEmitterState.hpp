@@ -274,6 +274,8 @@ struct MslGraphicsInterface {
 // preprocessor condition of the mode, of one per-vertex location, and corner fields (pv<L>_<vertex>).
 [[nodiscard]] std::string TriangleVertexMacroDefaults();
 [[nodiscard]] std::string TriangleVerticesCondition();
+// The window-space position remap (MslAbi::WindowSpaceMacro) of `position`, a float4 lvalue.
+[[nodiscard]] std::string WindowSpaceEpilogue(const std::string& position, const std::string& indent);
 [[nodiscard]] std::string PerVertexLocationCondition(std::uint32_t location);
 // The guest cull distances a vertex program writes (highest index + 1; MslAbi Version 10).
 [[nodiscard]] std::uint32_t MslCullDistanceCount(const MslEmitterState& state);

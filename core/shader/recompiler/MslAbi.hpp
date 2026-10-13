@@ -91,7 +91,10 @@ namespace ShaderRecompiler::MslAbi {
 // - pixel functions take [[early_fragment_tests]] whenever the request's earlyZ is set without
 //   alpha-to-coverage, depth or stencil export (#4210: kill and sample-mask exports no longer keep
 //   tests late).
-inline constexpr std::uint32_t Version = 11u;
+// Version 12: vertex and mesh functions take the window-space macros (APS5_WINDOW_SPACE,
+//   APS5_WINDOW_SPACE_WIDTH/HEIGHT): positions in pixels and depth (PA_CL_VTE_CNTL 0x300) are mapped
+//   to clip space over a viewport covering the render area.
+inline constexpr std::uint32_t Version = 12u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -252,6 +255,13 @@ inline constexpr const char* VertexOutputsHighMacro = "APS5_VERTEX_OUTPUTS_HI";
 inline constexpr const char* RectListMacro = "APS5_RECT_LIST";
 // - vertex: 1 when the guest clip space has z in [-w, w] (the function remaps z = (z + w) / 2).
 inline constexpr const char* DepthNegativeOneToOneMacro = "APS5_DEPTH_NEGATIVE_ONE_TO_ONE";
+// - vertex/mesh: 1 when the guest position is in window space (PA_CL_VTE_CNTL 0x300: x, y in pixels,
+//   z depth, w only for perspective-correct interpolation); the function writes
+//   ((2x / width - 1) w, (2y / height - 1) w, z w, w) for a Vulkan-style viewport (0, 0, width,
+//   height, 0, 1), width and height (integers) from the two size macros.
+inline constexpr const char* WindowSpaceMacro = "APS5_WINDOW_SPACE";
+inline constexpr const char* WindowSpaceWidthMacro = "APS5_WINDOW_SPACE_WIDTH";
+inline constexpr const char* WindowSpaceHeightMacro = "APS5_WINDOW_SPACE_HEIGHT";
 // - fragment: 1 when the pipeline blends with two sources (PipelineSpecialization::DualSourceBlend):
 //   colour location 1 becomes color(0) index(1) (Reflection::dualSource: the function writes it);
 inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";

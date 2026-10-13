@@ -894,6 +894,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
     }
     if (graphics.negativeOneToOne) request.vertex.macros.push_back({Abi::DepthNegativeOneToOneMacro, "1"});
+    if (graphics.windowSpacePosition) {
+        // The window-space epilogue is in the vertex and mesh stage functions; the tessellation
+        // pipeline's domain output and the triangle-vertices corner math work on clip positions.
+        if (tess || triangleVertices) throw std::runtime_error(std::string("Metal draw: window-space positions (PA_CL_VTE_CNTL 0x300) with ") + (tess ? "tessellation" : "a triangle-vertices draw") + " are not implemented");
+        request.vertex.macros.push_back({Abi::WindowSpaceMacro, "1"});
+        request.vertex.macros.push_back({Abi::WindowSpaceWidthMacro, std::to_string(static_cast<std::uint32_t>(graphics.viewport.width))});
+        request.vertex.macros.push_back({Abi::WindowSpaceHeightMacro, std::to_string(static_cast<std::uint32_t>(graphics.viewport.height))});
+    }
     if (fragmentResult != nullptr) {
         auto function = Graphics::Metal::PipelineFunction::From(*fragmentResult);
         function.macros.push_back({Abi::VertexOutputsMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations)) + "u"});

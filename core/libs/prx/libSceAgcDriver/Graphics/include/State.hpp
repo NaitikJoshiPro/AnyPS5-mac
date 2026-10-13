@@ -114,6 +114,9 @@ struct State {
     bool primitiveRestart = false;
     VkViewport viewport;
     bool negativeOneToOne;
+    // PA_CL_VTE_CNTL 0x300: positions are window coordinates (pixels, depth), no viewport transform;
+    // viewport is then the render area with depth [0, 1].
+    bool windowSpacePosition = false;
     bool depthClamp = false;
     bool alphaToCoverage = false;
     VkConservativeRasterizationModeEXT conservativeRasterization = VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
