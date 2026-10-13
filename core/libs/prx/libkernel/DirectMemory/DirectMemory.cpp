@@ -2,6 +2,7 @@
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -383,7 +384,7 @@ public:
 #ifdef _WIN32
         GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #else
-        if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
+        if (::mmap(reinterpret_cast<void*>(GuestArena::HostAddress(address)), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
 #endif
     }
 
@@ -643,7 +644,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             GuestArena::GuestArenaReset_nid_postfix(addr, len);
             if (nativeProtection != PROT_NONE) CommitArenaRange(addr, len, WinProtFromPosix(nativeProtection));
 #else
-            if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
+            if (::mmap(GuestArena::HostPointer(addr), len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
         }
@@ -655,8 +656,9 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
 #if defined(__linux__) || defined(__APPLE__)
 bool ArenaAvailable() { return GuestArena::GuestArenaAvailable_nid_postfix(); }
 
+// Returns the guest address; a displaced one is backed at its alias (GuestDisplaced.hpp).
 void* ArenaCommit(void* addr, size_t len, int prot) {
-    return mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return mmap(GuestArena::HostPointer(addr), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED ? MAP_FAILED : addr;
 }
 
 void ArenaForget(void* addr, size_t len) {
@@ -987,7 +989,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(mapped, len);
     const int nativeProtection = LinuxProtFromSce(prot);
     const int nativeFlags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED;
-    if (::mmap(mapped, len, nativeProtection, nativeFlags, descriptor, static_cast<off_t>(offset)) == MAP_FAILED) {
+    if (::mmap(GuestArena::HostPointer(mapped), len, nativeProtection, nativeFlags, descriptor, static_cast<off_t>(offset)) == MAP_FAILED) {
         const int error = errno;
         Unmap(mapped, len);
         throw std::system_error(error, std::generic_category(), "map guest shared memory");
@@ -1086,7 +1088,7 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     mutation.TrimToRegistered(pointer, bytes);
 #endif
     mutation.Protect(pointer, bytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
-        if (mprotect(const_cast<void*>(pointer), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
+        if (mprotect(GuestArena::HostPointer(const_cast<void*>(pointer)), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
 #ifdef __APPLE__
         GuestWriteWatch::GuestWriteWatchProtectionChanged_nid_postfix(pointer, bytes, nativeProtection);
 #endif

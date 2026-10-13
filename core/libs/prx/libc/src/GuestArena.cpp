@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
@@ -107,47 +108,51 @@ public:
         std::lock_guard lock(_lock);
         const auto start = reinterpret_cast<std::uintptr_t>(pointer);
         const auto end = start + bytes;
-        const auto exact = _used.find(start);
-        if (exact != _used.end() && exact->second >= end) return false;
-        const auto next = _used.lower_bound(start);
-        if ((next != _used.end() && next->first < end) || (next != _used.begin() && std::prev(next)->second > start)) {
+        auto& used = UsedFor(start, bytes);
+        const auto exact = used.find(start);
+        if (exact != used.end() && exact->second >= end) return false;
+        const auto next = used.lower_bound(start);
+        if ((next != used.end() && next->first < end) || (next != used.begin() && std::prev(next)->second > start)) {
             char message[160];
             std::snprintf(message, sizeof(message), "guest arena commit 0x%llx+0x%zx overlaps a used range", static_cast<unsigned long long>(start), bytes);
             throw std::runtime_error(message);
         }
-        _used.emplace(start, end);
+        used.emplace(start, end);
         return true;
     }
 
     void MarkUsed(const void* pointer, std::size_t bytes) {
         std::lock_guard lock(_lock);
         const auto start = reinterpret_cast<std::uintptr_t>(pointer);
-        const auto next = _used.lower_bound(start);
-        if ((next != _used.end() && next->first < start + bytes) || (next != _used.begin() && std::prev(next)->second > start)) {
+        auto& used = UsedFor(start, bytes);
+        const auto next = used.lower_bound(start);
+        if ((next != used.end() && next->first < start + bytes) || (next != used.begin() && std::prev(next)->second > start)) {
             char message[160];
             std::snprintf(message, sizeof(message), "fixed guest mapping 0x%llx+0x%zx overlaps %s", static_cast<unsigned long long>(start), bytes, OverlapsHostRegion(start, bytes) ? "a host region in the guest arena" : "a guest arena range");
             throw std::runtime_error(message);
         }
-        _used.emplace(start, start + bytes);
+        used.emplace(start, start + bytes);
     }
 
     void Release(const void* pointer, std::size_t bytes) {
         std::lock_guard lock(_lock);
         const auto start = reinterpret_cast<std::uintptr_t>(pointer);
         const auto end = start + bytes;
-        auto it = _used.upper_bound(start);
-        if (it != _used.begin()) --it;
-        while (it != _used.end() && it->first < end) {
+        auto& used = UsedFor(start, bytes);
+        auto it = used.upper_bound(start);
+        if (it != used.begin()) --it;
+        while (it != used.end() && it->first < end) {
             const auto rangeStart = it->first;
             const auto rangeEnd = it->second;
             if (rangeEnd <= start) {
                 ++it;
                 continue;
             }
-            it = _used.erase(it);
-            if (rangeStart < start) _used.emplace(rangeStart, start);
-            if (rangeEnd > end) _used.emplace(end, rangeEnd);
+            it = used.erase(it);
+            if (rangeStart < start) used.emplace(rangeStart, start);
+            if (rangeEnd > end) used.emplace(end, rangeEnd);
         }
+        if (&used == &_displacedUsed) return;
         for (const auto& [holeStart, holeEnd] : _holes) {
             if (holeStart < end && start < holeEnd) _used.emplace(holeStart, holeEnd);
         }
@@ -218,6 +223,7 @@ private:
     // places its regions between 448 and 512 GiB (macOS 27). Those stay host regions; what the host maps
     // later lands below 8 GiB or above the arena.
     void SeedAppleUsedRanges() {
+        _displacedActive = GuestDisplacedEnable_nid_no_patch();
         for (mach_vm_address_t address = ArenaStart; address < ApplicationAreaEnd;) {
             mach_vm_size_t size = 0;
             vm_region_basic_info_data_64_t info{};
@@ -226,10 +232,24 @@ private:
             if (mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || address >= ApplicationAreaEnd) break;
             const auto first = std::max<std::uintptr_t>(address, ArenaStart);
             const auto last = std::min<std::uintptr_t>(address + size, ApplicationAreaEnd);
+            address += size;
+            if (_displacedActive && OverlapsDisplaced(first, last - first)) {
+                // The kernel's guard there is backed by the displaced alias (GuestDisplaced.hpp): it stays out of
+                // first-fit placement (AddUsed below) but takes fixed guest mappings.
+                if (first < DisplacedStart) {
+                    AddUsed(first, DisplacedStart);
+                    _hostRegions.emplace_back(first, DisplacedStart);
+                }
+                if (last > DisplacedEnd) {
+                    AddUsed(DisplacedEnd, last);
+                    _hostRegions.emplace_back(DisplacedEnd, last);
+                }
+                continue;
+            }
             AddUsed(first, last);
             _hostRegions.emplace_back(first, last);
-            address += size;
         }
+        if (_displacedActive) AddUsed(DisplacedStart, DisplacedEnd);
         AddUsed(SystemReservedStart, SystemReservedEnd);
         _hostRegions.emplace_back(SystemReservedStart, SystemReservedEnd);
         ReserveFreeRanges();
@@ -294,7 +314,22 @@ private:
     }
 #endif
 
+    // Fixed guest mappings inside the displaced window are tracked apart from _used, where the whole window stays
+    // one used range so first-fit placement never lands there.
+    std::map<std::uintptr_t, std::uintptr_t>& UsedFor(std::uintptr_t start, std::size_t bytes) {
+        if (!_displacedActive || !OverlapsDisplaced(start, bytes)) return _used;
+        if (start < DisplacedStart || start + bytes > DisplacedEnd) {
+            char message[192];
+            std::snprintf(message, sizeof(message), "guest range 0x%llx+0x%zx straddles the edge of the displaced window 0x%llx-0x%llx",
+                static_cast<unsigned long long>(start), bytes, static_cast<unsigned long long>(DisplacedStart), static_cast<unsigned long long>(DisplacedEnd));
+            throw std::runtime_error(message);
+        }
+        return _displacedUsed;
+    }
+
     std::mutex _lock;
+    bool _displacedActive = false;
+    std::map<std::uintptr_t, std::uintptr_t> _displacedUsed;
     std::map<std::uintptr_t, std::uintptr_t> _used;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _holes;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostRegions;
@@ -443,8 +478,10 @@ int PosixProtection(std::uint32_t windowsProtection) {
     }
 }
 
+// Returns the guest address on success.
 void* PlaceAt(void* pointer, std::size_t bytes, std::uint32_t protection) {
-    return mmap(pointer, bytes, PosixProtection(protection), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    void* const placed = mmap(HostPointer(pointer), bytes, PosixProtection(protection), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return placed == MAP_FAILED ? MAP_FAILED : pointer;
 }
 }
 #endif
@@ -452,7 +489,7 @@ void* PlaceAt(void* pointer, std::size_t bytes, std::uint32_t protection) {
 #if defined(__linux__) || defined(__APPLE__)
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     if (!Arena::Get().Contains(reinterpret_cast<void*>(address), bytes)) throw OutsideArena("set protection", reinterpret_cast<void*>(address), bytes);
-    if (mprotect(reinterpret_cast<void*>(address), bytes, PosixProtection(protection)) != 0)
+    if (mprotect(reinterpret_cast<void*>(HostAddress(address)), bytes, PosixProtection(protection)) != 0)
         throw std::system_error(errno, std::generic_category(), "guest arena protection failed");
 }
 

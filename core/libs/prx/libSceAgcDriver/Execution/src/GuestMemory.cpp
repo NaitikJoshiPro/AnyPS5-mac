@@ -4,6 +4,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mutex>
 #include <array>
@@ -555,12 +556,22 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         cursor = next;
 #elif defined(__APPLE__)
         // The region at or above the cursor, with its current protection.
-        auto regionBase = static_cast<mach_vm_address_t>(cursor);
+        // A displaced guest range is mapped at its alias (GuestDisplaced.hpp); the window's guard itself never is.
+        auto regionBase = static_cast<mach_vm_address_t>(GuestArena::HostAddress(cursor));
         mach_vm_size_t regionSize = 0;
         vm_region_basic_info_data_64_t info{};
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t object = MACH_PORT_NULL;
-        const auto result = mach_vm_region(mach_task_self(), &regionBase, &regionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        auto result = mach_vm_region(mach_task_self(), &regionBase, &regionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (result == KERN_SUCCESS && GuestArena::IsDisplaced(cursor)) {
+            regionBase = GuestArena::GuestAddress(regionBase);
+            if (!GuestArena::IsDisplaced(regionBase)) {
+                regionBase = GuestArena::DisplacedEnd; // nothing mapped in the rest of the window
+                regionSize = PageBytes;
+            } else {
+                regionSize = std::min<mach_vm_size_t>(regionSize, GuestArena::DisplacedEnd - regionBase);
+            }
+        }
         if (result == KERN_INVALID_ADDRESS) {
             static_cast<void>(emit(PageRun{cursor, end, false, false}));
             return true;
@@ -1313,7 +1324,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 #ifndef _WIN32
         if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
 #endif
-        std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
+        std::memcpy(reinterpret_cast<void*>(GuestArena::HostAddress(address)), source.data(), source.size());
     });
 }
 
@@ -1823,7 +1834,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
         if (trace) std::fprintf(stderr, "[unreadable]   read from +0x%llx\n", ModuleOffset(__builtin_return_address(0)));
         throw;
     }
-    std::memcpy(destination.data(), source, destination.size());
+    std::memcpy(destination.data(), GuestArena::HostPointer(source), destination.size());
 }
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
@@ -1833,11 +1844,11 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
-        std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
+        std::memcpy(destination.data(), reinterpret_cast<const void*>(GuestArena::HostAddress(address)), destination.size());
         return;
     }
     std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(GuestArena::HostAddress(begin)), static_cast<std::size_t>(end - begin));
 }
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
@@ -1849,9 +1860,9 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
-    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
+    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(GuestArena::HostAddress(address)), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
-        if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;
+        if (std::memcmp(reinterpret_cast<const void*>(GuestArena::HostAddress(begin)), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;
     }
     return true;
 }
@@ -1863,7 +1874,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     // Each run's page state is consulted right before its bytes are compared.
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
-        else if (std::memcmp(reinterpret_cast<const void*>(run.begin), bytes.data() + (run.begin - address), static_cast<std::size_t>(run.end - run.begin)) != 0) outcome = Compare::Differs;
+        else if (std::memcmp(reinterpret_cast<const void*>(GuestArena::HostAddress(run.begin)), bytes.data() + (run.begin - address), static_cast<std::size_t>(run.end - run.begin)) != 0) outcome = Compare::Differs;
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;
@@ -1875,7 +1886,7 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
-        else std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+        else std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(GuestArena::HostAddress(run.begin)), static_cast<std::size_t>(run.end - run.begin));
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;
@@ -1904,6 +1915,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     const TimedAccess timed(CounterChangedWrite, current.size());
     auto* destination = reinterpret_cast<std::byte*>(address);
     CheckRange(destination, current.size(), 1, true);
+    destination = GuestArena::HostPointer(destination); // displaced guest memory lives at its alias
     const auto size = current.size();
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     storeOwn(address, size, [&] {
@@ -1966,6 +1978,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     CountWriteCaller(__builtin_return_address(0));
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
+    destination = GuestArena::HostPointer(destination);
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     if (source.size() >= PageBytes) StoreOwnBytes(address, source);
     else StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });

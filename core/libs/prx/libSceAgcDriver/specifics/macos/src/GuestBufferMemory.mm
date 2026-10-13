@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -316,7 +317,9 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
 }
 
 const char* createHostPointerImport(const Context& context, HostImport& entry, VkResult& failure) {
-    if (const char* step = unwrappable(entry.base, entry.base + entry.bytes)) {
+    // A displaced guest range (GuestDisplaced.hpp) is wrapped at its host alias; offsets into the buffer are the same.
+    const std::uint64_t hostBase = GuestArena::HostAddress(entry.base);
+    if (const char* step = unwrappable(hostBase, hostBase + entry.bytes)) {
         failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
         return step;
     }
@@ -326,7 +329,7 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     if (trace) {
         for (auto page = entry.base; page < entry.base + entry.bytes; page += 0x4000u) std::fprintf(stderr, "[metal] host import page 0x%llx: %s\n", static_cast<unsigned long long>(page), AgcDriver::Metal::VmWiredInfo(page).c_str());
     }
-    id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), entry.base, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
+    id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), hostBase, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(entry.base).c_str());
     if (buffer == nil) {
         failure = VK_ERROR_OUT_OF_DEVICE_MEMORY;

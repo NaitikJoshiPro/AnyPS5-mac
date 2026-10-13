@@ -186,6 +186,7 @@ agc_driver_global_vcc_base G1
 agc_driver_guarded_null_pointer G1
 agc_driver_half_expansion G1
 agc_driver_host_import_at_map G1
+agc_driver_displaced_guest_memory G1
 agc_driver_host_import_teardown G1
 agc_driver_image_by G1
 agc_driver_image_pck_n G1

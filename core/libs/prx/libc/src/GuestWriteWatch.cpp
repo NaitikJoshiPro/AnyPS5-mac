@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -337,12 +338,14 @@ public:
         std::vector<bool> queried(pages.size(), false);
         const Lock lock(_lock);
         for (auto cursor = begin; cursor < end;) {
-            mach_vm_address_t address = cursor;
+            mach_vm_address_t address = GuestArena::HostAddress(cursor);
             mach_vm_size_t size = 0;
             vm_region_basic_info_data_64_t info{};
             mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
             mach_port_t object = MACH_PORT_NULL;
-            if (mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || address >= end) break;
+            if (mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS) break;
+            address = GuestArena::GuestAddress(address);
+            if (address >= end) break;
             const auto first = std::max<std::uintptr_t>(cursor, address);
             const auto last = std::min<std::uintptr_t>(end, address + size);
             const std::uint8_t protection = ((info.protection & VM_PROT_READ) ? PROT_READ : 0) | ((info.protection & VM_PROT_WRITE) ? PROT_WRITE : 0) | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
@@ -423,7 +426,7 @@ public:
         const Lock lock(_lock);
         _hostWrites.emplace_back(begin, end);
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
+            if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(GuestArena::HostAddress(page)), _page, state & ProtectionMask);
             state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
         });
     }
@@ -510,7 +513,10 @@ private:
     }
 
     bool record(std::uintptr_t address) {
-        const auto page = pageStart(address);
+        // A fault on a displaced guest address is the kernel's guard, not a watched page: GuestDisplaced redirects
+        // it to the alias, where a write to an armed page faults again (at the alias) and lands here.
+        if (GuestArena::IsDisplaced(address)) return false;
+        const auto page = pageStart(GuestArena::GuestAddress(address));
         const Lock lock(_lock);
         auto it = _ranges.upper_bound(page);
         if (it == _ranges.begin()) return false;
@@ -519,7 +525,7 @@ private:
         auto& state = it->second.pages[(page - it->first) / _page];
         if ((state & Protected) != 0) {
             state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
-            ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
+            ::mprotect(reinterpret_cast<void*>(GuestArena::HostAddress(page)), _page, state & ProtectionMask);
             return true;
         }
         return (state & PROT_WRITE) != 0;
@@ -549,7 +555,7 @@ private:
         std::uintptr_t previous = begin;
         int runProtection = -1;
         const auto flush = [&](std::uintptr_t runEnd) {
-            if (runProtection >= 0) ::mprotect(reinterpret_cast<void*>(runStart), runEnd - runStart, runProtection);
+            if (runProtection >= 0) ::mprotect(reinterpret_cast<void*>(GuestArena::HostAddress(runStart)), runEnd - runStart, runProtection);
             runProtection = -1;
         };
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
@@ -594,7 +600,7 @@ private:
             const auto cutEnd = std::min(end, rangeEnd);
             for (auto page = cutBegin; page < cutEnd; page += _page) {
                 const auto state = pages[(page - rangeBegin) / _page];
-                if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
+                if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(GuestArena::HostAddress(page)), _page, state & ProtectionMask);
             }
             if (rangeBegin < cutBegin) _ranges.emplace(rangeBegin, Range{cutBegin, std::vector<std::uint8_t>(pages.begin(), pages.begin() + (cutBegin - rangeBegin) / _page)});
             if (cutEnd < rangeEnd) it = _ranges.emplace(cutEnd, Range{rangeEnd, std::vector<std::uint8_t>(pages.begin() + (cutEnd - rangeBegin) / _page, pages.end())}).first;
