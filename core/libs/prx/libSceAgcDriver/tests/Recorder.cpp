@@ -31,6 +31,9 @@
 #include "SampleArray_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
+#include "VertexRange_vert_spv.h"
+#include "VertexRangeProducer_frag_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -5527,6 +5530,165 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported) {
+    if (!device.Graphics() || (imported && device.GetContext().hostImportAlignment == 0)) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, bytes); }
+    } release{watched};
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    if (!imported) {
+        context.hostImportAlignment = 0;
+        context.dmaBufImport = false;
+    }
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (imported && HostImportFor(context, address, bytes) == nullptr) return false;
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto producerVertex = shader(COVER_VERT_SPV, 101);
+    auto producerPixel = shader(VERTEXRANGEPRODUCER_FRAG_SPV, 102);
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 103);
+    auto pixel = shader(COVER_FRAG_SPV, 104);
+    const std::array producerShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &producerVertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &producerPixel, 0}};
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    const auto stateFor = [](std::uint64_t base, VkFormat format, std::uint32_t elementBytes) {
+        State state{};
+        state.stages.path = ShaderPath::Vertex;
+        state.color = {base, {64, 64}, format, unit, 0xe4u, ColorTileMode::RenderTarget, elementBytes};
+        state.colors = {state.color};
+        state.hasColorTarget = true;
+        state.renderExtent = {64, 64};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0, 64, 64, -64, 0, 1};
+        state.scissor = {{0, 0}, {64, 64}};
+        state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state.blend.colorWriteMask = 15;
+        state.blends = {state.blend};
+        return state;
+    };
+    const auto producer = stateFor(address + unit, VK_FORMAT_R32G32B32A32_SFLOAT, 16);
+    const auto consumer = stateFor(address, VK_FORMAT_R8G8B8A8_UNORM, 4);
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    const auto produce = [&] {
+        Draw(context, producer, triangle, producerShaders);
+        WaitForOptimizedPipelines(context.device);
+        const std::array range{std::pair{address + unit, address + 2 * unit}};
+        Require(StorageTexture::AnyPendingOverlaps(range), "the color producer did not leave GPU results pending");
+    };
+    const auto attributeFor = [](std::uint64_t base, std::uint32_t stride, std::uint32_t fetchIndex) {
+        return ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) | (stride << 16u), static_cast<std::uint32_t>(bytes / 16), 77u << 12u}}, fetchIndex};
+    };
+    const auto check = [&](std::uint32_t edge) {
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(consumer.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < edge ? std::byte{0} : std::byte{255};
+                for (std::size_t channel = 0; channel < 4; ++channel) Require(texels[(y * 64 + x) * 4 + channel] == expected, "the draw did not consume the GPU-produced vertex offset");
+            }
+        }
+    };
+    const auto reject = [&](auto action, const char* expected) {
+        try { action(); }
+        catch (const std::runtime_error& error) {
+            Require(std::string(error.what()).find(expected) != std::string::npos, error.what());
+            return;
+        }
+        throw std::runtime_error("an actual render-target alias was accepted");
+    };
+    for (const std::uint32_t fetchIndex : {0u, 1u}) {
+        producerPixel = shader(VERTEXRANGEPRODUCER_FRAG_SPV, 102);
+        vertex.vertexAttributes = {attributeFor(address, 16, fetchIndex)};
+        auto draw = triangle;
+        if (fetchIndex == 0) draw.firstVertex = unit / 16;
+        else draw.firstInstance = unit / 16;
+        produce();
+        std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
+        Draw(context, consumer, draw, shaders, {}, &recipe);
+        WaitForOptimizedPipelines(context.device);
+        const auto read = recorder.DescribePendingRead(address + unit, 16);
+        Require(read.has_value() == imported && (!read || read->kind == Recorder::ReadKind::DrawInput), "the vertex regression used the wrong copied/imported path");
+        check(16);
+        Require(recipe != nullptr, "the range regression did not create a draw recipe");
+        std::vector<std::byte> cleared(unit);
+        AgcDriver::GuestMemory::Write(address, cleared);
+        for (std::size_t offset = 5; offset < producerPixel.spirv.size();) {
+            const auto count = producerPixel.spirv[offset] >> 16u;
+            Require(count != 0, "invalid producer SPIR-V");
+            if ((producerPixel.spirv[offset] & 0xffffu) == 43u && count == 4 && producerPixel.spirv[offset + 3] == 0x3f000000u) producerPixel.spirv[offset + 3] = 0x3f400000u;
+            offset += count;
+        }
+        producerPixel.variantId = 105;
+        produce();
+        const auto hit = DrawWithRecipe(context, consumer, draw, shaders, {}, *recipe);
+        WaitForOptimizedPipelines(context.device);
+        Require(hit.recorded, "the vertex range regression did not reuse its draw recipe");
+        check(24);
+        vertex.vertexAttributes = {attributeFor(address + unit, 16, fetchIndex)};
+        Draw(context, consumer, triangle, shaders);
+        WaitForOptimizedPipelines(context.device);
+        check(24);
+        vertex.vertexAttributes = {attributeFor(address, 16, fetchIndex)};
+        auto indirect = draw;
+        indirect.indirect.emplace();
+        reject([&] { Draw(context, consumer, indirect, shaders); }, "vertex buffer aliases the render target");
+        if (fetchIndex == 0) {
+            const std::array<std::uint16_t, 3> indices{0, 1, 2};
+            AgcDriver::GuestMemory::Write(address + 2 * unit, std::as_bytes(std::span(indices)));
+            auto indexed = draw;
+            indexed.indexed = true;
+            indexed.indexSize = 2;
+            indexed.indexAddress = address + 2 * unit;
+            produce();
+            Draw(context, consumer, indexed, shaders);
+            WaitForOptimizedPipelines(context.device);
+            check(24);
+            indexed.indexAddress = address;
+            reject([&] { Draw(context, consumer, indexed, shaders); }, "index buffer aliases the render target");
+        }
+        reject([&] { Draw(context, consumer, triangle, shaders); }, "vertex buffer aliases the render target");
+        vertex.vertexAttributes = {attributeFor(address, 0, fetchIndex)};
+        reject([&] { Draw(context, consumer, draw, shaders); }, "vertex buffer aliases the render target");
+    }
+    std::cout << "Vertex range and pending color producer tests passed (" << (imported ? "imported" : "copied") << ")\n";
+    return true;
+}
+
 void pipelineCacheTests(const Device& device, bool benchmark) {
     std::thread establishThreadedProcess([] {});
     establishThreadedProcess.join();
@@ -6077,6 +6239,10 @@ int main(int argc, char** argv) {
             drawSnapshotCapTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
             return 0;
+        }
+
+        if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
+            return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;
         }
 
         readTrackingTests(device, recorder);

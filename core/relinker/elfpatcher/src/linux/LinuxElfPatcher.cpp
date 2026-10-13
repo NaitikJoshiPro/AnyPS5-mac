@@ -207,12 +207,23 @@ std::vector<std::uint8_t> LinuxElfPatcher::Patch(
     for (char i : kInterp)
         buf.push_back(static_cast<std::uint8_t>(i));
 
+    std::uint64_t tableOff = phOff;
+    // Zero padding first (phSlots), then a moved table when even that is too small.
+    std::uint16_t tableSlots = phSlots;
+    if (const auto required = _programHeaderLayoutBuilder->RequiredProgramHeaderCount(originalHeaders); required > tableSlots && required <= std::numeric_limits<std::uint16_t>::max()) {
+        alignBuf(buf, kPhdrHeaderAlignment);
+        tableOff = static_cast<std::uint64_t>(buf.size());
+        tableSlots = static_cast<std::uint16_t>(required);
+        buf.resize(buf.size() + required * phEntSize);
+        _byteWriter->WriteU64(buf, kEhdrPhOffOffset, tableOff);
+    }
+
     const std::uint64_t extraBlockSize = static_cast<std::uint64_t>(buf.size()) - extraBlockOff;
 
     ProgramHeaderLayoutRequest layoutRequest{};
-    layoutRequest.PhOff = phOff;
+    layoutRequest.PhOff = tableOff;
     layoutRequest.PhEntSize = phEntSize;
-    layoutRequest.PhNum = phSlots;
+    layoutRequest.PhNum = tableSlots;
     layoutRequest.OriginalHeaders = originalHeaders;
     layoutRequest.ExtraBlockOffset = extraBlockOff;
     layoutRequest.ExtraBlockVaddr = extraBlockVaddr;

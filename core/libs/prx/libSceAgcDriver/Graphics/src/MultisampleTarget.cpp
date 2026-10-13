@@ -177,8 +177,16 @@ struct GuardedRange {
     std::uint32_t samples;
 };
 
+class PrimedSharedMutex : public std::shared_mutex {
+public:
+    PrimedSharedMutex() {
+        lock();
+        unlock();
+    }
+};
+
 std::shared_mutex& guardedMutex() {
-    static std::shared_mutex mutex;
+    static PrimedSharedMutex mutex;
     return mutex;
 }
 

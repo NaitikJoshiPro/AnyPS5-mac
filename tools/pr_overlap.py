@@ -80,7 +80,7 @@ def exports(diff):
     lines = diff.splitlines()
     for i, line in enumerate(lines):
         m = EXPORT.match(line)
-        if not m or m.group(1).endswith("_nid_no_patch"):
+        if not m or m.group(1).endswith(("_nid_no_patch", "_nid_no_patch_cut")):
             continue
         text = line[1:]
         for nxt in lines[i + 1:]:

@@ -1075,6 +1075,8 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     auto bytes = static_cast<std::size_t>(end - first);
     const void* pointer = reinterpret_cast<const void*>(first);
     const auto nativeProtection = LinuxProtFromSce(prot);
+    if (GuestThreadStackHostRangeOverlaps(address, address + len))
+        throw std::system_error(EACCES, std::generic_category(), "mprotect overlaps host-only guest thread stack pages");
     std::uintptr_t stackStart = 0;
     std::uintptr_t stackEnd = 0;
     if ((prot & GuestProtGpuReadWrite) == 0 && GuestThreadStack(address, &stackStart, &stackEnd) && address >= stackStart && address + len <= stackEnd) {
