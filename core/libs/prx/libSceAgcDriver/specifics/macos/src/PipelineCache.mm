@@ -4,6 +4,7 @@
 
 #include <sys/sysctl.h>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <string>
 #include <cstdio>
@@ -19,6 +20,38 @@ namespace {
 std::string Describe(NSError* error) {
     return error != nil ? std::string(error.localizedDescription.UTF8String) : std::string("unknown error");
 }
+
+// Reports a Metal compile still running after 5, 10, 15... s on stderr, as the recorder reports a
+// slow GPU batch. MSL compiles are synchronous and unbounded, and under MTL_SHADER_VALIDATION a
+// compile of a few seconds can grow past the GPU suite's 30 s cap when the compiler service is
+// busy: without this line such a timeout looks like a GPU hang (ATOM, 2026-10-13).
+class SlowCompileReport {
+public:
+    SlowCompileReport(const char* what, std::size_t sourceBytes) : state(std::make_shared<State>()) {
+        state->what = what;
+        state->bytes = sourceBytes;
+        Arm(state, 5);
+    }
+    ~SlowCompileReport() { state->finished.store(true, std::memory_order_release); }
+    SlowCompileReport(const SlowCompileReport&) = delete;
+    SlowCompileReport& operator=(const SlowCompileReport&) = delete;
+
+private:
+    struct State {
+        std::atomic<bool> finished{false};
+        const char* what = "";
+        std::size_t bytes = 0;
+    };
+    static void Arm(std::shared_ptr<State> state, unsigned seconds) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(seconds) * static_cast<int64_t>(NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (state->finished.load(std::memory_order_acquire)) return;
+            if (state->bytes != 0) std::fprintf(stderr, "[metal-pipelines] %s still compiling after %u s (%zu bytes of MSL)\n", state->what, seconds, state->bytes);
+            else std::fprintf(stderr, "[metal-pipelines] %s still compiling after %u s\n", state->what, seconds);
+            Arm(state, seconds + 5);
+        });
+    }
+    std::shared_ptr<State> state;
+};
 
 bool Profile() {
     static const bool enabled = std::getenv("APS5_PROFILE_PIPELINES") != nullptr;
@@ -204,6 +237,7 @@ id<MTLLibrary> PipelineCache::Library(const ShaderRecompiler::MslShader& shader,
         descriptor.options = options;
         NSError* error = nil;
         const auto start = std::chrono::steady_clock::now();
+        const SlowCompileReport report("an MSL library", shader.source.size());
         id<MTLLibrary> library = [compiler newLibraryWithDescriptor:descriptor error:&error];
         if (library == nil) {
             std::fprintf(stderr, "[metal] MSL compile failed:\n%s\n", shader.source.c_str());
@@ -289,6 +323,7 @@ id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& 
             error = nil;
         }
         const auto start = std::chrono::steady_clock::now();
+        const SlowCompileReport report("a compute pipeline", 0u);
         id<MTLComputePipelineState> pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
         if (pipeline == nil) throw std::runtime_error("Metal device: compute pipeline creation failed: " + Describe(error));
         const auto elapsed = Milliseconds(start);
@@ -384,6 +419,7 @@ id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineReques
             error = nil;
         }
         const auto start = std::chrono::steady_clock::now();
+        const SlowCompileReport report("a render pipeline", 0u);
         id<MTLRenderPipelineState> pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
         if (pipeline == nil) throw std::runtime_error("Metal device: render pipeline creation failed: " + Describe(error));
         const auto elapsed = Milliseconds(start);
