@@ -509,7 +509,9 @@ void ProtectPage(std::uint64_t address, bool readable) {
     DWORD previous = 0;
     Require(VirtualProtect(reinterpret_cast<void*>(address), 4096, readable ? PAGE_READWRITE : PAGE_NOACCESS, &previous) != 0, "cannot change the protection of a test page");
 #else
-    Require(mprotect(reinterpret_cast<void*>(address), 4096, readable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0, "cannot change the protection of a test page");
+    // The host page holding the address (16 KiB on Apple silicon, where mprotect refuses a 4 KiB range).
+    const auto page = static_cast<std::uint64_t>(::getpagesize());
+    Require(mprotect(reinterpret_cast<void*>(address & ~(page - 1u)), static_cast<std::size_t>(page), readable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0, "cannot change the protection of a test page");
 #endif
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(address), 4096);
 }
