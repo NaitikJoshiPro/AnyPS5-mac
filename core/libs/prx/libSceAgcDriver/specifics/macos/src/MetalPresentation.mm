@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -110,6 +112,82 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     file.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
 }
 
+// Every scale-th pixel of a BGRA8 image (the dump's pixels, upstream's downscale).
+std::vector<std::byte> DownscaleFrame(std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale, std::uint32_t& width, std::uint32_t& height) {
+    if (scale == 0u || full.size() != static_cast<std::size_t>(fullWidth) * fullHeight * 4u) Fail("invalid frame dump pixels");
+    width = (fullWidth + scale - 1u) / scale;
+    height = (fullHeight + scale - 1u) / scale;
+    std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4u);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4u, full.data() + (static_cast<std::size_t>(y) * scale * fullWidth + static_cast<std::size_t>(x) * scale) * 4u, 4u);
+    }
+    return pixels;
+}
+
+// Upstream's FrameDumpWriter (VulkanDevice.cpp): frame dumps are written by a worker, so a slow
+// file (or a pipe nobody reads yet: video_out_frame_dump_queue) never stalls a flip. Owned by the
+// presenter; device teardown joins it after the queued dumps are written.
+class FrameDumpWriter {
+public:
+    ~FrameDumpWriter() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        changed.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+
+    void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::vector<std::byte> pixels) {
+        std::lock_guard lock(mutex);
+        if (stopping) Fail("frame dump writer has stopped");
+        if (pixels.size() > MaxBytes - queuedBytes) Fail("frame dump queue exceeded 64 MiB");
+        if (!worker.joinable()) worker = std::thread([this] { run(); });
+        const auto bytes = pixels.size();
+        pending.push_back({index, width, height, std::move(pixels)});
+        queuedBytes += bytes;
+        changed.notify_one();
+    }
+
+private:
+    struct Frame {
+        int index;
+        std::uint32_t width;
+        std::uint32_t height;
+        std::vector<std::byte> pixels;
+    };
+
+    void run() {
+        try {
+            for (;;) {
+                std::deque<Frame> batch;
+                {
+                    std::unique_lock lock(mutex);
+                    changed.wait(lock, [this] { return stopping || !pending.empty(); });
+                    if (pending.empty() && stopping) return;
+                    batch.swap(pending);
+                }
+                for (const auto& frame : batch) {
+                    WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, 1u);
+                    std::lock_guard lock(mutex);
+                    queuedBytes -= frame.pixels.size();
+                }
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] frame dump writer failed: %s\n", error.what());
+            std::terminate();
+        }
+    }
+
+    static constexpr std::size_t MaxBytes = 64u * 1024u * 1024u;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<Frame> pending;
+    std::thread worker;
+    std::size_t queuedBytes = 0;
+    bool stopping = false;
+};
+
 bool Readback() {
     static const bool readback = std::getenv("APS5_METAL_PRESENT_READBACK") != nullptr;
     return readback;
@@ -176,6 +254,8 @@ struct Presenter {
         std::uint32_t height;
     };
     std::deque<Slot> slots;
+    // Frame dumps (APS5_DUMP_FRAMES), written off the presenting thread.
+    FrameDumpWriter dumpWriter;
 
     ~Presenter() {
         if (queue != nil && residency != nil) [queue removeResidencySet:residency];
@@ -448,7 +528,10 @@ void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std:
     if (width == 0u || height == 0u || width > 16384u || height > 16384u) Fail("invalid display image extent");
     if (pixels.size() != static_cast<std::uint64_t>(width) * height * 4u) Fail("invalid display pixel buffer size");
     auto& dumps = Dumps();
-    if (dumps.dumped < dumps.limit) WriteFrameBmp(dumps.dumped++, width, height, pixels, 1u);
+    if (dumps.dumped < dumps.limit) {
+        if (auto* presenter = state->presenter.get(); presenter != nullptr) presenter->dumpWriter.Enqueue(dumps.dumped++, width, height, {pixels.begin(), pixels.end()});
+        else WriteFrameBmp(dumps.dumped++, width, height, pixels, 1u);
+    }
     // Tests and tools present pixels synchronously; the game path splits the steps (Driver::Present).
     if (!present(width, height, true, pixels)) return;
     FinishPresent();
@@ -468,7 +551,12 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         if (dumpIndex >= 0) --dumps.dumped;
         return false;
     }
-    if (dumpIndex >= 0) WriteFrameBmp(dumpIndex, buffer.width, buffer.height, pixels, DumpScale());
+    if (dumpIndex >= 0) {
+        std::uint32_t dumpWidth = 0;
+        std::uint32_t dumpHeight = 0;
+        auto scaled = DownscaleFrame(buffer.width, buffer.height, pixels, DumpScale(), dumpWidth, dumpHeight);
+        state->presenter->dumpWriter.Enqueue(dumpIndex, dumpWidth, dumpHeight, std::move(scaled));
+    }
     return true;
 }
 
