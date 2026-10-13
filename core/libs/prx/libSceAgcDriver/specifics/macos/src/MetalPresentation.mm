@@ -143,6 +143,7 @@ public:
         if (stopping) Fail("frame dump writer has stopped");
         if (pixels.size() > MaxBytes - queuedBytes) Fail("frame dump queue exceeded 64 MiB");
         if (!worker.joinable()) worker = std::thread([this] { run(); });
+        if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp queued (%ux%u)\n", index, width, height);
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, std::move(pixels)});
         queuedBytes += bytes;
@@ -169,6 +170,7 @@ private:
                 }
                 for (const auto& frame : batch) {
                     WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, 1u);
+                    if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp written (%ux%u)\n", frame.index, frame.width, frame.height);
                     std::lock_guard lock(mutex);
                     queuedBytes -= frame.pixels.size();
                 }
