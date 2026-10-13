@@ -1,9 +1,11 @@
 #include "GuestCpu.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include "BareGuest.hpp"
 #include "Bridge.hpp"
 #include "CodeCache.hpp"
 #include "CodePool.hpp"
+#include "ConsoleSyscalls.hpp"
 #include "GuestProgram.hpp"
 #include "Options.hpp"
 
@@ -411,7 +413,10 @@ void OnFault(int signal, siginfo_t* info, void* context) {
         arm_thread_state64_set_pc_fptr(machine->__ss, &Aps5GuestCallEntry);
         return;
     }
-    if (HandleUnaligned(signal, info, machine)) return;
+    // macOS raises SIGBUS/BUS_ADRALN for protection faults as well. One on a displaced guest address is a host guard
+    // (D31, D33); libc's GuestDisplaced handler, further down the chain, runs the access at the alias. fex does not
+    // link libc, so it skips the coarse bounds (the dyld shared cache below the window is never guest memory).
+    if (!GuestArena::MayBeDisplaced(reinterpret_cast<std::uintptr_t>(info->si_addr)) && HandleUnaligned(signal, info, machine)) return;
     const struct sigaction& previous = signal == SIGBUS ? previousBus : previousSegv;
     if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
         previous.sa_sigaction(signal, info, context);
@@ -553,6 +558,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     state->context->SetThunkHandler(Bridge::Thunks());
     state->context->EnableExitOnHLT();
     if (!state->context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
+    if (const std::uint64_t gadget = CreateConsoleSyscallGadget(bridge)) state->context->AddThunkTrampolineIRHandler(ConsoleSyscallGadget, gadget);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
@@ -650,7 +656,57 @@ void GuestCpu::Start(Bridge& bridge, std::uint64_t start, std::uint64_t block, s
     std::abort();
 }
 
+namespace {
+
+std::uint64_t RunHere(FEXCore::Context::Context& context, std::uint64_t rip, std::uint64_t rsp, const std::vector<std::uint64_t>& initializers);
+
+#ifdef __APPLE__
+// The entry-point form of Run on macOS (no StartFunction): AppKit only creates windows on the process main
+// thread, and the libraries reach it through Aps5RunOnMainThread, which needs the main thread in its run
+// loop. So, as for Start, the guest's main thread runs on another thread (Aps5StartGuest, main-thread stack
+// size) and the process main thread serves the main queue. Before this, the guest kept the process main thread,
+// Aps5RunOnMainThread ran its function in place on the calling thread, and the first windowed sceVideoOutOpen
+// failed with "NSWindow should only be instantiated on the main thread!" (DOOM PPSA99666, 2026-10-13).
+struct ProgramEntry {
+    FEXCore::Context::Context* context;
+    std::uint64_t rip;
+    std::uint64_t rsp;
+    std::vector<std::uint64_t> initializers;
+};
+
+ProgramEntry programEntry;
+
+void RunProgramEntry(void*, void*) {
+    try {
+        const std::uint64_t rax = RunHere(*programEntry.context, programEntry.rip, programEntry.rsp, programEntry.initializers);
+        std::fprintf(stderr, "[aps5-fex] the guest halted with RAX %#llx\n", static_cast<unsigned long long>(rax));
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[aps5-fex] %s\n", error.what());
+    }
+    std::fflush(nullptr);
+    std::exit(1);
+}
+#endif
+
+}
+
 std::uint64_t GuestCpu::Run(std::uint64_t rip, std::uint64_t rsp, const std::vector<std::uint64_t>& initializers) {
+#ifdef __APPLE__
+    using StartGuest = void (*)(void (*)(void*, void*), void*);
+    if (guestCode.bridge != nullptr) {
+        if (auto* startGuest = reinterpret_cast<StartGuest>(guestCode.bridge->HostSymbol("Aps5StartGuest_nid_no_patch"))) {
+            programEntry = {state->context.get(), rip, rsp, initializers};
+            startGuest(RunProgramEntry, nullptr);
+            std::abort();
+        }
+    }
+#endif
+    return RunHere(*state->context, rip, rsp, initializers);
+}
+
+namespace {
+
+std::uint64_t RunHere(FEXCore::Context::Context& context, std::uint64_t rip, std::uint64_t rsp, const std::vector<std::uint64_t>& initializers) {
     ApplyThreadQos();
     GuestThread main(rip, rsp, 0);
     currentThread = main.Thread();
@@ -658,9 +714,11 @@ std::uint64_t GuestCpu::Run(std::uint64_t rip, std::uint64_t rsp, const std::vec
         Aps5GuestCallFrame frame {};
         CallGuest(currentThread, initializer, &frame);
     }
-    state->context->ExecuteThread(currentThread);
+    context.ExecuteThread(currentThread);
     currentThread = nullptr;
     return main.Thread()->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX];
+}
+
 }
 
 namespace {

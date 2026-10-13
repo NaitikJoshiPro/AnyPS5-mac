@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Queue.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -358,6 +359,38 @@ void testPresentMode() {
     check(expectFailure([&] { SelectPresentMode(nullptr, none); }).find("does not support") != std::string::npos, "FIFO was selected on a surface without it");
 }
 
+// Queue handles as the oops-sdk (SuperTuxKart) uses them: CreateQueue(type, &handle, 0), then
+// SubmitCommandBuffer(handle, &descriptor) runs the DCB on the graphics queue.
+void testQueues() {
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(9, output);
+    void* universal = nullptr;
+    void* direct = nullptr;
+    check(sceAgcDriverCreateQueue(0, &universal, 0) == 0 && universal, "universal queue creation failed");
+    check(sceAgcDriverCreateQueue(3, &direct, 0) == 0 && direct && direct != universal, "direct queue creation failed or reused a handle");
+    void* unused = nullptr;
+    check(expectFailure([&] { sceAgcDriverCreateQueue(1, &unused, 0); }).find("unsupported queue type 1") != std::string::npos, "unknown queue type accepted");
+    expectFailure([&] { sceAgcDriverCreateQueue(0, &unused, 1); });
+    expectFailure([] { sceAgcDriverCreateQueue(0, nullptr, 0); });
+    check(unused == nullptr, "a rejected queue creation wrote a handle");
+    std::array<std::uint32_t, 6> words{0xc004105c, 9, 0xfffffffeu, 1, 0x13572468u, 0x2468ace0u};
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitCommandBuffer(direct, &packet) == 0, "command buffer submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    {
+        std::lock_guard lock(output->state->mutex);
+        check(output->state->last.handle == 9 && output->state->last.argument == 0x2468ace013572468LL, "command buffer flip did not reach the video output");
+    }
+    int bogus = 0;
+    check(expectFailure([&] { sceAgcDriverSubmitCommandBuffer(&bogus, &packet); }).find("not created by sceAgcDriverCreateQueue") != std::string::npos, "unknown queue handle accepted");
+    expectFailure([&] { sceAgcDriverSubmitCommandBuffer(nullptr, &packet); });
+    check(sceAgcDriverDestroyQueue(direct) == 0, "queue destruction failed");
+    expectFailure([&] { sceAgcDriverDestroyQueue(direct); });
+    expectFailure([&] { sceAgcDriverSubmitCommandBuffer(direct, &packet); });
+    check(sceAgcDriverDestroyQueue(universal) == 0, "universal queue destruction failed");
+    AgcDriverUnregisterVideoOutput_nid_postfix(9, output);
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "present-mode") {
@@ -366,7 +399,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2) testReset(std::string(argv[1]) == "compute");
-        else { testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testFailure(); }
+        else { testQueues(); testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testFailure(); }
         const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
         check(shutdown.find(argc == 2 ? (std::string(argv[1]) == "compute" ? "not readable" : "required shader register") : "intentional flip failure") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC flip and suspend tests passed");

@@ -11,6 +11,8 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/NativeStat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Terminal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Open.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Link.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/FcntlAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/OpenFileLimit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/SharedMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/RandomDevice.cpp
@@ -27,12 +29,16 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Mutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Cond.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Attr.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/AttrPrio.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ConsoleSyscall.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/GuestTlsMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/MainThreadMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Barrier.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/CpuClock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Barrier.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Cond.cpp
@@ -63,7 +69,10 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Login.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SoftwareVersion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ThermalSensors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ThermalSensorsMacOs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/HardwareInfo.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Signals.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SigactionAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SignalSets.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Notification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/UserContext.cpp
@@ -323,6 +332,26 @@ if(BUILD_TESTING)
         set_tests_properties(guest_pthread_barrier PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(guest_sce_pthread_barrier_tests ${LIBS_INCLUDE_DIR}/tests/GuestScePthreadBarrier.cpp)
+    target_include_directories(guest_sce_pthread_barrier_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_sce_pthread_barrier_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_sce_pthread_barrier_tests)
+    add_test(NAME guest_sce_pthread_barrier COMMAND guest_sce_pthread_barrier_tests)
+    set_tests_properties(guest_sce_pthread_barrier PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_sce_pthread_barrier PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_kernel_host_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelHostInfo.cpp)
+    target_include_directories(guest_kernel_host_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_kernel_host_info_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_kernel_host_info_tests)
+    add_test(NAME guest_kernel_host_info COMMAND guest_kernel_host_info_tests)
+    set_tests_properties(guest_kernel_host_info PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_kernel_host_info PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(guest_kernel_is_stack_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelIsStack.cpp)
     target_include_directories(guest_kernel_is_stack_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_kernel_is_stack_tests PRIVATE libkernel libc)
@@ -441,6 +470,26 @@ if(BUILD_TESTING)
     set_tests_properties(guest_pthread_attr_errors PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_pthread_attr_errors PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_console_syscall_tests ${LIBS_INCLUDE_DIR}/tests/GuestConsoleSyscall.cpp)
+    target_include_directories(guest_console_syscall_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_console_syscall_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_console_syscall_tests)
+    add_test(NAME guest_console_syscall COMMAND guest_console_syscall_tests)
+    set_tests_properties(guest_console_syscall PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_console_syscall PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_pthread_attr_prio_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadAttrPrio.cpp)
+    target_include_directories(guest_pthread_attr_prio_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_pthread_attr_prio_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_pthread_attr_prio_tests)
+    add_test(NAME guest_pthread_attr_prio COMMAND guest_pthread_attr_prio_tests)
+    set_tests_properties(guest_pthread_attr_prio PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_pthread_attr_prio PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_pthread_stack_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadStack.cpp)
@@ -1168,6 +1217,16 @@ if(BUILD_TESTING)
     add_dependencies(guest_memory_tests guest_memory_module)
     target_compile_definitions(guest_memory_tests PRIVATE GUEST_MEMORY_MODULE="$<TARGET_FILE:guest_memory_module>")
     add_test(NAME guest_memory COMMAND guest_memory_tests)
+    add_test_executable(guest_displaced_memory_tests ${LIBS_INCLUDE_DIR}/tests/GuestDisplacedMemory.cpp)
+    target_include_directories(guest_displaced_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_displaced_memory_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_displaced_memory_tests)
+    add_test(NAME guest_displaced_memory COMMAND guest_displaced_memory_tests)
+    add_test_executable(guest_fcntl_duplicate_tests ${LIBS_INCLUDE_DIR}/tests/GuestFcntlDuplicate.cpp)
+    target_include_directories(guest_fcntl_duplicate_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_fcntl_duplicate_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_fcntl_duplicate_tests)
+    add_test(NAME guest_fcntl_duplicate COMMAND guest_fcntl_duplicate_tests)
     if(WIN32)
         set_tests_properties(guest_memory PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")

@@ -1,6 +1,8 @@
 #include "CodePool.hpp"
 
+#include <atomic>
 #include <iterator>
+#include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <stdexcept>
@@ -14,6 +16,10 @@ namespace {
 std::size_t RoundUp(std::size_t value) {
     return (value + CodePool::Granule - 1) & ~(CodePool::Granule - 1);
 }
+
+// Live pools, read from fault handlers (no locks).
+constexpr std::size_t MaxPools = 8;
+std::atomic<CodePool*> pools[MaxPools];
 
 }
 
@@ -39,9 +45,17 @@ CodePool::CodePool(std::size_t size) : size(RoundUp(size)) {
     writable = reinterpret_cast<std::uint8_t*>(rw);
     writeOffset = static_cast<std::int64_t>(rw) - static_cast<std::int64_t>(rx);
     free.emplace(0, this->size);
+    for (auto& slot : pools) {
+        CodePool* empty = nullptr;
+        if (slot.compare_exchange_strong(empty, this, std::memory_order_acq_rel)) break;
+    }
 }
 
 CodePool::~CodePool() {
+    for (auto& slot : pools) {
+        CodePool* self = this;
+        slot.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
+    }
     mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(code), size);
     mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(writable), size);
 }
@@ -108,6 +122,34 @@ std::size_t CodePool::Used() const {
 std::size_t CodePool::FreeRanges() const {
     std::lock_guard lock(mutex);
     return free.size();
+}
+
+bool CodePool::WriteInstruction(std::uintptr_t pc, std::uint32_t instruction) {
+    if ((pc & 3u) != 0) return false;
+    for (auto& slot : pools) {
+        auto* pool = slot.load(std::memory_order_acquire);
+        if (pool == nullptr || !pool->Contains(reinterpret_cast<const void*>(pc))) continue;
+        auto* target = reinterpret_cast<std::atomic<std::uint32_t>*>(pc + pool->writeOffset);
+        target->store(instruction, std::memory_order_release);
+        sys_icache_invalidate(reinterpret_cast<void*>(pc), 4);
+        return true;
+    }
+    return false;
+}
+
+std::uintptr_t CodePool::AllocateBeside(std::uintptr_t pc, std::size_t bytes, std::uintptr_t* writable) {
+    for (auto& slot : pools) {
+        auto* pool = slot.load(std::memory_order_acquire);
+        if (pool == nullptr || !pool->Contains(reinterpret_cast<const void*>(pc))) continue;
+        try {
+            const auto rx = reinterpret_cast<std::uintptr_t>(pool->Allocate(bytes));
+            *writable = rx + pool->writeOffset;
+            return rx;
+        } catch (const std::runtime_error&) {
+            return 0;
+        }
+    }
+    return 0;
 }
 
 }

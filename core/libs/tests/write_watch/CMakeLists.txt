@@ -7,7 +7,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 find_package(Threads REQUIRED)
-add_executable(write_watch_tests ../WriteWatch.cpp ../../prx/libc/src/GuestWriteWatch.cpp)
+# GuestDisplaced.cpp: the displaced window bounds GuestWriteWatch.cpp reads (D33); never enabled here.
+add_executable(write_watch_tests ../WriteWatch.cpp ../../prx/libc/src/GuestWriteWatch.cpp ../../prx/libc/src/GuestDisplaced.cpp)
 target_include_directories(write_watch_tests PRIVATE ../..)
 target_compile_features(write_watch_tests PRIVATE cxx_std_20)
 target_link_libraries(write_watch_tests PRIVATE Threads::Threads)

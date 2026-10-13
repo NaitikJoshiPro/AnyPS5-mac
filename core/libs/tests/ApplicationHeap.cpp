@@ -104,7 +104,23 @@ void write(std::array<std::byte, TSize>& data, std::size_t offset, TValue value)
 }
 
 int main(int argc, char** argv) {
-    reject([] { ApplicationHeapAllocate_nid_no_patch(64); });
+    if (argc > 1 && std::strcmp(argv[1], "lazy") == 0) {
+        // malloc without _init_env (oops-sdk titles): the first call sets up the default heap, since this
+        // test executable has no process parameters; a replacement table can no longer take over.
+        auto* pointer = static_cast<unsigned char*>(ApplicationHeapAllocate_nid_no_patch(64));
+        require(pointer != nullptr && ApplicationHeapUsableSize_nid_no_patch(pointer) == 64);
+        std::memset(pointer, 0x11, 64);
+        ApplicationHeapFree_nid_no_patch(pointer);
+        std::array<void*, 10> replacementApi{};
+        replacementApi[0] = reinterpret_cast<void*>(&allocate);
+        for (std::size_t index = 1; index < 7; ++index) replacementApi[index] = reinterpret_cast<void*>(&release);
+        reject([&] { ApplicationHeapRegister_nid_no_patch(replacementApi.data()); });
+        pointer = static_cast<unsigned char*>(ApplicationHeapCalloc_nid_no_patch(4, 4));
+        for (unsigned i = 0; i < 16; ++i) require(pointer[i] == 0);
+        ApplicationHeapFree_nid_no_patch(pointer);
+        require(initializes == 0 && lastSize == 0);
+        return 0;
+    }
     reject([] { ApplicationHeapRegister_nid_no_patch(nullptr); });
     std::array<std::byte, 0x40> process{};
     std::array<std::byte, 0x38> libc{};

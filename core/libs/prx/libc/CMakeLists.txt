@@ -19,10 +19,12 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileLock.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/SortSecure.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StandardStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestArena.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestDisplaced.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestStacks.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestWriteWatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Interfaces.cpp
@@ -77,6 +79,16 @@ if(BUILD_TESTING)
     add_test(NAME guest_dynamic_cast COMMAND guest_dynamic_cast_tests)
     if(WIN32)
         set_tests_properties(guest_dynamic_cast PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_qsort_s_tests ${LIBS_INCLUDE_DIR}/tests/GuestQsortS.cpp)
+    target_include_directories(guest_qsort_s_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_qsort_s_tests PRIVATE libc)
+    configure_windows_unwind(guest_qsort_s_tests)
+    add_test(NAME guest_qsort_s COMMAND guest_qsort_s_tests)
+    set_tests_properties(guest_qsort_s PROPERTIES TIMEOUT 10)
+    if(WIN32)
+        set_tests_properties(guest_qsort_s PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_time_conversion_tests ${LIBS_INCLUDE_DIR}/tests/GuestTimeConversion.cpp)
@@ -588,9 +600,10 @@ if(BUILD_TESTING)
     add_test(NAME application_heap_replacement COMMAND application_heap_tests)
     add_test(NAME application_heap_invalid_metadata COMMAND application_heap_tests invalid)
     add_test(NAME application_heap_default COMMAND application_heap_tests default)
+    add_test(NAME application_heap_lazy COMMAND application_heap_tests lazy)
     add_test(NAME application_heap_exit_order COMMAND application_heap_tests exit-order)
     if(WIN32)
-        set_tests_properties(application_heap_replacement application_heap_invalid_metadata application_heap_default application_heap_exit_order
+        set_tests_properties(application_heap_replacement application_heap_invalid_metadata application_heap_default application_heap_lazy application_heap_exit_order
             PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(application_heap_stats_tests ${LIBS_INCLUDE_DIR}/tests/ApplicationHeapStats.cpp)

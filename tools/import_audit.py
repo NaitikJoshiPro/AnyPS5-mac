@@ -278,6 +278,129 @@ def pe_exports(path, data):
     return names
 
 
+MACHO_MAGIC_64 = 0xfeedfacf
+FAT_MAGIC = 0xcafebabe
+FAT_MAGIC_64 = 0xcafebabf
+CPU_TYPE_ARM64 = 0x0100000c
+LC_SYMTAB = 0x2
+LC_DYLD_INFO = 0x22
+LC_DYLD_INFO_ONLY = 0x80000022
+LC_DYLD_EXPORTS_TRIE = 0x80000033
+N_STAB, N_PEXT, N_TYPE, N_EXT = 0xe0, 0x10, 0x0e, 0x01
+N_ABS, N_SECT, N_INDR = 0x2, 0xe, 0xa
+EXPORT_REEXPORT, EXPORT_STUB_AND_RESOLVER = 0x08, 0x10
+
+
+def uleb128(data, offset, limit, path, what):
+    value, shift = 0, 0
+    while True:
+        if offset >= limit:
+            raise AuditError(f"{path}: {what} runs past its table at 0x{offset:x}")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7f) << shift
+        if byte < 0x80:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            raise AuditError(f"{path}: {what} at 0x{offset:x} is longer than 64 bits")
+
+
+def macho_trie_exports(path, data, start, size):
+    """Terminal names of a dyld export trie (what dlsym looks up)."""
+    take(data, start, size, path, "Mach-O export trie")
+    limit = start + size
+    names, pending, visited = set(), [(0, b"")], set()
+    while pending:
+        node, prefix = pending.pop()
+        if node in visited:
+            raise AuditError(f"{path}: export trie node 0x{node:x} is reached twice")
+        visited.add(node)
+        offset = start + node
+        terminal, offset = uleb128(data, offset, limit, path, "export trie terminal size")
+        if terminal:
+            end = offset + terminal
+            if end > limit:
+                raise AuditError(f"{path}: export trie terminal at 0x{offset:x} runs past the trie")
+            flags, after = uleb128(data, offset, end, path, "export flags")
+            if flags & EXPORT_REEXPORT:
+                _, after = uleb128(data, after, end, path, "re-export ordinal")
+                cstring(data, after, end, path, "re-export name", errors="strict")
+            elif flags & EXPORT_STUB_AND_RESOLVER:
+                _, after = uleb128(data, after, end, path, "stub address")
+                uleb128(data, after, end, path, "resolver address")
+            else:
+                uleb128(data, after, end, path, "export address")
+            name = prefix.decode("utf-8", errors="surrogateescape")
+            names.add(name[1:] if name.startswith("_") else name)
+            offset = end
+        if offset >= limit:
+            raise AuditError(f"{path}: export trie node 0x{node:x} has no child count")
+        children = data[offset]
+        offset += 1
+        for _ in range(children):
+            edge_end = data.find(b"\0", offset, limit)
+            if edge_end < 0:
+                raise AuditError(f"{path}: export trie edge at 0x{offset:x} is not NUL-terminated")
+            edge = data[offset:edge_end]
+            child, offset = uleb128(data, edge_end + 1, limit, path, "export trie child offset")
+            if child >= size:
+                raise AuditError(f"{path}: export trie child 0x{child:x} lies outside the trie")
+            pending.append((child, prefix + edge))
+    return names
+
+
+def macho_exports(path, data):
+    """Exported names of a 64-bit little-endian Mach-O (or the arm64 slice of a universal file), with the C
+    prefix `_` removed. The dyld export trie (LC_DYLD_EXPORTS_TRIE or LC_DYLD_INFO) is what dlsym searches, and
+    it is the only place the macOS libraries' NID aliases appear, so it is used when present. Without one, the
+    LC_SYMTAB symbols that are external, not private-external, not debug entries and defined are the exports."""
+    if unpack(">I", data, 0, path, "Mach-O magic")[0] in (FAT_MAGIC, FAT_MAGIC_64):
+        magic, count = unpack(">II", data, 0, path, "universal header")
+        entry = 32 if magic == FAT_MAGIC_64 else 20
+        for index in range(count):
+            fields = unpack(">iiQQI" if entry == 32 else ">iiIII", data, 8 + index * entry, path, f"universal slice {index}")
+            if fields[0] == CPU_TYPE_ARM64:
+                return macho_exports(path, take(data, fields[2], fields[3], path, "arm64 slice"))
+        raise AuditError(f"{path}: universal Mach-O without an arm64 slice")
+    magic, _, _, _, command_count, commands_size, _, _ = unpack("<IiiIIIII", data, 0, path, "Mach-O header")
+    if magic != MACHO_MAGIC_64:
+        raise AuditError(f"{path}: only 64-bit little-endian Mach-O is supported (magic 0x{magic:08x})")
+    take(data, 32, commands_size, path, "Mach-O load commands")
+    symtabs, tries = [], []
+    offset = 32
+    for index in range(command_count):
+        command, size = unpack("<II", data, offset, path, f"load command {index}")
+        if size < 8 or offset + size > 32 + commands_size:
+            raise AuditError(f"{path}: load command {index} has invalid size {size}")
+        if command == LC_SYMTAB:
+            symtabs.append(unpack("<IIIIII", data, offset, path, "LC_SYMTAB")[2:])
+        elif command == LC_DYLD_EXPORTS_TRIE:
+            tries.append(unpack("<IIII", data, offset, path, "LC_DYLD_EXPORTS_TRIE")[2:])
+        elif command in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
+            export = unpack("<12I", data, offset, path, "LC_DYLD_INFO")[10:]
+            if export[1]:
+                tries.append(export)
+        offset += size
+    if len(tries) > 1:
+        raise AuditError(f"{path}: {len(tries)} export tries")
+    if tries:
+        return macho_trie_exports(path, data, *tries[0]) if tries[0][1] else set()
+    if len(symtabs) != 1:
+        raise AuditError(f"{path}: expected one LC_SYMTAB or an export trie, found {len(symtabs)} symbol tables")
+    symbols_offset, symbol_count, strings_offset, strings_size = symtabs[0]
+    take(data, symbols_offset, symbol_count * 16, path, "Mach-O symbol table")
+    take(data, strings_offset, strings_size, path, "Mach-O string table")
+    names = set()
+    for position in range(symbol_count):
+        name, kind, _, _, _ = unpack("<IBBHQ", data, symbols_offset + position * 16, path, "Mach-O symbol")
+        if name == 0 or kind & N_STAB or not kind & N_EXT or kind & N_PEXT or (kind & N_TYPE) not in (N_ABS, N_SECT, N_INDR):
+            continue
+        text = cstring(data, strings_offset + name, strings_offset + strings_size, path, "export name")
+        names.add(text[1:] if text.startswith("_") else text)
+    return names
+
+
 def read_exports(path, data=None):
     if data is None:
         data = path.read_bytes()
@@ -285,7 +408,9 @@ def read_exports(path, data=None):
         return elf_exports(path, data)
     if data[:2] == b"MZ":
         return pe_exports(path, data)
-    raise AuditError(f"{path}: neither ELF nor PE (first bytes {data[:4]!r})")
+    if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        return macho_exports(path, data)
+    raise AuditError(f"{path}: neither ELF nor PE nor Mach-O (first bytes {data[:4]!r})")
 
 
 def directory_files(directory, pattern):

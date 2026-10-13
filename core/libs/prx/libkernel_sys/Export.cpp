@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>

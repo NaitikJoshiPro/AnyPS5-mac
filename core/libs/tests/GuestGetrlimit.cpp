@@ -67,7 +67,9 @@ static void RequireHostLimit(int resource, int hostResource) {
 static void LoweredHostLimitIsReported() {
     rlimit host{};
     Require(getrlimit(RLIMIT_DATA, &host) == 0);
-    const rlim_t lowered = rlim_t{1} << 40;
+    // macOS counts reserved address space against RLIMIT_DATA and refuses a limit below it: the guest arena and the
+    // displaced window's alias (D31) reserve about 0.9 TiB, so lower the limit to 16 TiB.
+    const rlim_t lowered = rlim_t{1} << 44;
     if (host.rlim_max != RLIM_INFINITY && host.rlim_max < lowered) return;
     host.rlim_cur = lowered;
     Require(setrlimit(RLIMIT_DATA, &host) == 0);

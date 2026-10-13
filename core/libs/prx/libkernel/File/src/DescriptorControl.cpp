@@ -378,6 +378,12 @@ int CurrentStatus(int fd) {
 void SetCloseOnExec(int fd, bool value) {
     std::lock_guard lock(g_mutex);
     Materialize(fd).closeOnExec = value;
+#ifndef _WIN32
+    // The host descriptor carries the flag too, so a host exec (sceSystemServiceLoadExec) closes what the guest marked.
+    const int flags = ::fcntl(fd, F_GETFD);
+    if (flags < 0 || ::fcntl(fd, F_SETFD, value ? (flags | FD_CLOEXEC) : (flags & ~FD_CLOEXEC)) != 0)
+        throw std::runtime_error("fcntl: host F_SETFD failed, fd=" + std::to_string(fd) + ", errno=" + std::to_string(errno));
+#endif
 }
 
 int RecordLock(int fd, int command, std::intptr_t argument) {

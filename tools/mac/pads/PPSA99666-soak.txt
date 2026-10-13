@@ -1,0 +1,28 @@
+# DOOM Shareware (PPSA99666) soak: launcher → new game (E1, default skill) → walk, turn, fire, use in a loop.
+# Controls (lowbit/ps5-doom README): left stick move/strafe, d-pad move/turn, right stick turn, R2 fire,
+# cross/square use, options menu. Stick axes 0..255, 128 = centre, y 0 = forward.
+wait 12
+press cross 300        # launcher: DOOM SHAREWARE: EPISODE 1
+wait 8
+press options 300      # title/demo → main menu
+wait 2
+press cross 300        # New Game
+wait 2
+press cross 300        # episode 1
+wait 2
+press cross 300        # skill (default: Hurt me plenty)
+wait 4
+loop
+press release 1500 128 0 128 128    # walk forward
+press r2 400                        # fire
+press release 700 128 128 255 128   # turn right
+press r2 400
+press release 1500 128 0 128 128
+press cross 200                     # use (doors, switches; respawn after death)
+press release 900 128 128 0 128     # turn left
+press up 1000                       # d-pad forward
+press right 500                     # d-pad turn
+press r2 300
+press release 800 0 128 128 128     # strafe left
+press square 200                    # use
+wait 0.5

@@ -103,3 +103,59 @@ int Aps5AbiCallStored(int value) {
 }
 
 }
+
+#ifdef __APPLE__
+#include <dlfcn.h>
+#include <pthread.h>
+
+// The process threading model aps5-fex sets up for a guest on macOS (GuestCpu::Run / Start through
+// Aps5StartGuest): the guest's main thread is not the process main thread, the process main thread serves the
+// main queue, and AppKit work sent there with Aps5RunOnMainThread can create a window. The window is never
+// shown (deferred, never ordered front) and is closed at once. AppKit and the Objective-C runtime are looked up
+// at run time so the test library links nothing extra.
+namespace {
+
+struct MainThreadProbe {
+    bool onMain = false;
+    bool window = false;
+};
+
+struct ProbeRect {
+    double x, y, width, height; // CGRect: an HFA of four doubles, as the real type is
+};
+
+void CreateHiddenWindow(void* context) {
+    auto* probe = static_cast<MainThreadProbe*>(context);
+    probe->onMain = pthread_main_np() != 0;
+    if (dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_NOW | RTLD_GLOBAL) == nullptr) return;
+    auto* getClass = reinterpret_cast<void* (*)(const char*)>(dlsym(RTLD_DEFAULT, "objc_getClass"));
+    auto* selector = reinterpret_cast<void* (*)(const char*)>(dlsym(RTLD_DEFAULT, "sel_registerName"));
+    void* send = dlsym(RTLD_DEFAULT, "objc_msgSend");
+    if (getClass == nullptr || selector == nullptr || send == nullptr) return;
+    try {
+        reinterpret_cast<void* (*)(void*, void*)>(send)(getClass("NSApplication"), selector("sharedApplication"));
+        void* window = reinterpret_cast<void* (*)(void*, void*)>(send)(getClass("NSWindow"), selector("alloc"));
+        // styleMask 0 (borderless), backing 2 (NSBackingStoreBuffered), defer YES: no window server surface yet.
+        window = reinterpret_cast<void* (*)(void*, void*, ProbeRect, unsigned long, unsigned long, bool)>(send)(
+            window, selector("initWithContentRect:styleMask:backing:defer:"), ProbeRect {0, 0, 64, 64}, 0, 2, true);
+        if (window == nullptr) return;
+        probe->window = true;
+        reinterpret_cast<void (*)(void*, void*)>(send)(window, selector("close"));
+    } catch (...) {
+        // AppKit raises NSInternalInconsistencyException off the main thread: probe->window stays false.
+    }
+}
+
+}
+
+extern "C" int Aps5AbiMainThreadProbe() {
+    int result = pthread_main_np() == 0 ? 1 : 0;
+    auto* runOnMain = reinterpret_cast<void (*)(void (*)(void*), void*)>(dlsym(RTLD_DEFAULT, "Aps5RunOnMainThread_nid_no_patch"));
+    if (runOnMain == nullptr) return result;
+    MainThreadProbe probe;
+    runOnMain(CreateHiddenWindow, &probe);
+    if (probe.onMain) result |= 2;
+    if (probe.window) result |= 4;
+    return result;
+}
+#endif

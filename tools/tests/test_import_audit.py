@@ -98,6 +98,54 @@ def build_sectionless_elf(symbols, needed=(), gnu_hash=False):
     return bytes(image)
 
 
+def build_macho(symbols, cpu=0x0100000c):
+    """A minimal 64-bit Mach-O dylib: a header, one LC_SYMTAB, nlist_64 entries (name, n_type) and strings."""
+    strings = b"\0"
+    entries = []
+    for name, kind in symbols:
+        entries.append(struct.pack("<IBBHQ", len(strings), kind, 1, 0, 0))
+        strings += name.encode() + b"\0"
+    table_offset = 32 + 24
+    strings_offset = table_offset + 16 * len(entries)
+    header = struct.pack("<IiiIIIII", 0xfeedfacf, cpu, 0, 6, 1, 24, 0, 0)
+    symtab = struct.pack("<IIIIII", 0x2, 24, table_offset, len(entries), strings_offset, len(strings))
+    return header + symtab + b"".join(entries) + strings
+
+
+def build_macho_trie(names, symbols=()):
+    """A Mach-O whose LC_DYLD_EXPORTS_TRIE exports names (one edge per name from the root; offsets < 128) next to
+    an LC_SYMTAB with symbols, which the trie must take precedence over."""
+    leaves, root_size = [], 2 + sum(len(name) + 2 + 1 for name in names)
+    trie = bytearray([0, len(names)])
+    offset = root_size
+    for name in names:
+        trie += b"_" + name.encode() + b"\0" + bytes([offset])
+        leaves.append(bytes([2, 0, 0x10, 0]))  # terminal size 2: flags 0, address 0x10; no children
+        offset += 4
+    trie += b"".join(leaves)
+    base = build_macho(list(symbols))
+    commands = struct.unpack_from("<IiiIIIII", base)
+    trie_offset = len(base) + 16
+    header = struct.pack("<IiiIIIII", commands[0], commands[1], 0, 6, 2, 24 + 16, 0, 0)
+    symtab = bytearray(base[32:56])
+    for field in (8, 16):  # symbol and string offsets move by the extra 16-byte load command
+        struct.pack_into("<I", symtab, field, struct.unpack_from("<I", symtab, field)[0] + 16)
+    command = struct.pack("<IIII", 0x80000033, 16, trie_offset, len(trie))
+    return header + bytes(symtab) + command + base[56:] + bytes(trie)
+
+
+def universal(slices):
+    """A 32-bit universal (fat) file holding (cputype, image) slices at 4 KiB alignment."""
+    header = struct.pack(">II", 0xcafebabe, len(slices))
+    offset = 4096
+    body = bytearray()
+    for cpu, image in slices:
+        header += struct.pack(">iiIII", cpu, 0, offset, len(image), 12)
+        body += bytes(offset - 4096 - len(body)) + image
+        offset += -(-len(image) // 4096) * 4096
+    return header + bytes(4096 - len(header)) + bytes(body)
+
+
 def exporting(*names):
     return build_elf([(name, 1, GLOBAL_FUNCTION) for name in names])
 
@@ -446,6 +494,56 @@ class ImportAuditTests(unittest.TestCase):
         for cut in (10, 64, len(image) - 5):
             with self.assertRaisesRegex(import_audit.AuditError, "mod.prx"):
                 import_audit.elf_imports(path, image[:cut])
+
+    def test_macho_export_trie_is_what_dlsym_sees(self):
+        path = Path("lib.prx")
+        image = build_macho_trie(["JfEPXVxhFqA", "sce+Name-1"], [("_onlyInSymtab", 0x0f)])
+        self.assertEqual(import_audit.read_exports(path, image), {"JfEPXVxhFqA", "sce+Name-1"})
+        self.assertEqual(import_audit.read_exports(path, build_macho_trie([])), set())
+        for cut in (len(image) - 1, len(image) - 6):
+            with self.subTest(cut=cut), self.assertRaisesRegex(import_audit.AuditError, "lib.prx"):
+                import_audit.read_exports(path, image[:cut])
+        looped = bytearray(image)
+        looped[-4 * 2 - 1] = 0  # last edge's child offset → the root again
+        with self.assertRaisesRegex(import_audit.AuditError, "reached twice|outside"):
+            import_audit.read_exports(path, bytes(looped))
+
+    def test_macho_reader(self):
+        external, private, undefined, local, debug, absolute = 0x0f, 0x1f, 0x01, 0x0e, 0x24, 0x03
+        image = build_macho([("_sceFoo", external), ("_hidden", private), ("_sceUndef", undefined), ("_local", local),
+                             ("_debug", debug), ("_sceAbs", absolute), ("noUnderscore", external)])
+        path = Path("lib.prx")
+        self.assertEqual(import_audit.macho_exports(path, image), {"sceFoo", "sceAbs", "noUnderscore"})
+        self.assertEqual(import_audit.read_exports(path, image), {"sceFoo", "sceAbs", "noUnderscore"})
+        self.assertEqual(import_audit.macho_exports(path, build_macho([])), set())
+        for cut in (3, 20, 40, len(image) - 3):
+            with self.subTest(cut=cut), self.assertRaisesRegex(import_audit.AuditError, "lib.prx"):
+                import_audit.read_exports(path, image[:cut])
+
+    def test_macho_universal_uses_the_arm64_slice(self):
+        path = Path("lib.prx")
+        fat = universal([(0x01000007, build_macho([("_x86only", 0x0f)], cpu=0x01000007)), (0x0100000c, build_macho([("_armOnly", 0x0f)]))])
+        self.assertEqual(import_audit.read_exports(path, fat), {"armOnly"})
+        x86 = universal([(0x01000007, build_macho([("_x86only", 0x0f)], cpu=0x01000007))])
+        with self.assertRaisesRegex(import_audit.AuditError, "without an arm64 slice"):
+            import_audit.read_exports(path, x86)
+
+    def test_macho_rejects_32_bit_and_missing_symtab(self):
+        path = Path("lib.prx")
+        thin32 = struct.pack("<IiiIIIII", 0xfeedface, 7, 0, 6, 0, 0, 0, 0)
+        with self.assertRaisesRegex(import_audit.AuditError, "neither ELF nor PE nor Mach-O"):
+            import_audit.read_exports(path, thin32)
+        no_symtab = struct.pack("<IiiIIIII", 0xfeedfacf, 0x0100000c, 0, 6, 0, 0, 0, 0)
+        with self.assertRaisesRegex(import_audit.AuditError, "expected one LC_SYMTAB"):
+            import_audit.read_exports(path, no_symtab)
+
+    def test_macho_libraries_join_the_audit(self):
+        work = self.work
+        (work.libs / "libSceM.prx").write_bytes(build_macho([("_AAAAAAAAAAA", 0x0f)]))
+        (work.libs / "libSceE.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        exports, libraries = import_audit.built_libraries([work.libs])
+        self.assertEqual(exports, {"AAAAAAAAAAA": ["libSceE.prx", "libSceM.prx"]})
+        self.assertEqual(libraries, {"libSceE.prx", "libSceM.prx"})
 
     def test_pe_reader(self):
         path = Path("lib.prx")

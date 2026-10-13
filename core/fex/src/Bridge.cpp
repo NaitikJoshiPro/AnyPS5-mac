@@ -1,4 +1,5 @@
 #include "Bridge.hpp"
+#include "CodePool.hpp"
 
 #include "BridgeSignatures.hpp"
 #include "GuestCall.hpp"
@@ -283,6 +284,7 @@ constexpr VariadicExport VariadicExports[] = {
     {"wprintf_nid_postfix", GuestList, 1},
     {"_open_nid_postfix", Integers, 2},
     {"fcntl_nid_postfix", Integers, 2},
+    {"_fcntl_nid_postfix", Integers, 2},
 };
 
 constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix"};
@@ -455,6 +457,11 @@ void Bridge::Open(const std::string& name) {
     }
 }
 
+void Bridge::OpenIfPresent(const std::string& name) {
+    std::error_code error;
+    if (std::filesystem::exists(directory / name, error)) Open(name);
+}
+
 void* Bridge::HostSymbol(const char* name) const {
     for (void* library : handles)
         if (void* symbol = dlsym(library, name)) return symbol;
@@ -477,6 +484,10 @@ void Bridge::Connect() {
         reinterpret_cast<SetFiberBridge>(setFiber)(CaptureGuestFrame, ResumeGuestFrame, GuestControl,
                                                    AddStub(reinterpret_cast<void*>(&FiberEntryReturned), "fiber entry return"));
     }
+    // Displaced guest accesses in JIT code are backpatched through the code pool's writable view (D31).
+    if (void* setWriter = HostSymbol("GuestDisplacedSetCodeWriter_nid_no_patch"))
+        reinterpret_cast<void (*)(bool (*)(std::uintptr_t, std::uint32_t), std::uintptr_t (*)(std::uintptr_t, std::size_t, std::uintptr_t*))>(setWriter)(
+            &CodePool::WriteInstruction, &CodePool::AllocateBeside);
     if (void* setMachine = HostSymbol("Aps5SetBridgeMachineState_nid_no_patch")) {
         std::uint64_t entry = 0;
         if (void* finish = HostSymbol("Aps5MakecontextFinish_nid_no_patch")) {
