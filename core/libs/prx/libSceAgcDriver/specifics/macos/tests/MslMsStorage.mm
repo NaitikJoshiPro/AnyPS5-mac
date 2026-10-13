@@ -87,7 +87,9 @@ std::vector<std::uint32_t> Code(const Variant& variant) {
 ShaderRecompiler::RecompileResult Recompile(std::span<const std::uint32_t> code, bool multisample) {
     ShaderRecompiler::RecompileRequest request{};
     request.shader = {ShaderRecompiler::ShaderStage::Compute, 0x30000u, code, 0, {}};
-    static const std::array<std::uint32_t, 16> users{};
+    // s8..s11 = the data v4..v7 carry (1.5f, 2.5f, 3.5f, 4.5f; raw words for uint views), the T#
+    // s[0:7] and the workgroup origin s12/s13 zero.
+    static const std::array<std::uint32_t, 16> users{0, 0, 0, 0, 0, 0, 0, 0, 0x3fc00000u, 0x40200000u, 0x40600000u, 0x40900000u, 0, 0, 0, 0};
     request.context.userData = users;
     request.context.waveSize = 32;
     request.context.compute = ShaderRecompiler::ShaderComputeStageInfo{{8, 8, 1}, 0, {true, true, false}, false, 2, {}};
@@ -277,19 +279,13 @@ void Run(id<MTLDevice> device, id<MTLCommandQueue> queue, const Variant& variant
     Require(target != nil, name + ": the written heap is not in the table");
     std::vector<std::uint64_t> table;
     for (id<MTLTexture> texture : textures) table.push_back(texture.gpuResourceID._impl);
-    // User data s0..s15: s8..s11 = the stored data (v4..v7), s12/s13 = 0 (workgroup origin).
-    // The user data start at push dword PushDataOffset (function constant, recompile-time value).
-    std::uint32_t base = 0u;
-    for (const auto& constant : result.specialization) {
-        if (constant.id == ShaderRecompiler::PipelineSpecialization::PushDataOffset) base = constant.value;
-    }
-    Require(base + 16u <= 64u, name + ": unexpected push data offset");
-    std::array<std::uint32_t, 64> push{};
-    const std::array<float, 4> floats{1.5f, 2.5f, 3.5f, 4.5f};
-    const std::array<std::uint32_t, 4> uints{0x1234u, 0x5678u, 0x9abcu, 0xdef0u};
-    for (std::uint32_t component = 0; component < 4u; ++component) push[base + 8u + component] = isFloat ? std::bit_cast<std::uint32_t>(floats[component]) : uints[component];
+    // The push data the recompile laid out from the request's user data (only the dwords the program
+    // reads, compacted), as the driver binds them.
+    std::vector<std::uint8_t> push(std::max<std::size_t>(result.pushConstants.size(), 16u), 0u);
+    std::memcpy(push.data(), result.pushConstants.data(), result.pushConstants.size());
+    const std::array<std::uint32_t, 4> data{0x3fc00000u, 0x40200000u, 0x40600000u, 0x40900000u};
     id<MTLBuffer> tableBuffer = [device newBufferWithBytes:table.data() length:table.size() * sizeof(std::uint64_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> pushBuffer = [device newBufferWithBytes:push.data() length:sizeof(push) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> pushBuffer = [device newBufferWithBytes:push.data() length:push.size() options:MTLResourceStorageModeShared];
     // Private textures (as the driver's storage images): zero-filled by a blit before the dispatch,
     // read back through a buffer after it.
     const auto texelBytes = isFloat ? 16u : 4u;
@@ -323,7 +319,7 @@ void Run(id<MTLDevice> device, id<MTLCommandQueue> queue, const Variant& variant
         for (std::uint32_t texel = 0; texel < Extent * Extent; ++texel) {
             for (std::uint32_t component = 0; component < (isFloat ? 4u : 1u); ++component) {
                 const auto value = texels[texel * (isFloat ? 4u : 1u) + component];
-                const auto expected = check != slice ? 0u : push[base + 8u + component];
+                const auto expected = check != slice ? 0u : data[component];
                 if (value != expected) {
                     throw std::runtime_error(name + ": heap " + std::to_string(written) + " slice " + std::to_string(check) + " texel " + std::to_string(texel) + " component " + std::to_string(component) + " is 0x" + std::to_string(value) + ", expected " + std::to_string(expected) + " (sample " + std::to_string(variant.sample) + " of layer " + std::to_string(variant.layer) + " is slice " + std::to_string(slice) + ")");
                 }
