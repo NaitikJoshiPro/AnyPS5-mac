@@ -445,7 +445,9 @@ std::string MslBdaContext(MslEmitterState& state) {
 }
 
 bool MslBdaStops(const MslEmitterState& state) {
-    if (state.program.Resources().stage != IrShaderStage::Compute || state.waveLdsScope != MslBarrierScope::None) return false;
+    // SpirvEmitter: bdaStopsInvocations for every stage but mesh (its output writes are shared by
+    // the workgroup) when no wave-LDS barrier or workgroup barrier would be left incomplete.
+    if (state.program.Resources().stage == IrShaderStage::Mesh || state.waveLdsScope != MslBarrierScope::None) return false;
     // BdaInvocationsMayStop: programs with workgroup barriers keep every invocation running.
     for (const auto* block : state.program.BlockOrder()) {
         for (const auto* instruction : block->Instructions()) {
@@ -455,8 +457,16 @@ bool MslBdaStops(const MslEmitterState& state) {
     return true;
 }
 
+std::string MslBdaStopStatement(const MslEmitterState& state) {
+    // StopBdaInvocationIf: pixel invocations are killed (OpKill), so the faulting fragment writes no
+    // colour, depth or sample mask; after discard_fragment its buffer and texture writes are
+    // inhibited, which also covers the raster-order ticket write-back of the stage function (raster
+    // order groups order the accesses themselves, so no later fragment waits on that value).
+    return state.program.Resources().stage == IrShaderStage::Pixel ? "{ discard_fragment(); return; }" : "return;";
+}
+
 void MslB5StopIf(MslEmitterState& state, std::string_view flag) {
-    if (MslBdaStops(state)) state.Line("if (" + std::string(flag) + ") return;");
+    if (MslBdaStops(state)) state.Line("if (" + std::string(flag) + ") " + MslBdaStopStatement(state));
 }
 
 std::uint32_t MslUsedDwords(const IrValue& instruction, std::uint32_t dwords) {

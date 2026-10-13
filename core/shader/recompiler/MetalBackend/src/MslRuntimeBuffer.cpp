@@ -1061,7 +1061,7 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         state.Line("if ((" + byte + " & " + mask + ") != 0u) {");
         state.Indent();
         state.Line(MslRecordFault(state, 7u, descriptor.base + " + ulong(" + access + ".byte)", std::to_string(bytes) + "u", MslB5Pc(instruction)));
-        if (MslBdaStops(state)) state.Line("return;");
+        if (MslBdaStops(state)) state.Line(MslBdaStopStatement(state));
         state.Outdent();
         state.Line("} else if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
         state.Indent();
@@ -1080,7 +1080,7 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         state.Line("if ((" + address + " & " + mask + "l) != 0ul) {");
         state.Indent();
         state.Line("aps5_bda_fault(" + descriptor.bda + ", 7u, " + address + ", " + std::to_string(bytes) + "u, " + descriptor.pc + ");");
-        if (descriptor.stops) state.Line("return;");
+        if (descriptor.stops) state.Line(MslBdaStopStatement(state));
         state.Outdent();
         state.Line("} else {");
         state.Indent();

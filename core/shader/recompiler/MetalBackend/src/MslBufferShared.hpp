@@ -37,9 +37,12 @@ namespace ShaderRecompiler {
 [[nodiscard]] std::string MslBdaContext(MslEmitterState& state);
 // Whether a faulting BDA access ends its invocation, as SpirvEmitter decides it: programs with
 // workgroup barriers or wave-LDS barriers keep every invocation running (the faulting access reads
-// zero instead), and only compute invocations stop here (other stages are not ported yet).
+// zero instead); mesh invocations never stop.
 [[nodiscard]] bool MslBdaStops(const MslEmitterState& state);
-// `if (<flag>) return;` when the invocation may stop (MslBdaStops), nothing otherwise.
+// The statement that ends a stopping invocation: `return;`, or discard_fragment() and return in a
+// pixel shader (OpKill on the SPIR-V path).
+[[nodiscard]] std::string MslBdaStopStatement(const MslEmitterState& state);
+// `if (<flag>) <MslBdaStopStatement>` when the invocation may stop (MslBdaStops), nothing otherwise.
 void MslB5StopIf(MslEmitterState& state, std::string_view flag);
 
 // The dwords of a 1-4 dword load that the program extracts (all of them when the composite is used
