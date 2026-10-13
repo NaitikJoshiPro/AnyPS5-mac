@@ -559,3 +559,29 @@ Effort estimate: emitter ~1.5 days (stage namespaces, tessellation attribute opc
 | `agc_descriptor_pool_reset_failure` | skip, allowlisted: a Metal pool reset cannot fail | SKIP (`t1-g7a`) |
 | `agc_driver_bda_device` (BdaDevice.cpp + BdaExecution.cpp) | BdaDeviceTwin.mm: contract and written-page decode checks; every BdaExecution.cpp case through the MSL Bda prelude helper the emitter uses, over Metal buffers, with upstream's expected bytes, faults and written pages; the Metal device's page table (in-place registered allocations, bound V# ranges merged by DisjointRanges, Permission/Unmapped faults) | PASS (`gpu-suite/t1-bda2`) |
 Gap: RunGuestSamplerResourceTests' backend-neutral decode checks do not run on Metal (the check is listed whole because its capture half checks VkSamplerCreateInfo); owner D5.
+
+### CORPUS results: MSL corpus, exit criterion 1 (2026-10-13)
+- Corpus definition (D25): every request `APS5_DUMP_REQUESTS` recorded during a suite run, whichever backend it was recorded for, that SpirvBackend accepts. The registered `agc_metal_msl_corpus` now passes `--include-spirv`. Before this, it replayed only the 99 Metal-target requests (43/43 accepted, so it "passed"). The 313/359 in "SHD results, part 2" counted all of them.
+- Corpus used: `build-metal/msl-corpus` (dump of 2026-10-12 20:18: 99 msl + 379 spirv requests) + committed seed `specifics/macos/tests/msl-corpus` (17 + 42 requests that failed before).
+- Before (HEAD 9069c835e+TESS, `--include-spirv`): **296/359**. The 63 failures:
+  - 31: wave64 compute at a claimed 64-lane host (vote/ballot/readfirstlane/readlane across two SIMD groups);
+  - 22: wave64 graphics `v_readlane_b32` lane 63;
+  - 7 + 2: ShaderClock / RealtimeClock, no emitter;
+  - 1: pixel pos0 export ("vertex input info is missing");
+  - 1: vertex `s_barrier` with LDS.
+- After (HEAD 939ffabc0): **338/338** accepted requests valid: 241 compiled kernels + 97 linked vertex/fragment functions. Not counted:
+  - 136 front-end-rejected;
+  - 19 spirv-rejected: SpirvBackend refuses them too (agc_vertex_barrier's LDS case, ShaderMemory.cpp expected failures at 32/8 lanes);
+  - 2 host-width-rejected: ShaderMemory.cpp lane-63 reads in wave64 pixel programs recorded for a 64-lane host, which SpirvBackend refuses on a 32-lane host. Their emulation is M3 backlog: TechnicalDebt `metal-b6-half-wave`.
+- Fixes:
+  - Recompiler.cpp `HostSubgroupSize` lays every MSL request out for 32 lanes (8beac174c for compute/mesh, 71ddb44c3 for all stages);
+  - emulated shader clock, a device-wide read counter after the 1024 lock words (8beac174c, lock layout restored in 939ffabc0; MetalDevice advertises `CapabilityShaderClockKHR` and the allowlist line is gone, 2e2a8259e);
+  - pixel pos0 export dropped as on SPIR-V (8beac174c);
+  - checker outcomes spirv-rejected / host-width-rejected, `--replay-width`, seed corpus (ebe788db1).
+  - Note: 8beac174c is TESS's commit, which swept these CORPUS edits in by mistake.
+- Tests: `agc_metal_msl_compile` adds shader_clock (wave32/64) and a wave64 lane-63 readlane at a claimed 64-lane host. `agc_metal_msl_corpus` fails on any regression, and the seed keeps the fixed requests in a clean build. Direct compile-only runs: corpus 338/338 in 0.4 s, 4.5 s with MTL_SHADER_VALIDATION=1.
+- GPU (`gpu_suite --validation --build-first`), all runs VOID because TESS rebuilt binaries mid-run (corpus-v1, corpus-v3); indicative results:
+  - passed: agc_driver_shader_clock (it no longer skips), pixel/ngg wave reductions, shader_memory, vertex_barrier, image_atomics64, inc_dec64, agc_metal_device_*, every agc_metal_msl_* except the corpus;
+  - `agc_metal_msl_corpus` timed out at gpu_suite's 30 s cap under load 6-12; directly it takes 4.5 s with validation.
+  - **`agc_driver_global_atomics64` and `agc_driver_buffer_atomics_or_swap64` time out (30 s) reproducibly**, with the 1024-word lock layout restored as well. CORPUS changes do not touch their path (Metal target = 32 lanes, no clock). Last pass: db6d57ea4 (shd-final2). Suspect: 28a79003e (atomic64 reads as dword atomic loads, never GPU-verified). Owner: SHD successor / main.
+- Open: the dump is from 2026-10-12, before mesh, tessellation, MS storage, per-vertex and conservative raster landed. A fresh `gpu_suite all --dump-requests build-metal/msl-corpus` on a clean, quiet tree is needed before exit criterion 1 can be called met. Then rerun `agc_metal_msl_corpus`.
