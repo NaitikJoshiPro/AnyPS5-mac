@@ -157,3 +157,17 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
     - Verify the upstream image default on G1/G2/G4, then delete the bring-up path.
     - look_back_scan supervised rerun.
     - First windowed run (supervised).
+
+## 2026-10-13 ~07:00 — M2: user greenlit tests again; no "Apple limits"
+- User lifted the test freeze, and ordered that missing Metal features be EMULATED rather than allowlisted (conservative raster, per-vertex fragment values; later mesh and tessellation, M3 backlog in M2_DESIGN).
+- Shared "triangle vertices" mode (MslAbi v5, vertex slot 6): header 7fb900ce2 (SHD3), driver side 9ec6a7ffb, conservative snippets 07fe3aac8/a8aa31286 (DRAW). Built, not run; the SHD3 emitter is pending.
+- Results, all under --validation:
+  - draw_targets/primitives/cmask 3/3 (gpu-suite/20261013T002138Z)
+  - G3 21/34, up from 7 (20261013T002224Z-G3_G4)
+  - G4 25/39, up from 18
+  - G1 181/182 + 1 skip (20261013T003936Z-G1)
+  - SHD2 queue 7/7 (shd3-t1)
+  - vertex_fetch now passes
+- GDS bug narrowed down: GPU atomics land in the D3 host import's pages, but the CPU still reads the seed after WaitIdle. The VM object is unchanged. Owned by D3, now DRAW2.
+- Agents: DRAW handed off (context full). Now running: DRAW2 (D3 GDS, 9 driver G3/G4 failures, SDL options, windowed-run prep, which needs approval) and SHD3 (per-vertex emulation, alpha_to_coverage, dst_sel, interp param, wave64 ReadLane, MSAA ImageWrite, upstream image-path verification, pixel_interlock one-shot).
+- Next: collect the results, then M2 exit verification.
