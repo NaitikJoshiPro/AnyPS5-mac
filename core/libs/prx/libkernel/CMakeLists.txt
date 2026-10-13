@@ -33,6 +33,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/MainThreadMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Barrier.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Barrier.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Cond.cpp
@@ -294,6 +295,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_pthread_barrier PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_pthread_barrier PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_sce_pthread_barrier_tests ${LIBS_INCLUDE_DIR}/tests/GuestScePthreadBarrier.cpp)
+    target_include_directories(guest_sce_pthread_barrier_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_sce_pthread_barrier_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_sce_pthread_barrier_tests)
+    add_test(NAME guest_sce_pthread_barrier COMMAND guest_sce_pthread_barrier_tests)
+    set_tests_properties(guest_sce_pthread_barrier PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_sce_pthread_barrier PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_kernel_is_stack_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelIsStack.cpp)
