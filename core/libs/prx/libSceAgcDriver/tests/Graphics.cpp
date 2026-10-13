@@ -610,6 +610,39 @@ void ShaderStageTests() {
     }
     queue.context[0x286] = 0x42800000;
     queue.context[0x287] = 0x3f800000;
+    {
+        // A target with every tessellation feature (DECISIONS D26, the Metal target) decodes every
+        // domain, partitioning and output topology and the level clamps; reserved encodings stay refused.
+        const auto all = ShaderRecompiler::TessellationFeatures::All();
+        struct Accepted {
+            std::uint32_t parameters;
+            std::uint32_t domain;
+            std::uint32_t partitioning;
+            std::uint32_t topology;
+        };
+        for (const auto [parameters, domain, partitioning, topology] : {Accepted{0x40069u, 1, 2, 3}, Accepted{0x4006au, 2, 2, 3}, Accepted{0x40042u, 2, 0, 2}, Accepted{0x4002cu, 0, 3, 1}, Accepted{0x40004u, 0, 1, 0}, Accepted{0x4000du, 1, 3, 0}}) {
+            queue.context[0x2db] = parameters;
+            const auto decoded = AgcDriver::Graphics::DecodeState(queue, false, all).stages.tessellation;
+            Require(decoded && decoded->domain == domain && decoded->partitioning == partitioning && decoded->outputTopology == topology, "a tessellation configuration the target supports decoded differently");
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "only triangular");
+        }
+        for (const auto [parameters, reason] : {std::pair{0x40059u, "not supported by the target"}, std::pair{0x40048u, "isoline tessellation cannot output triangles"}, std::pair{0x400c9u, "not supported by the target"}, std::pair{0x40043u, "not supported by the target"}}) {
+            queue.context[0x2db] = parameters;
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, false, all); }, reason);
+        }
+        queue.context[0x2db] = 0x40049;
+        queue.context[0x286] = 0x41100000;
+        queue.context[0x287] = 0x40000000;
+        const auto clamped = AgcDriver::Graphics::DecodeState(queue, false, all).stages;
+        Require(clamped.tessellationMinLevel == 2.0f && clamped.tessellationMaxLevel == 9.0f, "the tessellation level clamps decoded differently");
+        for (const auto [maximum, minimum, reason] : {std::tuple{0x3f800000u, 0x40000000u, "tessellation level clamps must be finite"}, std::tuple{0x7fc00000u, 0x3f800000u, "non-finite register"}, std::tuple{0x42800000u, 0xff800000u, "non-finite register"}}) {
+            queue.context[0x286] = maximum;
+            queue.context[0x287] = minimum;
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, false, all); }, reason);
+        }
+        queue.context[0x286] = 0x42800000;
+        queue.context[0x287] = 0x3f800000;
+    }
     queue.context[0x2d5] = 0x202d;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "combined tessellation and geometry");
     queue.context[0x2d5] = 0x0200210d;

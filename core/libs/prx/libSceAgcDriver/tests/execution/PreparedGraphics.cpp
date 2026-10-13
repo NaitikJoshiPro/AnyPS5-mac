@@ -158,7 +158,12 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
     for (const auto& stage : stages) stage.snapshot->prepared->entries.push_back(stage.entry);
     const auto& pixelArtifact = GetPreparedArtifact(*stages.back().entry.handle);
     Require(!pixelArtifact.fragmentParameters.empty() && pixelArtifact.fragmentParameters.front().sourceLocation == 3u, "prepared fragment lost interpolant mapping");
-    if (!mesh && !tessellation) {
+    if (!mesh && !tessellation && target.backend == ShaderRecompiler::ShaderBackend::Msl) {
+        // The MSL backend expands rect lists in the vertex function (MslAbi::RectListMacro): a rect
+        // list request prepares no tessellation stages and publishes no rectangles.
+        ResolvePreparedGraphics(*front.snapshot, fragment.snapshot, 17, target);
+        Require(front.snapshot->prepared->rectangles.empty(), "the MSL backend prepared rect-list tessellation stages");
+    } else if (!mesh && !tessellation) {
         const auto frontCount = front.snapshot->prepared->entries.size();
         const auto pixelCount = fragment.snapshot->prepared->entries.size();
         Reject([&] {

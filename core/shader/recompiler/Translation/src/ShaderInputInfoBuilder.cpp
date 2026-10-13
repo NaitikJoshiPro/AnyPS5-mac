@@ -115,6 +115,9 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         place(PixelInput::PerspectiveCentroid, pixel.perspectiveCentroid);
         place(PixelInput::LinearCenter, pixel.noPerspective);
         place(PixelInput::LinearCentroid, pixel.linearCentroid);
+        // PERSP/LINEAR_SAMPLE: their VGPRs exist whenever SPI_PS_INPUT_ADDR lays them out.
+        place(PixelInput::PerspectiveSample, (pixel.inputAddr & PixelInputBit(PixelInput::PerspectiveSample)) != 0u);
+        place(PixelInput::LinearSample, (pixel.inputAddr & PixelInputBit(PixelInput::LinearSample)) != 0u);
         place(PixelInput::PositionX, pixel.posX);
         place(PixelInput::PositionY, pixel.posY);
         place(PixelInput::PositionZ, pixel.posZ);
@@ -179,7 +182,9 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         if (stage == ShaderStageKind::Local || stage == ShaderStageKind::TessellationControl || stage == ShaderStageKind::TessellationEvaluation) {
             if (tessellation == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: tessellation configuration is missing");
             if (tessellation->inputControlPoints == 0u || tessellation->inputControlPoints > 32u || tessellation->outputControlPoints == 0u || tessellation->outputControlPoints > 32u) throw std::runtime_error("ShaderInputInfoBuilder: invalid tessellation control-point counts");
-            if (tessellation->domain != 1u || tessellation->partitioning != 2u || tessellation->outputTopology != 2u) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation configuration");
+            // Any VGT_TF_PARAM encoding (DECISIONS D26): the graphics decoder admits what the target
+            // draws, and the SPIR-V backend still refuses everything but its triangle set.
+            if (tessellation->domain > 2u || tessellation->partitioning > 3u || tessellation->outputTopology > 3u || (tessellation->domain == 0u && tessellation->outputTopology > 1u)) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation configuration");
             auto& target = vertexStorage.tess;
             target.inputControlPoints = tessellation->inputControlPoints;
             target.outputControlPoints = tessellation->outputControlPoints;

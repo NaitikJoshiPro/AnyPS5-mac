@@ -648,7 +648,8 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
             if (registration) return {};
             auto stageState = state;
             stageState.context[0x1b6] = 0;
-            const auto stages = Graphics::DecodeShaderStages(stageState);
+            const auto deviceTessellation = device.Target().tessellation;
+            const auto stages = Graphics::DecodeShaderStages(stageState, false, deviceTessellation ? deviceTessellation->features : ShaderRecompiler::TessellationFeatures{});
             graphics = ShaderRecompiler::GraphicsCompileContext{0, {}, stages.mesh, stages.tessellation, {}};
             if (stages.mesh) { stage = Stage::Mesh; firstUser = 0; }
             if (stages.tessellation && snapshot.type == 2) stage = Stage::TessellationEvaluation;
@@ -974,7 +975,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         return;
     }
     DrawDecode decoded{};
-    decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
+    const auto deviceTessellation = localDevice->Target().tessellation;
+    decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry), deviceTessellation ? deviceTessellation->features : ShaderRecompiler::TessellationFeatures{});
     DecodeGraphicsPrograms(decoded, state, *registry, true, false);
     auto prepared = PrepareGraphicsStages(decoded, localDevice->Target());
     for (auto& stage : prepared) {
@@ -1117,7 +1119,9 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
             prepared.rectangleRequested |= newRequest;
         }
         const auto& prepared = transaction.Read(front);
-        if (!prepared.rectangleRequested) {
+        // The MSL backend expands rect lists in the vertex function (MslAbi::RectListMacro): no
+        // tessellation stages to prepare.
+        if (!prepared.rectangleRequested || target.backend == ShaderRecompiler::ShaderBackend::Msl) {
             transaction.Commit();
             return;
         }

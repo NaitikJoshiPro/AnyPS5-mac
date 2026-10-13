@@ -249,6 +249,19 @@ void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
         }
         const auto handle = PrepareShader(request);
         const auto& artifact = GetPreparedArtifact(*handle);
+        const auto expectedSample = variant == 0u ? 0u : variant % 2u != 0u ? 3u : 2u;
+        if (!artifact.msl.empty()) {
+            // MSL (MslAbi Version 6): Metal shaders cannot write multisampled textures, so the storage
+            // view is a texture2d_array of layers * samples slices and the sample selects the slice.
+            const std::string source(artifact.msl.Source());
+            char sample[32];
+            std::snprintf(sample, sizeof(sample), "_s = 0x%xu;", expectedSample);
+            Require(source.find(variant < 3u ? "texture2d_array<float, access::read_write>" : "texture2d_array<uint, access::read_write>") != std::string::npos, "MSAA storage image is not a writable 2D array");
+            Require(source.find(variant < 3u ? ".write(" : ".atomic_exchange(") != std::string::npos, variant < 3u ? "MSAA storage write lost its slice write" : "MSAA atomic lost its slice atomic");
+            Require(source.find(sample) != std::string::npos, "MSAA storage operation addresses the wrong sample");
+            Require(source.find("_l * ") != std::string::npos && source.find("_n + ") != std::string::npos, "MSAA storage operation has no layer * samples + sample slice");
+            continue;
+        }
         std::vector<std::uint32_t> samples;
         for (std::size_t offset = 5; offset < artifact.spirv.size(); offset += artifact.spirv[offset] >> 16u) {
             const auto instruction = artifact.spirv[offset];
@@ -262,7 +275,6 @@ void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
             }
         }
         Require(!samples.empty(), "MSAA storage shader has no image writes or atomics");
-        const auto expectedSample = variant == 0u ? 0u : variant % 2u != 0u ? 3u : 2u;
         for (const auto sample : samples) {
             bool found = false;
             for (std::size_t offset = 5; offset < artifact.spirv.size(); offset += artifact.spirv[offset] >> 16u) {

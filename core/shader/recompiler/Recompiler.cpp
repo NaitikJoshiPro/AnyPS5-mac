@@ -10,6 +10,7 @@
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include "MetalBackend/MslEmitter.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
 #include <list>
@@ -92,6 +93,13 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
         std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
         if (list.find(address) != std::string::npos) return 64u;
     }
+    // MSL programs run on 32-wide Apple SIMD groups whatever width the target claims, and MetalBackend
+    // emits for 32 lanes: the front end lays them out for that host. A wave64 compute or mesh program
+    // then holds two guest lanes per invocation (one lane per invocation would spread its wave over
+    // two SIMD groups that ballots, votes and lane reads cannot reach), a wave64 graphics program
+    // takes the 32-lane half-wave view (MslGraphicsHalfWave). APS5_SINGLE_LANE above stays the way
+    // to lay a program out for 64 lanes.
+    if (request.target.backend == ShaderBackend::Msl) return 32u;
     return request.target.subgroupSize;
 }
 
@@ -174,7 +182,14 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
     translateOptions.sharedMemoryBytes = DeviceMemoryLdsBytes(request);
-    translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
+    // The MSL backend's fragmentShaderBarycentricEnabled means per-vertex values are emulated
+    // (MslAbi::TriangleVerticesMacro: the vertex function sees its triangle's 3 vertices). Programs
+    // still start with host interpolation, and only those that need per-vertex values (raw P0/P10/
+    // P20 reads, 16-bit interpolation, exact barycentrics) pay for the emulation, as on Vulkan
+    // devices without VK_KHR_fragment_shader_barycentric.
+    const bool emulatedPerVertex = request.target.fragmentShaderBarycentricEnabled && request.target.backend == ShaderBackend::Msl;
+    translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled && !emulatedPerVertex;
+    translateOptions.barycentricFallback = emulatedPerVertex;
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
@@ -227,7 +242,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         }
     };
     simplify();
-    if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel)) {
+    if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && (program.Metadata().barycentricEmulation || !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel))) {
         translateOptions.fragmentShaderBarycentricEnabled = true;
         program = translator.Translate(decoded, cfg, translateOptions);
         program.Metadata().barycentricEmulation = true;
@@ -408,7 +423,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     shaderInfoCollector.Collect(program, inputInfo);
 
     constexpr BindingAllocator bindingAllocator;
-    bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
+    const bool msl = request.target.backend == ShaderBackend::Msl;
+    bool registration = !msl && request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
     auto bindings = bindingAllocator.Allocate(program, request.layout, registration);
 
     SpirvTargetOptions targetOptions {};
@@ -427,13 +443,24 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
-    result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
-    if (registration && result.spirv.size() > request.target.registrationWordLimit) {
-        registration = false;
-        program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false);
-        targetOptions.registrationModules = false;
+    if (msl) {
+        MslTargetOptions mslOptions;
+        mslOptions.subgroupSize = request.target.subgroupSize;
+        mslOptions.bdaAbiVersion = request.target.bdaAbiVersion;
+        mslOptions.maxThreadgroupMemoryBytes = request.target.maxWorkgroupSharedMemoryBytes;
+        mslOptions.keepF32Denormals = request.context.floatMode.has_value() && ((request.context.floatMode->floatMode >> 4u) & 3u) == 3u;
+        mslOptions.storageImageMultisample = std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStorageImageMultisample)) != request.target.supportedCapabilities.end();
+        constexpr MslEmitter mslEmitter;
+        result.msl = SharedMsl(mslEmitter.Emit(program, inputInfo, bindings, mslOptions));
+    } else {
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        if (registration && result.spirv.size() > request.target.registrationWordLimit) {
+            registration = false;
+            program.Metadata().bindingLayoutComplete = false;
+            bindings = bindingAllocator.Allocate(program, request.layout, false);
+            targetOptions.registrationModules = false;
+            result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        }
     }
     result.registrationModule = registration;
 
@@ -477,10 +504,10 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         }
     }
 
-    const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
+    const bool embedded = !msl && !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+    if (!msl) result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
     if (embedded) {
         std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> classes{};
         for (std::uint32_t kind = 1u; kind < 3u; ++kind) {
@@ -502,11 +529,41 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 struct SpecializedModule {
     std::uint64_t specializationId = 0;
     SharedSpirv spirv;
+    // The Metal form keeps its source: the constants become function constants at pipeline creation.
+    SharedMsl msl;
+    std::vector<PipelineSpecializationConstant> functionConstants;
     std::vector<std::uint32_t> bindings;
     bool pushData = false;
 };
 
+std::shared_ptr<const SpecializedModule> buildMslModule(const CompiledShaderArtifact& artifact, std::span<const PipelineSpecializationConstant> constants) {
+    const auto& reflection = artifact.msl.Reflection();
+    auto module = std::make_shared<SpecializedModule>();
+    std::set<std::uint32_t> supplied;
+    for (const auto& constant : constants) {
+        if (!supplied.insert(constant.id).second) throw std::runtime_error("duplicate prepared specialization ID");
+        if (std::find(reflection.functionConstants.begin(), reflection.functionConstants.end(), constant.id) != reflection.functionConstants.end()) module->functionConstants.push_back(constant);
+    }
+    // The sampler heap is bound only when a sampler reference survives the supplied constants: an
+    // unconditional one, or one inside the runtime image mode its selector constant picks (default 0).
+    bool samplers = reflection.samplerUnconditional;
+    for (std::size_t index = 0; !samplers && index + 1u < reflection.samplerModeUses.size(); index += 2u) {
+        const auto id = reflection.samplerModeUses[index];
+        const auto found = std::find_if(constants.begin(), constants.end(), [id](const PipelineSpecializationConstant& constant) { return constant.id == id; });
+        samplers = (found != constants.end() ? found->value : 0u) == reflection.samplerModeUses[index + 1u];
+    }
+    for (const auto& range : reflection.table.ranges) {
+        if (range.binding == RuntimeAbi::Binding::Samplers && !samplers) continue;
+        module->bindings.push_back(RuntimeAbi::BindingNumber(reflection.group, range.binding));
+    }
+    module->msl = artifact.msl;
+    module->pushData = reflection.usesPushData;
+    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    return module;
+}
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    if (!artifact.msl.empty()) return buildMslModule(artifact, constants);
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
@@ -687,7 +744,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     std::call_once(plan->ready, [&] {
         try {
-            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet);
+            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet, !variant.artifact.msl.empty());
         } catch (...) {
             plan->failure = std::current_exception();
         }
@@ -764,13 +821,17 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources / RuntimeAbi::VertexSelectorsPerDword> runtimeSelectors{};
+    // Embedded-fetch selectors (dst_sel, "one" bits) are specialization constants of the module. The
+    // SPIR-V path records them as vertex-input patches; MSL libraries read them as function constants
+    // (MslStageIo GetAttribute) with no patches, so an MSL embedded-fetch program is prepared too.
+    const bool preparedVertex = !artifact.vertexInputPatches.empty() || (!artifact.msl.empty() && request.context.vertex && request.context.vertex->fetchEmbedded && !result.vertexInputs.empty());
     for (const auto& input : result.vertexInputs) {
         if (!request.context.vertex || input.location >= request.context.vertex->resourcesNum || input.location >= request.context.vertex->resources.size()) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
         const auto& vertex = *request.context.vertex;
         const auto& resource = vertex.resources[input.location];
         const auto fetchIndex = vertex.fetchEmbedded ? vertex.resourcesDst[input.location].fetchIndex : input.fetchIndex;
         result.vertexAttributes.push_back({input.location, input.components, resource, fetchIndex});
-        if (!artifact.vertexInputPatches.empty()) {
+        if (preparedVertex) {
             const auto format = static_cast<IrBufferFormat>((resource.fields[3] >> 12u) & 0x7fu);
             const auto numeric = registrationDefaults && format == IrBufferFormat::Invalid ? IrTextureNumericClass::Float : VertexInputNumericClass(format);
             if (numeric == IrTextureNumericClass::Unsupported) throw std::runtime_error("unsupported prepared vertex format");
@@ -789,7 +850,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || preparedVertex || request.context.pixel) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -807,7 +868,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
             }
-            if (!artifact.vertexInputPatches.empty()) {
+            if (preparedVertex) {
                 for (const auto& input : result.vertexInputs) {
                     const auto selectors = moduleKey[index++];
                     const auto first = PipelineSpecialization::VertexBase + input.location * PipelineSpecialization::VertexWords;
@@ -819,7 +880,18 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
             const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
-            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
+            // An MSL library keeps every descriptor-table range it declares (its table layout is fixed
+            // at emission), including the image heaps of runtime image modes the specialization does
+            // not select; a SPIR-V module drops those variables. The plan keeps only the heaps the
+            // snapshot's modes use: the other ranges stay zero in the table (only unselected switch
+            // cases could reach them), so they are not part of the selection.
+            auto moduleBindings = module->bindings;
+            if (!module->msl.empty()) {
+                std::erase_if(moduleBindings, [&](std::uint32_t binding) {
+                    return std::none_of(plan->bindings.bindings.begin(), plan->bindings.bindings.end(), [&](const auto& planned) { return planned.descriptor.binding == binding; });
+                });
+            }
+            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, moduleBindings);
             entry->bindings = std::move(selected);
             entry->module = module;
         };
@@ -834,9 +906,12 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto& module = entry->module;
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
+        result.msl = module->msl;
+        result.specialization = module->functionConstants;
         bindingPlan = &entry->bindings;
     } else {
         result.spirv = artifact.spirv;
+        result.msl = artifact.msl;
     }
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
@@ -1096,9 +1171,48 @@ std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& req
     return materializeMemoized(*capture.source, request, capture.snapshot, memoHit);
 }
 
+void dumpRequest(const RecompileRequest& request) {
+    static const char* const directory = std::getenv("APS5_DUMP_REQUESTS");
+    if (directory == nullptr || *directory == '\0') return;
+    static std::mutex dumpedMutex;
+    static std::set<std::uint64_t> dumped;
+    static std::atomic<std::uint64_t> sequence{0};
+    std::string text;
+    try {
+        text = RequestSerializer{}.Serialize(request);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[shader] APS5_DUMP_REQUESTS: the request cannot be serialized: %s\n", error.what());
+        return;
+    }
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const char value : text) hash = (hash ^ static_cast<std::uint8_t>(value)) * 0x100000001b3ull;
+    hash = (hash ^ static_cast<std::uint8_t>(request.target.backend)) * 0x100000001b3ull;
+    {
+        std::lock_guard lock(dumpedMutex);
+        if (!dumped.insert(hash).second) return;
+    }
+    char name[40];
+    std::snprintf(name, sizeof(name), "/%016llx.%s.req", static_cast<unsigned long long>(hash), request.target.backend == ShaderBackend::Msl ? "msl" : "spirv");
+    const std::string path = std::string(directory) + name;
+    if (std::FILE* existing = std::fopen(path.c_str(), "rb")) {
+        std::fclose(existing);
+        return;
+    }
+    const auto stamp = static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string temporary = path + "." + std::to_string(stamp) + "." + std::to_string(sequence.fetch_add(1)) + ".tmp";
+    std::FILE* file = std::fopen(temporary.c_str(), "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "[shader] APS5_DUMP_REQUESTS: cannot write %s\n", temporary.c_str());
+        return;
+    }
+    const bool written = std::fwrite(text.data(), 1, text.size(), file) == text.size();
+    if (std::fclose(file) != 0 || !written || std::rename(temporary.c_str(), path.c_str()) != 0) std::remove(temporary.c_str());
+}
+
 template <typename Impl>
 auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltype(impl()) {
     try {
+        dumpRequest(request);
         return impl();
     } catch (const std::exception& e) {
         constexpr auto requestSerializer = RequestSerializer{};

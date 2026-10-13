@@ -137,6 +137,19 @@ F16x2Math FindF16x2Math(std::span<const std::uint32_t> spirv) {
     return math;
 }
 
+// The MetalBackend form of the same f16x2 operations (MslAluMath.cpp: half2 add and mul on the packed bits).
+F16x2Math FindF16x2Math(const std::string& msl) {
+    F16x2Math math;
+    math.add = msl.find(") + as_type<half2>(") != std::string::npos;
+    math.mul = msl.find(") * as_type<half2>(") != std::string::npos;
+    math.fma = msl.find("fma(as_type<half2>(") != std::string::npos;
+    return math;
+}
+
+F16x2Math FindF16x2Math(const ShaderRecompiler::RecompileResult& result) {
+    return result.msl.empty() ? FindF16x2Math(result.spirv.Words()) : FindF16x2Math(result.msl.Source());
+}
+
 }
 
 int main() {
@@ -186,8 +199,8 @@ int main() {
         for (const auto& mode : Modes) {
             const auto native = compile(target, mode);
             const auto emulated = compile(emulatedTarget, mode);
-            const F16x2Math nativeMath = FindF16x2Math(native.spirv.Words());
-            const F16x2Math emulatedMath = FindF16x2Math(emulated.spirv.Words());
+            const F16x2Math nativeMath = FindF16x2Math(native);
+            const F16x2Math emulatedMath = FindF16x2Math(emulated);
             Require(nativeMath.add && nativeMath.mul, std::string("packed f16 native: ") + mode.name + " does not use f16vec2 add and mul");
             Require(!nativeMath.fma, std::string("packed f16 native: ") + mode.name + " uses an f16vec2 Fma, which Vulkan does not require to be fused");
             Require(!emulatedMath.add && !emulatedMath.mul && !emulatedMath.fma, std::string("packed f16 native: ") + mode.name + " uses f16vec2 math without Float16");

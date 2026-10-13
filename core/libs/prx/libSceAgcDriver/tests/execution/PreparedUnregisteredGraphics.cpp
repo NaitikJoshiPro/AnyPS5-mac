@@ -84,6 +84,11 @@ void Check(AgcDriver::VulkanDevice& device) {
         Require(program.snapshot->prepared->entries.size() == 1, "a relocated push-constant block prepared an unregistered graphics program again");
     }
     ResolvePreparedGraphics(*draw.programs[0].snapshot, draw.programs[1].snapshot, 17, target);
+    if (target.backend == ShaderBackend::Msl) {
+        // The MSL backend expands rect lists in the vertex function: no rectangle stages.
+        Require(draw.programs[0].snapshot->prepared->rectangles.empty(), "the MSL backend prepared rect-list tessellation stages");
+        return;
+    }
     const auto rectangle = PreparedRectangle(*draw.programs[0].snapshot, variants[0], variants[1]);
     Require(!rectangle.control.spirv.empty() && !rectangle.evaluation.spirv.empty(), "unregistered graphics programs did not prepare rectangle shaders");
 }

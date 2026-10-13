@@ -21,6 +21,12 @@ struct PresentationWindow {
     std::uint32_t width;
     std::uint32_t height;
     std::shared_ptr<FrameTiming> timing;
+#ifdef __APPLE__
+    // macOS (Metal device): the window's CAMetalLayer (a bridged CAMetalLayer*), or null when the
+    // window has none (SDL's offscreen driver): the device then presents headless, into offscreen
+    // targets. Null callback: headless too.
+    void* (*metalLayer)(void* context) = nullptr;
+#endif
 };
 
 }

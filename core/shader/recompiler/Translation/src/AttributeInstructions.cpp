@@ -78,11 +78,15 @@ void TranslationContext::vInterpP2F32(const RdnaInstruction& inst) {
             return base != ShaderPixelInputInfo::NoPixelInputVgpr && inst.source0.reg == base + 1u;
         };
         const auto bit = 1u << inst.source1.value;
-        if (readsPair(PixelInput::LinearCenter) || readsPair(PixelInput::LinearCentroid)) {
-            program.Metadata().pixelLinearInputs |= bit;
-        } else if (readsPair(PixelInput::PerspectiveCenter) || readsPair(PixelInput::PerspectiveCentroid)) {
-            program.Metadata().pixelPerspectiveInputs |= bit;
+        auto& metadata = program.Metadata();
+        if (readsPair(PixelInput::LinearCenter) || readsPair(PixelInput::LinearCentroid) || readsPair(PixelInput::LinearSample)) {
+            metadata.pixelLinearInputs |= bit;
+        } else if (readsPair(PixelInput::PerspectiveCenter) || readsPair(PixelInput::PerspectiveCentroid) || readsPair(PixelInput::PerspectiveSample)) {
+            metadata.pixelPerspectiveInputs |= bit;
         }
+        if (readsPair(PixelInput::LinearCenter) || readsPair(PixelInput::PerspectiveCenter)) metadata.pixelCenterInputs |= bit;
+        if (readsPair(PixelInput::LinearCentroid) || readsPair(PixelInput::PerspectiveCentroid)) metadata.pixelCentroidInputs |= bit;
+        if (readsPair(PixelInput::LinearSample) || readsPair(PixelInput::PerspectiveSample)) metadata.pixelSampleInputs |= bit;
     }
     (void)ir.Emit(IrOpcode::InterpolateHostP2, IrType::Void, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value), readOperand(inst.source0, IrType::F32), readOperand(inst.destination, IrType::F32), &ir.GetExec()});
     IrValue& value = ir.Emit(IrOpcode::GetAttribute, IrType::U32, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value)});
@@ -99,7 +103,9 @@ void TranslationContext::vInterpMovF32(const RdnaInstruction& inst) {
 
 IrF32 TranslationContext::interpolationParameterF16(const RdnaInstruction& inst, std::uint32_t mode) {
     if (!fragmentShaderBarycentricEnabled) {
-        throw std::runtime_error("16-bit interpolation of pixel input " + std::to_string(inst.source1.value) + " requires fragmentShaderBarycentric");
+        if (!barycentricFallback) throw std::runtime_error("16-bit interpolation of pixel input " + std::to_string(inst.source1.value) + " requires fragmentShaderBarycentric");
+        // The recompiler re-translates the program with barycentrics (emulated per-vertex values).
+        program.Metadata().barycentricEmulation = true;
     }
     if (pixelInput == nullptr || !pixelInput->InputIsFp16(inst.source1.value)) {
         throw std::runtime_error("pixel input " + std::to_string(inst.source1.value) + " is read with 16-bit interpolation without FP16_INTERP_MODE");

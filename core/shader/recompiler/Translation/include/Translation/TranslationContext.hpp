@@ -15,7 +15,7 @@ public:
 
     void TranslateEmbeddedFetch(const RdnaInstruction& instruction, std::uint32_t attribute, std::uint32_t components);
     void TranslateInstruction(const RdnaInstruction& instruction);
-    void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; }
+    void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled, bool fallback = false) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; barycentricFallback = fallback; }
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) { floatMode = mode; ieeeMode = mode.has_value() && mode->ieeeMode; }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
@@ -348,6 +348,7 @@ private:
     IrProgram& program;
     const ShaderPixelInputInfo* pixelInput = nullptr;
     bool fragmentShaderBarycentricEnabled = false;
+    bool barycentricFallback = false;
     std::optional<ShaderFloatMode> floatMode;
     bool ieeeMode = false;
     bool nativeFloat16 = false;

@@ -1777,8 +1777,10 @@ std::uint32_t GpuLockThreadTag() {
 }
 
 GpuMutexType& GpuMutex() {
-    static GpuMutexType mutex;
-    return mutex;
+    // Leaked on purpose: the static Driver (constructed before the first use here) locks it in its
+    // destructor at exit; a destroyed mutex fails to lock on macOS (EINVAL, abort).
+    static GpuMutexType* const mutex = new GpuMutexType;
+    return *mutex;
 }
 
 void TagGpuLockThread(std::uint32_t queue) {

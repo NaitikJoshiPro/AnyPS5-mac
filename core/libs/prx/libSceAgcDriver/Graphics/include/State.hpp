@@ -28,6 +28,10 @@ struct ShaderStages {
     std::uint32_t fragmentWaveSize;
     std::optional<ShaderRecompiler::MeshConfiguration> mesh;
     std::optional<ShaderRecompiler::TessellationConfiguration> tessellation;
+    // VGT_HOS_MIN/MAX_TESS_LEVEL of a tessellated draw: applied to the hull program's factors by
+    // targets with TessellationFeatures::levelClamps (DECISIONS D26), no-ops otherwise.
+    float tessellationMinLevel = 0.0f;
+    float tessellationMaxLevel = 64.0f;
 };
 
 struct ColorTarget {
@@ -120,8 +124,10 @@ struct State {
     bool customSampleLocations = false;
 };
 
-ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
-State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
+// `tessellation` is what the target draws (TessellationFeatures, DECISIONS D26); the default is the
+// reference path's triangle / fractional_odd / triangle_cw set.
+ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false, const ShaderRecompiler::TessellationFeatures& tessellation = {});
+State DecodeState(const QueueState& queue, bool vertexWorkgroup = false, const ShaderRecompiler::TessellationFeatures& tessellation = {});
 std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);

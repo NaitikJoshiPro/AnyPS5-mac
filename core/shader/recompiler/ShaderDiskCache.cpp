@@ -301,9 +301,90 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.bufferRead);
 }
 
+void encodeMsl(Writer& writer, const SharedMsl& msl) {
+    writer.Value(!msl.empty());
+    if (msl.empty()) return;
+    const auto& reflection = msl.Reflection();
+    writer.Text(msl.Source());
+    writer.Value(reflection.abiVersion);
+    writer.Value(reflection.stage);
+    writer.Value(reflection.group);
+    for (const auto threads : reflection.threadsPerThreadgroup) writer.Value(threads);
+    writer.Value(reflection.threadgroupMemoryBytes);
+    writer.Value(reflection.workgroupMemoryStrideDwords);
+    writer.Value(reflection.usesPushData);
+    writer.Value(reflection.usesDriverData);
+    writer.List(reflection.table.ranges, [](Writer& out, const MslAbi::TableRange& range) {
+        out.Value(range.binding);
+        out.Value(range.kind);
+        out.Value(range.count);
+        out.Value(range.offset);
+    });
+    writer.Value(reflection.table.bytes);
+    writer.Values(std::span<const std::uint32_t>(reflection.functionConstants));
+    writer.Value(reflection.outputLocations);
+    writer.Value(reflection.vertexFetchLocations);
+    writer.Value(reflection.colorOutputs);
+    writer.Value(reflection.exportsDepth);
+    writer.Value(reflection.exportsStencil);
+    writer.Value(reflection.exportsSampleMask);
+    writer.Value(reflection.dualSource);
+    writer.Value(reflection.perSample);
+    writer.Value(reflection.earlyFragmentTests);
+    writer.Value(reflection.usesDiscard);
+    writer.Values(std::span<const std::uint32_t>(reflection.samplerModeUses));
+    writer.Value(reflection.samplerUnconditional);
+    writer.Value(reflection.rasterOrder);
+    writer.Value(reflection.perVertexLocations);
+    writer.Value(reflection.emulatedBarycentrics);
+}
+
+void decodeMsl(Reader& reader, SharedMsl& msl) {
+    if (!reader.Get<bool>()) {
+        msl = {};
+        return;
+    }
+    MslShader shader;
+    auto& reflection = shader.reflection;
+    reader.Text(shader.source);
+    reader.Value(reflection.abiVersion);
+    reader.Value(reflection.stage);
+    reader.Value(reflection.group);
+    for (auto& threads : reflection.threadsPerThreadgroup) reader.Value(threads);
+    reader.Value(reflection.threadgroupMemoryBytes);
+    reader.Value(reflection.workgroupMemoryStrideDwords);
+    reader.Value(reflection.usesPushData);
+    reader.Value(reflection.usesDriverData);
+    reader.List(reflection.table.ranges, 4, [](Reader& in, MslAbi::TableRange& range) {
+        in.Value(range.binding);
+        in.Value(range.kind);
+        in.Value(range.count);
+        in.Value(range.offset);
+    });
+    reader.Value(reflection.table.bytes);
+    reader.Values(reflection.functionConstants);
+    reader.Value(reflection.outputLocations);
+    reader.Value(reflection.vertexFetchLocations);
+    reader.Value(reflection.colorOutputs);
+    reader.Value(reflection.exportsDepth);
+    reader.Value(reflection.exportsStencil);
+    reader.Value(reflection.exportsSampleMask);
+    reader.Value(reflection.dualSource);
+    reader.Value(reflection.perSample);
+    reader.Value(reflection.earlyFragmentTests);
+    reader.Value(reflection.usesDiscard);
+    reader.Values(reflection.samplerModeUses);
+    reader.Value(reflection.samplerUnconditional);
+    reader.Value(reflection.rasterOrder);
+    reader.Value(reflection.perVertexLocations);
+    reader.Value(reflection.emulatedBarycentrics);
+    msl = SharedMsl(std::move(shader));
+}
+
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.runtimeAbiVersion);
     writer.Values(std::span<const std::uint32_t>(result.spirv.Words()));
+    encodeMsl(writer, result.msl);
     writer.Value(result.bdaAbiVersion);
     writer.Value(result.memoryOffsetDword);
     writer.Value(result.shaderDataDwords);
@@ -347,6 +428,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     std::vector<std::uint32_t> words;
     reader.Values(words);
     result.spirv = std::move(words);
+    decodeMsl(reader, result.msl);
     reader.Value(result.bdaAbiVersion);
     reader.Value(result.memoryOffsetDword);
     reader.Value(result.shaderDataDwords);
@@ -937,7 +1019,7 @@ bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result) {
     decodeInvocation(reader, result);
     reader.Value(result.workgroupMemoryDwords);
     result.cacheHit = false;
-    return reader.Done() && result.runtimeAbiVersion == RuntimeAbi::Version;
+    return reader.Done() && result.runtimeAbiVersion == RuntimeAbi::Version && (result.msl.empty() || result.msl.Reflection().abiVersion == MslAbi::Version);
 }
 
 std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant) {
@@ -973,6 +1055,7 @@ LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byt
     decodeInfo(reader, decoded.info);
     decodeAllocation(reader, decoded.bindings);
     if (!reader.Done() || decoded.artifact.runtimeAbiVersion != RuntimeAbi::Version) return LoadStatus::Rejected;
+    if (!decoded.artifact.msl.empty() && decoded.artifact.msl.Reflection().abiVersion != MslAbi::Version) return LoadStatus::Rejected;
     variant.info = std::move(decoded.info);
     variant.bindings = std::move(decoded.bindings);
     variant.artifact = std::move(decoded.artifact);

@@ -1,0 +1,6 @@
+# Known-good GPU tests gpu_suite runs first in every invocation (DECISIONS D19.2); any failure stops the run.
+# Keep them short, stable and covering the path every other test needs: the MSL compile gate (D19.3: shaders that
+# don't compile are never launched), one RDNA2 program end to end through MetalBackend, and D2's recorder.
+agc_metal_msl_compile
+agc_driver_vop1_control
+agc_metal_recorder

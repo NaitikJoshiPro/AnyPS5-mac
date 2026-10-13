@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <iostream>
 #include <map>
@@ -48,6 +49,14 @@
 #endif
 
 namespace {
+
+// GuestContext::memory is a span: a request must not view the vector ShaderMemory::Regions() returns
+// as a temporary (it dangles at the end of the statement; APS5_DUMP_REQUESTS serializes every region
+// and read freed memory in --bindless). The vectors are kept for the life of the test process.
+std::span<const ShaderRecompiler::MemoryRegion> KeepRegions(std::vector<ShaderRecompiler::MemoryRegion> regions) {
+    static std::deque<std::vector<ShaderRecompiler::MemoryRegion>> kept;
+    return kept.emplace_back(std::move(regions));
+}
 
 ShaderRecompiler::SpirvTarget BufferTarget() {
     static constexpr std::array<std::uint32_t, 6> capabilities{spv::CapabilityShader, spv::CapabilityImageGatherExtended, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityClipDistance};
@@ -517,7 +526,7 @@ void verifyOutOfRangeConstantReads() {
     require(plan->info.images.size() == 2u && plan->info.samplers.size() == 1u, "out-of-range s_buffer_load: the two T#s were not planned as one image each");
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
-    request.context.memory = memory.Regions();
+    request.context.memory = KeepRegions(memory.Regions());
     static_cast<void>(Recompile(request, *capture));
     const auto holds = [&](const std::array<std::uint32_t, 8>& words) {
         return std::ranges::any_of(capture->snapshot.images, [&](const DescriptorValue& value) {
@@ -805,7 +814,7 @@ void verifyBindlessTable() {
         const auto rangeCapture = rangeMemory.Capture(request);
         const auto rangeMapping = mappingOf(rangeCapture->snapshot);
         require(std::vector<std::uint32_t>(rangeMapping.begin(), rangeMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an out-of-range key was kept");
-        request.context.memory = rangeMemory.Regions();
+        request.context.memory = KeepRegions(rangeMemory.Regions());
         require(Recompile(request, *rangeCapture)->variantId == compiled->variantId, "bindless: the keys changed the variant");
     }
     materials[2][1] = 2u;
@@ -828,7 +837,7 @@ void verifyBindlessTable() {
     const auto wholeMapping = mappingOf(wholeCapture->snapshot);
     require(std::vector<std::uint32_t>(wholeMapping.begin(), wholeMapping.begin() + 7) == std::vector<std::uint32_t>{3u, 0u, 0u, 1u, 1u, 3u, 3u}, "bindless: mode T is not the identity mapping");
     require(wholeCapture->snapshot.images[wholeRoot].dwords == heap[0] && wholeCapture->snapshot.images[wholeDirect].dwords == heap[1] && wholeCapture->snapshot.images[wholeDirect + 1u].dwords == heap[2] && wholeCapture->snapshot.images[wholeDirect + 2u].dwords == heap[3], "bindless: mode T slots are wrong");
-    whole.context.memory = wholeMemory.Regions();
+    whole.context.memory = KeepRegions(wholeMemory.Regions());
     require(!Recompile(whole, *wholeCapture)->spirv.empty(), "bindless: mode T did not compile");
     std::vector<std::uint32_t> latchCode(wholeCode.begin(), wholeCode.begin() + 12);
     latchCode.insert(latchCode.end(), {0xbea80380u, 0xf09c0f08u, 0x00450000u, 0x80288128u, 0xbf0a8428u, 0xbf85fffbu, 0xe0700000u, 0x80070000u, 0xbf810000u});
@@ -849,7 +858,7 @@ void verifyBindlessTable() {
     AgcDriver::ShaderMemory emptyMemory({});
     const auto emptyCapture = emptyMemory.Capture(request);
     require(mappingOf(emptyCapture->snapshot).front() == 0u, "bindless: an empty table has mapped keys");
-    request.context.memory = emptyMemory.Regions();
+    request.context.memory = KeepRegions(emptyMemory.Regions());
     require(Recompile(request, *emptyCapture)->variantId == compiled->variantId, "bindless: an empty table changed the artifact");
     heap = savedHeap;
     heap[0][3] &= 0x0fffffffu;
@@ -931,7 +940,7 @@ void verifyDescriptorPhis() {
         require(plan->info.images.size() == images && plan->info.samplers.size() == samplers && plan->info.sampledPairs.size() == 2u, "descriptor Phi: the edges were not given one resource each");
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
-        request.context.memory = memory.Regions();
+        request.context.memory = KeepRegions(memory.Regions());
         const auto compiled = Recompile(request, *capture);
         require(countOps(compiled->spirv, OpImageSampleExplicitLod) == 2u, "descriptor Phi: the specialized SPIR-V does not sample once per edge");
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -962,7 +971,7 @@ void verifyDescriptorPhis() {
     auto twoLane = makeRequest(samplerCode, 64u);
     AgcDriver::ShaderMemory twoLaneMemory({});
     const auto twoLaneCapture = twoLaneMemory.Capture(twoLane);
-    twoLane.context.memory = twoLaneMemory.Regions();
+    twoLane.context.memory = KeepRegions(twoLaneMemory.Regions());
     require(countOps(Recompile(twoLane, *twoLaneCapture)->spirv, OpImageSampleExplicitLod) == 4u, "descriptor Phi: the specialized two-lane SPIR-V does not sample once per edge and half");
 
     auto dynamic = makeRequest(dynamicCode);
@@ -984,7 +993,7 @@ void verifyDescriptorPhis() {
     require(sequentialPlan->info.images.size() == 2u && sequentialPlan->info.samplers.size() == 2u, "descriptor Phi: a T# and an S# chosen in separate blocks were not split into their SRT descriptors");
     AgcDriver::ShaderMemory sequentialMemory({});
     const auto sequentialCapture = sequentialMemory.Capture(sequential);
-    sequential.context.memory = sequentialMemory.Regions();
+    sequential.context.memory = KeepRegions(sequentialMemory.Regions());
     static_cast<void>(Recompile(sequential, *sequentialCapture));
 
     const auto entryWrites = [&](std::initializer_list<std::uint32_t> words) {
@@ -1092,7 +1101,7 @@ void verifyLaneSelectedDescriptors() {
     require(plan->info.images.size() == 2u && plan->info.samplers.size() == 1u, "lane-selected T#: the T#s selected per lane were not planned as one image each");
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
-    request.context.memory = memory.Regions();
+    request.context.memory = KeepRegions(memory.Regions());
     static_cast<void>(Recompile(request, *capture));
     const auto holds = [&](const std::array<std::uint32_t, 8>& words) {
         return std::ranges::any_of(capture->snapshot.images, [&](const DescriptorValue& value) {
@@ -1138,7 +1147,7 @@ void verifyProgramCounterRelativeData() {
     };
     AgcDriver::ShaderMemory memory({});
     static_cast<void>(memory.Capture(request));
-    request.context.memory = memory.Regions();
+    request.context.memory = KeepRegions(memory.Regions());
     const auto first = Recompile(request);
     require(dataBase(first) == codeAddress + 56u, "program counter data: the V# does not name the data at the shader's address");
     auto relocated = request;
@@ -1965,7 +1974,7 @@ void verifyComputedTexelOffsets() {
         request.useCache = false;
         AgcDriver::ShaderMemory memory({});
         static_cast<void>(memory.Capture(request));
-        request.context.memory = memory.Regions();
+        request.context.memory = KeepRegions(memory.Regions());
         return Recompile(request).spirv;
     };
     const auto sampleOperands = [](const std::vector<std::uint32_t>& words) {
@@ -2015,7 +2024,7 @@ void verifyShaderClockScopes() {
         request.useCache = false;
         AgcDriver::ShaderMemory memory({});
         static_cast<void>(memory.Capture(request));
-        request.context.memory = memory.Regions();
+        request.context.memory = KeepRegions(memory.Regions());
         const auto words = Recompile(request).spirv;
         std::map<std::uint32_t, std::uint32_t> constants;
         std::vector<std::uint32_t> scopeIds;
@@ -2230,7 +2239,7 @@ void verifyUnnormalizedSamplers() {
         request.layout.pushConstantSizeBytes = 128;
         AgcDriver::ShaderMemory memory({});
         static_cast<void>(memory.Capture(request));
-        request.context.memory = memory.Regions();
+        request.context.memory = KeepRegions(memory.Regions());
         return Recompile(request);
     };
     const auto flags = [](const RecompileResult& result, DescriptorRole role) {
@@ -2524,7 +2533,7 @@ void verifyTwoLaneUniformValues() {
         request.layout.pushConstantSizeBytes = 128;
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
-        request.context.memory = memory.Regions();
+        request.context.memory = KeepRegions(memory.Regions());
         const auto words = Recompile(request, *capture)->spirv;
         std::size_t count = 0;
         for (std::size_t cursor = 5; cursor < words.size();) {
@@ -2893,7 +2902,7 @@ void verifyGuardedNullPointers() {
     const auto valid = validMemory.Capture(branch.request);
     require(valid->snapshot.srtPoison.empty() && valid->plan->guardedSrtSlots.size() == 1u && slotPc(*valid->plan, valid->plan->guardedSrtSlots[0]) == 0x2cu && GuardRecords(*valid), "guarded pointer: a mapped nested pointer was poisoned, or its read has no guard");
     require(valid->snapshot.flattenedSrt.at(valid->plan->guardedSrtSlots[0]) == payload, "guarded pointer: a mapped nested read does not hold its word");
-    branch.request.context.memory = validMemory.Regions();
+    branch.request.context.memory = KeepRegions(validMemory.Regions());
     const auto validResult = Recompile(branch.request, *valid);
     require(validResult->poisonedSrtReads == 0u && faultBinding(*validResult) && validResult->bdaAbiVersion == BdaAbi::Version, "guarded pointer: a guarded program has no fault buffer");
 
@@ -2935,20 +2944,20 @@ void verifyGuardedNullPointers() {
         const bool throughPointer = own == 0x38u && poison.address == unmapped;
         require(poison.pc == 0x2cu && (pointerWord || throughPointer), "guarded pointer: a derived poison does not name the inaccessible read");
     }
-    chain.request.context.memory = chainMemory.Regions();
+    chain.request.context.memory = KeepRegions(chainMemory.Regions());
     const auto chainResult = Recompile(chain.request, *chained);
     indirect = 0;
     point(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&indirect)));
     AgcDriver::ShaderMemory nullChainMemory({});
     const auto nullChain = nullChainMemory.Capture(chain.request);
     require(nullChain->snapshot.srtPoison.size() == 1u && nullChain->snapshot.srtPoison[0].pc == 0x38u && nullChain->snapshot.srtPoison[0].address == 0u && GuardRecords(*nullChain), "guarded pointer: a null pointer read from memory did not poison the read through it");
-    chain.request.context.memory = nullChainMemory.Regions();
+    chain.request.context.memory = KeepRegions(nullChainMemory.Regions());
     const auto nullChainResult = Recompile(chain.request, *nullChain);
     indirect = payloadAddress;
     AgcDriver::ShaderMemory mappedChainMemory({});
     const auto mappedChain = mappedChainMemory.Capture(chain.request);
     require(mappedChain->snapshot.srtPoison.empty() && mappedChain->plan->guardedSrtSlots.size() == 3u && GuardRecords(*mappedChain), "guarded pointer: a mapped pointer chain was poisoned, or its reads have no guards");
-    chain.request.context.memory = mappedChainMemory.Regions();
+    chain.request.context.memory = KeepRegions(mappedChainMemory.Regions());
     const auto mappedChainResult = Recompile(chain.request, *mappedChain);
     require(chainResult->poisonedSrtReads == 3u && nullChainResult->poisonedSrtReads == 1u && mappedChainResult->poisonedSrtReads == 0u, "guarded pointer: a chain result does not count its poisoned reads");
     require(samePipeline(*chainResult, *mappedChainResult) && samePipeline(*nullChainResult, *mappedChainResult), "guarded pointer: a chain's poison changed the variant, the specialization or the module");
@@ -2971,7 +2980,7 @@ void verifyGuardedNullPointers() {
     AgcDriver::ShaderMemory zeroMemory({});
     const auto zeroCapture = zeroMemory.Capture(descriptor.request);
     require(zeroCapture->snapshot.srtPoison.empty() && zeroBuffer(*zeroCapture) && GuardRecords(*zeroCapture), "guarded pointer: a zero V# read from mapped memory was poisoned or not read");
-    descriptor.request.context.memory = zeroMemory.Regions();
+    descriptor.request.context.memory = KeepRegions(zeroMemory.Regions());
     const auto zeroResult = Recompile(descriptor.request, *zeroCapture);
     for (const auto pointer : {std::uint64_t{0}, unmapped}) {
         point(pointer);
@@ -3026,7 +3035,7 @@ void verifyGuardedNullPointers() {
     const auto rootlessCapture = rootlessMemory.Capture(rootless.request);
     require(rootlessCapture->snapshot.nullRootReads != 0u && GuardRecords(*rootlessCapture), "guarded pointer: reads through a null user-data pointer were not counted");
     require(std::all_of(rootlessCapture->snapshot.buffers.begin(), rootlessCapture->snapshot.buffers.end(), [](const DescriptorValue& value) { return std::all_of(value.dwords.begin(), value.dwords.end(), [](std::uint32_t word) { return word == 0u; }); }), "guarded pointer: a V# read through a null user-data pointer is not zero");
-    rootless.request.context.memory = rootlessMemory.Regions();
+    rootless.request.context.memory = KeepRegions(rootlessMemory.Regions());
     const auto rootlessResult = Recompile(rootless.request, *rootlessCapture);
     require(rootlessResult->poisonedSrtReads >= rootlessCapture->snapshot.nullRootReads, "guarded pointer: a capture through a null user-data pointer is cacheable");
     point(0u);
@@ -3270,7 +3279,7 @@ int main(int argc, char** argv) {
             const auto changedCapture = changedMemory.Capture(request);
             auto changed = updated;
             changed.useCache = true;
-            changed.context.memory = changedMemory.Regions();
+            changed.context.memory = KeepRegions(changedMemory.Regions());
             auto before = updated;
             before.useCache = true;
             before.context.memory = updatedRegions;
@@ -3333,7 +3342,7 @@ int main(int argc, char** argv) {
         AgcDriver::ShaderMemory nullRoot({});
         const auto nullRootCapture = nullRoot.Capture(request);
         require(nullRootCapture->snapshot.nullRootReads != 0u, "reads through a null user-data pointer were not counted");
-        request.context.memory = nullRoot.Regions();
+        request.context.memory = KeepRegions(nullRoot.Regions());
         require(Recompile(request, *nullRootCapture)->poisonedSrtReads >= nullRootCapture->snapshot.nullRootReads, "a capture through a null user-data pointer is cacheable");
         std::cout << "Shader memory capture, strict validation and deterministic replay passed\n";
         return 0;

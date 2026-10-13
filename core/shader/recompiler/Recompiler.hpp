@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "MslAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include <array>
 #include <cstddef>
@@ -10,6 +11,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <string_view>
 #include <vector>
@@ -202,6 +205,23 @@ struct MeshTargetLimits {
     std::uint32_t outputPerPrimitiveGranularity;
 };
 
+// The VGT_TF_PARAM encodings and level clamps a target can draw (DECISIONS D26). Bit n of a mask is
+// encoding n: domain TYPE (0 isoline, 1 triangle, 2 quad), PARTITIONING (0 integer, 1 pow2,
+// 2 fractional_odd, 3 fractional_even), TOPOLOGY (0 point, 1 line, 2 triangle_cw, 3 triangle_ccw).
+// levelClamps: the target applies VGT_HOS_MIN/MAX_TESS_LEVEL to the factors; without it the
+// clamps must lie outside the fractional-odd range [1, 63] (they are then no-ops). The default is
+// the reference (SPIR-V) set: triangle, fractional_odd, triangle_cw, no clamps. Graphics state
+// decoding consumes it; it changes no compiled program, so it is neither serialized nor keyed.
+struct TessellationFeatures {
+    std::uint32_t domains = 1u << 1u;
+    std::uint32_t partitionings = 1u << 2u;
+    std::uint32_t topologies = 1u << 2u;
+    bool levelClamps = false;
+
+    static constexpr TessellationFeatures All() { return {0x7u, 0xfu, 0xfu, true}; }
+    bool operator==(const TessellationFeatures&) const = default;
+};
+
 struct TessellationTargetLimits {
     std::uint32_t maxPatchSize;
     std::uint32_t maxControlPerVertexInputComponents;
@@ -210,6 +230,13 @@ struct TessellationTargetLimits {
     std::uint32_t maxControlTotalOutputComponents;
     std::uint32_t maxEvaluationInputComponents;
     std::uint32_t maxEvaluationOutputComponents;
+    TessellationFeatures features{};
+};
+
+// The form the device consumes: SPIR-V for Vulkan, Metal Shading Language source for Metal.
+enum class ShaderBackend : std::uint32_t {
+    Spirv,
+    Msl
 };
 
 struct SpirvTarget {
@@ -232,6 +259,7 @@ struct SpirvTarget {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
+    ShaderBackend backend = ShaderBackend::Spirv;
 };
 
 struct BindingLayout {
@@ -330,7 +358,10 @@ enum class DescriptorImageShape {
     Image2DArray,
     ImageCube,
     Image3D,
-    Image1DArray
+    Image1DArray,
+    // Sampled views of 2D MSAA (array) T#s: MSL targets only (DECISIONS D27), texture2d_ms(_array).
+    Image2DMultisample,
+    Image2DMultisampleArray
 };
 
 enum class DescriptorRole {
@@ -453,6 +484,34 @@ private:
     std::shared_ptr<std::vector<std::uint32_t>> words;
 };
 
+// MetalBackend output: one library's source with its stage function MslAbi::EntryPoint, and what
+// it declares. Shared like SharedSpirv: cached results and every result materialized from them
+// point at one immutable shader.
+struct MslShader {
+    std::string source;
+    MslAbi::Reflection reflection;
+
+    bool operator==(const MslShader& other) const = default;
+};
+
+class SharedMsl {
+public:
+    SharedMsl() = default;
+    explicit SharedMsl(MslShader shader) : shader(std::make_shared<const MslShader>(std::move(shader))) {}
+
+    [[nodiscard]] bool empty() const { return shader == nullptr; }
+    [[nodiscard]] const MslShader& Shader() const {
+        if (shader == nullptr) throw std::runtime_error("the shader has no Metal Shading Language form");
+        return *shader;
+    }
+    [[nodiscard]] const std::string& Source() const { return Shader().source; }
+    [[nodiscard]] const MslAbi::Reflection& Reflection() const { return Shader().reflection; }
+    friend bool operator==(const SharedMsl& left, const SharedMsl& right) { return left.shader == right.shader || (left.shader != nullptr && right.shader != nullptr && *left.shader == *right.shader); }
+
+private:
+    std::shared_ptr<const MslShader> shader;
+};
+
 struct VertexInput {
     std::uint32_t location;
     std::uint32_t components;
@@ -473,6 +532,7 @@ struct VertexInputPatch {
 struct CompiledShaderArtifact {
     std::vector<VertexInputPatch> vertexInputPatches;
     SharedSpirv spirv;
+    SharedMsl msl;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t shaderDataDwords = 0;
     std::uint32_t imageMetadataDword = 0;

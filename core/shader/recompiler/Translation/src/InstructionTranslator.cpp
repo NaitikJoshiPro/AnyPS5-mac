@@ -340,8 +340,11 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto* ps = options.inputInfo.pixel;
         const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
         const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
+        // The sample pairs (PERSP/LINEAR_SAMPLE) carry the same host barycentrics: v_interp reads of
+        // them are host-interpolated at the sample (AttributeInstructions, pixelSampleInputs).
         for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth},
-                                         std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective}}) {
+                                         std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective},
+                                         std::pair{PixelInput::PerspectiveSample, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::LinearSample, StageInputKind::BaryCoordNoPerspective}}) {
             if (!loaded(input)) continue;
             setVector(static_cast<VectorReg>(vgpr(input)), builtin(kind, 0u));
             setVector(static_cast<VectorReg>(vgpr(input) + 1u), builtin(kind, 1u));
@@ -505,7 +508,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     for (const auto& cfgBlock : cfg.blocks) {
         const auto typedIndex = blockIndices.at(cfgBlock.id);
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
-        context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
+        context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled, options.barycentricFallback);
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {

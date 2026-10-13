@@ -96,7 +96,9 @@ bool sharesSlots(const IrProgram& program, const ShaderPixelInputInfo& pixel) {
             if (inst->Opcode() != IrOpcode::GetAttribute && inst->Opcode() != IrOpcode::GetInterpolationParameter) continue;
             const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
             if (input >= pixel.inputNum || pixel.InputIsDefault(input)) continue;
-            const auto mode = pixel.InputIsFlat(input) ? 2u : pixel.InputIsLinear(input, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs) ? 1u : 0u;
+            auto mode = pixel.InputIsFlat(input) ? 2u : pixel.InputIsLinear(input, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs) ? 1u : 0u;
+            // The interpolation location (center, centroid, sample) is per host slot too.
+            if (mode != 2u) mode += (((metadata.pixelCentroidInputs >> input) & 1u) != 0u ? 4u : 0u) + (((metadata.pixelSampleInputs >> input) & 1u) != 0u ? 8u : 0u);
             auto& slot = interpolation[pixel.InputSlot(input)];
             if (slot != unassigned && slot != mode) return true;
             slot = mode;

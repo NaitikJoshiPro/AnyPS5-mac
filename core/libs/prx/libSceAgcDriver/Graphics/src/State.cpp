@@ -582,7 +582,7 @@ std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state) {
     return locations;
 }
 
-ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
+ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, const ShaderRecompiler::TessellationFeatures& features) {
     const auto value = read(queue.context, 0x2d5);
     const auto validate = [&](bool condition, const char* reason) {
         if (condition) return;
@@ -612,9 +612,24 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         ShaderRecompiler::TessellationConfiguration tess{(config >> 8u) & 0x3fu, (config >> 14u) & 0x3fu, parameters & 3u, (parameters >> 2u) & 7u, (parameters >> 5u) & 7u};
         validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
         if ((parameters & ~0x000600ffu) != 0) Require(false, zeroMessage(0x2db, parameters, "VGT_TF_PARAM donut, factor detection, memory type or reserved state"));
-        validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
-        Require(readFloat(queue.context, 0x287) <= 1.0f && readFloat(queue.context, 0x286) >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
+        const auto supported = [](std::uint32_t mask, std::uint32_t value) { return value < 32u && ((mask >> value) & 1u) != 0; };
+        if (features == ShaderRecompiler::TessellationFeatures{}) {
+            validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
+        } else {
+            validate(tess.domain != 0 || tess.outputTopology < 2, "isoline tessellation cannot output triangles");
+            validate(supported(features.domains, tess.domain) && supported(features.partitionings, tess.partitioning) && supported(features.topologies, tess.outputTopology), "the tessellation domain, partitioning or output topology is not supported by the target");
+        }
+        const auto minimum = readFloat(queue.context, 0x287);
+        const auto maximum = readFloat(queue.context, 0x286);
+        if (features.levelClamps) {
+            // DECISIONS D26: the clamps apply to the hull program's factors after patch culling.
+            Require(std::isfinite(minimum) && std::isfinite(maximum) && minimum <= maximum, "tessellation level clamps must be finite with VGT_HOS_MIN_TESS_LEVEL <= VGT_HOS_MAX_TESS_LEVEL");
+        } else {
+            Require(minimum <= 1.0f && maximum >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
+        }
         result.tessellation = tess;
+        result.tessellationMinLevel = minimum;
+        result.tessellationMaxLevel = maximum;
     } else {
         validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
         const auto group = read(queue.userConfig, 0x25b, RegisterBank::UserConfig);
@@ -663,12 +678,12 @@ std::string DepthMaintenanceRejection(const QueueState& queue) {
     return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy, resummarize or decompress");
 }
 
-State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
+State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRecompiler::TessellationFeatures& tessellation) {
     if (auto reason = DepthMaintenanceRejection(queue); !reason.empty()) throw std::runtime_error(reason);
     const auto& cx = queue.context;
     State result{};
     result.conservativeRasterization = decodeConservativeRasterization(queue);
-    result.stages = DecodeShaderStages(queue, vertexWorkgroup);
+    result.stages = DecodeShaderStages(queue, vertexWorkgroup, tessellation);
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
     APS5_LOG_OUT_DEBUG("DecodeState primitive=%u path=%u vertexWave=%u", primitive, static_cast<unsigned>(result.stages.path), result.stages.vertexWaveSize);
     switch (primitive) {

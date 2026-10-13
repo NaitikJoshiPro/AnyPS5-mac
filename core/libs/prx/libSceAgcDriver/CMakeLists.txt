@@ -1,3 +1,7 @@
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
+
 # Every test registered here can reach the GPU: `ctest -LE gpu` leaves them out and `ctest -L gpu` selects them.
 cmake_language(DEFER CALL label_directory_tests gpu)
 
@@ -1734,4 +1738,8 @@ if(BUILD_TESTING)
         set_tests_properties(agc_constant_phi PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+if(APPLE)
+    include(specifics/macos/Metal.cmake)
 endif()

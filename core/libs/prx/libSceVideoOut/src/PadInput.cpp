@@ -244,6 +244,14 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     if (ignoreInput) return;
     if (keyboard && event.key.repeat != 0) return;
     const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
+#ifdef __APPLE__
+    // macOS: Cmd+Ctrl+F toggles fullscreen too (the system's own shortcut; F11 is "Show Desktop"
+    // unless Fn is held). The chord is not passed on to the pad bindings.
+    if (keyboard && event.key.keysym.scancode == SDL_SCANCODE_F && (event.key.keysym.mod & KMOD_GUI) != 0 && (event.key.keysym.mod & KMOD_CTRL) != 0) {
+        if (down && window.Handle() != nullptr && event.key.windowID == SDL_GetWindowID(window.Handle())) window.ToggleFullscreen();
+        return;
+    }
+#endif
     for (std::size_t index = 0; index < bindings.size(); ++index) {
         const auto& binding = bindings[index];
         const bool matches = keyboard

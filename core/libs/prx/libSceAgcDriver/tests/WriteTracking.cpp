@@ -8,6 +8,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 #include <array>
 #include <cstdint>
@@ -285,18 +286,21 @@ void CheckCollectBoundaries() {
         Require(CollectWrites(base + offset, 16) >= stored && !UnchangedSince(base + offset, 16, observed), "a memoized observation hid a driver write");
     }
 #ifndef _WIN32
+    // The neighbour is the next host page: the write watch works in host pages (16 KiB on Apple
+    // silicon), so a 4 KiB neighbour inside the first page would unwatch the prefix as well.
+    const auto page = static_cast<std::size_t>(::getpagesize());
     BumpCollectEpoch();
     Require(CollectWrites(base, 1) != 0, "initial partial-block observation failed");
-    Unwatch(base + 4096, 4096);
-    Require(CollectWrites(base + 4096, 1) == 0, "an unwatched neighbor retained an epoch observation");
+    Unwatch(base + page, page);
+    Require(CollectWrites(base + page, 1) == 0, "an unwatched neighbor retained an epoch observation");
     BumpCollectEpoch();
     const auto before = CollectWrites(base, 16);
     Require(before != 0, "an unwatched neighbor prevented collecting a watched prefix");
     memory[0] ^= 1;
     BumpCollectEpoch();
     Require(CollectWrites(base, 16) > before && !UnchangedSince(base, 16, before), "partial-block collection missed a CPU write");
-    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory + 4096, 4096);
-    Require(CollectWrites(base + 4096, 1) != 0, "a re-registered neighbor stayed unwatched");
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory + page, page);
+    Require(CollectWrites(base + page, 1) != 0, "a re-registered neighbor stayed unwatched");
 #endif
 }
 }
