@@ -19,6 +19,7 @@
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -126,9 +127,11 @@ GuestBufferRange DecodeBuffer(std::span<const std::uint32_t> words) {
     return {base, stride == 0u ? records : records * stride};
 }
 
-// Whether every page of [pageBegin, pageEnd) is mapped readable (executable pages included).
+// Whether every page of guest [pageBegin, pageEnd) is mapped readable (executable pages included). A displaced range
+// (GuestDisplaced.hpp, D31/D33) is queried at its alias; its guest address is a guard.
 bool Readable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
-    mach_vm_address_t cursor = pageBegin;
+    mach_vm_address_t cursor = GuestArena::HostAddress(pageBegin);
+    pageEnd = cursor + (pageEnd - pageBegin);
     while (cursor < pageEnd) {
         mach_vm_address_t region = cursor;
         mach_vm_size_t size = 0;
@@ -145,7 +148,8 @@ bool Readable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
 // Why [pageBegin, pageEnd) cannot be wrapped in place, empty when it can: every page must be
 // mapped, readable and not executable (code-signed pages fault when wrapped).
 std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
-    mach_vm_address_t cursor = pageBegin;
+    mach_vm_address_t cursor = GuestArena::HostAddress(pageBegin);
+    pageEnd = cursor + (pageEnd - pageBegin);
     while (cursor < pageEnd) {
         mach_vm_address_t region = cursor;
         mach_vm_size_t size = 0;
@@ -153,10 +157,10 @@ std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t object = MACH_PORT_NULL;
         if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || region > cursor) {
-            return "guest memory at " + Hex(cursor) + " is not mapped";
+            return "guest memory at " + Hex(GuestArena::GuestAddress(cursor)) + " is not mapped";
         }
         if ((info.protection & VM_PROT_EXECUTE) != 0 || (info.protection & VM_PROT_READ) == 0) {
-            return "guest memory at " + Hex(cursor) + " is executable or unreadable and cannot be wrapped (ranges a command only reads are copied instead)";
+            return "guest memory at " + Hex(GuestArena::GuestAddress(cursor)) + " is executable or unreadable and cannot be wrapped (ranges a command only reads are copied instead)";
         }
         cursor = region + size;
     }
@@ -258,7 +262,7 @@ std::uint64_t VulkanDevice::State::WrapOrCopy(std::uint64_t address, std::uint64
         const auto reason = Unwrappable(pageBegin, pageEnd);
         throw std::runtime_error("Metal device: " + (reason.empty() ? "newBufferWithBytesNoCopy refused guest memory at " + Hex(pageBegin) : reason) + (written ? " (the command writes it: a copy would lose the stores)" : bytes > MaxCopiedBytes ? " (too large to copy: " + std::to_string(bytes) + " bytes)" : ""));
     }
-    return stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(address), bytes), 16u).address;
+    return stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostAddress(address)), bytes), 16u).address;
 }
 
 id<MTLBuffer> VulkanDevice::State::WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const {
@@ -1036,7 +1040,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     };
     outcome.reason = refusal();
     if (outcome.reason == CopyOutcome::None) {
-        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
+        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memmove(reinterpret_cast<void*>(GuestArena::HostAddress(destination)), reinterpret_cast<const void*>(GuestArena::HostAddress(source)), bytes); });
         outcome.path = 0;
         outcome.sourceSettledBySignal = settledBySignal;
         return outcome;

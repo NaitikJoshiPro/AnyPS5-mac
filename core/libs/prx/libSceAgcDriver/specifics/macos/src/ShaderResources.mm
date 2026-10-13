@@ -5,6 +5,7 @@
 // Metal device's dispatches (it binds buffers itself).
 #include "MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "ThreadOwned.hpp"
@@ -3671,7 +3672,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(GuestArena::HostRange(begin, bytes)), bytes); // alias if displaced (D31, D33)
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
         selected.push_back(index);

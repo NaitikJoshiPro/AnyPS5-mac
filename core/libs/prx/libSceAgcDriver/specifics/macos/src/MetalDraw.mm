@@ -27,6 +27,7 @@
 #include "MetalMesh.h"
 #include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -343,7 +344,8 @@ Graphics::ColorTargetLayout TiledGuestLayout(const DrawCache::TiledTarget& targe
 
 void DetileTarget(const DrawCache::TiledTarget& target, std::span<std::byte> linear) {
     const auto layout = TiledGuestLayout(target);
-    const auto* guest = reinterpret_cast<const std::byte*>(target.address);
+    // Whole-surface native access: a displaced target (D31, D33) at its alias, not through the fault path.
+    const auto* guest = reinterpret_cast<const std::byte*>(GuestArena::HostRange(target.address, layout.Bytes()));
     if (!target.tail) {
         layout.Detile(std::span<const std::byte>(guest, layout.Bytes()), linear);
         return;
@@ -356,7 +358,7 @@ void DetileTarget(const DrawCache::TiledTarget& target, std::span<std::byte> lin
 
 void TileTarget(const DrawCache::TiledTarget& target, std::span<const std::byte> linear) {
     const auto layout = TiledGuestLayout(target);
-    auto* guest = reinterpret_cast<std::byte*>(target.address);
+    auto* guest = reinterpret_cast<std::byte*>(GuestArena::HostRange(target.address, layout.Bytes()));
     if (!target.tail) {
         layout.Tile(linear, std::span<std::byte>(guest, layout.Bytes()));
         return;
@@ -425,7 +427,7 @@ static void CheckInputsClearOfTarget(Settle settle, const Graphics::State& graph
                 } else {
                     settle(indexBegin, indexBytes);
                     const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(indexBegin), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart && !listTopology);
+                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, static_cast<std::size_t>(indexBytes))), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart && !listTopology);
                     if (highest) maxIndex = *highest + draw.firstVertex;
                 }
             }
@@ -460,7 +462,7 @@ void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color, G
     const auto bytes = layout.Bytes();
     if (color.cmaskBytes != bytes) Fail("CMASK size differs from the color target's CMASK layout");
     SettleRange(color.cmaskAddress, bytes);
-    const auto* mask = reinterpret_cast<const std::uint8_t*>(color.cmaskAddress);
+    const auto* mask = reinterpret_cast<const std::uint8_t*>(GuestArena::HostRange(color.cmaskAddress, bytes)); // alias if displaced (D31, D33)
     if (std::all_of(mask, mask + bytes, [](std::uint8_t value) { return value == 0xffu; })) return;
     std::vector<std::uint32_t> cleared;
     for (std::uint32_t tileY = 0; tileY < layout.TilesY(); ++tileY) {
@@ -640,7 +642,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (draw.indexed) {
             const auto bytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
             state.SettleRange(draw.indexAddress, bytes);
-            indices = std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), bytes);
+            indices = std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostRange(draw.indexAddress, bytes)), bytes);
         }
         meshPlan = Graphics::Metal::PlanMeshDraw(graphics, draw, indices);
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
@@ -1042,7 +1044,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (draw.indexed) {
             state.SettleRange(indexBegin, indexBytes);
             guest.resize(indexBytes);
-            std::memcpy(guest.data(), reinterpret_cast<const void*>(indexBegin), indexBytes);
+            std::memcpy(guest.data(), reinterpret_cast<const void*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes);
         }
         const auto indexAt = [&](std::uint32_t position) -> std::uint32_t {
             if (draw.indexSize == 2u) {
@@ -1413,7 +1415,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 state.KeepWrapped(indexBegin, indexBytes);
             } else {
                 state.SettleRange(indexBegin, indexBytes);
-                const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(indexBegin), indexBytes), 16u);
+                const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes), 16u);
                 indexAddress = upload.address;
             }
             indexLength = indexBytes;

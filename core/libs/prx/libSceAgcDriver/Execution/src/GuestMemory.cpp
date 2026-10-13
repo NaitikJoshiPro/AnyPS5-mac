@@ -781,7 +781,7 @@ struct WindowCopy {
     std::span<const std::byte> bytes;
 
     bool Holds(std::uintptr_t page) const {
-        return std::memcmp(reinterpret_cast<const void*>(page), bytes.data() + (page - first), WritePageBytes) == 0;
+        return std::memcmp(reinterpret_cast<const void*>(GuestArena::HostRange(page, WritePageBytes)), bytes.data() + (page - first), WritePageBytes) == 0;
     }
 };
 
@@ -1262,7 +1262,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     std::vector<std::byte> saved;
     if (covered && staysWatched) {
         CheckRange(reinterpret_cast<const void*>(first), static_cast<std::size_t>(stop - first), 1, false);
-        const auto* source = reinterpret_cast<const std::byte*>(first);
+        const auto* source = reinterpret_cast<const std::byte*>(GuestArena::HostRange(first, static_cast<std::size_t>(stop - first)));
         saved.assign(source, source + (stop - first));
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);

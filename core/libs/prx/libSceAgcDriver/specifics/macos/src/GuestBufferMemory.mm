@@ -355,12 +355,12 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     }
     id<MTLResidencySet> residency = residencySetFor(context);
     static const bool trace = std::getenv("APS5_METAL_TRACE") != nullptr;
-    if (trace) std::fprintf(stderr, "[metal] host import 0x%llx+0x%llx before: %s\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), AgcDriver::Metal::VmRegionInfo(entry.base).c_str());
+    if (trace) std::fprintf(stderr, "[metal] host import 0x%llx+0x%llx before: %s\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), AgcDriver::Metal::VmRegionInfo(hostBase).c_str());
     if (trace) {
-        for (auto page = entry.base; page < entry.base + entry.bytes; page += 0x4000u) std::fprintf(stderr, "[metal] host import page 0x%llx: %s\n", static_cast<unsigned long long>(page), AgcDriver::Metal::VmWiredInfo(page).c_str());
+        for (auto page = entry.base; page < entry.base + entry.bytes; page += 0x4000u) std::fprintf(stderr, "[metal] host import page 0x%llx: %s\n", static_cast<unsigned long long>(page), AgcDriver::Metal::VmWiredInfo(GuestArena::HostAddress(page)).c_str());
     }
-    id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), hostBase, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
-    if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(entry.base).c_str());
+    id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), entry.base, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
+    if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(hostBase).c_str());
     if (buffer == nil) {
         failure = VK_ERROR_OUT_OF_DEVICE_MEMORY;
         return "newBufferWithBytesNoCopy";
@@ -1097,7 +1097,8 @@ constexpr std::uint8_t SparseZero = 2;
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
 bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
-    const auto* guest = reinterpret_cast<const std::byte*>(block.address);
+    // Bulk compare/copy of guest memory: a displaced block (D31, D33) is read at its alias, not through the fault path.
+    const auto* guest = reinterpret_cast<const std::byte*>(GuestArena::HostRange(block.address, block.length));
     if (block.fill != 0) {
         auto* target = block.mirror->buffer->Bytes().data() + offset;
         if (block.fill == SparseZero) std::memset(target, 0, block.length);
@@ -2564,7 +2565,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
             return;
         }
         const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
-        const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
+        const auto* source = live ? reinterpret_cast<const std::byte*>(GuestArena::HostRange(snapshot.address, snapshot.bytes.size())) : owner->snapshot.data() + offset;
         Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -3264,7 +3265,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         auto copyOffset = region->begin - region->copySourceBase;
         if (!pendingWriter && !writable) {
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+            std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(GuestArena::HostRange(address, static_cast<std::size_t>(bytes))), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
             copyOffset = 0;
             recorder->Keep(inputSnapshot);

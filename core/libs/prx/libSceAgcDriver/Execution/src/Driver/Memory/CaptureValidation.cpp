@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
@@ -196,7 +197,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
                 std::vector<std::byte> copy;
                 if (GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) {
                     copy.resize(region.bytes.size());
-                    std::memcpy(copy.data(), reinterpret_cast<const void*>(region.guestAddress), copy.size());
+                    std::memcpy(copy.data(), reinterpret_cast<const void*>(GuestArena::HostRange(region.guestAddress, copy.size())), copy.size());
                 }
                 before.push_back(std::move(copy));
             }
