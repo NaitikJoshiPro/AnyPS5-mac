@@ -599,7 +599,7 @@ void ShaderStageTests() {
     }
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation, "tessellation routing changed");
     const auto& tessellation = *stages.tessellation;
-    Require(tessellation.inputControlPoints == 3 && tessellation.outputControlPoints == 3 && tessellation.domain == 1 && tessellation.partitioning == 2 && tessellation.outputTopology == 2 && stages.minTessellationLevel == 1.0f && stages.maxTessellationLevel == 64.0f, "the passthrough triangle-patch configuration decoded differently");
+    Require(tessellation.inputControlPoints == 3 && tessellation.outputControlPoints == 3 && tessellation.domain == 1 && tessellation.partitioning == 2 && tessellation.outputTopology == 2 && stages.minTessellationLevel == 1.0f && stages.maxTessellationLevel == 64.0f && tessellation.patchesPerGroup == 85, "the passthrough triangle-patch configuration decoded differently");
     for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "fractional-odd partitioning"}, std::pair{0x4004du, "fractional-odd partitioning"}, std::pair{0x40048u, "fractional-odd partitioning"}, std::pair{0x40029u, "fractional-odd partitioning"}, std::pair{0x4004bu, "fractional-odd partitioning"}}) {
         queue.context[0x2db] = parameters;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
@@ -609,7 +609,7 @@ void ShaderStageTests() {
     queue.context[0x286] = 0x41100000;
     const auto quadStages = AgcDriver::Graphics::DecodeState(queue).stages;
     const auto& quads = quadStages.tessellation;
-    Require(quads && quads->inputControlPoints == 4 && quads->outputControlPoints == 4 && quads->domain == 2 && quads->partitioning == 2 && quads->outputTopology == 3 && quadStages.minTessellationLevel == 1.0f && quadStages.maxTessellationLevel == 9.0f, "counter-clockwise quad patches with HOS levels [1, 9] decoded differently");
+    Require(quads && quads->inputControlPoints == 4 && quads->outputControlPoints == 4 && quads->domain == 2 && quads->partitioning == 2 && quads->outputTopology == 3 && quadStages.minTessellationLevel == 1.0f && quadStages.maxTessellationLevel == 9.0f && quads->patchesPerGroup == 63, "counter-clockwise quad patches with HOS levels [1, 9] and 63 patches per group decoded differently");
     queue.context[0x2db] = 0x40069;
     Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->outputTopology == 3, "counter-clockwise triangle patches decoded differently");
     for (const auto [maximum, minimum, reason] : {std::tuple{0x3f800000u, 0x40000000u, "tessellation level clamps"}, std::tuple{0x41100000u, 0xbf800000u, "tessellation level clamps"}, std::tuple{0x3f000000u, 0x00000000u, "tessellation level clamps"}, std::tuple{0x42800000u, 0x42800000u, "tessellation level clamps"}, std::tuple{0x7fc00000u, 0x3f800000u, "non-finite register"}, std::tuple{0x7f800000u, 0x3f800000u, "non-finite register"}}) {
@@ -662,6 +662,8 @@ void ShaderStageTests() {
     queue.context[0x2d5] = 0x0200210d;
     queue.context[0x2d6] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "control-point counts");
+    queue.context[0x2d6] = 0xc300;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "NUM_PATCHES is zero");
     queue = makeState();
     for (const auto value : {0x2003u, 0x2018u, 0x20c0u, 0x80002000u}) {
         queue.context[0x2d5] = value;
@@ -2136,6 +2138,54 @@ void multisampleTests() {
     state = DecodeState(queue);
     Require(state.samples == 8 && !state.customSampleLocations && state.colors.size() == 1 && state.colors[0].samples == 8, "the standard 8x pattern (sample 7 at (7, -7), PPSA99902's registers) did not decode as standard");
     AgcDriver::Graphics::ValidateSampleLocations({}, state);
+    for (const auto log2 : {0u, 1u, 2u, 3u}) {
+        queue = log2 == 0 ? makeState() : multisampled();
+        queue.context[0x1b3] = 2u;
+        queue.context[0x1b4] = 2u;
+        queue.context[0x2f8] = (log2 << 20u) | log2 | 0x20000000u;
+        queue.context[0x31d] = (log2 << 12u) | (log2 << 15u);
+        for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+            queue.context[0x2fe + pixel * 4u] = log2 == 3 ? 0xbd153fd1u : log2 == 2 ? 0x622ae6aeu : 0xcc44u;
+            queue.context[0x2ff + pixel * 4u] = log2 == 3 ? 0x9773f95bu : 0u;
+        }
+        std::vector<AgcDriver::Graphics::RegisterRead> sampleReads;
+        AgcDriver::Graphics::RegisterReadLog() = &sampleReads;
+        const auto coveredCenter = DecodeState(queue);
+        const auto coveredRejection = AgcDriver::Graphics::DrawRejection(queue, false);
+        AgcDriver::Graphics::RegisterReadLog() = nullptr;
+        Require(coveredCenter.samples == (1u << log2) && !coveredCenter.customSampleLocations, "covered-centroid mode changed the sample count or locations without centroid inputs");
+        for (const auto read : sampleReads) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a covered-centroid register");
+        Require(coveredRejection.empty(), "covered-centroid mode without centroid inputs was refused: " + coveredRejection);
+        for (const auto centroid : {4u, 64u, 68u}) {
+            queue.context[0x1b3] = 2u | centroid;
+            queue.context[0x1b4] = 2u | centroid;
+            expectFailure([&] { DecodeState(queue); }, "COVERED_CENTROID_IS_CENTER with active or unspecified centroid inputs");
+            Require(AgcDriver::Graphics::DrawRejection(queue, false).find("COVERED_CENTROID_IS_CENTER with active or unspecified centroid inputs") != std::string::npos, "the precheck accepted active covered-centroid interpolation");
+            queue.context[0x1b4] = 2u;
+            Require(DecodeState(queue).samples == (1u << log2) && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "an unaddressed centroid input changed covered-centroid mode");
+            queue.context[0x1b3] = 2u;
+            queue.context[0x1b4] = 2u | centroid;
+            Require(DecodeState(queue).samples == (1u << log2) && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a disabled centroid input changed covered-centroid mode");
+        }
+        queue.context[0x1b3] = 2u;
+        queue.context[0x1b4] = 2u;
+        for (const auto offset : {0x1b3u, 0x1b4u}) {
+            queue.context.erase(offset);
+            expectFailure([&] { DecodeState(queue); }, "COVERED_CENTROID_IS_CENTER with active or unspecified centroid inputs");
+            Require(AgcDriver::Graphics::DrawRejection(queue, false).find("COVERED_CENTROID_IS_CENTER with active or unspecified centroid inputs") != std::string::npos, "the precheck accepted unspecified centroid inputs");
+            queue.context[offset] = 2u;
+        }
+        const auto withProgram = queue;
+        queue.shader[0x008] = 0;
+        queue.context[0x8e] = 0;
+        queue.context.erase(0x1b3);
+        queue.context.erase(0x1b4);
+        Require(DecodeState(queue).samples == (1u << log2) && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "covered-centroid mode was refused with no pixel program");
+        queue = withProgram;
+        queue.context[0x2f8] |= 0x10u;
+        expectFailure([&] { DecodeState(queue); }, "coverage conversion or nonstandard multisampling");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("coverage conversion or nonstandard multisampling") != std::string::npos, "covered-centroid handling admitted unrelated AA bits");
+    }
     queue = multisampled();
     queue.context[0x31d] = 0x1000;
     expectFailure([&] { DecodeState(queue); }, "fewer fragments than samples");
@@ -2414,7 +2464,7 @@ void AlphaToCoverageTests() {
         Require(AgcDriver::Graphics::DrawRejection(queue, false).find("alpha-to-coverage") != std::string::npos, "the precheck accepted unsupported alpha-to-coverage");
     }
     queue.context[0x2dc] = 0xaa01;
-    const auto exportFormat = queue.context.at(0x1c5);
+    const std::uint32_t exportFormat = queue.context.at(0x1c5);
     for (const auto format : {4u, 5u, 6u, 9u}) {
         queue.context[0x1c5] = (exportFormat & ~0xfu) | format;
         Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "alpha-to-coverage rejected an MRT0 export format with a floating-point alpha");
@@ -4149,6 +4199,41 @@ void conservativeZExportTests() {
     expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported fragment execution mode");
 }
 
+bool declaresEarlyFragmentTests(const ShaderRecompiler::RecompileRequest& request) {
+    const auto result = ShaderRecompiler::Recompile(request);
+    const auto& words = result.spirv.Words();
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        if (static_cast<spv::Op>(words[at] & 0xffffu) == spv::OpExecutionMode && words[at + 2] == spv::ExecutionModeEarlyFragmentTests) return true;
+    }
+    return false;
+}
+
+void earlyFragmentTestsTests() {
+    const std::array<std::pair<std::uint32_t, bool>, 9> cases{{
+        {0x0000u, false},
+        {0x0020u, false},
+        {0x0010u, true},
+        {0x0030u, true},
+        {0x0050u, false},
+        {0x0011u, false},
+        {0x1000u, true},
+        {0x1050u, true},
+        {0x1031u, true}
+    }};
+    const ShaderRecompiler::RequestSerializer serializer;
+    for (const auto& [shaderControl, expected] : cases) {
+        const auto request = depthExportRequest(shaderControl);
+        const auto replayed = serializer.Deserialize(serializer.Serialize(request));
+        Require(declaresEarlyFragmentTests(request) == expected && declaresEarlyFragmentTests(replayed.request) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + (expected ? " did not declare" : " declared") + " early fragment tests");
+    }
+    for (const auto shaderControl : {0x0010u, 0x1000u}) {
+        auto request = depthExportRequest(shaderControl);
+        request.context.pixel->alphaToCoverage = true;
+        const auto replayed = serializer.Deserialize(serializer.Serialize(request));
+        Require(!declaresEarlyFragmentTests(request) && !declaresEarlyFragmentTests(replayed.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with alpha-to-coverage declared early fragment tests");
+    }
+}
+
 constexpr std::array<std::uint32_t, 5> OrderedPixelCode{0x7e0e02f2u, 0xbf900007u, 0xf800180fu, 0x07070707u, 0xbf810000u};
 constexpr std::array<std::uint32_t, 12> OrderedBdaPixelCode{0x7e040f00u, 0x7e060280u, 0xdc208001u, 0x047d0002u, 0xdc308008u, 0x057d0002u, 0xbf8c3f70u, 0x4a080b04u, 0x7e0e0d04u, 0xf800180fu, 0x07070707u, 0xbf810000u};
 
@@ -4352,6 +4437,7 @@ void stencilRefExportTests() {
         Require(!AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck accepted STENCIL_OP_VAL_EXPORT_ENABLE in DB_SHADER_CONTROL " + std::to_string(shaderControl));
     }
     Require(!AgcDriver::Graphics::DecodePixelStageInfo(stencilRefExportQueue(0x50u, 2u).context, IdentityExports).stencilRefExportEnable, "a pixel stage without STENCIL_TEST_VAL_EXPORT_ENABLE exports the stencil reference");
+    Require(AgcDriver::Graphics::DecodePixelStageInfo(stencilRefExportQueue(0x1012u, 2u).context, IdentityExports).earlyZ, "DEPTH_BEFORE_SHADER with a stencil reference export did not get early tests");
     const std::array<std::uint32_t, 2> stencilExport{spv::CapabilityShader, spv::CapabilityStencilExportEXT};
     const std::array<std::uint32_t, 1> plain{spv::CapabilityShader};
     const ShaderRecompiler::RequestSerializer serializer;
@@ -5021,6 +5107,7 @@ void validationTests() {
         vertex.vertexAttributes[0].components = 2;
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "metadata disagrees");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 2, 1) == 80, "incorrect strided vertex range");
+        Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 64, "vertex range includes records before the first vertex");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 3, 1) == 112, "an index past the records still spans its fetch");
         {
             auto wider = attribute;
@@ -5043,6 +5130,7 @@ void validationTests() {
             Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(narrow)), 2, false, 4u) == 4u && narrow[0] == 4u && narrow[1] == 1u, "clamping 16-bit indices failed");
         }
         attribute.fetchIndex = 1;
+        Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 224, "instance range includes records before the first instance");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 48, "instance attributes used the vertex index");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2, 1) == 80, "first instance was ignored");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 2, 2) == 112, "a first instance past the records still spans its fetch");
@@ -5060,6 +5148,7 @@ void validationTests() {
         attribute.resource.fields[1] = 0;
         attribute.resource.fields[2] = 16;
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 16, "zero stride must repeat one value");
+        Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 100, 7) == 0, "zero-stride input skipped its repeated value");
         attribute.resource.fields[2] = 8;
         expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 1); }, "byte range");
         Require(!AgcDriver::Graphics::VertexFetchOutOfRange(attribute), "a structured zero-stride fetch was treated as out of range");
@@ -5508,6 +5597,11 @@ int main(int argc, char** argv) {
             std::cerr << "descriptor pool reset failure did not terminate\n";
             return 1;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--covered-centroid-state") {
+            multisampleTests();
+            std::cout << "Covered-centroid and multisample state checks passed\n";
+            return 0;
+        }
         {
             const AgcDriver::Graphics::Context context{};
             const AgcDriver::Graphics::State state{};
@@ -5554,6 +5648,7 @@ int main(int argc, char** argv) {
         unorm10_11_11TargetTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();
+        earlyFragmentTestsTests();
         orderedPixelShaderTests();
         stencilRefExportTests();
         aliasedBufferViewTests();

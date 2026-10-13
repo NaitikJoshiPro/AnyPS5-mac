@@ -81,9 +81,8 @@ struct SpirvEmitterState {
     SpirvModule module;
     const IrProgram& program;
     ShaderStageInputInfo inputInfo;
-    std::array<std::uint32_t, 6> tessVariables {};
+    std::array<std::uint32_t, 7> tessVariables {};
     std::uint32_t tessInnerVariable = 0;
-    std::uint32_t tessPatchBase = 0;
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
@@ -108,6 +107,7 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
     std::uint32_t storageBufferCoherentVariable = 0;
+    std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;

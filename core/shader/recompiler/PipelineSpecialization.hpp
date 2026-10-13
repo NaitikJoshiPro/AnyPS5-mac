@@ -27,6 +27,7 @@ inline constexpr std::uint32_t ExportBase = 8192u;
 inline constexpr std::uint32_t ExportPackingBase = 8224u;
 inline constexpr std::uint32_t DualSourceBlend = 8232u;
 inline constexpr std::uint32_t RasterPrimitive = 8233u;
+inline constexpr std::uint32_t LayerExported = 8234u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 // Multisampled storage images on MSL backends (MslAbi Version 6): Metal shaders cannot write

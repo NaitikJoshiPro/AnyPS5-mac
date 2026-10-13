@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -23,7 +24,7 @@ using ShaderRecompiler::ShaderStage;
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Halves = 1u << 16u;
 alignas(256) std::array<std::uint32_t, Halves> Input{};
-alignas(256) std::array<std::uint32_t, Halves> Output{};
+alignas(256) std::array<std::uint32_t, Halves * 2u> Output{};
 
 alignas(256) constexpr std::array<std::uint32_t, 10> ConvertCode{
     0x34020082, 0x8f098708, 0x4a020209, 0xe0301000, 0x80000401, 0xbf8c3f70, 0x7e0a1704, 0xe0701000,
@@ -33,6 +34,12 @@ alignas(256) constexpr std::array<std::uint32_t, 10> ConvertCode{
 alignas(256) constexpr std::array<std::uint32_t, 13> ByteCode{
     0x34020082, 0x8f098708, 0x4a020209, 0xe0301000, 0x80000401, 0x7e0e02ff, 0x00008000, 0xbf8c3f70,
     0x640c0ef9, 0x06010604, 0xe0701000, 0x80010601, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 22> CompareCode{
+    0x34020082, 0x34040083, 0x8f098708, 0x8f0a8808, 0x4a020209, 0x4a04040a, 0xe0301000, 0x80000401,
+    0x7e0c02ff, 0x00003c00, 0xbf8c3f70, 0x7dd00904, 0xd5010005, 0x01a90280, 0x7d920d04, 0xd5010007,
+    0x01a90280, 0xe0701000, 0x80010502, 0xe0701004, 0x80010702, 0xbf810000,
 };
 
 std::uint32_t HalfToFloatBits(std::uint32_t half) {
@@ -79,6 +86,7 @@ ShaderRecompiler::RecompileRequest Request(std::span<const std::uint32_t> code, 
 
 struct F16Decode {
     std::uint32_t unpacks = 0;
+    std::uint32_t nanRebuilds = 0;
     bool denormPreserve16 = false;
 };
 
@@ -90,6 +98,7 @@ F16Decode ScanF16Decode(std::span<const std::uint32_t> words) {
         Require(count != 0 && cursor + count <= words.size(), "f16 to f32 unpack: malformed SPIR-V");
         if (opcode == spv::OpExecutionMode && count == 4 && words[cursor + 2] == spv::ExecutionModeDenormPreserve && words[cursor + 3] == 16u) decode.denormPreserve16 = true;
         if (opcode == spv::OpExtInst && count >= 5 && words[cursor + 4] == GLSLstd450UnpackHalf2x16) ++decode.unpacks;
+        if (opcode == spv::OpShiftRightArithmetic) ++decode.nanRebuilds;
         cursor += count;
     }
     return decode;
@@ -116,15 +125,28 @@ void VerifySpirv() {
     target.maxWorkgroupSize = {1024, 1024, 64};
     target.maxWorkgroupInvocations = 1024;
     target.maxWorkgroupSharedMemoryBytes = 49152;
-    for (const std::span<const std::uint32_t> code : {std::span<const std::uint32_t>(ConvertCode), std::span<const std::uint32_t>(ByteCode)}) {
-        const std::string program = code.size() == ConvertCode.size() ? "v_cvt_f32_f16" : "v_add_f16 src0_sel:BYTE_1";
-        const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    struct Program {
+        std::span<const std::uint32_t> code;
+        const char* name;
+        std::optional<bool> nanBits;
+    };
+    const std::array<Program, 3> programs{{
+        {ConvertCode, "v_cvt_f32_f16", true},
+        {ByteCode, "v_add_f16 src0_sel:BYTE_1", std::nullopt},
+        {CompareCode, "v_cmp_u_f16 and v_cmp_lt_f16", false},
+    }};
+    for (const auto& program : programs) {
+        const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(program.code.data()), std::as_bytes(program.code)}}};
         for (const bool preserve : {false, true}) {
             target.float16DenormPreserve = preserve;
             const std::string flag = std::string(" with float16DenormPreserve=") + (preserve ? "true" : "false");
-            const auto decode = ScanF16Decode(ShaderRecompiler::Recompile(Request(code, target, userData, memory)).spirv.Words());
-            Require(decode.denormPreserve16 == preserve, "f16 to f32 unpack: " + program + (preserve ? " lacks" : " has") + " DenormPreserve 16" + flag);
-            Require(decode.unpacks == (preserve ? 1u : 0u), "f16 to f32 unpack: " + program + " has " + std::to_string(decode.unpacks) + " UnpackHalf2x16" + flag);
+            const auto decode = ScanF16Decode(ShaderRecompiler::Recompile(Request(program.code, target, userData, memory)).spirv.Words());
+            const std::string name = std::string("f16 to f32 unpack: ") + program.name;
+            Require(decode.denormPreserve16 == preserve, name + (preserve ? " lacks" : " has") + " DenormPreserve 16" + flag);
+            Require(preserve ? decode.unpacks != 0u : decode.unpacks == 0u, name + " has " + std::to_string(decode.unpacks) + " UnpackHalf2x16" + flag);
+            if (program.nanBits.has_value()) {
+                Require(decode.nanRebuilds == (preserve && *program.nanBits ? decode.unpacks : 0u), name + " rebuilds " + std::to_string(decode.nanRebuilds) + " of " + std::to_string(decode.unpacks) + " NaN results" + flag);
+            }
         }
     }
 }
@@ -147,6 +169,14 @@ void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& t
     for (std::uint32_t lane = 0; lane < Halves; ++lane) {
         const std::uint32_t selected = (Input[lane] >> 8u) & 0xffu;
         Require((Output[lane] & 0xffffu) == selected, std::string("f16 to f32 unpack (") + name + "): v_add_f16 src0_sel:BYTE_1 of " + Hex(Input[lane]) + " and -0 is " + Hex(Output[lane]) + ", expected " + Hex(selected));
+    }
+    Dispatch(device, CompareCode, target);
+    for (std::uint32_t lane = 0; lane < Halves; ++lane) {
+        const float value = std::bit_cast<float>(HalfToFloatBits(lane));
+        const std::uint32_t unordered = value != value ? 1u : 0u;
+        const std::uint32_t less = value < 1.0f ? 1u : 0u;
+        Require(Output[lane * 2u] == unordered, std::string("f16 to f32 unpack (") + name + "): v_cmp_u_f16 of " + Hex(lane) + " with itself is " + Hex(Output[lane * 2u]) + ", expected " + Hex(unordered));
+        Require(Output[lane * 2u + 1u] == less, std::string("f16 to f32 unpack (") + name + "): v_cmp_lt_f16 of " + Hex(lane) + " and 1.0 is " + Hex(Output[lane * 2u + 1u]) + ", expected " + Hex(less));
     }
 }
 

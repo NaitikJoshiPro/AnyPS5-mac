@@ -44,6 +44,7 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI stat_nid_postfix(const char* path, FileStat* sb);
 
 namespace {
 
@@ -353,6 +354,14 @@ int APS5_VABI execv_nid_postfix(const char* path, char* const* arguments) {
     (void)path;
     (void)arguments;
     NotImplemented_nid_no_patch("execv: executable replacement");
+    return -1;
+}
+
+int APS5_VABI execve_nid_postfix(const char* path, char* const* arguments, char* const* environment) {
+    (void)path;
+    (void)arguments;
+    (void)environment;
+    NotImplemented_nid_no_patch("execve: executable replacement");
     return -1;
 }
 

@@ -300,7 +300,9 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
                                  || std::any_of(raw.begin() + static_cast<std::ptrdiff_t>(symOff), raw.begin() + static_cast<std::ptrdiff_t>(symOff + symEntSize),
                                                 [](const std::uint8_t byte) { return byte != 0; })))
                 throw RelinkerException("Unnamed import symbol is not a null symbol entry", symOff);
-            nidRefs.push_back({name, Domain::ImportModule(name, importModules, neededLibraries), relType, pos, rOffset, rAddend, (raw[symOff + 4] >> 4) == STB_WEAK});
+            const bool weak = (raw[symOff + 4] >> 4) == STB_WEAK;
+            const bool function = (raw[symOff + 4] & 15) == STT_FUNC;
+            nidRefs.push_back({name, Domain::ImportModule(name, importModules, neededLibraries), relType, pos, rOffset, rAddend, weak, function});
         }
     };
 
