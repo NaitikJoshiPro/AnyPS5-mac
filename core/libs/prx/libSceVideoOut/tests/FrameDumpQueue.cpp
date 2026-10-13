@@ -19,6 +19,9 @@
 #include <vector>
 #include <fcntl.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <sys/select.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -63,8 +66,18 @@ public:
     std::vector<char> Release() const {
         std::vector<char> dump(DumpBytes);
         for (std::size_t done = 0; done < dump.size();) {
+#ifdef __APPLE__
+            // macOS poll() does not report a FIFO's data as POLLIN (the writer filled the pipe
+            // and blocked while poll slept): select() does.
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(descriptor, &readable);
+            timeval timeout{15, 0};
+            check(select(descriptor + 1, &readable, nullptr, nullptr, &timeout) == 1, "a queued frame dump was not written");
+#else
             pollfd waiting{descriptor, POLLIN, 0};
             check(poll(&waiting, 1, 15000) == 1, "a queued frame dump was not written");
+#endif
             const auto count = read(descriptor, dump.data() + done, dump.size() - done);
             check(count > 0, "a frame dump pipe could not be read");
             done += static_cast<std::size_t>(count);
