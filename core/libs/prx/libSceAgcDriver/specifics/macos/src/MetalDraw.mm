@@ -1242,6 +1242,11 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     state.NoteBindings(fragmentPlan);
     state.NoteBindings(targetPlan);
     state.CheckFaultsOnComplete(true);
+    // As upstream (Draw.cpp, SyncNotResident): a draw over a colour target that is not a resident
+    // image writes guest memory in place, which the CPU may read without a flush hook (a queue
+    // reported idle does not wait for the GPU), so it is submitted and waited for here.
+    const bool inPlaceTargets = std::any_of(colors.begin(), colors.end(), [](const ColorAttachment& attachment) { return attachment.resident == nullptr; });
+    if (inPlaceTargets) state.Sync();
     if (Trace()) {
         std::fprintf(stderr, "[metal] draw state: render %ux%u viewport (%.1f %.1f %.1f %.1f) scissor (%d %d %u %u) colorOutputs 0x%x\n", graphics.renderExtent.width, graphics.renderExtent.height, graphics.viewport.x, graphics.viewport.y, graphics.viewport.width, graphics.viewport.height, graphics.scissor.offset.x, graphics.scissor.offset.y, graphics.scissor.extent.width, graphics.scissor.extent.height, colorOutputs);
         for (const auto& attachment : colors) {
