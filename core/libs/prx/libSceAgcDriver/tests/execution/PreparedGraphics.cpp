@@ -304,8 +304,16 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         Require(late.snapshot->prepared->entries.size() == 2u, "a second state of the local program was not prepared at its draw");
         registry.erase(late.snapshot->codeAddress);
     }
+    // The draw's programs registered as compute shaders: a program inside a registered shader of another
+    // type is refused (an address outside every registration would be read raw).
     ShaderRegistry invalidRegistry;
-    invalidRegistry[1] = {std::make_shared<const ShaderSnapshot>(ShaderSnapshot{1, 0, 2, {}, {}})};
+    for (const auto& [address, snapshots] : registry) {
+        for (const auto& snapshot : snapshots) {
+            auto compute = *snapshot;
+            compute.type = 0;
+            invalidRegistry[address].push_back(std::make_shared<const ShaderSnapshot>(std::move(compute)));
+        }
+    }
     DrawDecode invalid{};
     invalid.state = prepared.state;
     Reject([&] { DecodeGraphicsPrograms(invalid, queue, invalidRegistry, true, true); }, "registered");
