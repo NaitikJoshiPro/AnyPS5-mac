@@ -631,8 +631,8 @@ bool EmitMslWaveInstruction(MslEmitterState& state, const IrValue& instruction) 
         Ballot(state, instruction);
         return true;
     case IrOpcode::LaneId:
-        if (state.program.Resources().stage == IrShaderStage::TessellationControl) state.Fail(instruction, "the TCS lane id is the invocation id (work package B6)");
-        state.Define(instruction, state.GuestLane());
+        // The hull program's lane is its control point, as the SPIR-V path's EmitLaneId.
+        state.Define(instruction, state.program.Resources().stage == IrShaderStage::TessellationControl ? MslTessellationInvocation(state) : state.GuestLane());
         return true;
     case IrOpcode::ReadFirstLane:
         ReadFirstLane(state, instruction);

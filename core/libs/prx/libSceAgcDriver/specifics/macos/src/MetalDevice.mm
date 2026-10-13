@@ -712,6 +712,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // varyings (Metal Feature Set Tables: mesh shading Apple7+, 1,048,575 mesh threadgroups per grid
     // on Apple9). Pipelines and draws: M2_DESIGN "SHD4 results".
     target.mesh = ShaderRecompiler::MeshTargetLimits{{static_cast<std::uint32_t>(threads.width), 1u, 1u}, static_cast<std::uint32_t>(threads.width), threadgroupMemory, 256u, 512u, 124u, threadgroupMemory, 1u, 1u};
+    // Tessellation runs on object + mesh functions (DECISIONS D24, MetalTessellation.h): 32 control
+    // points, hull outputs bounded by the 16 KiB object payload (LinkMslTessellation checks it).
+    target.tessellation = ShaderRecompiler::TessellationTargetLimits{32u, 128u, 128u, 120u, 4096u, 128u, 124u};
     return target;
 }
 

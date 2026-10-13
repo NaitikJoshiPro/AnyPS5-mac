@@ -6,6 +6,8 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Recompiler.hpp"
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -30,6 +32,29 @@ class MslEmitter {
 public:
     [[nodiscard]] MslShader Emit(const IrProgram& program, const ShaderStageInputInfo& inputInfo, const CompiledBindingLayout& bindings, const MslTargetOptions& target) const;
 };
+
+// Tessellation (DECISIONS D24, MslAbi Version 7): one tessellation stage library (Stage::Local,
+// Hull or Domain) with the function constant values of its pipeline.
+struct MslTessellationProgram {
+    const MslShader* shader = nullptr;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> constants;
+};
+
+// The object function (local + hull programs per patch) and the mesh function (software
+// tessellator + domain program) of a tessellated draw, each one self-contained library whose
+// function constants are already resolved, and the draw's launch shape: object threadgroups of
+// objectThreads threads (one per patch and instance), mesh threadgroups of meshThreads threads.
+struct MslTessellationPipeline {
+    MslShader object;
+    MslShader mesh;
+    std::uint32_t objectThreads = 0;
+    std::uint32_t meshThreads = 0;
+    std::uint32_t payloadBytes = 0;
+    std::uint32_t maxMeshThreadgroups = 0;
+    std::uint32_t topology = 0;
+};
+
+[[nodiscard]] MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local, const MslTessellationProgram& hull, const MslTessellationProgram& domain, const TessellationConfiguration& config);
 
 }
 

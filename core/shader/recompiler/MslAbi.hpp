@@ -45,7 +45,14 @@ namespace ShaderRecompiler::MslAbi {
 // slice l * samples + s; Metal shaders cannot write texture2d_ms). The sample count is function
 // constant PipelineSpecialization::SampleCountBase + resource (direct images) or the T# LAST_LEVEL of
 // the resource metadata (table images). Sampled multisampled heaps stay texture2d_ms.
-inline constexpr std::uint32_t Version = 6u;
+// Version 7: tessellation (DECISIONS D24). The local, hull and domain programs are Stage::Local,
+// Stage::Hull and Stage::Domain libraries without a stage function: each defines
+// `aps5_stage(...)` with the fixed signature of its role (MslTessellation.cpp), and
+// LinkMslTessellation wraps them in namespaces into an object function (local + hull per patch) and
+// a mesh function (software tessellator + domain program). The object stage binds the hull
+// program's descriptor table at BufferIndex::TessellationHullTable and the TessellationDraw record
+// at BufferIndex::TessellationDraw; both stages read the object payload (TessellationPayload*).
+inline constexpr std::uint32_t Version = 7u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -72,7 +79,11 @@ enum class BufferIndex : std::uint32_t {
     // Version 5: vertex functions compiled with TriangleVerticesMacro only: a TriangleVerticesHeader
     // followed by `uint guestVertex[3 * triangles]` (see TriangleVerticesHeader).
     TriangleVertices = 6u,
-    Count = 7u
+    // Version 7: tessellation object functions only (LinkMslTessellation): the hull program's
+    // descriptor table (the local program's is at DescriptorTable), and the TessellationDraw record.
+    TessellationHullTable = 7u,
+    TessellationDraw = 8u,
+    Count = 9u
 };
 
 inline constexpr std::uint32_t Index(BufferIndex index) {
@@ -255,8 +266,38 @@ enum class Stage : std::uint32_t {
     Vertex,
     Fragment,
     Object,
-    Mesh
+    Mesh,
+    // Version 7: tessellation stage libraries (no stage function, see Version).
+    Local,
+    Hull,
+    Domain
 };
+
+// Version 7: the record at BufferIndex::TessellationDraw. Object threadgroup (p, i) runs patch p of
+// instance i: its local invocations fetch control point c's vertex id from the guest index buffer at
+// indexAddress (element firstIndex + p * inputControlPoints + c, plus vertexOffset) or, for a
+// non-indexed draw (indexSize 0), as firstIndex + p * inputControlPoints + c; the instance id is
+// firstInstance + i.
+struct TessellationDraw {
+    std::uint64_t indexAddress;
+    std::uint32_t indexSize;
+    std::uint32_t firstIndex;
+    std::int32_t vertexOffset;
+    std::uint32_t firstInstance;
+    std::uint32_t reserved[2];
+};
+static_assert(std::is_standard_layout_v<TessellationDraw> && sizeof(TessellationDraw) == 32u);
+
+// Version 7: the object payload, in dwords: the raw tessellation factors as the hull program wrote
+// them (outer 0-3, inner 0-1; triangle inner at 4), the patch id, the patch's tessellated primitive
+// count, then the hull outputs at TessellationPayloadHeaderWords + byte address / 4 (control point c
+// at c * control stride, patch constants at their own addresses).
+inline constexpr std::uint32_t TessellationPayloadFactorWords = 6u;
+inline constexpr std::uint32_t TessellationPayloadPatchWord = 6u;
+inline constexpr std::uint32_t TessellationPayloadPrimitivesWord = 7u;
+inline constexpr std::uint32_t TessellationPayloadHeaderWords = 8u;
+// Metal Feature Set Tables (2026-05-21): 16,384 bytes of payload in a mesh shader pipeline.
+inline constexpr std::uint32_t TessellationPayloadBytes = 16384u;
 
 // What an emitted library declares, for the driver's pipeline and binding setup.
 struct Reflection {

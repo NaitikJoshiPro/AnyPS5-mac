@@ -158,6 +158,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslAddress.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslImage.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslStageIo.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslTessellation.cpp
 
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DummyShaders.cpp
     )

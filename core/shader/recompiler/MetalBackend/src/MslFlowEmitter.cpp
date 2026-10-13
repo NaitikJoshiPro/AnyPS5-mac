@@ -433,7 +433,9 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
 
 void EmitBarrier(MslEmitterState& state, const IrValue& instruction) {
     const auto stage = state.program.Resources().stage;
-    if (stage == IrShaderStage::Vertex) {
+    // Local and domain programs run per control point / corner in object and mesh functions, inside
+    // branches no barrier may sit in: as vertex programs, their barriers order nothing.
+    if (stage == IrShaderStage::Vertex || stage == IrShaderStage::Local || stage == IrShaderStage::TessellationEvaluation) {
         // One guest wave per primitive group on the SPIR-V path too: an s_barrier between vertex
         // invocations orders nothing unless they communicate through memory.
         for (const auto* block : state.program.BlockOrder()) {

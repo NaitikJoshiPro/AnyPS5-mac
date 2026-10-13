@@ -250,6 +250,15 @@ private:
 // assertions that the Metal compiler lays it out as MslAbi::LayoutTable does.
 [[nodiscard]] std::string MslTableDeclaration(const MslAbi::TableLayout& layout);
 
+// Tessellation stages (MslTessellation.cpp, MslAbi Version 7): the local, hull and domain programs
+// as libraries defining aps5_stage(...) (no stage function), their tessellation attribute accesses
+// and builtins (empty: not a tessellation builtin).
+[[nodiscard]] bool MslTessellationStage(IrShaderStage stage);
+bool EmitMslTessellationInstruction(MslEmitterState& state, const IrValue& instruction);
+[[nodiscard]] std::string MslTessellationBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component);
+[[nodiscard]] std::string MslTessellationInvocation(MslEmitterState& state);
+void PrepareMslTessellationStage(MslEmitterState& state);
+[[nodiscard]] std::string EmitMslTessellationStage(MslEmitterState& state, std::vector<std::string> parameters, bool hasTable);
 // The stage function's signature and module-scope declarations (MslEntryPoint.cpp).
 [[nodiscard]] std::string EmitMslEntryPoint(MslEmitterState& state);
 // Graphics stages (MslStageIo.cpp, B6): the stage-function output/input struct declarations and the

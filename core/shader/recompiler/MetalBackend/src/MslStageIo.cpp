@@ -125,7 +125,10 @@ std::uint32_t PixelLocation(MslEmitterState& state, const IrValue& instruction, 
 // EmitBuiltinU32 for vertex and pixel programs: the value's bits as a uint.
 std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
     const auto stage = StageOf(state);
-    if (stage == IrShaderStage::Vertex) {
+    if (MslTessellationStage(stage)) {
+        if (auto value = MslTessellationBuiltin(state, instruction, kind, component); !value.empty()) return value;
+    }
+    if (stage == IrShaderStage::Vertex || stage == IrShaderStage::Local) {
         switch (kind) {
         case StageInputKind::VertexIndex: return VertexId(state);
         case StageInputKind::InstanceIndex: return InstanceId(state);
@@ -211,7 +214,7 @@ void GetAttribute(MslEmitterState& state, const IrValue& instruction) {
         state.Define(instruction, PixelAttribute(state, instruction, attribute, channel));
         return;
     }
-    if (stage != IrShaderStage::Vertex) state.Fail(instruction, "attributes of this stage are not implemented in the MSL backend yet (work package B6)");
+    if (stage != IrShaderStage::Vertex && stage != IrShaderStage::Local) state.Fail(instruction, "attributes of this stage are not implemented in the MSL backend yet (work package B6)");
     if (instruction.Flags<std::uint32_t>() != 1u) {
         state.Define(instruction, VertexAttribute(state, instruction, attribute, channel));
         return;
@@ -429,7 +432,7 @@ std::string ExportPacking(MslEmitterState& state, std::uint32_t target, const st
 
 void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
     const auto stage = StageOf(state);
-    if (stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh) state.Fail(instruction, "exports of this stage are not implemented in the MSL backend yet (work package B6)");
+    if (stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh && stage != IrShaderStage::TessellationEvaluation) state.Fail(instruction, "exports of this stage are not implemented in the MSL backend yet (work package B6)");
     const auto& exports = state.program.Metadata().exportInfo;
     const auto index = instruction.Flags<ExportFlags>().index;
     if (index >= exports.size()) state.Fail(instruction, "export metadata index is out of range");
@@ -585,6 +588,9 @@ bool EmitMslStageInstruction(MslEmitterState& state, const IrValue& instruction)
     case IrOpcode::MeshRestartStart:
         MeshRestartStart(state, instruction);
         return true;
+    case IrOpcode::GetTessellationAttribute:
+    case IrOpcode::SetTessellationAttribute:
+        return EmitMslTessellationInstruction(state, instruction);
     case IrOpcode::GetInterpolationParameter:
         GetInterpolationParameter(state, instruction, false);
         return true;
@@ -600,7 +606,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     MslGraphicsInterface result;
     const auto stage = StageOf(state);
     std::string& text = result.declarations;
-    if (stage == IrShaderStage::Vertex) {
+    if (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation) {
         const auto clips = ClipDistanceCount(state) + 1u;
         if (clips > MaxClipDistances) state.Fail("guest clip distances plus the all-zero clip position distance exceed 8 clip distances");
         text += "struct Aps5VertexOut {\n    float4 aps5_position [[position]];\n";
@@ -614,8 +620,12 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                 scalars += 4u;
                 break;
             case StageOutputKind::PointSize: text += "    float aps5_point_size [[point_size]];\n"; break;
-            case StageOutputKind::Layer: text += "    uint aps5_layer [[render_target_array_index]];\n"; break;
-            case StageOutputKind::ViewportIndex: text += "    uint aps5_viewport [[viewport_array_index]];\n"; break;
+            case StageOutputKind::Layer:
+            case StageOutputKind::ViewportIndex:
+                // Domain programs run in mesh functions, whose layer and viewport are per primitive.
+                if (stage == IrShaderStage::TessellationEvaluation) state.Fail("domain programs that write the layer or viewport index (Metal mesh vertices have neither; TechnicalDebt metal-tessellation)");
+                text += output.kind == StageOutputKind::Layer ? "    uint aps5_layer [[render_target_array_index]];\n" : "    uint aps5_viewport [[viewport_array_index]];\n";
+                break;
             case StageOutputKind::CullDistance: state.Fail("cull distances have no Metal vertex output (work package B6)");
             default: break;
             }

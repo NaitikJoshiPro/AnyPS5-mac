@@ -31,9 +31,13 @@ MslAbi::Stage ReflectedStage(IrShaderStage stage) {
     case IrShaderStage::Compute:
         return MslAbi::Stage::Kernel;
     case IrShaderStage::Vertex:
-    case IrShaderStage::Local:
-    case IrShaderStage::TessellationEvaluation:
         return MslAbi::Stage::Vertex;
+    case IrShaderStage::Local:
+        return MslAbi::Stage::Local;
+    case IrShaderStage::TessellationControl:
+        return MslAbi::Stage::Hull;
+    case IrShaderStage::TessellationEvaluation:
+        return MslAbi::Stage::Domain;
     case IrShaderStage::Pixel:
         return MslAbi::Stage::Fragment;
     case IrShaderStage::Mesh:
@@ -442,8 +446,8 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     if (state.ThreadgroupStage()) state.waveUniform = WaveUniformValues(program);
     static const bool survey = std::getenv("APS5_MSL_SURVEY") != nullptr;
     state.survey = survey;
-    if (stage != IrShaderStage::Compute && stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh) state.Fail("only compute, vertex, pixel and mesh shaders are implemented in the MSL backend so far (tessellation: M3 emulation backlog)");
-    if ((stage == IrShaderStage::Vertex || stage == IrShaderStage::Mesh) && inputInfo.vertex == nullptr) state.Fail("vertex input info is missing (work package B6)");
+    if (stage != IrShaderStage::Compute && stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh && !MslTessellationStage(stage)) state.Fail("unsupported shader stage for the MSL backend");
+    if ((stage == IrShaderStage::Vertex || stage == IrShaderStage::Mesh || MslTessellationStage(stage)) && inputInfo.vertex == nullptr) state.Fail("vertex input info is missing (work package B6)");
     state.waveLdsScope = MslWaveLdsScope(state);
     EmitMslFunctionBody(state);
     const auto entry = EmitMslEntryPoint(state);

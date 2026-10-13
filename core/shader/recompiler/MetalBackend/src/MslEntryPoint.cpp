@@ -213,6 +213,8 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         state.RequirePrelude(MslPreludeChunk::Common);
         parameters.push_back("constant Aps5DriverData& aps5_driver [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DriverData)) + ")]]");
     }
+    const bool tessellation = MslTessellationStage(state.program.Resources().stage);
+    if (tessellation) PrepareMslTessellationStage(state);
     if (state.reflection.stage == MslAbi::Stage::Vertex && state.builtins.any()) {
         // Vertex functions have no [[thread_index_in_simdgroup]]: the lane is the number of active
         // lanes below this one (the hardware lane while the SIMD group is full, as vertex groups are
@@ -235,6 +237,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         return text;
     }
     if (state.reflection.stage == MslAbi::Stage::Mesh) return text + EmitMeshFunction(state, std::move(parameters));
+    if (tessellation) return text + EmitMslTessellationStage(state, std::move(parameters), state.reflection.table.bytes != 0u);
     if (state.reflection.stage != MslAbi::Stage::Vertex && state.reflection.stage != MslAbi::Stage::Fragment) state.Fail("only kernel, vertex and fragment stage functions are implemented in the MSL backend so far (work package B6)");
     // Vertex and fragment functions (B6): the guest body runs in aps5_body, which takes every stage
     // parameter (without its attribute) and the output struct by reference, so the body's returns
