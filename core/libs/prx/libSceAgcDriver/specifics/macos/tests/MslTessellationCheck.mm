@@ -16,7 +16,6 @@
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include <array>
-#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <optional>
@@ -163,13 +162,6 @@ int main() {
             const auto domain = Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor);
             const auto fragment = Compile(target, ShaderStage::Fragment, PixelCode, cursor);
             std::puts("recompiled the local, hull, domain and pixel programs");
-            for (const auto& [name, result] : {std::pair{"local", &local}, std::pair{"hull", &hull}, std::pair{"domain", &domain}}) {
-                const std::string path = std::string("build-metal/tess-dump-") + name + ".msl";
-                if (FILE* file = std::fopen(path.c_str(), "w")) {
-                    std::fputs(result->msl.Source().c_str(), file);
-                    std::fclose(file);
-                }
-            }
             const std::array<std::pair<const ShaderRecompiler::RecompileResult*, Abi::Stage>, 3> stages{{{&local, Abi::Stage::Local}, {&hull, Abi::Stage::Hull}, {&domain, Abi::Stage::Domain}}};
             for (const auto& [result, stage] : stages) {
                 Require(!result->msl.empty() && result->msl.Reflection().stage == stage, "a tessellation program does not reflect its tessellation stage");
