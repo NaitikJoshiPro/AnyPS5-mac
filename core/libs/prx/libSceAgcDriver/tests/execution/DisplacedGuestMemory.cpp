@@ -1,6 +1,7 @@
 // Guest memory in the displaced window (D31, D33: the macOS arm64 GPU carveout at 64-448 GiB and the dyld shared
 // region's unused tail, backed at guest | DisplacedFlip) reaches the GPU, at 0x4000000000 and at 0x400000000: the driver wraps the alias, a GPU fill lands in the pages the CPU sees at both the
 // guest address (through the fault handler) and the alias, and the driver's own guest reads and writes translate.
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -162,6 +163,22 @@ int main() {
                 const auto expected = AgcDriver::DecodeDisplayBuffer(display, {reinterpret_cast<const std::byte*>(GuestArena::HostAddress(Base)), size});
                 Require(pixels == expected, "displaced guest memory: the display buffer decode differs from the alias");
                 Require(faultsAfter == faultsBefore, "displaced guest memory: the display buffer decode faulted on the guest address");
+            }
+
+            // WAIT_REG_MEM label polls read the alias: a label in the window (STK's fences at 0x400000000) does not
+            // fault on every poll, 32- and 64-bit alike.
+            {
+                const std::uint64_t label = Base + 0x40;
+                reinterpret_cast<volatile std::uint64_t*>(GuestArena::HostAddress(label))[0] = 0xbeefcafe00000007ull;
+                const auto wait32 = std::array<std::uint32_t, 7>{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 7u, 0xffffffffu, 4u};
+                const auto miss32 = std::array<std::uint32_t, 7>{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 8u, 0xffffffffu, 4u};
+                const auto wait64 = std::array<std::uint32_t, 9>{0xc0079300u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 7u, 0xbeefcafeu, 0xffffffffu, 0xffffffffu, 4u};
+                const auto faults = Faults();
+                for (int poll = 0; poll < 1000; ++poll) {
+                    Require(AgcDriver::Pm4::WaitSatisfiedUnchecked(wait32) && !AgcDriver::Pm4::WaitSatisfiedUnchecked(miss32), "displaced guest memory: a 32-bit label poll misread the label");
+                    Require(AgcDriver::Pm4::WaitSatisfiedUnchecked(wait64), "displaced guest memory: a 64-bit label poll misread the label");
+                }
+                Require(Faults() == faults, "displaced guest memory: label polls faulted on the guest address (" + std::to_string(Faults() - faults) + " faults)");
             }
 
             GuestAllocations::Mutation().Remove(guest);

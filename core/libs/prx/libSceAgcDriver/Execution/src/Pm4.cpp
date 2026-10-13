@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include <algorithm>
 #include <thread>
@@ -540,7 +541,9 @@ bool WaitSatisfied(std::span<const std::uint32_t> packet) {
 
 bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
-    const auto source = address(packet[2], packet[3]);
+    // Labels in the displaced window (D31/D33: STK's buffers at 0x400000000) are polled at their alias, so a
+    // poll does not take the fault handler's path on every load.
+    const auto source = GuestArena::HostRange(static_cast<std::uintptr_t>(address(packet[2], packet[3])), wide ? 8u : 4u);
     const std::uint64_t value = wide ? *reinterpret_cast<const volatile std::uint64_t*>(source) : *reinterpret_cast<const volatile std::uint32_t*>(source);
     return waitCompares(packet, wide, value);
 }
