@@ -108,6 +108,9 @@ struct PixelCase {
     std::uint32_t barycentrics;
     bool alphaToCoverage = false;
     std::uint32_t outputMode = 9u;
+    // MslAbi Version 9 (DECISIONS D28): the qualifier of host-interpolated input 0, by the I/J pair
+    // the program's v_interp_p2 reads (empty: not checked).
+    const char* qualifier = "";
 };
 
 ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTarget& target, const PixelCase& test, std::uint32_t vertexPush) {
@@ -130,6 +133,8 @@ ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTa
     pixel.inputAddr = test.inputs;
     pixel.hasPerspectiveCenterVgpr = (test.inputs & PixelInputBit(PixelInput::PerspectiveCenter)) != 0u;
     pixel.noPerspective = (test.inputs & PixelInputBit(PixelInput::LinearCenter)) != 0u;
+    pixel.perspectiveCentroid = (test.inputs & PixelInputBit(PixelInput::PerspectiveCentroid)) != 0u;
+    pixel.linearCentroid = (test.inputs & PixelInputBit(PixelInput::LinearCentroid)) != 0u;
     pixel.targetOutputMode[0] = test.outputMode;
     pixel.alphaToCoverage = test.alphaToCoverage;
     pixel.targetExportMapping.fill(0xe4u);
@@ -219,8 +224,12 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
         // Alpha to coverage starts from full coverage (SPIR-V: StoreCoverage(-1)); only a float MRT0
         // export lowers it, so a uint export must keep every sample.
         Require(Has(source, "aps5_out.aps5_sample_mask = 0xffffffffu;") && Has(source, "[[sample_mask]]"), name + ": alpha to coverage does not start from full coverage");
-        Require(Has(source, "aps5_out.aps5_sample_mask = !(as_type<float>(") == (test.outputMode != 7u), name + ": the alpha test does not match the export type");
+        // MslAbi Version 9: the measured proportional mask (DECISIONS D28), over the guest sample count.
+        Require(Has(source, "aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(") == (test.outputMode != 7u), name + ": the alpha-to-coverage mask does not match the export type");
+        Require(Has(source, "#define APS5_SAMPLE_COUNT get_num_samples()") == (test.outputMode != 7u), name + ": the alpha-to-coverage mask has no guest sample count default");
+        Require(Has(source, "#if APS5_SAMPLE_BASE"), name + ": the exported mask is not shifted to the pass's samples");
     }
+    if (*test.qualifier != '\0') Require(Has(source, std::string(" [[user(locn0), ") + test.qualifier + "]]"), name + ": input 0 is not interpolated with " + test.qualifier);
     const auto format = test.outputMode == 7u ? MTLPixelFormatRGBA32Uint : MTLPixelFormatRGBA32Float;
     Link(device, name, vertex, pixel, 0u, format);
     Link(device, name, vertex, pixel, 1u, format);
@@ -246,7 +255,7 @@ int main() {
             const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
             const auto linear = PixelInputBit(PixelInput::LinearCenter);
             const auto position = PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY);
-            const std::array<PixelCase, 8> cases{{
+            const std::array<PixelCase, 13> cases{{
                 {"perspective I/J", BarycentricPixelCode, perspective, false, 64u, 0u, 1u},
                 {"linear I/J", BarycentricPixelCode, linear, false, 64u, 0u, 2u},
                 {"v_interp_mov P10/P20/P0", VertexValuePixelCode, perspective, false, 64u, 1u, 0u},
@@ -255,6 +264,13 @@ int main() {
                 {"16-bit interpolation wave32", F16PixelCode, perspective | position, true, 32u, 1u, 1u},
                 {"alpha to coverage, float export", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u, true, 9u},
                 {"alpha to coverage, uint export", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u, true, 7u},
+                // The same v_interp_p1/p2 over the I/J pair of each location (the only enabled pair
+                // is v0/v1): the input's MSL interpolation qualifier follows it.
+                {"host v_interp at the center", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u, false, 9u, "center_perspective"},
+                {"host v_interp at the sample (PERSP_SAMPLE)", InterpolatedPixelCode, PixelInputBit(PixelInput::PerspectiveSample), false, 64u, 0u, 0u, false, 9u, "sample_perspective"},
+                {"host v_interp at the sample (LINEAR_SAMPLE)", InterpolatedPixelCode, PixelInputBit(PixelInput::LinearSample), false, 64u, 0u, 0u, false, 9u, "sample_no_perspective"},
+                {"host v_interp at the centroid (PERSP_CENTROID)", InterpolatedPixelCode, PixelInputBit(PixelInput::PerspectiveCentroid), false, 64u, 0u, 0u, false, 9u, "centroid_perspective"},
+                {"host v_interp at the centroid (LINEAR_CENTROID)", InterpolatedPixelCode, PixelInputBit(PixelInput::LinearCentroid), false, 64u, 0u, 0u, false, 9u, "centroid_no_perspective"},
             }};
             for (const auto& test : cases) Check(metal, target, vertex, test);
         }

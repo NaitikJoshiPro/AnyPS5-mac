@@ -136,6 +136,15 @@ struct HostSamples {
     std::uint32_t slices = 1;
 };
 HostSamples HostSamplesOf(id<MTLDevice> device, std::uint32_t guestSamples);
+// The cost of the emulation, cumulative (MetalDraw.mm): draws recorded over several slices, the
+// slice passes they recorded and how many of those began a render pass (the others continued the
+// open one).
+struct EmulatedSampleStatistics {
+    std::uint64_t draws = 0;
+    std::uint64_t slicePasses = 0;
+    std::uint64_t begun = 0;
+};
+EmulatedSampleStatistics EmulatedSampleCounts();
 
 // A CB resolve (DECISIONS D27): every pixel of `destination` (single-sample, the same pixel format
 // and extent) becomes the box-filtered average of `source`'s samples, through a render pass whose

@@ -42,6 +42,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -306,6 +307,10 @@ Metal::DrawCache& VulkanDevice::State::Draws() {
 }
 
 namespace {
+
+std::atomic<std::uint64_t> emulatedDraws{0};
+std::atomic<std::uint64_t> emulatedSlicePasses{0};
+std::atomic<std::uint64_t> emulatedBegun{0};
 
 // One color attachment of a draw.
 struct ColorAttachment {
@@ -1409,6 +1414,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
         recorder.LeaveRenderPassOpen(slicePassKey, Recorder::NoTiming, false, access, std::move(afterPass));
         anyContinued |= continued;
+        if (slices > 1u) {
+            emulatedSlicePasses.fetch_add(1u, std::memory_order_relaxed);
+            if (!continued) emulatedBegun.fetch_add(1u, std::memory_order_relaxed);
+        }
     };
     // Begun at the slice whose pass the recorder holds open: consecutive draws then share passes
     // (slices are independent targets, so their order between slices is free).
@@ -1417,6 +1426,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (cache.passKey == slicePassKeyOf(slice)) firstSlice = slice;
     }
     for (std::uint32_t index = 0; index < slices; ++index) recordSlice((firstSlice + index) % slices);
+    if (slices > 1u) emulatedDraws.fetch_add(1u, std::memory_order_relaxed);
 
     // Resident targets: the results stay on the GPU until something reads the target's memory.
     for (const auto& attachment : colors) {
@@ -1452,6 +1462,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
     }
     if (Trace()) std::fprintf(stderr, "[metal] draw %llu commands recorded in %u slice pass(es), %zu color targets, depth %s, pass %s\n", static_cast<unsigned long long>(recorded), slices, colors.size(), depth != nullptr ? "yes" : "no", anyContinued ? "continued" : "begun");
+}
+
+namespace Graphics::Metal {
+
+EmulatedSampleStatistics EmulatedSampleCounts() {
+    return {emulatedDraws.load(std::memory_order_relaxed), emulatedSlicePasses.load(std::memory_order_relaxed), emulatedBegun.load(std::memory_order_relaxed)};
+}
+
 }
 
 std::optional<ShaderRecompiler::GeometryStageLimits> VulkanDevice::GeometryLimits() const {
