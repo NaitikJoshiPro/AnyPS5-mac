@@ -246,7 +246,8 @@ std::string PipelineCache::RenderKey(const RenderPipelineRequest& request) {
     else key += "-\n";
     for (const auto& color : request.colors) AppendColor(key, color);
     for (const auto value : {static_cast<std::uint64_t>(request.depthFormat), static_cast<std::uint64_t>(request.stencilFormat), static_cast<std::uint64_t>(request.rasterSampleCount), static_cast<std::uint64_t>(request.alphaToCoverage),
-                             static_cast<std::uint64_t>(request.alphaToOne), static_cast<std::uint64_t>(request.rasterization), static_cast<std::uint64_t>(request.topology)}) {
+                             static_cast<std::uint64_t>(request.alphaToOne), static_cast<std::uint64_t>(request.rasterization), static_cast<std::uint64_t>(request.topology),
+                             static_cast<std::uint64_t>(request.mesh), static_cast<std::uint64_t>(request.meshThreads)}) {
         key += std::to_string(value) + ',';
     }
     return key;
@@ -302,6 +303,7 @@ id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& 
 }
 
 id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineRequest& request) {
+    if (request.mesh) return buildMeshRender(request);
     @autoreleasepool {
         MTL4RenderPipelineDescriptor* descriptor = [MTL4RenderPipelineDescriptor new];
         descriptor.vertexFunctionDescriptor = functionDescriptor(request.vertex);

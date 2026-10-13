@@ -98,6 +98,10 @@ struct RenderPipelineRequest {
     bool alphaToOne = false;
     bool rasterization = true;
     MTLPrimitiveTopologyClass topology = MTLPrimitiveTopologyClassUnspecified;
+    // `vertex` is an MSL mesh function: an MTL4MeshRenderPipelineDescriptor (MetalMesh.mm, B6),
+    // `meshThreads` its threads per mesh threadgroup (Reflection::threadsPerThreadgroup).
+    bool mesh = false;
+    std::uint32_t meshThreads = 0;
     // Vertex amplification and raster order groups are not used by M2.
 };
 
@@ -166,6 +170,7 @@ private:
     std::shared_ptr<Entry> entryFor(const std::string& key, bool* created);
     id<MTLComputePipelineState> buildCompute(const PipelineFunction& function);
     id<MTLRenderPipelineState> buildRender(const RenderPipelineRequest& request);
+    id<MTLRenderPipelineState> buildMeshRender(const RenderPipelineRequest& request);
     MTL4FunctionDescriptor* functionDescriptor(const PipelineFunction& function);
     void submit(std::function<void()> task);
     void worker();

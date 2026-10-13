@@ -24,6 +24,7 @@
 #include "MetalImages.h"
 #include "MetalVulkanImages.h"
 #include "MetalDepthSurfaces.h"
+#include "MetalMesh.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -506,7 +507,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const auto& vertexReflection = vertexResult.msl.Reflection();
     const auto* fragmentResult = fragment != nullptr ? fragment->program : nullptr;
     const Abi::Reflection* fragmentReflection = fragmentResult != nullptr ? &fragmentResult->msl.Reflection() : nullptr;
-    if (vertexReflection.stage != Abi::Stage::Vertex) Fail("the vertex stage's MSL is not a vertex function");
+    // Mesh draws (B6 stage 5, MetalMesh.h): the "vertex" stage is the NGG primitive shader's mesh function.
+    const bool mesh = vertexReflection.stage == Abi::Stage::Mesh && graphics.stages.mesh.has_value();
+    if (vertexReflection.stage != Abi::Stage::Vertex && !mesh) Fail("the vertex stage's MSL is not a vertex function");
     if (fragmentReflection != nullptr && fragmentReflection->stage != Abi::Stage::Fragment) Fail("the pixel stage's MSL is not a fragment function");
     if (vertexReflection.workgroupMemoryStrideDwords != 0u || (fragmentReflection != nullptr && fragmentReflection->workgroupMemoryStrideDwords != 0u)) Fail("device-memory LDS in a draw stage");
     if (graphics.samples > 1u) Fail("multisampled draws (" + std::to_string(graphics.samples) + " samples)");
@@ -516,6 +519,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const std::uint32_t conservativeMode = graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT ? 1u : graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT ? 2u : 0u;
     const bool perVertex = fragmentReflection != nullptr && (fragmentReflection->perVertexLocations != 0u || fragmentReflection->emulatedBarycentrics != 0u);
     const bool triangleVertices = conservativeMode != 0u || perVertex;
+    if (mesh && triangleVertices) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of mesh draws");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
     // The draws to record: direct, or the indirect records read on the CPU (through the checked
@@ -544,6 +548,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (!draw.indexed) calls.back().first = draw.firstVertex;
     }
     if (calls.empty()) return;
+    Graphics::Metal::MeshDrawPlan meshPlan;
+    if (mesh) {
+        std::span<const std::byte> indices;
+        if (draw.indexed) {
+            const auto bytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+            state.SettleRange(draw.indexAddress, bytes);
+            indices = std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), bytes);
+        }
+        meshPlan = Graphics::Metal::PlanMeshDraw(graphics, draw, indices);
+        if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
+    }
 
     const auto primitive = graphics.rectList ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
     if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
@@ -702,6 +717,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // per-face depth bias (as upstream's secondChannel and backFaces pipelines).
     Graphics::Metal::RenderPipelineRequest request;
     request.vertex = Graphics::Metal::PipelineFunction::From(vertexResult);
+    request.mesh = mesh;
+    request.meshThreads = mesh ? vertexReflection.threadsPerThreadgroup[0] : 0u;
     if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
@@ -757,7 +774,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // B6 emulates alpha-to-coverage in the fragment function's [[sample_mask]] (the guest's rule);
     // Metal's own would apply on top.
     request.alphaToCoverage = graphics.alphaToCoverage && !(fragmentReflection != nullptr && fragmentReflection->exportsSampleMask);
-    request.topology = primitive.topologyClass;
+    request.topology = mesh ? MTLPrimitiveTopologyClassUnspecified : primitive.topologyClass;
     struct PipelinePass {
         id<MTLRenderPipelineState> pipeline;
         MTLCullMode cull;
@@ -823,7 +840,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
     // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
     const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
-    const bool expand = primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint);
+    const bool expand = !mesh && (primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
     if (expand) {
@@ -1035,6 +1052,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     };
     const auto vertexTable = state.WriteTable(vertexResult, snapshots, stream, vertexPlan, copyPush(vertexResult, vertex.pushConstantOffset));
     const auto fragmentTable = fragmentResult != nullptr ? state.WriteTable(*fragmentResult, snapshots, stream, fragmentPlan, copyPush(*fragmentResult, fragment->pushConstantOffset)) : 0u;
+    if (mesh) {
+        // The mesh draw words after the mesh function's own push data (pushDrawConstants).
+        if (vertexResult.pushConstants.size() > ShaderRecompiler::MeshDrawPushOffsetBytes) Fail("mesh push constants overlap the mesh draw words");
+        auto words = meshPlan.words;
+        if (!meshPlan.arguments.empty()) {
+            const auto arguments = stream.Write(std::span<const std::byte>(meshPlan.arguments), 16u).address;
+            words[4] = static_cast<std::uint32_t>(arguments);
+            words[5] = static_cast<std::uint32_t>(arguments >> 32u);
+        }
+        std::memcpy(push.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
+    }
     const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     const auto driverAddress = state.WriteDriverData(stream, {0u, 0u, 0u});
     std::uint64_t fetchAddress = driverAddress;
@@ -1073,7 +1101,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         rasterOrderAddress = cache.rasterOrder.gpuAddress;
     }
     [cache.fragmentArguments setAddress:rasterOrderAddress atIndex:Abi::Index(Abi::BufferIndex::RasterOrder)];
-    [encoder setArgumentTable:cache.vertexArguments atStages:MTLRenderStageVertex];
+    [encoder setArgumentTable:cache.vertexArguments atStages:mesh ? MTLRenderStageMesh : MTLRenderStageVertex];
     [encoder setArgumentTable:cache.fragmentArguments atStages:MTLRenderStageFragment];
 
     // Dynamic state. Vulkan's viewport transform is y_fb = y + (1 + y_ndc) h / 2, Metal's
@@ -1164,6 +1192,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             [encoder setRenderPipelineState:pass.pipeline];
             [encoder setCullMode:pass.cull];
             [encoder setDepthBias:pass.biasConstant slopeScale:pass.biasSlope clamp:graphics.depthBias ? graphics.depthBiasClamp : 0.0f];
+            if (mesh) {
+                // Grid (mesh groups, instances): the mesh function's WorkgroupId x and y.
+                [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
+                stream.CountCommand();
+                ++recorded;
+                held->objects.push_back(pass.pipeline);
+                continue;
+            }
             for (const auto& call : drawCalls) {
                 if (call.count == 0u || call.instances == 0u) continue;
                 if (graphics.rectList) {
@@ -1309,12 +1345,15 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
     for (const auto& shader : shaders) {
-        if (shader.stage == ShaderRecompiler::ShaderStage::Vertex && vertex == nullptr) vertex = &shader;
+        if ((shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Mesh) && vertex == nullptr) vertex = &shader;
         else if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && fragment == nullptr) fragment = &shader;
-        else Fail("draws with a " + std::to_string(static_cast<int>(shader.stage)) + " stage (geometry, tessellation and mesh paths are not implemented)");
+        else Fail("draws with a " + std::to_string(static_cast<int>(shader.stage)) + " stage (the tessellation path is not implemented)");
     }
-    if (vertex == nullptr) Fail("a draw without a vertex stage");
-    if (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh || graphics.stages.tessellation) Fail("the geometry, tessellation and mesh shader paths");
+    if (vertex == nullptr) Fail("a draw without a vertex or mesh stage");
+    // Mesh draws: the geometry path's NGG primitive shader as a mesh function (MetalMesh.h).
+    const bool meshDraw = vertex->stage == ShaderRecompiler::ShaderStage::Mesh;
+    if (graphics.stages.tessellation) Fail("the tessellation shader path");
+    if (meshDraw ? (graphics.stages.path != Graphics::ShaderPath::Geometry || !graphics.stages.mesh) : (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh)) Fail("the geometry shader path without a mesh configuration, or a mesh configuration on the vertex path");
     for (const auto* shader : {vertex, fragment}) {
         if (shader == nullptr) continue;
         if (shader->program->msl.empty()) throw std::runtime_error("Metal device: the shader has no MSL form (recompile it for the device's Target(), whose backend is Msl)");
@@ -1328,9 +1367,10 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
-    if (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh || graphics.stages.tessellation) return std::string("Metal draw (work package D6): the geometry, tessellation and mesh shader paths are not implemented");
+    const bool meshPath = graphics.stages.path == Graphics::ShaderPath::Geometry && graphics.stages.mesh;
+    if ((graphics.stages.path != Graphics::ShaderPath::Vertex && !meshPath) || graphics.stages.tessellation) return std::string("Metal draw (work package D6): the tessellation shader path and the geometry path without a mesh configuration are not implemented");
     for (const auto& shader : shaders) {
-        if (shader.stage != ShaderRecompiler::ShaderStage::Vertex && shader.stage != ShaderRecompiler::ShaderStage::Fragment) return std::string("Metal draw (work package D6): only vertex and pixel stages are implemented");
+        if (shader.stage != ShaderRecompiler::ShaderStage::Vertex && shader.stage != ShaderRecompiler::ShaderStage::Fragment && shader.stage != ShaderRecompiler::ShaderStage::Mesh) return std::string("Metal draw (work package D6): only vertex, mesh and pixel stages are implemented");
     }
     if (graphics.samples > 1u) return std::string("Metal draw (work package D6): multisampled draws are not implemented");
     return std::nullopt;
