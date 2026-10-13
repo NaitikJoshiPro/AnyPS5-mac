@@ -256,14 +256,15 @@ static_assert(std::is_standard_layout_v<TriangleVerticesHeader> && sizeof(Triang
 // as the guest's ordered (POPS) pixel shaders and SPV_EXT_fragment_shader_interlock do.
 inline constexpr std::uint32_t RasterOrderBytes = 16384u;
 
-// Size of the lock table DriverData::atomicLocks points at (1024 words, zero-filled by the driver):
-// words [0, AtomicLockWords) are the 64-bit atomic lock words, hashed by address; the two words at
-// ClockCounterWord (low, high) count the emulated shader clock reads (s_memtime, s_memrealtime:
-// MSL has no shader clock, MslFlowEmitter.cpp EmitClock). The rest is unused.
+// Size of the lock table DriverData::atomicLocks points at: AtomicLockWords 64-bit atomic lock
+// words, hashed by address. The driver allocates AtomicLockAllocationBytes, zero-filled: after the
+// lock words, the two words at ClockCounterWord (low, high) count the emulated shader clock reads
+// (s_memtime, s_memrealtime: MSL has no shader clock, MslFlowEmitter.cpp EmitClock).
 inline constexpr std::uint32_t AtomicLockTableBytes = 4096u;
-inline constexpr std::uint32_t AtomicLockWords = 512u;
-inline constexpr std::uint32_t ClockCounterWord = 512u;
-static_assert((AtomicLockWords & (AtomicLockWords - 1u)) == 0u && ClockCounterWord >= AtomicLockWords && (ClockCounterWord + 2u) * 4u <= AtomicLockTableBytes);
+inline constexpr std::uint32_t AtomicLockWords = AtomicLockTableBytes / 4u;
+inline constexpr std::uint32_t ClockCounterWord = AtomicLockWords;
+inline constexpr std::uint32_t AtomicLockAllocationBytes = AtomicLockTableBytes + 16u;
+static_assert((AtomicLockWords & (AtomicLockWords - 1u)) == 0u && (ClockCounterWord + 2u) * 4u <= AtomicLockAllocationBytes);
 
 static_assert(std::is_standard_layout_v<DriverData> && sizeof(DriverData) == 32u && offsetof(DriverData, faultBuffer) == 16u);
 

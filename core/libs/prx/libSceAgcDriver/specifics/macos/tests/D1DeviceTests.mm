@@ -419,7 +419,8 @@ void CheckAddressTable(AgcDriver::VulkanDevice& device) {
 
 // MslAbi v2: DriverData.atomicLocks is the device's zero-filled AtomicLockTableBytes table, the
 // same for every dispatch; a kernel can take and release a lock word in it. Only the lock words
-// (AtomicLockWords) must be free: the emulated shader clock counts in the words after them.
+// (AtomicLockWords) must be free: the emulated shader clock counts in the words after them
+// (AtomicLockAllocationBytes).
 void CheckAtomicLocks(AgcDriver::VulkanDevice& device) {
     alignas(16384) static std::array<std::uint32_t, 64> output {};
     output.fill(0xdeadbeefu);
