@@ -815,13 +815,15 @@ void EmitQueryDimensions(MslEmitterState& state, const Access& access) {
     const auto lodArg = ms ? std::string() : lod;
     result[0] = texture + ".get_width(" + lodArg + ")";
     if (ms) {
-        // MslAbi Version 9: the guest's sample count in w (DECISIONS D28: the T#'s 1 << LAST_LEVEL,
-        // as Mesa's ac_nir_lower_resinfo derives the MSAA resinfo from the descriptor) and layers in
-        // guest layers (emulated 8x targets hold two host slices per layer).
+        // MslAbi Version 9 (DECISIONS D28): w is the T#'s level count LAST_LEVEL - BASE_LEVEL + 1,
+        // which MSAA T#s fill with log2(samples) (BASE_LEVEL is 0: MultisampleSampledTexture), i.e.
+        // log2(samples) + 1. RDNA has no sample-count query; compilers read 1 << LAST_LEVEL from the
+        // T# (Mesa ac_nir_lower_resinfo query_samples). Layers are guest layers (emulated 8x targets
+        // hold two host slices per layer).
         const auto samples = SampledMultisample(state, access, texture, false);
         result[1] = texture + ".get_height()";
         if (dimension == RdnaImageDimension::Dim2DMsaaArray) result[2] = "(" + texture + ".get_array_size() / " + samples.slicesPerLayer + ")";
-        result[3] = samples.guestSamples;
+        result[3] = "(ctz(" + samples.guestSamples + ") + 1u)";
         state.Define(access.inst, "uint4(" + result[0] + ", " + result[1] + ", " + result[2] + ", " + result[3] + ")");
         return;
     }

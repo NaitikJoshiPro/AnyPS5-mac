@@ -59,7 +59,8 @@ namespace ShaderRecompiler::MslAbi {
 // Version 9: multisampling (DECISIONS D28). Sampled heaps of both MSAA dimensions are
 // texture2d_ms_array: guest layer l, sample s of a view whose texture holds h samples per slice is
 // slice l * (n / h) + s / h, sample s % h, n the guest sample count (SampleCountBase + resource,
-// now supplied for sampled MSAA views too, or the table metadata's T#); size queries return n in w.
+// now supplied for sampled MSAA views too, or the table metadata's T#); size queries return log2(n) + 1
+// (the T#'s level count) in w and guest layers in z.
 // Fragment functions take SampleBaseMacro (an 8x target emulated as two 4x halves draws each half
 // with base 0 and 4), interpolate inputs at the location the guest's I/J pair names
 // (center/centroid/sample) and take [[sample_id]] under PS_ITER_SAMPLE.
