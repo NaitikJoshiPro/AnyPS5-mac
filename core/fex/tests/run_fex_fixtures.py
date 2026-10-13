@@ -166,6 +166,7 @@ COMPILED = {
                   "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, ["-O2"]), 43),
     "code-churn": (lambda d: compiled_executable(d, [str(HERE / "code_churn.cpp")], {"libc.prx": ["exit"],
                    "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, ["-O2"]), 43),
+    "console-syscall": (lambda d: compiled_executable(d, [str(HERE / "console_syscall.cpp")], {"libc.prx": ["exit"]}), 43),
     "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
                    "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }

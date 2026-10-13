@@ -24,6 +24,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Cond.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/AttrPrio.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ConsoleSyscall.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/GuestTlsMacOs.cpp
@@ -399,6 +400,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_pthread_attr_errors PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_pthread_attr_errors PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_console_syscall_tests ${LIBS_INCLUDE_DIR}/tests/GuestConsoleSyscall.cpp)
+    target_include_directories(guest_console_syscall_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_console_syscall_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_console_syscall_tests)
+    add_test(NAME guest_console_syscall COMMAND guest_console_syscall_tests)
+    set_tests_properties(guest_console_syscall PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_console_syscall PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_pthread_attr_prio_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadAttrPrio.cpp)

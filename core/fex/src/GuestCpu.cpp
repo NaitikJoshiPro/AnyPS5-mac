@@ -4,6 +4,7 @@
 #include "Bridge.hpp"
 #include "CodeCache.hpp"
 #include "CodePool.hpp"
+#include "ConsoleSyscalls.hpp"
 #include "GuestProgram.hpp"
 #include "Options.hpp"
 
@@ -553,6 +554,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     state->context->SetThunkHandler(Bridge::Thunks());
     state->context->EnableExitOnHLT();
     if (!state->context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
+    if (const std::uint64_t gadget = CreateConsoleSyscallGadget(bridge)) state->context->AddThunkTrampolineIRHandler(ConsoleSyscallGadget, gadget);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
