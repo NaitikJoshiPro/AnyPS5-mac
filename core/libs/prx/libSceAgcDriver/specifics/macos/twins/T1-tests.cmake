@@ -9,6 +9,12 @@ list(APPEND agcMetalTwins
         "tests/Recorder.cpp=specifics/macos/tests/RecorderTwin.mm"
         "tests/ResidentPresent.cpp=specifics/macos/tests/RecorderTwin.mm"
         "tests/BdaDevice.cpp=specifics/macos/tests/BdaDeviceTwin.mm"
+        # agc_driver_graphics_tests compiles the texture twins without
+        # Execution/src/VulkanDevice.cpp, which carries D4's Metal::Vk image calls in the library
+        # (each target gets a twin source once).
+        "Graphics/src/Texture.cpp=specifics/macos/src/MetalVulkanImages.mm"
+        "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextures.mm"
+        "Graphics/src/Texture.cpp=specifics/macos/src/MetalTextureFormat.mm"
         "tests/execution/PipelineOptimizedReadback.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/OversizedDescriptorSets.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/PooledBufferRange.cpp=specifics/macos/tests/PendingTwins.mm"
