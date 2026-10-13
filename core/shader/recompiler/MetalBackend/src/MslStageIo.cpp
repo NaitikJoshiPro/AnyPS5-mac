@@ -195,6 +195,11 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             return "aps5_layer_in";
         case StageInputKind::HelperInvocation:
             return "(simd_is_helper_thread() ? 1u : 0u)";
+        case StageInputKind::LayerExported:
+            // Upstream #5097 (EmitBuiltinU32): 1 when the draw's last geometry stage exports a render
+            // target index (PipelineSpecialization::LayerExported, default 0); the ancillary word's
+            // bits 16-26 read Layer times this (ConstantFolder::ComposePackedAncillary).
+            return state.FunctionConstant(PipelineSpecialization::LayerExported, 0u);
         case StageInputKind::RasterPrimitive:
             // Upstream #4031 (EmitBuiltinU32): the rasterized primitive class of the pipeline
             // (Recompiler.hpp RasterPrimitive), PipelineSpecialization::RasterPrimitive, default
@@ -846,7 +851,13 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     // program): the stage function brackets the guest body with raster-order-group accesses
     // (EmitMslEntryPoint, BufferIndex::RasterOrder).
     if (pixel.psOrderedPixelShader) state.reflection.rasterOrder = true;
-    if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable && !pixel.psStencilRefExportEnable && !pixel.psAlphaToCoverage) {
+    // Upstream #4210 (SpirvModuleSetup DefineModule): the front end decides earlyZ (DB_SHADER_CONTROL
+    // DEPTH_BEFORE_SHADER, or Z_ORDER 1/3 without kill and exports) and the backend keeps only the
+    // alpha-to-coverage exception, so a killing or mask-exporting shader can test early. Metal also
+    // refuses [[early_fragment_tests]] on a function that returns [[depth]] or [[stencil]] (MSL
+    // specification 5.1.2), so depth and stencil exports keep late tests here (Vulkan ignores those
+    // writes under EarlyFragmentTests; TechnicalDebt metal-early-depth-export).
+    if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.psDepthExportEnable && !pixel.psStencilRefExportEnable) {
         // Conservative rasterization discards in the stage function (MslConservative), which
         // early fragment tests would not wait for.
         result.attributes = "#if !(defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE)\n[[early_fragment_tests]]\n#endif\n";

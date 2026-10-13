@@ -80,7 +80,18 @@ namespace ShaderRecompiler::MslAbi {
 // - vertex and local programs of a target without vertexSubgroups (#4470) run as one-lane waves
 //   (the front end's host subgroup size 1): the library maps the SIMD-group functions to their
 //   one-lane values (MslEmitter.cpp SingleLaneDefines).
-inline constexpr std::uint32_t Version = 10u;
+// Version 11 (upstream sync to fdefd7660):
+// - the hull's patch constants are a record of ceil(tessellationPatchStride / 4) dwords after the
+//   control points in the object payload, each constant at its off-chip address modulo the record
+//   stride (#4163; was the hull's written range, compacted), and domain programs read it (patch
+//   inputs);
+// - new function constant PipelineSpecialization::LayerExported (pixel functions reading the
+//   ancillary word's render target index, #5097: [[render_target_array_index]] times the constant);
+// - GDS plain reads and writes are relaxed atomics (the coherent gds buffer, #4279);
+// - pixel functions take [[early_fragment_tests]] whenever the request's earlyZ is set without
+//   alpha-to-coverage, depth or stencil export (#4210: kill and sample-mask exports no longer keep
+//   tests late).
+inline constexpr std::uint32_t Version = 11u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -341,7 +352,7 @@ static_assert(std::is_standard_layout_v<TessellationDraw> && sizeof(Tessellation
 // them in the tessellator's order (outer 0-3, inner 0-1; triangle inner at 4; isoline density at 0
 // and detail at 1, the reverse of the ring; Version 8: clamped by the object stage), the patch id, the patch's tessellated primitive
 // count, then the hull outputs at TessellationPayloadHeaderWords + byte address / 4 (control point c
-// at c * control stride, patch constants at their own addresses).
+// at c * control stride; Version 11: then the patch-constant record, offsets modulo its stride).
 inline constexpr std::uint32_t TessellationPayloadFactorWords = 6u;
 inline constexpr std::uint32_t TessellationPayloadPatchWord = 6u;
 inline constexpr std::uint32_t TessellationPayloadPrimitivesWord = 7u;

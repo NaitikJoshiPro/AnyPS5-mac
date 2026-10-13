@@ -22,8 +22,9 @@
 //   bit for bit against it on the CPU (agc_metal_tessellator).
 // The tessellation rings and LDS accesses arrive lowered (TessellationLowering): Get/Set
 // TessellationAttribute with byte addresses inside one vertex's LDS slot (local outputs), the patch's
-// LDS (hull inputs), one control point (hull control outputs), the patch-constant addresses (hull
-// patch outputs), the patch's control points (domain inputs) or the factor record (factors).
+// LDS (hull inputs), one control point (hull control outputs), the patch-constant record (hull
+// patch outputs, domain patch inputs; offsets modulo the record stride), the patch's control points
+// (domain inputs) or the factor record (factors).
 
 namespace ShaderRecompiler {
 
@@ -52,32 +53,22 @@ std::uint32_t ControlWords(const MslEmitterState& state) {
     return state.program.Metadata().tessellationControlStride / 4u;
 }
 
-// The hull program's patch-constant byte range [begin, end) (immediate addresses, as the SPIR-V path's
-// tessPatchBase): patch constants follow the control points in the payload, compacted.
-std::pair<std::uint32_t, std::uint32_t> PatchRange(const MslEmitterState& state) {
-    std::uint32_t begin = 0xffffffffu;
-    std::uint32_t end = 0u;
-    for (const auto* block : state.program.BlockOrder()) {
-        for (const auto* instruction : block->Instructions()) {
-            if (instruction->Opcode() != IrOpcode::SetTessellationAttribute) continue;
-            if (instruction->Argument(0)->Resolve()->ImmediateU32() != static_cast<std::uint32_t>(TessellationAttribute::PatchOutput)) continue;
-            const auto* address = instruction->Argument(1)->Resolve();
-            if (!address->HasImmediate()) state.Fail(*instruction, "tessellation patch output offset must be immediate");
-            begin = std::min(begin, address->ImmediateU32());
-            end = std::max(end, address->ImmediateU32() + 4u);
-        }
-    }
-    return {begin == 0xffffffffu ? 0u : begin, end};
+// Patch-constant record dwords (upstream #4163, SpirvModuleEmitter DefineTessellationInterfaces):
+// TessellationLowering places every hull patch output and domain patch input at its off-chip address
+// modulo the record stride (ProgramMetadata::tessellationPatchStride), so the hull and the domain
+// program, compiled apart, agree on each constant's slot.
+std::uint32_t PatchWords(const MslEmitterState& state) {
+    return (state.program.Metadata().tessellationPatchStride + 3u) / 4u;
 }
 
 std::uint32_t ControlPointWords(const MslEmitterState& state) {
     return Tessellation(state).outputControlPoints * ControlWords(state);
 }
 
-// Hull outputs in payload dwords after the header: every control point, then the patch constants.
+// Hull outputs in payload dwords after the header: every control point, then the patch-constant
+// record.
 std::uint32_t PayloadWords(const MslEmitterState& state) {
-    const auto [begin, end] = PatchRange(state);
-    return ControlPointWords(state) + (end - begin) / 4u;
+    return ControlPointWords(state) + PatchWords(state);
 }
 
 std::string Index(MslEmitterState& state, const IrValue& instruction) {
@@ -109,6 +100,14 @@ void Get(MslEmitterState& state, const IrValue& instruction) {
         state.Define(instruction, "(" + predicate + ") && " + index + " < " + U32(ControlPointWords(state)) + " ? aps5_tess_payload[" + U32(HeaderWords) + " + " + index + "] : 0u");
         return;
     }
+    if (kind == TessellationAttribute::PatchInput) {
+        // Upstream #4163: the domain program reads the hull's patch constants from the record after
+        // the control points.
+        if (StageOf(state) != IrShaderStage::TessellationEvaluation) state.Fail(instruction, "patch inputs outside the domain program");
+        state.AddParameter("const object_data uint* aps5_tess_payload");
+        state.Define(instruction, "(" + predicate + ") && " + index + " < " + U32(PatchWords(state)) + " ? aps5_tess_payload[" + U32(HeaderWords + ControlPointWords(state)) + " + " + index + "] : 0u");
+        return;
+    }
     state.Fail(instruction, "unsupported tessellation attribute read");
 }
 
@@ -136,7 +135,7 @@ void Set(MslEmitterState& state, const IrValue& instruction) {
     case TessellationAttribute::PatchOutput:
         if (StageOf(state) != IrShaderStage::TessellationControl) state.Fail(instruction, "patch outputs outside the hull program");
         state.AddParameter("object_data uint* aps5_tess_payload");
-        state.Line("aps5_tess_payload[" + U32(HeaderWords + ControlPointWords(state)) + " + " + index + " - " + U32(PatchRange(state).first / 4u) + "] = " + value + ";");
+        state.Line("if (" + index + " < " + U32(PatchWords(state)) + ") aps5_tess_payload[" + U32(HeaderWords + ControlPointWords(state)) + " + " + index + "] = " + value + ";");
         break;
     case TessellationAttribute::Factor: {
         if (StageOf(state) != IrShaderStage::TessellationControl) state.Fail(instruction, "tessellation factors outside the hull program");
