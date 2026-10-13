@@ -4,7 +4,6 @@
 # tests whose behaviour has no Metal counterpart. f64 and 64-bit atomics are emulated, never allowlisted. A line whose
 # test ran instead of skipping is reported as stale: remove it.
 agc_driver_shader_clock | lacks shaderSubgroupClock or shaderDeviceClock | metal-shader-clock
-agc_driver_pixel_barycentric_emulation | lacks geometryShader | metal-geometry-shaders
 agc_driver_draw_cache_reuse | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_pipeline_library | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_pipeline_library_off | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
@@ -19,4 +18,3 @@ agc_driver_pipeline_optimized_readback_d16_fast | graphics pipeline libraries ar
 agc_driver_pipeline_optimized_readback_d32 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_d32_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_conservative_rasterization | has no VK_EXT_conservative_rasterization | metal-conservative-rasterization
-agc_driver_interpolation_f16 | the device has no fragmentShaderBarycentric | metal-per-vertex-values
