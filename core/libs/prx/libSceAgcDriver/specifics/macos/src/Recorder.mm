@@ -2577,7 +2577,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         const auto from = std::max(address, aligned + k * block);
         const auto to = std::min(end, aligned + (k + 1) * block);
         const auto offset = static_cast<std::size_t>(from - address);
-        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(GuestArena::HostRange(from, static_cast<std::size_t>(to - from))), static_cast<std::size_t>(to - from)}); // alias if displaced (D31, D33)
     }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
@@ -2589,7 +2589,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(GuestArena::HostRange(address + offset, length)), length);
     return true;
 }
 
