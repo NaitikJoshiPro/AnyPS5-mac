@@ -839,6 +839,17 @@ VkFormat StorageFormatFor(const Context& context, VkFormat format) {
     return storage;
 }
 
+// The format of a resident image's own texture. Metal's packed 16-bit formats (B5G6R5Unorm,
+// BGR5A1Unorm) cannot be shader-written, so images of R5G6B5 and A1R5G5B5 surfaces are R16Uint
+// textures holding the guest bits unchanged (uploads, write-backs and clears move raw 16-bit
+// elements) and render through a view in the target's format (MTLTextureUsagePixelFormatView,
+// AttachmentView). Guest storage bindings of these formats still ask StorageFormatFor and throw:
+// a shader store would need the unorm packing done in the shader.
+VkFormat ImageFormatFor(const Context& context, VkFormat format) {
+    if (StorageFormatOrUndefined(context, format) == VK_FORMAT_UNDEFINED && (format == VK_FORMAT_A1R5G5B5_UNORM_PACK16 || format == VK_FORMAT_R5G6B5_UNORM_PACK16)) return VK_FORMAT_R16_UINT;
+    return StorageFormatFor(context, format);
+}
+
 }
 
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat) {
@@ -881,6 +892,10 @@ bool ClearColorFor(VkFormat format, DccKeys keys, VkClearColorValue& clear) {
 
 VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat) {
     return StorageFormatFor(context, ResolveTextureFormat(guestFormat));
+}
+
+VkFormat ImageFormatForGuest(const Context& context, std::uint32_t guestFormat) {
+    return ImageFormatFor(context, ResolveTextureFormat(guestFormat));
 }
 
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys) {
@@ -938,7 +953,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
-        const auto vkFormat = StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
+        const auto vkFormat = ImageFormatFor(context, ResolveTextureFormat(descriptor.format));
         storageFormat = vkFormat;
         APS5_LOG_OUT("StorageTexture address=0x%llx %ux%u mips=%u mip=%u layers=%u base=%u dim=%d tile=%d format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, mipLevel,
                      descriptor.depthOrLastArray, descriptor.baseArray, static_cast<int>(descriptor.dimension), static_cast<int>(descriptor.tileMode), descriptor.format, static_cast<int>(vkFormat));
@@ -1512,6 +1527,9 @@ VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
 }
 
 VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer) {
+    // An R16Uint image of a packed 16-bit surface (ImageFormatFor) has no shader-writable form of
+    // the guest format: a store would need its unorm packing.
+    if (storageFormat == VK_FORMAT_R16_UINT) StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
     const auto format = UintFormatOfSint(storageFormat);
     if (format == VK_FORMAT_UNDEFINED) return firstLayer ? FirstLayerView(mip) : View(mip);
     if (format == VK_FORMAT_R32_UINT) return AtomicView(mip, firstLayer);

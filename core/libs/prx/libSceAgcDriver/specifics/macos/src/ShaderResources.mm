@@ -45,6 +45,11 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 
 namespace AgcDriver::Graphics {
+
+// Texture.mm: the format of a resident image's texture (StorageFormatForGuest, but packed 16-bit
+// formats Metal cannot shader-write are R16Uint textures rendered through views of their format).
+VkFormat ImageFormatForGuest(const Context& context, std::uint32_t guestFormat);
+
 namespace {
 
 // Storage image allocations tagged so are indexes into `textures`: the storage shadows of guest
@@ -807,7 +812,7 @@ std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::li
 // mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
-    return {static_cast<std::uint32_t>(resource.baseAddress | resource.pipeBankXor), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
+    return {static_cast<std::uint32_t>(resource.baseAddress | resource.pipeBankXor), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(ImageFormatForGuest(context, resource.format))};
 }
 
 struct ExtendedSurfaces {

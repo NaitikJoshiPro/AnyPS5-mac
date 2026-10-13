@@ -261,6 +261,11 @@ struct DrawCache {
         std::uint32_t pipeBankXor;
         id<MTLTexture> texture;
         std::uint32_t gpuNewer = 0;
+        // A mip in its surface's packed mip tail (upstream #4328): `address` is the tail block, the
+        // mip's texels sit at (tailX, tailY) of it, and the rest of the block belongs to other mips.
+        bool tail = false;
+        std::uint32_t tailX = 0;
+        std::uint32_t tailY = 0;
     };
     std::vector<std::shared_ptr<TiledTarget>> tiled;
 
@@ -327,6 +332,40 @@ struct ColorAttachment {
     // guest memory is guarded, as upstream's MultisampleTarget.cpp).
     id<MTLTexture> multisample = nil;
 };
+
+// Tiled targets outside the image cache move between guest memory and their private texture as
+// tightly packed rows. A packed mip tail moves only its own texels, addressed in the tail block's
+// layout, so the other mips sharing the block keep their bytes (upstream renders such a mip
+// through the GPU detiler with the mip's ComputeColorTargetMipLayout).
+Graphics::ColorTargetLayout TiledGuestLayout(const DrawCache::TiledTarget& target) {
+    return Graphics::ColorTargetLayout(target.tail ? target.tailX + target.extent.width : target.extent.width, target.tail ? target.tailY + target.extent.height : target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
+}
+
+void DetileTarget(const DrawCache::TiledTarget& target, std::span<std::byte> linear) {
+    const auto layout = TiledGuestLayout(target);
+    const auto* guest = reinterpret_cast<const std::byte*>(target.address);
+    if (!target.tail) {
+        layout.Detile(std::span<const std::byte>(guest, layout.Bytes()), linear);
+        return;
+    }
+    const std::size_t element = target.elementBytes;
+    for (std::uint32_t y = 0; y < target.extent.height; ++y) {
+        for (std::uint32_t x = 0; x < target.extent.width; ++x) std::memcpy(linear.data() + (static_cast<std::size_t>(y) * target.extent.width + x) * element, guest + layout.Offset(target.tailX + x, target.tailY + y), element);
+    }
+}
+
+void TileTarget(const DrawCache::TiledTarget& target, std::span<const std::byte> linear) {
+    const auto layout = TiledGuestLayout(target);
+    auto* guest = reinterpret_cast<std::byte*>(target.address);
+    if (!target.tail) {
+        layout.Tile(linear, std::span<std::byte>(guest, layout.Bytes()));
+        return;
+    }
+    const std::size_t element = target.elementBytes;
+    for (std::uint32_t y = 0; y < target.extent.height; ++y) {
+        for (std::uint32_t x = 0; x < target.extent.width; ++x) std::memcpy(guest + layout.Offset(target.tailX + x, target.tailY + y), linear.data() + (static_cast<std::size_t>(y) * target.extent.width + x) * element, element);
+    }
+}
 
 // A slice of a 2D array color target as the whole array (upstream ArraySurfaceForTarget).
 Graphics::GuestTextureResource ArraySurfaceForTarget(const Graphics::ColorTarget& color) {
@@ -656,8 +695,13 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             // up (Refresh).
             state.MaterializeDcc(target, resident.get());
             state.MaterializeCmask(target, resident.get());
-        } else if (target.depth > 1u || target.arrayAddress != 0u || target.mip != 0u || target.mipCount > 1u) {
-            Fail("linear color targets with mips, slices or array layers");
+        } else if (target.depth > 1u || target.arrayAddress != 0u) {
+            // Linear targets, and tiled ones without the image cache (APS5_NO_RESIDENT_TARGETS):
+            // a mip is its own surface at the view's address (as upstream's transfer and GPU tiled
+            // fallbacks), a packed tail mip a window of the tail block (TileTarget).
+            Fail("color targets with slices or array layers outside the image cache (linear, or APS5_NO_RESIDENT_TARGETS)");
+        } else if (target.mipTail && target.tileMode == Graphics::ColorTileMode::Linear) {
+            Fail("a packed mip tail of a linear color target");
         }
         const auto format = Graphics::Metal::PixelFormatOf(target.format);
         if (format.format == MTLPixelFormatInvalid) Fail("color target format " + std::to_string(target.format) + " has no Metal pixel format");
@@ -714,8 +758,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             continue;
         }
         if (target.tileMode == Graphics::ColorTileMode::Linear) continue;
+        std::uint32_t tailX = 0;
+        std::uint32_t tailY = 0;
+        if (target.mipTail) {
+            const auto mip = Graphics::ComputeColorTargetMipLayout(target.tileMode, target.elementBytes, target.surfaceExtent.width, target.surfaceExtent.height, target.mipCount, target.mip);
+            if (!mip.tail || mip.width != target.extent.width || mip.height != target.extent.height) Fail("the packed mip tail layout of a color target differs from its view");
+            tailX = mip.tailX;
+            tailY = mip.tailY;
+            passKey = Mix(passKey, (static_cast<std::uint64_t>(tailX) << 32u) | tailY | (1ull << 63u));
+        }
         for (const auto& entry : cache.tiled) {
-            if (entry->address == target.address && entry->extent.width == target.extent.width && entry->extent.height == target.extent.height && entry->format == target.format && entry->tileMode == target.tileMode && entry->elementBytes == target.elementBytes && entry->pipeBankXor == target.pipeBankXor) {
+            if (entry->address == target.address && entry->extent.width == target.extent.width && entry->extent.height == target.extent.height && entry->format == target.format && entry->tileMode == target.tileMode && entry->elementBytes == target.elementBytes && entry->pipeBankXor == target.pipeBankXor && entry->tail == target.mipTail && entry->tailX == tailX && entry->tailY == tailY) {
                 attachment.tiled = entry;
                 break;
             }
@@ -728,7 +781,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (texture == nil) Fail("cannot create a tiled color target texture");
             const std::array<id<MTLTexture>, 1> resident {texture};
             state.images->MakeResident(resident);
-            attachment.tiled = std::make_shared<DrawCache::TiledTarget>(DrawCache::TiledTarget{target.address, target.extent, target.format, target.tileMode, target.elementBytes, target.pipeBankXor, texture, 0u});
+            attachment.tiled = std::make_shared<DrawCache::TiledTarget>(DrawCache::TiledTarget{target.address, target.extent, target.format, target.tileMode, target.elementBytes, target.pipeBankXor, texture, 0u, target.mipTail, tailX, tailY});
+            if (target.mipTail && TiledGuestLayout(*attachment.tiled).Bytes() != Graphics::ColorTargetLayout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor).Bytes()) Fail("a packed mip tail of a color target spans more than its tail block");
             cache.tiled.push_back(attachment.tiled);
         }
         attachment.load = attachment.tiled->gpuNewer == 0u;
@@ -1072,11 +1126,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 } else if (attachment.tiled != nullptr) {
                     texture = attachment.tiled->texture;
                     if (attachment.load) {
-                        const Graphics::ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
                         const auto pitch = static_cast<std::size_t>(target.extent.width) * target.elementBytes;
                         const auto linearBytes = pitch * target.extent.height;
                         auto upload = stream.Allocate(linearBytes, 256u);
-                        layout.Detile(std::span<const std::byte>(reinterpret_cast<const std::byte*>(target.address), layout.Bytes()), std::span<std::byte>(upload.host, linearBytes));
+                        DetileTarget(*attachment.tiled, std::span<std::byte>(upload.host, linearBytes));
                         id<MTL4ComputeCommandEncoder> copy = stream.Compute();
                         [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:pitch sourceBytesPerImage:linearBytes sourceSize:MTLSizeMake(target.extent.width, target.extent.height, 1) toTexture:texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
                         stream.CountCommand();
@@ -1407,8 +1460,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     auto target = tiled;
                     std::byte* host = upload.host;
                     active->OnComplete([target, host, linearBytes] {
-                        const Graphics::ColorTargetLayout layout(target->extent.width, target->extent.height, target->tileMode, target->elementBytes, target->pipeBankXor);
-                        layout.Tile(std::span<const std::byte>(host, linearBytes), std::span<std::byte>(reinterpret_cast<std::byte*>(target->address), layout.Bytes()));
+                        TileTarget(*target, std::span<const std::byte>(host, linearBytes));
                         if (target->gpuNewer != 0u) --target->gpuNewer;
                     });
                 }
