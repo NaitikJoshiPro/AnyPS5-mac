@@ -5,7 +5,11 @@
 // next render pass performs (its depth/stencil load action Clear) instead of upstream's
 // vkCmdClearDepthStencilImage. The HTILE helpers are upstream's. Sampling a depth surface as a
 // texture (DepthSurfaceTexture) is not implemented yet: such reads see guest memory
-// (docs/dev/TechnicalDebt.md metal-d6-depth-sampling). Objective-C++ only.
+// (docs/dev/TechnicalDebt.md metal-d6-depth-sampling), and storage image access to a depth surface
+// (upstream 27e112277, DepthSurfaceStorage) throws (metal-d6-depth-storage). HostDepthFormat is the
+// Metal storage of each guest depth format (MetalDraw.mm DepthFormat): Apple GPUs have neither
+// D16_UNORM_S8_UINT nor D24_UNORM_S8_UINT, so a 16-bit depth with stencil is Depth32Float_Stencil8.
+// The memory-value HTILE fill match is upstream's. Objective-C++ only.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -13,11 +17,17 @@
 #include "MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "MetalDepthSurfaces.h"
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -86,6 +96,40 @@ bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std
     return (properties.sampleCounts & samples) != 0;
 }
 
+// Upstream asks the device for the first of D16_UNORM_S8_UINT, D24_UNORM_S8_UINT, D32_SFLOAT_S8_UINT
+// with attachment and sampled support; that query runs when the context carries one (a test's mock
+// device). The Metal device has none (Apple GPUs support neither 16- nor 24-bit depth with stencil,
+// Metal Feature Set Tables), so the answer is the format MetalDraw.mm's DepthFormat stores it in.
+VkFormat HostDepthFormat(const Context& context, VkFormat format) {
+    if (format != VK_FORMAT_D16_UNORM_S8_UINT) return format;
+    if (context.formatProperties == nullptr) return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    static std::mutex mutex;
+    static std::map<VkPhysicalDevice, VkFormat> chosen;
+    std::lock_guard lock(mutex);
+    if (const auto found = chosen.find(context.physical); found != chosen.end()) return found->second;
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    auto host = format;
+    for (const auto candidate : {VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, candidate, &properties);
+        if ((properties.optimalTilingFeatures & required) != required) continue;
+        host = candidate;
+        break;
+    }
+    chosen.emplace(context.physical, host);
+    return host;
+}
+
+// As upstream: a 16-bit depth stored as 24-bit unorm scales the constant bias by 256; stored as
+// 32-bit float (always on Metal) the bias unit depends on each primitive's depth exponent, which no
+// constant reproduces, so a nonzero constant is refused.
+float HostDepthBiasConstant(const Context& context, VkFormat format, float constant) {
+    const auto host = HostDepthFormat(context, format);
+    if (constant == 0.0f || host == format) return constant;
+    Require(host == VK_FORMAT_D24_UNORM_S8_UINT, "a constant depth bias on a 16-bit depth target with stencil that the device stores as 32-bit float depth is not implemented");
+    return constant * 256.0f;
+}
+
 VkImageView DepthSurfaceView(const Context&, const DepthTarget&) {
     Fail("DepthSurfaceView is the Vulkan draw path's; the Metal draw path acquires surfaces with Metal::AcquireDepthSurface");
 }
@@ -96,6 +140,31 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
     if (code.size() < htileMaskKernel.size() || !std::equal(htileMaskKernel.begin(), htileMaskKernel.end(), code.begin())) return 0;
     if ((userData[5] & 0xfu) != 0 || (userData[4] & 0xfu) != 0) return 0;
     return userData[2] | (static_cast<std::uint64_t>(userData[3]) << 32u);
+}
+
+std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static constexpr std::array<std::uint32_t, 9> kernel{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    if (userData.size() < 8 || numThreads != std::array<std::uint32_t, 3>{64u, 1u, 1u} || groups[1] != 1u || groups[2] != 1u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+    const auto type = userData[3] >> 30u;
+    const auto format = (userData[3] >> 12u) & 0x7fu;
+    const auto valueStride = (userData[5] >> 16u) & 0x3fffu;
+    const auto valueBytes = valueStride == 0 ? static_cast<std::uint64_t>(userData[6]) : static_cast<std::uint64_t>(userData[6]) * valueStride;
+    if (type != 0 || stride != 4 || swizzled || addTid || format < 20u || format > 22u || valueBytes < 4u) return std::nullopt;
+    const auto dwords = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, userData[2]);
+    const auto address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    const auto valueAddress = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+    if (dwords == 0 || valueAddress == 0 || (valueAddress & 3u) != 0) return std::nullopt;
+    return MemoryValueFill{address, static_cast<std::size_t>(dwords * 4u), valueAddress};
+}
+
+void NoteMemoryValueFill(const MemoryValueFill& fill) {
+    std::uint32_t value = 0;
+    GuestMemory::Read(fill.valueAddress, std::as_writable_bytes(std::span(&value, 1)), 4);
+    NoteDepthMetadataFill(fill.address, fill.bytes, value);
 }
 
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
@@ -146,6 +215,43 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
         const VkImageAspectFlags written = DepthAspect | (target.htileStencil ? StencilAspect : 0u);
         surface.pendingClear = (surface.pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
     }
+}
+
+bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto key = reinterpret_cast<const void*>(context.device);
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const Surface& surface) {
+        return surface.device == key && (surface.target.address == resource.baseAddress || (surface.target.stencilAddress != 0 && surface.target.stencilAddress == resource.baseAddress));
+    });
+    if (found == list.rend()) return false;
+    const auto& target = found->target;
+    if (resource.width != target.extent.width || resource.height != target.extent.height) return false;
+    const bool stencil = target.stencilAddress != 0 && target.stencilAddress == resource.baseAddress;
+    const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+    const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+    return ResolveTextureFormat(resource.format) == expected || depthBits;
+}
+
+// Upstream (27e112277) copies the depth or stencil plane into a color storage image and back after
+// the writes. The Metal surfaces are not sampled either (metal-d6-depth-sampling), so a storage
+// access to one throws, as the twin's storage path did before (TechnicalDebt metal-d6-depth-storage).
+std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std::span<const std::uint32_t>, const GuestTextureResource& resource, std::uint32_t mip) {
+    std::lock_guard lock(surfacesMutex());
+    const auto key = reinterpret_cast<const void*>(context.device);
+    const auto found = std::find_if(surfaces().rbegin(), surfaces().rend(), [&](const Surface& surface) {
+        return surface.device == key && (surface.target.address == resource.baseAddress || (surface.target.stencilAddress != 0 && surface.target.stencilAddress == resource.baseAddress));
+    });
+    if (found == surfaces().rend()) return nullptr;
+    char text[288];
+    std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx (storage %ux%u guest format %u mip %u) is not implemented on Metal (TechnicalDebt metal-d6-depth-storage)", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, mip);
+    throw std::runtime_error(text);
+}
+
+// No storage image of a depth surface is handed out (DepthSurfaceStorage), so none is stored back.
+bool DepthSurfaceStoreBack(const Context&, const StorageTexture&) {
+    return false;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
