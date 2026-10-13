@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include "MetalTestDevice.h"
+#include "MslAbi.hpp"
 #include "../src/MetalImages.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -34,10 +35,22 @@ class Device {
 public:
     Device() : cache(test.device, test.queue) {
         // The limits the device's setup gives its Context (MetalDevice.mm), which the test device leaves at zero.
+        auto& limits = test.context.limits;
         const auto bufferLength = static_cast<std::uint64_t>(test.device.maxBufferLength);
-        test.context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
-        test.context.limits.maxUniformBufferRange = test.context.limits.maxStorageBufferRange;
-        test.context.limits.maxComputeWorkGroupCount[0] = test.context.limits.maxComputeWorkGroupCount[1] = test.context.limits.maxComputeWorkGroupCount[2] = 65535u;
+        limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
+        limits.maxUniformBufferRange = limits.maxStorageBufferRange;
+        limits.maxPushConstantsSize = ShaderRecompiler::MslAbi::PushDataBytes;
+        limits.maxBoundDescriptorSets = 4u;
+        limits.minStorageBufferOffsetAlignment = 4u;
+        limits.nonCoherentAtomSize = 1u;
+        limits.maxComputeWorkGroupCount[0] = limits.maxComputeWorkGroupCount[1] = limits.maxComputeWorkGroupCount[2] = 65535u;
+        const auto threads = test.device.maxThreadsPerThreadgroup;
+        limits.maxComputeWorkGroupSize[0] = static_cast<std::uint32_t>(threads.width);
+        limits.maxComputeWorkGroupSize[1] = static_cast<std::uint32_t>(threads.height);
+        limits.maxComputeWorkGroupSize[2] = static_cast<std::uint32_t>(threads.depth);
+        limits.maxComputeWorkGroupInvocations = 1024u;
+        limits.maxComputeSharedMemorySize = static_cast<std::uint32_t>(test.device.maxThreadgroupMemoryLength);
+        test.context.subgroup.subgroupSize = 32u;
         // Color sample counts the device can render (Apple9: 1, 2, 4; 8 on Apple10, TechnicalDebt metal-msaa-8x).
         VkSampleCountFlags samples = 0;
         for (const std::uint32_t count : {1u, 2u, 4u, 8u}) {

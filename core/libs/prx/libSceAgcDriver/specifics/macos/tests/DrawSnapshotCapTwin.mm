@@ -4,6 +4,8 @@
 // Metal recorder's snapshot cache (Recorder.mm ReusableDrawSnapshot) over a host import of write-watched memory
 // (GuestBufferMemory.mm: no-copy Metal buffers over 16 KiB pages). An input over the cap is bound in place and
 // sees CPU writes, one under it is snapshotted and does not, and the cap is cumulative over the layout's bindings.
+// Upstream's exits for a device without host imports or write watching (and its watched-only reuse check) are
+// requirements here: the Metal device has both, so a pass means every check ran.
 // Expected values are upstream's.
 
 #include "RecorderTwinHarness.h"
@@ -46,10 +48,8 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     } restore{previous, saved};
     constexpr std::size_t bytes = 3 * 1024 * 1024;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
-    if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: draw snapshot cap not tested\n";
-        return;
-    }
+    // The Metal device always has host imports and write watching: upstream's "not tested" exits fail here.
+    Require(block != nullptr, "host imports or write watching unavailable: draw snapshot cap not tested");
     struct Release {
         void* block;
         ~Release() { ReleaseWatched(block, bytes); }
@@ -71,10 +71,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
         }
     } unregister{context, block};
-    if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: draw snapshot cap not tested\n";
-        return;
-    }
+    Require(HostImportFor(context, address, bytes) != nullptr, "host import of the watched block refused: draw snapshot cap not tested");
     const auto smallAddress = address + 4096;
     constexpr std::size_t smallBytes = 1024 * 1024 - 4096;
     const auto largeAddress = address + 1024 * 1024 + 8192;
@@ -111,9 +108,8 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Require(bindings->snapshots.size() == 1, "an input exceeding the draw snapshot cap was snapshotted");
         Require(bindings->snapshots[0].address == smallAddress, "the snapshotted input does not match the smaller buffer below the cap");
         Require(snapshotRecorder.ReusableDrawSnapshot(largeAddress, largeBytes) == nullptr, "an input exceeding the draw snapshot cap was kept in the snapshot cache");
-        if (Watched(address, bytes)) {
-            Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) != nullptr, "an input below the draw snapshot cap was not kept in the snapshot cache");
-        }
+        Require(Watched(address, bytes), "the watched block is not watched: snapshot cache reuse not tested");
+        Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) != nullptr, "an input below the draw snapshot cap was not kept in the snapshot cache");
         const auto contents = bindings->snapshots[0].buffer->Bytes();
         Require(contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [](std::byte value) { return value == std::byte{0x11}; }), "a draw snapshot does not hold the guest bytes of its draw");
         std::memset(reinterpret_cast<void*>(smallAddress), 0x22, smallBytes);

@@ -5,6 +5,8 @@
 // Metal recorder (Recorder.mm): an input is bound in place only when imported, aligned, recorded and clear of
 // pending GPU writes and queued label stores; its read is noted on the open batch and retired with it; the highest
 // index of a kept index range is reused until a guest write changes it. Expected values are upstream's.
+// Upstream's "not tested" exits (no host imports, no write watching) are requirements here: the Metal device
+// has both, so a pass means every check ran.
 // The Metal draw path (MetalDraw.mm) reads vertex and index memory through the device's guest page table rather
 // than through these primitives (TechnicalDebt metal-vulkan-internal-tests).
 
@@ -23,10 +25,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
-    if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: in-place draw inputs not tested\n";
-        return;
-    }
+    Require(block != nullptr, "host imports or write watching unavailable: in-place draw inputs not tested");
     struct Release {
         void* block;
         ~Release() { ReleaseWatched(block, bytes); }
@@ -47,10 +46,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
         }
     } unregister{context, block};
-    if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: in-place draw inputs not tested\n";
-        return;
-    }
+    Require(HostImportFor(context, address, bytes) != nullptr, "host import of the watched block refused: in-place draw inputs not tested");
     context.recorder = &recorder;
     recorder.Sync();
     const auto vertices = address + 4096;
@@ -74,10 +70,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(unrecorded, vertices, 256, 4) == nullptr, "a draw without a recorder bound its input in place");
     recorder.Sync();
     Require(!recorder.PendingReadOverlaps(vertices, 256), "an in-place draw input's read outlived its batch");
-    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "host imports are compared, not watched: kept highest indices not tested\n";
-        return;
-    }
+    Require(AgcDriver::GuestMemory::Watched(address, bytes), "host imports are compared, not watched: kept highest indices not tested");
     const auto indices = address + 20480;
     constexpr std::size_t kept = Recorder::KeptIndexRangeIndices * 2;
     std::vector<std::uint16_t> first(Recorder::KeptIndexRangeIndices * 2, 1);
