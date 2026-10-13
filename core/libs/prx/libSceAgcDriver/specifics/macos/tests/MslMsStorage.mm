@@ -1,7 +1,7 @@
 // agc_metal_msl_ms_storage (MslAbi Version 6): emulated multisampled storage images. Metal shaders
 // cannot write texture2d_ms, so storage views of 2D MSAA (array) images are texture2d_array textures
 // of layers * samples slices, sample s of layer l at slice l * samples + s (MslImage.cpp,
-// EmulatedMultisampleCoord; DECISIONS D21).
+// EmulatedMultisampleCoord; DECISIONS D22).
 // - CPU: the MIMG stores and atomics of tests/execution/PreparedShaders.cpp (PrepareMultisampledStorage)
 //   plus a 64-bit atomic are recompiled for an MSL target that advertises
 //   CapabilityStorageImageMultisample; the storage heap must be a read_write texture2d_array, the
