@@ -5,9 +5,13 @@
 #include "SDL_keyboard.h"
 
 #include <cstdlib>
+#include <initializer_list>
+#include <stdexcept>
 
 extern "C" {
 int APS5_VABI sceKeyboardInit(void);
+int APS5_VABI sceKeyboardSetProcessPrivilege(int);
+int APS5_VABI sceKeyboardSetProcessFocus(int);
 int APS5_VABI sceKeyboardOpen(int, std::int32_t, std::int32_t, const void*);
 int APS5_VABI sceKeyboardClose(std::int32_t);
 int APS5_VABI sceKeyboardRead(std::int32_t, KeyboardData*, std::int32_t);
@@ -44,6 +48,15 @@ int main() {
     Require(sceKeyboardOpen(1, 0, 0, nullptr) == KEYBOARD_ERROR_NOT_INITIALIZED);
     Require(sceKeyboardInit() == KEYBOARD_OK);
     Require(sceKeyboardInit() == KEYBOARD_OK);
+    Require(sceKeyboardSetProcessPrivilege(1) == KEYBOARD_OK && sceKeyboardSetProcessFocus(1) == KEYBOARD_OK);
+    for (int value : {0, 2}) {
+        bool threw = false;
+        try { sceKeyboardSetProcessPrivilege(value); } catch (const std::runtime_error&) { threw = true; }
+        Require(threw);
+        threw = false;
+        try { sceKeyboardSetProcessFocus(value); } catch (const std::runtime_error&) { threw = true; }
+        Require(threw);
+    }
     Require(sceKeyboardOpen(1, 0, 1, nullptr) == KEYBOARD_ERROR_INVALID_ARG);
     Require(sceKeyboardOpen(1, 1, 0, nullptr) == KEYBOARD_ERROR_INVALID_ARG);
     Require(sceKeyboardGetKey2Char(KEYBOARD_HANDLE, KEYBOARD_ARRANGEMENT_101, 0, 0, 0x04, &charData) == KEYBOARD_ERROR_INVALID_HANDLE);
