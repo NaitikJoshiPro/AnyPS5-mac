@@ -81,7 +81,8 @@ bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std
     const auto result = context.imageFormatProperties != nullptr
         ? context.imageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, &properties)
         : Metal::Vk::GetPhysicalDeviceImageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, &properties);
-    if (result != VK_SUCCESS) return false;
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return false;
+    Check(result, "vkGetPhysicalDeviceImageFormatProperties sample locations depth");
     return (properties.sampleCounts & samples) != 0;
 }
 
