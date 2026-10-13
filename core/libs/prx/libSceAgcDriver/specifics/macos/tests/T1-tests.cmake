@@ -27,3 +27,9 @@ add_test(NAME agc_metal_msl_corpus COMMAND agc_metal_msl_corpus_tests --corpus $
 set_tests_properties(agc_metal_msl_corpus PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 900)
 add_test(NAME agc_metal_request_dump COMMAND agc_metal_request_dump_tests)
 set_tests_properties(agc_metal_request_dump PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+
+# agc_descriptor_pool_reset_failure (tests/Graphics.cpp --descriptor-pool-reset-failure) skips on Metal: descriptor
+# pools are tokens whose reset cannot fail (GraphicsTwin.mm; allowlisted, TechnicalDebt metal-vulkan-internal-tests).
+if(TEST agc_descriptor_pool_reset_failure)
+    set_tests_properties(agc_descriptor_pool_reset_failure PROPERTIES SKIP_RETURN_CODE 77)
+endif()

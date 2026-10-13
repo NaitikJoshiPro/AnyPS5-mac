@@ -9,6 +9,7 @@ agc_pipeline_library | graphics pipeline libraries are unavailable | metal-graph
 agc_pipeline_library_off | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_pipeline_library_fast_only | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_descriptor_pool_recycling | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests
+agc_descriptor_pool_reset_failure | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests
 agc_driver_pipeline_optimized_readback_color32 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_color32_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_color64 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
