@@ -290,6 +290,7 @@ void CommandStream::Recycle() {
     current = nil;
     currentUsed = 0;
     arena->Give(uploads);
+    kept.clear();
 }
 
 namespace {

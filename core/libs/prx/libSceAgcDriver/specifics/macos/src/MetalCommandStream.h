@@ -178,6 +178,10 @@ public:
     // Returns the stream's upload memory once the GPU finished the command buffer (or it was never
     // committed). The owner destroys a stream only in that state too.
     void Recycle();
+    // An object the recorded commands use that nothing else holds until they complete (a texture view
+    // a helper dispatch binds by resource ID): a one-shot batch has no recorder to keep it, so the
+    // stream does, until Recycle or its destruction (both only once the GPU is done with it).
+    void Keep(std::shared_ptr<void> object) { kept.push_back(std::move(object)); }
 
     // Counters for tests and the [barriers] line: encoders opened, barriers recorded, commands.
     std::uint64_t Encoders() const { return encoders; }
@@ -193,6 +197,7 @@ private:
     id<MTLBuffer> renderVisibility = nil;
     bool recording = false;
     std::vector<id<MTLBuffer>> uploads;
+    std::vector<std::shared_ptr<void>> kept;
     id<MTLBuffer> current = nil;
     std::size_t currentUsed = 0;
     id<MTL4ArgumentTable> arguments = nil;

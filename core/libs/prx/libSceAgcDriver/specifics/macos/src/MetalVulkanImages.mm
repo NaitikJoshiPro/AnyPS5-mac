@@ -635,13 +635,13 @@ void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout, 
             std::memcpy(params.bits, color->uint32, sizeof(params.bits));
             params.kind = numeric + (volume ? 3u : 0u);
             params.textures[params.kind] = view.gpuResourceID._impl;
-            // The view lives until the batch that clears through it completes.
-            if (auto* recorder = Recorder::Active()) {
-                struct Held {
-                    id<MTLTexture> view;
-                };
-                recorder->Keep(std::make_shared<Held>(Held{view}));
-            }
+            // The view lives until the batch that clears through it completes: the active recorder's
+            // batch, or (no recorder: a one-shot CommandBatch) the stream itself.
+            struct Held {
+                id<MTLTexture> view;
+            };
+            if (auto* recorder = Recorder::Active()) recorder->Keep(std::make_shared<Held>(Held{view}));
+            else stream.Keep(std::make_shared<Held>(Held{view}));
             const auto width = std::max<NSUInteger>(texture.width >> level, 1u);
             const auto height = std::max<NSUInteger>(texture.height >> level, 1u);
             const auto depth = volume ? std::max<NSUInteger>(texture.depth >> level, 1u) : layers;
