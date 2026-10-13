@@ -288,6 +288,13 @@ void RequireRecords(const Case& test, const Expectation& expected) {
         std::string detail;
         for (std::size_t i = 0; i < std::min<std::size_t>(extra.size(), 4); ++i) detail += " ran (" + std::to_string(std::bit_cast<float>(extra[i].first)) + ", " + std::to_string(std::bit_cast<float>(extra[i].second)) + ")";
         for (std::size_t i = 0; i < std::min<std::size_t>(missing.size(), 4); ++i) detail += " expected (" + std::to_string(std::bit_cast<float>(missing[i].first)) + ", " + std::to_string(std::bit_cast<float>(missing[i].second)) + ")";
+        for (std::uint32_t i = 0; i < runs; ++i) {
+            const auto* record = &Records[4u + i * 4u];
+            if (std::find(extra.begin(), extra.end(), std::pair{record[0], record[1]}) != extra.end()) detail += " [record " + std::to_string(i) + " of " + std::to_string(runs) + "]";
+        }
+        for (std::size_t i = 1; i < seen.size(); ++i) {
+            if (seen[i] == seen[i - 1]) detail += " duplicate (" + std::to_string(std::bit_cast<float>(seen[i].first)) + ", " + std::to_string(std::bit_cast<float>(seen[i].second)) + ")";
+        }
         Require(false, name + ": the domain locations differ from the tessellator's (" + std::to_string(extra.size()) + " unexpected, " + std::to_string(missing.size()) + " missing):" + detail);
     }
 }
