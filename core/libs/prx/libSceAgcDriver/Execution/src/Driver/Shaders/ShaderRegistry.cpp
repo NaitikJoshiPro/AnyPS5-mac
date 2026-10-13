@@ -1117,7 +1117,9 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
             prepared.rectangleRequested |= newRequest;
         }
         const auto& prepared = transaction.Read(front);
-        if (!prepared.rectangleRequested) {
+        // The MSL backend expands rect lists in the vertex function (MslAbi::RectListMacro): no
+        // tessellation stages to prepare.
+        if (!prepared.rectangleRequested || target.backend == ShaderRecompiler::ShaderBackend::Msl) {
             transaction.Commit();
             return;
         }

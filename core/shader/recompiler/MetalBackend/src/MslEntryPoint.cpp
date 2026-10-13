@@ -182,7 +182,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     if (!fragment) {
         text += "struct Aps5TriangleVertices {\n    float4 viewport;\n    float2 depthRange;\n    uint triangles;\n    uint flags;\n};\n";
         text += "static_assert(sizeof(Aps5TriangleVertices) == 32, \"MslAbi::TriangleVerticesHeader\");\n\n";
-        parameters.back() += "\n#if " + TriangleVerticesCondition() + "\n    , device const uint* aps5_triangles [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::TriangleVertices)) + ")]]\n#endif";
+        parameters.back() += "\n#if " + TriangleVerticesCondition() + "\n    , device const uint* aps5_triangles [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::TriangleVertices)) + ")]]\n#endif\n";
     }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
