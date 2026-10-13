@@ -877,7 +877,9 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
     }
     const char* forced = std::getenv("APS5_SRGB_ATTACHMENT_PROXY");
     VkFormatProperties properties{};
-    Metal::Vk::GetPhysicalDeviceFormatProperties(context.physical, format, &properties);
+    // As upstream: the context's format query (a test's mock device sets it), else the Metal device's.
+    if (context.formatProperties != nullptr) context.formatProperties(context.physical, format, &properties);
+    else Metal::Vk::GetPhysicalDeviceFormatProperties(context.physical, format, &properties);
     constexpr VkFormatFeatureFlags attachment = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
     const bool proxied = (forced != nullptr && std::strcmp(forced, "1") == 0) || (properties.optimalTilingFeatures & attachment) != attachment;
     const auto proxy = proxied ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_UNDEFINED;

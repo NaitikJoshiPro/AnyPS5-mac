@@ -72,6 +72,18 @@ foreach(agcMetalTarget IN LISTS agcMetalTargets)
     endif()
 endforeach()
 
+# agc_driver_bda_device_tests compiles three driver sources whose twins need the rest of the Metal
+# driver (the recorder, the image cache and D4's Metal::Vk image calls): on macOS it links the driver
+# library for them instead, as the Metal-only tests do.
+if(TARGET agc_driver_bda_device_tests)
+    get_target_property(agcBdaSources agc_driver_bda_device_tests SOURCES)
+    foreach(agcBdaDriverSource IN ITEMS Resources.mm PlaceholderImages.mm BufferAddress.mm)
+        list(REMOVE_ITEM agcBdaSources ${agcMetalDir}/src/${agcBdaDriverSource})
+    endforeach()
+    set_property(TARGET agc_driver_bda_device_tests PROPERTY SOURCES ${agcBdaSources})
+    target_link_libraries(agc_driver_bda_device_tests PRIVATE libSceAgcDriver)
+endif()
+
 # libSceAudioIn/libSceAudioOut/libSceVideoOut take SDL from the driver on macOS (one SDL per process, see
 # libSceAudioOut/CMakeLists.txt). The Vulkan driver pulls SDL's core in through SDL_Init; the Metal driver does
 # not call SDL yet (presentation is D6), so keep SDL_Init (and through it the audio/video subsystems) linked.
