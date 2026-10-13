@@ -17,6 +17,10 @@ struct MslTargetOptions {
     // FLOAT_MODE keeps f32 denormals (FP_DENORM_32 == 3). Apple GPUs flush f32 denormals in every float
     // operation, so the ALU emits exact (slower) f32 arithmetic in this mode (MslAluMath.cpp, B2).
     bool keepF32Denormals = false;
+    // The target advertises spv::CapabilityStorageImageMultisample: storage views of multisampled
+    // images are emulated as 2D arrays of layers * samples slices (MslAbi Version 6). Without it they
+    // fail as the SPIR-V backend does.
+    bool storageImageMultisample = false;
 };
 
 // IR -> Metal Shading Language, the MetalBackend counterpart of SpirvEmitter (same inputs, same

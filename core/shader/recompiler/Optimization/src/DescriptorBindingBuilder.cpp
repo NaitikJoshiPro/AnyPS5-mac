@@ -76,8 +76,11 @@ DescriptorRole RoleFor(DescriptorBindingKind kind) {
     fail("DescriptorBindingBuilder::Populate binding kind has no descriptor role");
 }
 
-DescriptorImageShape ImageShapeForResource(const ImageResource& image) {
+DescriptorImageShape ImageShapeForResource(const ImageResource& image, bool msl) {
     const RdnaImageDimensionInfo& info = RdnaImageDimensionInfoFor(image.dimension);
+    // MSL backends (MslAbi Version 6) bind storage views of multisampled images as 2D arrays of
+    // layers * samples slices: Metal shaders cannot write multisampled textures.
+    if (info.multisampled != 0u && msl && image.resourceClass == ImageResourceClass::Storage) return DescriptorImageShape::Image2DArray;
     if (info.multisampled != 0u) {
         fail("DescriptorBindingBuilder::Populate multisampled image resources have no descriptor image shape");
     }
@@ -252,7 +255,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     allocation.specialization = std::move(plan.specialization);
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet) const {
+DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, bool msl) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity");
     DescriptorBindingPlan plan;
@@ -313,6 +316,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        // MSL storage views of multisampled images are 2D arrays of layers * samples slices; the
+        // sample count is the T#'s LAST_LEVEL (log2 samples for MSAA types).
+        const auto& mode = info.runtimeImageModes.at(index).at(imageModes[index]);
+        if (mode.resourceClass == ImageResourceClass::Storage && (mode.dimension == RdnaImageDimension::Dim2DMsaa || mode.dimension == RdnaImageDimension::Dim2DMsaaArray)) {
+            plan.specialization.push_back({PipelineSpecialization::SampleCountBase + index, 1u << ((snapshot.images.at(index).dwords[3] >> 16u) & 0xfu)});
+        }
     }
     for (std::uint32_t target = 0; target < exportMappings.size() && !registrationModules; ++target) {
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({PipelineSpecialization::ExportBase + target * 4u + component, (exportMappings[target] >> (component * 2u)) & 3u});
@@ -408,7 +417,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             const auto& modes = info.runtimeImageModes.at(compact.resources.front());
             const auto shape = std::ranges::find_if(modes, [&](const ImageResource& mode) { return DescriptorBindingForImage(mode) == compact.kind; });
             if (shape == modes.end()) fail("runtime image heap has no static image type");
-            physical.imageShape = ImageShapeForResource(*shape);
+            physical.imageShape = ImageShapeForResource(*shape, msl);
             for (std::size_t element = 0; element < compact.resources.size(); ++element) {
                 const auto resource = compact.resources[element];
                 const auto& image = info.images.at(resource);

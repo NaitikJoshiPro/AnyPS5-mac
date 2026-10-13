@@ -442,6 +442,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         mslOptions.bdaAbiVersion = request.target.bdaAbiVersion;
         mslOptions.maxThreadgroupMemoryBytes = request.target.maxWorkgroupSharedMemoryBytes;
         mslOptions.keepF32Denormals = request.context.floatMode.has_value() && ((request.context.floatMode->floatMode >> 4u) & 3u) == 3u;
+        mslOptions.storageImageMultisample = std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStorageImageMultisample)) != request.target.supportedCapabilities.end();
         constexpr MslEmitter mslEmitter;
         result.msl = SharedMsl(mslEmitter.Emit(program, inputInfo, bindings, mslOptions));
     } else {
@@ -736,7 +737,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     std::call_once(plan->ready, [&] {
         try {
-            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet);
+            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet, !variant.artifact.msl.empty());
         } catch (...) {
             plan->failure = std::current_exception();
         }

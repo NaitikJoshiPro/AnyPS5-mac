@@ -54,12 +54,14 @@ std::string MslTableMemberType(DescriptorBindingKind kind) {
         return std::string(DepthShapes[(value - RuntimeAbi::FirstComparisonImageBinding) % HeapDimensions]) + "<float>";
     }
     // Storage float (29-35), uint (36-42), 32-bit atomic uint (43-49), 64-bit atomic uint (50-56).
-    // Metal cannot write multisampled textures from a shader: those heaps are read-only.
+    // MslAbi Version 6: Metal cannot write multisampled textures from a shader, so storage views of
+    // 2D MSAA (array) images are 2D arrays of layers * samples slices (MslImage.cpp,
+    // EmulatedMultisampleCoord).
     static constexpr const char* Scalars[] = {"float", "uint", "uint", "ulong"};
     const auto index = value - RuntimeAbi::FirstStorageImageBinding;
     const auto dimension = index % HeapDimensions;
     const bool multisampled = dimension == 4u || dimension == 5u;
-    return std::string(TextureShapes[dimension]) + "<" + Scalars[index / HeapDimensions] + (multisampled ? ", access::read>" : ", access::read_write>");
+    return std::string(multisampled ? "texture2d_array" : TextureShapes[dimension]) + "<" + Scalars[index / HeapDimensions] + ", access::read_write>";
 }
 
 std::string MslTableDeclaration(const MslAbi::TableLayout& layout) {

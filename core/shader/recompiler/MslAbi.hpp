@@ -40,7 +40,12 @@
 
 namespace ShaderRecompiler::MslAbi {
 
-inline constexpr std::uint32_t Version = 5u;
+// Version 6: storage image heaps of the 2D MSAA and 2D MSAA array dimensions are
+// texture2d_array<T, access::read_write> textures of layers * samples slices (sample s of layer l at
+// slice l * samples + s; Metal shaders cannot write texture2d_ms). The sample count is function
+// constant PipelineSpecialization::SampleCountBase + resource (direct images) or the T# LAST_LEVEL of
+// the resource metadata (table images). Sampled multisampled heaps stay texture2d_ms.
+inline constexpr std::uint32_t Version = 6u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).

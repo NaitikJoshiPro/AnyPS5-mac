@@ -443,6 +443,46 @@ std::string SampleIndex(MslEmitterState& state, const Access& access) {
     return AddressU32(state, access, addressInfo.coordinateComponents);
 }
 
+// --- multisampled storage views (MslAbi Version 6) -----------------------------------------------
+// Metal shaders cannot write multisampled textures (MSL: texture2d_ms supports access::read only),
+// so the storage heaps of the 2D MSAA and 2D MSAA array dimensions are texture2d_array textures of
+// layers * samples slices: sample s of layer l is slice l * samples + s. The sample count is a
+// function constant for direct images (SampleCountBase + resource, supplied by the binding plan from
+// the T#) and the T#'s LAST_LEVEL (log2 samples on MSAA types) of the resource metadata for table
+// images. Sampled multisampled views stay texture2d_ms.
+bool EmulatedMultisample(const Access& access) {
+    return access.image.resourceClass == ImageResourceClass::Storage && Multisampled(access.image.dimension);
+}
+
+std::string StorageSampleCount(MslEmitterState& state, const Access& access) {
+    if (access.image.indirectRoot != ImageResource::NoIndirectImage) {
+        const auto index = access.metadata.empty() ? std::to_string(access.mem.resource) + "u" : access.metadata;
+        return "(1u << ((" + MetadataDword(state, index, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + 3u) + " >> 16u) & 0xfu))";
+    }
+    return state.FunctionConstant(PipelineSpecialization::SampleCountBase + access.mem.resource, 1u);
+}
+
+// The 2D-array coordinate of the access's sample and whether x, y, the sample and the layer lie
+// inside the view.
+struct MultisampleStorageCoord {
+    TexelCoord coord;
+    std::string inside;
+};
+
+MultisampleStorageCoord EmulatedMultisampleCoord(MslEmitterState& state, const Access& access, const std::string& texture) {
+    if (!state.target.storageImageMultisample) state.Fail(access.inst, "accesses a multisampled storage image: storage image multisampling is unavailable on the target device");
+    if (access.image.mipMode == ImageMipMode::DynamicStorage) state.Fail(access.inst, "is a multisampled storage image with dynamic mip levels");
+    const auto base = CoordU32(state, access);
+    const auto sample = SampleIndex(state, access);
+    const auto name = state.Temporary("aps5_ms");
+    state.Line("const uint2 " + name + "_xy = " + base.coord + ";");
+    state.Line("const uint " + name + "_n = " + StorageSampleCount(state, access) + ";");
+    state.Line("const uint " + name + "_s = " + sample + ";");
+    state.Line("const uint " + name + "_l = " + (base.slice.empty() ? std::string("0u") : base.slice) + ";");
+    state.Line("const bool " + name + "_in = " + name + "_xy.x < " + texture + ".get_width() && " + name + "_xy.y < " + texture + ".get_height() && " + name + "_s < " + name + "_n && " + name + "_l < " + texture + ".get_array_size() / " + name + "_n;");
+    return {{name + "_xy", name + "_l * " + name + "_n + " + name + "_s"}, name + "_in"};
+}
+
 // Declares `name` = whether the texel coordinate (at mip `lod` for sampled views) lies inside the
 // view, and returns the read expression arguments after the coordinate.
 std::string BoundsCheck(MslEmitterState& state, const std::string& texture, const RdnaImageDimension dimension, const TexelCoord& coord, const std::string& lod, bool storage, const std::string& sample) {
@@ -688,6 +728,9 @@ void EmitRead(MslEmitterState& state, const Access& access) {
     state.Indent();
     const bool storage = access.image.resourceClass == ImageResourceClass::Storage;
     const auto texture = Texture(state, access);
+    // Reads are sampled-class resources (ResourceTracker: only writes and atomics are storage), so a
+    // multisampled storage read never reaches the emitter.
+    if (EmulatedMultisample(access)) state.Fail(access.inst, "reads a multisampled storage image");
     const auto coord = CoordU32(state, access);
     const auto lod = state.Temporary("aps5_lod");
     state.Line("const uint " + lod + " = " + LodU32(state, access) + ";");
@@ -716,6 +759,7 @@ void EmitQueryDimensions(MslEmitterState& state, const Access& access) {
     const auto lod = storage ? std::string() : AddressU32(state, access, 0);
     std::array<std::string, 4> result{"0u", "0u", "0u", "0u"};
     const bool ms = Multisampled(dimension);
+    if (EmulatedMultisample(access)) state.Fail(access.inst, "queries a multisampled storage image (queries are sampled-class resources)");
     const auto lodArg = ms ? std::string() : lod;
     result[0] = texture + ".get_width(" + lodArg + ")";
     switch (dimension) {
@@ -848,12 +892,22 @@ std::string WriteCall(const std::string& texture, RdnaImageDimension dimension, 
 }
 
 void EmitWrite(MslEmitterState& state, const Access& access) {
-    if (Multisampled(access.image.dimension)) state.Fail(access.inst, "stores to a multisampled image, which Metal shaders cannot write (work package B4)");
+    if (Multisampled(access.image.dimension) && !EmulatedMultisample(access)) state.Fail(access.inst, "stores to a multisampled image that is not a storage image");
     const bool uintImage = access.image.numericClass == IrTextureNumericClass::Uint;
     state.Line("if (" + state.Arg(access.inst, 3) + ") {");
     state.Indent();
-    const auto coord = CoordU32(state, access);
     const auto data = state.Arg(access.inst, 2);
+    if (EmulatedMultisample(access)) {
+        // Metal cannot write texture2d_ms: the sample is a slice of the 2D-array backing.
+        const auto texture = Texture(state, access);
+        const auto ms = EmulatedMultisampleCoord(state, access, texture);
+        const auto texel = access.mem.imagePacked ? PackedStoreTexel(state, access, data) : StoreTexel(state, access, data, uintImage);
+        state.Line("if (" + ms.inside + ") " + WriteCall(texture, RdnaImageDimension::Dim2DArray, ms.coord, texel) + ";");
+        state.Outdent();
+        state.Line("}");
+        return;
+    }
+    const auto coord = CoordU32(state, access);
     const auto texel = access.mem.imagePacked ? PackedStoreTexel(state, access, data) : StoreTexel(state, access, data, uintImage);
     const auto write = [&](const std::string& texture) {
         const auto inside = BoundsCheck(state, texture, access.image.dimension, coord, "0u", true, "0u");
@@ -933,7 +987,7 @@ std::optional<std::uint32_t> Atomic64Op(IrOpcode opcode) {
 void EmitAtomic64(MslEmitterState& state, const Access& access) {
     const auto op = Atomic64Op(access.inst.Opcode());
     if (!op) state.Fail(access.inst, "is a 64-bit image atomic the MSL backend does not know");
-    if (Multisampled(access.image.dimension)) state.Fail(access.inst, "is an atomic on a multisampled image, which Metal does not support");
+    if (Multisampled(access.image.dimension) && !EmulatedMultisample(access)) state.Fail(access.inst, "is an atomic on a multisampled image that is not a storage image");
     state.RequirePrelude(MslPreludeChunk::Atomics64);
     state.usesDriverData = true;
     const auto condition = state.Arg(access.inst, access.inst.ArgumentCount() - 1u);
@@ -942,13 +996,15 @@ void EmitAtomic64(MslEmitterState& state, const Access& access) {
     const auto result = state.Name(access.inst);
     state.Line(result + " = 0ul;");
     const auto texture = Texture(state, access);
-    const auto coord = CoordU32(state, access);
+    std::optional<MultisampleStorageCoord> ms;
+    if (EmulatedMultisample(access)) ms = EmulatedMultisampleCoord(state, access, texture);
+    const auto coord = ms ? ms->coord : CoordU32(state, access);
     const auto where = coord.coord + (coord.slice.empty() ? "" : ", " + coord.slice);
     const auto tag = state.Temporary("aps5_ia64");
     state.Line("bool " + tag + "_done = !(" + condition + ");");
     state.Line("if (!" + tag + "_done) {");
     state.Indent();
-    const auto inside = BoundsCheck(state, texture, access.image.dimension, coord, "0u", true, "0u");
+    const auto inside = ms ? ms->inside : BoundsCheck(state, texture, access.image.dimension, coord, "0u", true, "0u");
     state.Line("if (!" + inside + ") " + tag + "_done = true;");
     state.Outdent();
     state.Line("}");
@@ -991,7 +1047,7 @@ void EmitAtomic(MslEmitterState& state, const Access& access) {
     }
     const auto op = AtomicOp(opcode);
     if (!op) state.Fail(access.inst, "is an image atomic the MSL backend does not know");
-    if (Multisampled(access.image.dimension)) state.Fail(access.inst, "is an atomic on a multisampled image, which Metal does not support");
+    if (Multisampled(access.image.dimension) && !EmulatedMultisample(access)) state.Fail(access.inst, "is an atomic on a multisampled image that is not a storage image");
     state.RequirePrelude(MslPreludeChunk::RuntimeBuffer);
     const auto condition = state.Arg(access.inst, access.inst.ArgumentCount() - 1u);
     const auto value = state.Arg(access.inst, 2);
@@ -1002,8 +1058,10 @@ void EmitAtomic(MslEmitterState& state, const Access& access) {
     state.Line("if (" + condition + ") {");
     state.Indent();
     const auto texture = Texture(state, access);
-    const auto coord = CoordU32(state, access);
-    const auto inside = BoundsCheck(state, texture, access.image.dimension, coord, "0u", true, "0u");
+    std::optional<MultisampleStorageCoord> ms;
+    if (EmulatedMultisample(access)) ms = EmulatedMultisampleCoord(state, access, texture);
+    const auto coord = ms ? ms->coord : CoordU32(state, access);
+    const auto inside = ms ? ms->inside : BoundsCheck(state, texture, access.image.dimension, coord, "0u", true, "0u");
     state.Line("if (" + inside + ") {");
     state.Indent();
     // The invocation's earlier image stores come first (Vulkan orders them by program order; Metal
