@@ -1,13 +1,17 @@
 """Pure-Python tests for tools/mac/title_run.py (no title, GPU or subprocess)."""
 import itertools
+import os
+import tempfile
 from pathlib import Path
 import struct
 import sys
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import title_run  # noqa: E402
+import buildlock  # noqa: E402
 
 
 class PadScriptTests(unittest.TestCase):
@@ -156,6 +160,21 @@ class EnvAndAudioTests(unittest.TestCase):
         self.assertAlmostEqual(rms[1], 0.5)
         f32 = struct.pack("<2f", 0.25, -0.25)
         self.assertAlmostEqual(title_run.pcm_windows(f32, "f32", 2, 1, 1.0)[0], 0.25)
+
+
+class GpuLockTests(unittest.TestCase):
+    def test_cmd_run_holds_the_gpu_lock_for_the_whole_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "locks", "gpu.lock")
+            seen = []
+            args = mock.Mock(id="T1", tag="x")
+            with mock.patch.dict(os.environ, {buildlock.GPU_LOCK_ENV: path}), \
+                    mock.patch.object(title_run, "run_locked", lambda a: seen.append(buildlock.read_gpu_holder(path)) or 7):
+                os.environ.pop(buildlock.GPU_HELD_ENV, None)
+                self.assertEqual(title_run.cmd_run(args), 7)
+                self.assertIsNone(buildlock.read_gpu_holder(path))
+            self.assertEqual(seen[0]["pid"], os.getpid())
+            self.assertIn("title_run T1", seen[0]["command"])
 
 
 if __name__ == "__main__":

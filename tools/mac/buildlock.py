@@ -8,6 +8,10 @@ test command that touches a shared build directory:
     tools/mac/buildlock.py build-arm64 -- ninja -C build-arm64 libs
     tools/mac/buildlock.py build-arm64 -- ctest --test-dir build-arm64 -R guest_tcp
 
+The build lock is per build directory. GPU work must also take the machine-wide GPU lock (one flock shared by every
+worktree, <repo>/.mac-work/locks/gpu.lock, holder recorded in gpu.lock.info); gpu_suite and title_run do it themselves,
+for ad-hoc commands pass --gpu:  tools/mac/buildlock.py --gpu build-arm64 -- <command>
+
 The lock is released when the command exits, including on a crash.
 
 A gpu_suite run freezes the build directory for its whole duration with a suite lease
@@ -17,6 +21,7 @@ lease (dead pid, or over its max) is ignored and removed. To see who holds it:
 
     cat <build-dir>/.aps5-suite-lease.json
 """
+import contextlib
 import fcntl
 import json
 import os
@@ -115,10 +120,121 @@ def release_lease(build_dir) -> None:
             pass
 
 
+# ---- machine-wide GPU lock ---------------------------------------------------------------------------------
+# One flock on a fixed path outside every worktree (<repo>/.mac-work/locks/gpu.lock, shared by all worktrees), so GPU
+# workloads from different build directories never overlap. A sidecar file (gpu.lock.info) says who holds it. The
+# kernel drops the flock when the holder dies, so a dead holder never blocks; a stale sidecar is just overwritten.
+# Lock order is always GPU lock first, then the per-build lock (never the reverse) so the two cannot deadlock.
+
+GPU_LOCK_ENV = "APS5_GPU_LOCK"            # overrides the lock path (tests)
+GPU_HELD_ENV = "APS5_GPU_LOCK_HELD"       # set in the environment of children of a holder: they must not re-take it
+GPU_MESSAGE_EVERY = 60.0
+
+
+def gpu_lock_path() -> str:
+    override = os.environ.get(GPU_LOCK_ENV)
+    if override:
+        return override
+    here = os.path.dirname(os.path.abspath(__file__))
+    probe = here
+    while True:  # a worktree lives at <repo>/.mac-work/wt/<name>: the enclosing .mac-work is the shared one
+        if os.path.basename(probe) == ".mac-work":
+            return os.path.join(probe, "locks", "gpu.lock")
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        common = subprocess.run(["git", "-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        return os.path.join(os.path.dirname(common), ".mac-work", "locks", "gpu.lock")
+    except (OSError, subprocess.CalledProcessError):
+        return os.path.join(os.path.dirname(os.path.dirname(here)), ".mac-work", "locks", "gpu.lock")
+
+
+def read_gpu_holder(path=None):
+    """The sidecar record of the last holder, or None."""
+    try:
+        with open((path or gpu_lock_path()) + ".info", encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError):
+        return None
+
+
+def describe_gpu_holder(info) -> str:
+    if not info:
+        return "an unknown holder"
+    try:
+        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(info["started"])))
+    except (KeyError, TypeError, ValueError):
+        started = "?"
+    return f"pid {info.get('pid', '?')} running `{info.get('command', '?')}` since {started}"
+
+
+@contextlib.contextmanager
+def gpu_lock(label="", out=None, poll=1.0, message_every=GPU_MESSAGE_EVERY, path=None):
+    """Holds the machine-wide GPU lock for the with block, printing who holds it while waiting."""
+    if os.environ.get(GPU_HELD_ENV):
+        yield
+        return
+    out = out or sys.stderr
+    path = path or gpu_lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    start = time.monotonic()
+    with open(path, "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            last = None
+            while True:
+                if last is None or time.monotonic() - last >= message_every:
+                    out.write(f"gpu lock: waiting for {path}, held by {describe_gpu_holder(read_gpu_holder(path))}\n")
+                    out.flush()
+                    last = time.monotonic()
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(poll)
+            out.write(f"gpu lock: acquired after {time.monotonic() - start:.0f} s\n")
+            out.flush()
+        info = {"pid": os.getpid(), "started": time.time(), "command": label or " ".join(sys.argv)}
+        tmp = f"{path}.info.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as stream:
+            json.dump(info, stream)
+        os.replace(tmp, path + ".info")
+        previous = os.environ.get(GPU_HELD_ENV)
+        os.environ[GPU_HELD_ENV] = str(os.getpid())
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(GPU_HELD_ENV, None)
+            else:
+                os.environ[GPU_HELD_ENV] = previous
+            try:
+                if (read_gpu_holder(path) or {}).get("pid") == os.getpid():
+                    os.unlink(path + ".info")
+            except OSError:
+                pass
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+    use_gpu = bool(argv) and argv[0] == "--gpu"
+    if use_gpu:
+        sys.argv.pop(1)
     if len(sys.argv) < 4 or sys.argv[2] != "--":
-        sys.stderr.write("usage: buildlock.py <build-dir> -- <command...>\n")
+        sys.stderr.write("usage: buildlock.py [--gpu] <build-dir> -- <command...>\n"
+                         "  --gpu also takes the machine-wide GPU lock (for ad-hoc GPU commands)\n")
         return 2
+    if use_gpu:
+        with gpu_lock(label=" ".join(sys.argv[3:])):
+            return build_locked()
+    return build_locked()
+
+
+def build_locked() -> int:
     build_dir = sys.argv[1]
     command = sys.argv[3:]
     os.makedirs(build_dir, exist_ok=True)

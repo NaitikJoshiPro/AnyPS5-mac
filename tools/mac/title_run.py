@@ -43,7 +43,9 @@ import time
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "tools"))
+import buildlock  # noqa: E402  (machine-wide GPU lock)
 import pad_input  # noqa: E402  (BUTTONS table)
 
 P_TRANSLATED = 0x00020000  # sys/proc.h: process runs under Rosetta translation
@@ -371,6 +373,12 @@ def cmd_prepare(args):
 
 
 def cmd_run(args):
+    """One title run; the whole run holds the machine-wide GPU lock (taken before the per-build lock)."""
+    with buildlock.gpu_lock(label=f"title_run {args.id} --tag {args.tag}", out=sys.stdout):
+        return run_locked(args)
+
+
+def run_locked(args):
     work = work_dir()
     build = Path(args.build).resolve()
     run_dir = work / "runs" / "m3" / args.id
