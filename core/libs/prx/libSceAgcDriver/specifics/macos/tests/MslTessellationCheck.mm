@@ -163,10 +163,12 @@ int main() {
             const auto domain = Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor);
             const auto fragment = Compile(target, ShaderStage::Fragment, PixelCode, cursor);
             std::puts("recompiled the local, hull, domain and pixel programs");
-            if (std::getenv("APS5_TESS_DUMP") != nullptr || true) {
-                const std::string hs(hull.msl.Source());
-                const std::string ls(local.msl.Source());
-                std::printf("=== LOCAL BODY\n%s\n=== HULL BODY\n%s\n", ls.substr(ls.find("static void aps5_body(")).c_str(), hs.substr(hs.find("static void aps5_body(")).c_str());
+            for (const auto& [name, result] : {std::pair{"local", &local}, std::pair{"hull", &hull}, std::pair{"domain", &domain}}) {
+                const std::string path = std::string("build-metal/tess-dump-") + name + ".msl";
+                if (FILE* file = std::fopen(path.c_str(), "w")) {
+                    std::fputs(result->msl.Source().c_str(), file);
+                    std::fclose(file);
+                }
             }
             const std::array<std::pair<const ShaderRecompiler::RecompileResult*, Abi::Stage>, 3> stages{{{&local, Abi::Stage::Local}, {&hull, Abi::Stage::Hull}, {&domain, Abi::Stage::Domain}}};
             for (const auto& [result, stage] : stages) {
