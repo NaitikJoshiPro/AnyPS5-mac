@@ -19,10 +19,7 @@ struct Pending {
 constexpr Pending Tests[] = {
     {"agc_driver_pipeline_optimized_readback_tests", "agc_driver_pipeline_optimized_readback_*", nullptr,
      "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back"},
-    {"agc_driver_oversized_descriptor_sets_tests", "agc_driver_oversized_descriptor_sets", "D5 (descriptor tables of 4097 storage buffers)", nullptr},
     {"agc_driver_pooled_buffer_range_tests", "agc_driver_pooled_buffer_range", "D2 (pooled buffer ranges)", nullptr},
-    {"agc_driver_sampled_cache_budget_tests", "agc_driver_sampled_cache_budget, agc_driver_sampled_cache_budget_memory, agc_driver_resource_cache_*",
-     "D5 (sampled texture and resource cache budgets, with D3 host imports)", nullptr},
 };
 
 }
