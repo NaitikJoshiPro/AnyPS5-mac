@@ -246,3 +246,8 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Open: windowed audio not confirmed by ear; headless audio capture 578 s vs 680 s run (not investigated); the f16 supervised test still needs the user (auto-mode classifier denied main).
 - Origin: public fork NaitikJoshiPro/AnyPS5. All our commits rewritten to the NaitikJoshiPro identity before the first push.
 - 2026-10-13: the user confirmed the windowed DOOM run by eye and ear: picture correct, all sounds heard. The windowed audio criterion is verified.
+
+## 2026-10-13 late — agc_driver_f16_denormal_flush (the 2026-10-12 panic test): passes, M2 exit item closed
+- Supervised run (user's go): gpu-suite/main-f16-supervised, --validation, G1 1/1 pass, no panic.
+- Correction found while checking: the test was already released from quarantine on 2026-10-12 (a16969bc0, supervised pass after the teardown fix). It has since passed in 13 suite runs (G1 runs from 20261012T193710Z through msimg-g124). Only the EXIT agent's private list excluded it. The coordinator's "still needs the user" status was stale.
+- M2 exit criteria are now fully met with no exclusions.
