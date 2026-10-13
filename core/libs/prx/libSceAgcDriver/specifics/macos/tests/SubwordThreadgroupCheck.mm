@@ -4,7 +4,8 @@
 // M3. This test runs the pre-fix vertex sharing shape (thread 0 fills `corners`, a barrier, every
 // corner thread finds its owner corner, stores it in a ushort array, owners take a uchar slot from an
 // atomic counter, a barrier, read back) in a compute kernel and in a mesh function, once with the
-// sub-word arrays and once with 32-bit arrays, for 256, 255 (85 x 3) and 128 x 2 corners. It checks
+// sub-word arrays and once with 32-bit arrays, for 256, 255 (85 x 3) and 128 x 2 corners, the arrays sized as the mesh function sized them
+// (slice x corners). It checks
 // that the corner array is unchanged, owners match the CPU and slots are a permutation.
 // The emitters no longer declare sub-word threadgroup arrays (all are uint/int words); this test
 // only records whether the Metal compiler/GPU reproduces the corruption in isolation.
@@ -36,10 +37,10 @@ constexpr const char* Source = R"(
 using namespace metal;
 
 #define APS5_BODY                                                                                   \
-    threadgroup int corners[256];                                                                   \
+    threadgroup int corners[N];                                                                   \
     threadgroup uint count[1];                                                                      \
-    threadgroup SLOT_T slot[256];                                                                   \
-    threadgroup FIRST_T first[256];                                                                 \
+    threadgroup SLOT_T slot[N];                                                                   \
+    threadgroup FIRST_T first[N];                                                                 \
     threadgroup atomic_uint vertices[1];                                                            \
     if (tid == 0u) {                                                                                \
         for (uint i = 0u; i < used; ++i) corners[i] = input[i];                                     \
@@ -70,7 +71,7 @@ kernel void aps5_compute(device const int* input [[buffer(0)]], device uint* out
 
 struct Aps5Vertex { float4 position [[position]]; };
 struct Aps5Primitive { bool culled [[primitive_culled]]; };
-using Aps5Mesh = metal::mesh<Aps5Vertex, Aps5Primitive, 256, 256, metal::topology::point>;
+using Aps5Mesh = metal::mesh<Aps5Vertex, Aps5Primitive, N, N, metal::topology::point>;
 
 [[mesh]] void aps5_mesh(Aps5Mesh mesh, device const int* input [[buffer(0)]], device uint* output [[buffer(1)]], constant uint& used [[buffer(2)]], uint tid [[thread_index_in_threadgroup]])
 {
@@ -107,22 +108,22 @@ int main() {
             const int distinct[] = {97, 85, 129};
             int failures = 0;
             for (const auto& variant : variants) {
-                MTLCompileOptions* options = [MTLCompileOptions new];
-                options.languageVersion = MTLLanguageVersion4_0;
-                options.preprocessorMacros = @{@"FIRST_T": [NSString stringWithUTF8String:variant.firstType], @"SLOT_T": [NSString stringWithUTF8String:variant.slotType]};
-                NSError* error = nil;
-                id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:Source] options:options error:&error];
-                Require(library != nil, std::string("the repro does not compile: ") + (error != nil ? error.localizedDescription.UTF8String : "no error"));
-                id<MTLComputePipelineState> compute = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"aps5_compute"] error:&error];
-                Require(compute != nil, "no compute pipeline");
-                MTLMeshRenderPipelineDescriptor* meshDescriptor = [MTLMeshRenderPipelineDescriptor new];
-                meshDescriptor.meshFunction = [library newFunctionWithName:@"aps5_mesh"];
-                meshDescriptor.fragmentFunction = [library newFunctionWithName:@"aps5_fragment"];
-                meshDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-                id<MTLRenderPipelineState> mesh = [device newRenderPipelineStateWithMeshDescriptor:meshDescriptor options:MTLPipelineOptionNone reflection:nil error:&error];
-                Require(mesh != nil, std::string("no mesh pipeline: ") + (error != nil ? error.localizedDescription.UTF8String : "no error"));
                 for (std::size_t c = 0; c < std::size(sizes); ++c) {
                     const std::uint32_t used = sizes[c];
+                    MTLCompileOptions* options = [MTLCompileOptions new];
+                    options.languageVersion = MTLLanguageVersion4_0;
+                    options.preprocessorMacros = @{@"N": @(used), @"FIRST_T": [NSString stringWithUTF8String:variant.firstType], @"SLOT_T": [NSString stringWithUTF8String:variant.slotType]};
+                    NSError* error = nil;
+                    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:Source] options:options error:&error];
+                    Require(library != nil, std::string("the repro does not compile: ") + (error != nil ? error.localizedDescription.UTF8String : "no error"));
+                    id<MTLComputePipelineState> compute = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"aps5_compute"] error:&error];
+                    Require(compute != nil, "no compute pipeline");
+                    MTLMeshRenderPipelineDescriptor* meshDescriptor = [MTLMeshRenderPipelineDescriptor new];
+                    meshDescriptor.meshFunction = [library newFunctionWithName:@"aps5_mesh"];
+                    meshDescriptor.fragmentFunction = [library newFunctionWithName:@"aps5_fragment"];
+                    meshDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                    id<MTLRenderPipelineState> mesh = [device newRenderPipelineStateWithMeshDescriptor:meshDescriptor options:MTLPipelineOptionNone reflection:nil error:&error];
+                    Require(mesh != nil, std::string("no mesh pipeline: ") + (error != nil ? error.localizedDescription.UTF8String : "no error"));
                     std::vector<std::int32_t> input(Threads);
                     for (std::uint32_t i = 0; i < used; ++i) input[i] = static_cast<std::int32_t>((i * 7919u + c) % static_cast<std::uint32_t>(distinct[c]));
                     std::vector<std::uint32_t> owners(used);
