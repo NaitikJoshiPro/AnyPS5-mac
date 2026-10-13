@@ -100,6 +100,7 @@ GPU features that Apple hardware or Metal lacks (MoltenVK failures that map onto
 - Runtime MSL compilation works without Xcode but is slow cold (0.05–4.4 s front end + 0.25–20 s pipeline under load); the OS shader cache persists across process restarts even for command-line tools, and explicit binary archives work at runtime without Xcode. A Metal 4 archive saved with binaries+descriptors fails with a nil error on macOS 27.0.1 (binaries-only works).
 - `fma(l, r, 0)` turns -0 into +0. Emit plain multiplies where sign matters.
 - RDNA2 wave64 vs Apple SIMD width 32: see upstream discussion #2013 (wave64 programs at one lane per invocation on 32-wide hosts).
+- macOS arm64 user VA (measured on macOS 27.0.1, xnu vm_map_exec): `__PAGEZERO` 0–4 GiB, the dyld shared region 6–63 GiB, the commpage nesting region 63–64 GiB and the **GPU carveout 64–448 GiB** (`MACH_VM_MIN/MAX_GPU_CARVEOUT_ADDRESS`, a permanent prot-0 `VM_MEMORY_GUARD` entry in every 64-bit process before `main`). None of them can be unmapped, overwritten or reprotected, and no entitlement moves them (`extended-virtual-addressing` is a no-op on macOS and AMFI kills ad-hoc binaries that claim it). Guest fixed mappings in the carveout are backed at `guest | 1<<40` (D31). Protection faults arrive as SIGBUS with `si_code` BUS_ADRALN, the same code as real misalignment.
 - Storage buffers per stage, MSAA storage images, `nullDescriptor`: in Metal use argument buffers / bindless resources (Metal 3+, residency sets in Metal 4) instead of fixed binding slots.
 
 ## 6. Architecture
