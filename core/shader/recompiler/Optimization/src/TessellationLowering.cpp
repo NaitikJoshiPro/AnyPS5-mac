@@ -558,7 +558,7 @@ private:
                 if (address.constant < 0 || end > outputs * controlStride) Fail("the domain shader reads off-chip memory outside its patch's control points", access.pc);
                 break;
             case TessellationAttribute::Factor:
-                if (tessellation.domain > 2u || address.vertex != 0 || address.relative != FactorBytes(tessellation.domain) || address.constant < 0 || end > FactorBytes(tessellation.domain)) Fail("the hull shader writes tessellation factors outside its patch's factor record", access.pc);
+                if (tessellation.domain > 2u || address.vertex != 0 || address.relative != FactorBytes(tessellation.domain) || address.constant < 0 || end > FactorBytes(tessellation.domain)) Fail(tessellation.domain == 2u ? "the hull shader writes tessellation factors outside its patch's quad factors" : tessellation.domain == 1u ? "the hull shader writes tessellation factors outside its patch's triangle factors" : "the hull shader writes tessellation factors outside its patch's isoline factors", access.pc);
                 requireFirstInvocation(access);
                 break;
             case TessellationAttribute::PatchOutput:
