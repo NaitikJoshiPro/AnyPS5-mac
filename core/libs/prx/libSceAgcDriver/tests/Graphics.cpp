@@ -635,10 +635,10 @@ void ShaderStageTests() {
         queue.context[0x287] = 0x40000000;
         const auto clamped = AgcDriver::Graphics::DecodeState(queue, false, all).stages;
         Require(clamped.tessellationMinLevel == 2.0f && clamped.tessellationMaxLevel == 9.0f, "the tessellation level clamps decoded differently");
-        for (const auto [maximum, minimum] : {std::pair{0x3f800000u, 0x40000000u}, std::pair{0x7fc00000u, 0x3f800000u}, std::pair{0x42800000u, 0xff800000u}}) {
+        for (const auto [maximum, minimum, reason] : {std::tuple{0x3f800000u, 0x40000000u, "tessellation level clamps must be finite"}, std::tuple{0x7fc00000u, 0x3f800000u, "non-finite register"}, std::tuple{0x42800000u, 0xff800000u, "non-finite register"}}) {
             queue.context[0x286] = maximum;
             queue.context[0x287] = minimum;
-            expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, false, all); }, "tessellation level clamps must be finite");
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, false, all); }, reason);
         }
         queue.context[0x286] = 0x42800000;
         queue.context[0x287] = 0x3f800000;
