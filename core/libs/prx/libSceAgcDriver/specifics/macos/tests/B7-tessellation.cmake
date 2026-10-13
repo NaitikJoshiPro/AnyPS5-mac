@@ -43,3 +43,16 @@ if(CMAKE_CXX_COMPILER_LAUNCHER)
 endif()
 add_test(NAME agc_metal_tessellator_gpu COMMAND agc_metal_tessellator_gpu_tests)
 set_tests_properties(agc_metal_tessellator_gpu PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS "gpu")
+# agc_metal_subword_threadgroup: minimal repro of the TESS2 finding (83ed2d518): the pre-fix vertex
+# sharing shape with uchar/ushort threadgroup arrays next to an int array, in a compute kernel and a
+# mesh function, against a 32-bit-word control. Records whether the corruption reproduces in
+# isolation (the emitters declare only 32-bit threadgroup arrays). GPU, one 256-thread threadgroup.
+add_test_executable(agc_metal_subword_threadgroup_tests ${agcMetalDir}/tests/SubwordThreadgroupCheck.mm)
+target_link_libraries(agc_metal_subword_threadgroup_tests PRIVATE "-framework Metal" "-framework Foundation")
+set_source_files_properties(${agcMetalDir}/tests/SubwordThreadgroupCheck.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+set_target_properties(agc_metal_subword_threadgroup_tests PROPERTIES CXX_EXTENSIONS OFF OBJCXX_STANDARD 20)
+if(CMAKE_CXX_COMPILER_LAUNCHER)
+    set_property(TARGET agc_metal_subword_threadgroup_tests PROPERTY OBJCXX_COMPILER_LAUNCHER ${CMAKE_CXX_COMPILER_LAUNCHER})
+endif()
+add_test(NAME agc_metal_subword_threadgroup COMMAND agc_metal_subword_threadgroup_tests)
+set_tests_properties(agc_metal_subword_threadgroup PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS "gpu")
