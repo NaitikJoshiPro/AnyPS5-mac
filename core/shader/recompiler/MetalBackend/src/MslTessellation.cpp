@@ -377,9 +377,10 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     object += "        const int aps5_count = aps5_tess_primitive_count(aps5_patch, aps5_none);\n";
     object += "        aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "] = aps5_patch_id;\n";
     object += "        aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "] = uint(aps5_count);\n";
-    object += "        const uint aps5_slices = (uint(aps5_count) + " + U32(slice - 1u) + ") / " + U32(slice) + ";\n";
-    // A culled patch launches no mesh grid (set_threadgroups_per_grid is never called).
-    object += "        if (aps5_slices != 0u) aps5_grid.set_threadgroups_per_grid(uint3(aps5_slices, 1u, 1u));\n    }\n}\n";
+    // A culled patch launches one mesh threadgroup that emits nothing: the MSL specification defines
+    // only the uncalled case, and calling it always keeps every object threadgroup on one path.
+    object += "    }\n    threadgroup_barrier(mem_flags::mem_object_data);\n";
+    object += "    if (aps5_tid == 0u) aps5_grid.set_threadgroups_per_grid(uint3(max((aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "] + " + U32(slice - 1u) + ") / " + U32(slice) + ", 1u), 1u, 1u));\n}\n";
 
     const char* topologyName = topology == T::Point ? "point" : topology == T::Line ? "line" : "triangle";
     std::string mesh = common + Namespaced(domain, "aps5_ds");
