@@ -421,6 +421,7 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     // Vertex sharing within the slice: the first corner that uses a domain point owns its vertex
     // (the domain program runs once per unique point); later corners index the owner's vertex.
     mesh += "    const uint aps5_used = aps5_primitives * " + U32(corners) + ";\n";
+    mesh += "    const int aps5_corner = aps5_tid < aps5_used ? aps5_corners[aps5_tid] : 0;\n";
     mesh += "    if (aps5_tid < aps5_used) {\n";
     mesh += "        uint aps5_owner = aps5_tid;\n";
     mesh += "";
@@ -429,10 +430,10 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     mesh += "    }\n";
     mesh += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     mesh += "    if (aps5_tid < aps5_used && aps5_first[aps5_tid] == aps5_tid) {\n";
-    mesh += "        const Aps5TessPoint aps5_point = aps5_tess_point(aps5_patch, aps5_corners[aps5_tid]);\n";
+    mesh += "        const Aps5TessPoint aps5_point = aps5_tess_point(aps5_patch, aps5_corner);\n";
     // Domain locations as the D3D11 reference: (u, v) and, for triangles, w = 1 - u - v.
     mesh += "        const float3 aps5_coord0 = float3(aps5_point.u, aps5_point.v, " + std::string(config.domain == T::Triangle ? "1.0f - aps5_point.u - aps5_point.v" : "0.0f") + ");\n";
-    mesh += "        const float3 aps5_coord = (aps5_corners[aps5_tid] < 0 || aps5_corners[aps5_tid] >= aps5_patch.points) ? float3(-1.0f - float(aps5_slice.x), float(aps5_corners[aps5_tid]) + float(aps5_tid) / 1024.0f, 0.0f) : aps5_coord0;\n";
+    mesh += "        const float3 aps5_coord = (aps5_corner < 0 || aps5_corner >= aps5_patch.points) ? float3(-1.0f - float(aps5_slice.x), float(aps5_corner) + float(aps5_tid) / 1024.0f, 0.0f) : aps5_coord0;\n";
     mesh += "        aps5_ds::Aps5VertexOut aps5_vertex = {};\n";
     mesh += "#ifdef APS5_TESS_POINT_SIZE_FIELD\n        aps5_vertex.aps5_tess_point_size = 1.0f;\n#endif\n";
     mesh += "        aps5_ds::aps5_stage(aps5_ds_table, aps5_push, aps5_driver, aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "], aps5_coord, aps5_lane, aps5_payload.words, aps5_vertex);\n";
