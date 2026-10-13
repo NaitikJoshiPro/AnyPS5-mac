@@ -231,8 +231,31 @@ int main() {
     Require(chroot_nid_postfix(file.c_str()) == -1 && Error() == 20);
     Require(chroot_nid_postfix((root / "file.txt" / "child").string().c_str()) == -1 && Error() == 20);
     Require(chroot_nid_postfix((file + "/").c_str()) == -1 && Error() == 20);
+    Require(chroot_nid_postfix((root / "file.txt" / "..").string().c_str()) == -1 && Error() == 20);
+    Require(chroot_nid_postfix((root / std::string(256, 'n')).string().c_str()) == -1 && Error() == 63);
+    Require(chroot_nid_postfix(("/" + std::string(1024, 'p')).c_str()) == -1 && Error() == 63);
     Require(ChrootThrows(root.string()));
-    Require(ChrootThrows("/"));
+    Require(ChrootThrows("/" + root.filename().string() + "/."));
+    const auto guestRoot = "/" + root.filename().string();
+    const auto chrootFile = guestRoot + "/file.txt";
+    const int top = sceKernelOpen("/", SCE_KERNEL_O_RDONLY | SCE_KERNEL_O_DIRECTORY, 0);
+    Require(top >= 0);
+    Require(chdir_nid_postfix(guestRoot.c_str()) == 0);
+    Require(fchdir_nid_postfix(top) == 0 && chroot_nid_postfix(".") == 0);
+    Require(getcwd_nid_postfix(directoryPath, sizeof(directoryPath)) == directoryPath && std::strcmp(directoryPath, "/") == 0);
+    Require(sceKernelClose(top) == 0);
+    Require(chroot_nid_postfix("/") == 0 && chroot_nid_postfix("/..") == 0 && chroot_nid_postfix("//./") == 0);
+    Require(chdir_nid_postfix(guestRoot.c_str()) == 0);
+    Require(chroot_nid_postfix("..") == 0 && chroot_nid_postfix("../..") == 0);
+    Require(getcwd_nid_postfix(directoryPath, sizeof(directoryPath)) == directoryPath && guestRoot == directoryPath);
+    Require(ChrootThrows("."));
+    for (const auto& path : {std::string("file.txt"), chrootFile, "/../../.." + chrootFile, "../.." + chrootFile}) {
+        const int opened = sceKernelOpen(path.c_str(), SCE_KERNEL_O_RDONLY, 0);
+        char byte = 0;
+        Require(opened >= 0 && sceKernelRead(opened, &byte, 1) == 1 && byte == 'x');
+        Require(sceKernelClose(opened) == 0);
+    }
+    Require(chdir_nid_postfix("/") == 0);
     Require(getcwd_nid_postfix(directoryPath, sizeof(directoryPath)) == directoryPath && std::strcmp(directoryPath, "/") == 0);
     Require(readlink_nid_postfix(file.c_str(), buffer, sizeof(buffer)) == -1 && Error() == 22);
     const auto symbolic = (root / "symbolic").string();

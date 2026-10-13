@@ -375,13 +375,18 @@ int APS5_VABI fchdir_nid_postfix(int fd) {
 
 int APS5_VABI chroot_nid_postfix(const char* path) {
     if (path == nullptr) return static_cast<int>(Fail(GuestEfault));
-    if (*path == ' ') return static_cast<int>(Fail(GuestEnoent));
-    const auto native = ResolvePath_nid_no_patch(path);
+    if (*path == '\0') return static_cast<int>(Fail(GuestEnoent));
+    if (std::strlen(path) >= GuestPathMax || HasLongComponent(path)) return static_cast<int>(Fail(GuestEnametoolong));
+    std::filesystem::path native;
+    if (const int error = ResolvePathError_nid_no_patch(path, native)) return static_cast<int>(Fail(error));
     std::error_code error;
     const auto status = std::filesystem::status(native, error);
     if (status.type() == std::filesystem::file_type::not_found) return static_cast<int>(Fail(HasNonDirectoryPrefix(native) ? GuestEnotdir : GuestEnoent));
     if (error) return static_cast<int>(Fail(GuestError(error)));
     if (!std::filesystem::is_directory(status)) return static_cast<int>(Fail(GuestEnotdir));
+    const bool root = std::filesystem::equivalent(native, ResolvePath_nid_no_patch("/"), error);
+    if (error) return static_cast<int>(Fail(GuestError(error)));
+    if (root) return 0;
     throw std::runtime_error(std::string("chroot: changing the root directory to ") + path + " is not supported, the guest path resolver keeps a fixed root");
 }
 
