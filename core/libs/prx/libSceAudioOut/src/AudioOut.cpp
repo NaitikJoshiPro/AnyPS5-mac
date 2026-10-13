@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <prx/libc/include/General.hpp>
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include "SDL.h"
 #include "SceTypes.hpp"
@@ -215,6 +216,8 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
         return;
     }
 
+    // The guest's PCM buffer is read (and may be queued to SDL) natively: a displaced one (D31, D33) by its alias.
+    data = GuestArena::HostRange(data, static_cast<std::size_t>(port.samplesNum) * static_cast<std::uint32_t>(port.channels) * bytesPerSample(port.format));
     std::vector<std::uint8_t> prepareBuf;
     const void* prepared = prepareBuffer(port, data, prepareBuf);
     const std::uint32_t preparedSize = port.samplesNum *

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 // Guest addresses the host cannot map at their own value live at a fixed alias instead: host = guest | DisplacedFlip
 // (D31, D33). On macOS arm64 these are a table of host-reserved ranges, found at startup (GuestDisplaced.cpp):
@@ -72,6 +73,27 @@ inline std::uintptr_t GuestAddress(std::uintptr_t host) {
 template <typename T>
 inline T* HostPointer(T* guest) {
     return reinterpret_cast<T*>(HostAddress(reinterpret_cast<std::uintptr_t>(guest)));
+}
+
+// The host address of guest [guest, guest + bytes) for native bulk access (memcpy, memcmp, scans, host system calls),
+// translated once up front instead of faulting per load/store; a host system call cannot be rescued by the fault
+// handler at all (the kernel returns EFAULT). A range crossing the window's edge has no single backing and throws
+// (the arena never maps one: the shared cache lies below the window, malloc's regions above it). Host addresses,
+// aliases included, pass through unchanged. Costs one compare for memory above the window.
+inline std::uintptr_t HostRange(std::uintptr_t guest, std::size_t bytes) {
+    if (!MayBeDisplaced(guest)) return guest;
+    const auto start = DisplacedStart();
+    if (guest >= start) {
+        if (bytes > DisplacedEnd - guest) throw std::runtime_error("native access to guest memory straddles the upper edge of the displaced window");
+        return guest | DisplacedFlip;
+    }
+    if (bytes > start - guest) throw std::runtime_error("native access to guest memory straddles the lower edge of the displaced window");
+    return guest;
+}
+
+template <typename T>
+inline T* HostRange(T* guest, std::size_t bytes) {
+    return reinterpret_cast<T*>(HostRange(reinterpret_cast<std::uintptr_t>(guest), bytes));
 }
 
 extern "C" {

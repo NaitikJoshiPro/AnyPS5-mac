@@ -9,6 +9,7 @@
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "AudioOut2Internal.hpp"
 #include "AudioOut2PadMix.hpp"
 
@@ -67,6 +68,11 @@ static const AudioOut2StereoFold* StereoFoldFor(std::uint32_t channels) {
     return found == std::end(STEREO_FOLDS) ? nullptr : found;
 }
 
+// The guest's port buffer is read natively per grain: a displaced one (D31, D33) by its alias, translated once.
+static const void* HostPortData(const AudioOut2Port& port, const void* data, std::uint32_t frames) {
+    return GuestArena::HostRange(data, static_cast<std::size_t>(frames) * port.channels * (port.int16 ? sizeof(std::int16_t) : sizeof(float)));
+}
+
 static void ReadFrame(const AudioOut2Port& port, const void* data, std::uint32_t frame, float* in) {
     const auto first = static_cast<std::size_t>(frame) * port.channels;
     for (std::uint32_t c = 0; c < port.channels; c++) {
@@ -75,6 +81,7 @@ static void ReadFrame(const AudioOut2Port& port, const void* data, std::uint32_t
 }
 
 static void AccumulatePadPort(const AudioOut2Port& port, const void* data, AudioOut2Route route, float* out, std::uint32_t frames) {
+    data = HostPortData(port, data, frames);
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
         ReadFrame(port, data, frame, in);
@@ -83,6 +90,7 @@ static void AccumulatePadPort(const AudioOut2Port& port, const void* data, Audio
 }
 
 static void AccumulatePort(const AudioOut2Port& port, const void* data, float* out, std::uint32_t frames) {
+    data = HostPortData(port, data, frames);
     const auto& fold = *port.fold;
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {

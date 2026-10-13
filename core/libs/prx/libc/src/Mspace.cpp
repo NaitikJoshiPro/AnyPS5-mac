@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -204,7 +205,7 @@ void* APS5_VABI sceLibcMspaceCalloc_nid_postfix(void* handle, std::size_t count,
     }
     std::lock_guard lock(arenaMutex);
     void* result = Allocate(Find(handle), count * size, Granule);
-    if (result) std::memset(result, 0, count * size);
+    if (result) std::memset(GuestArena::HostRange(result, count * size), 0, count * size); // a guest mspace may lie in the displaced window
     return result;
 }
 
@@ -234,7 +235,7 @@ void* APS5_VABI sceLibcMspaceRealloc_nid_postfix(void* handle, void* pointer, st
     }
     void* result = Allocate(arena, size, Granule);
     if (result) {
-        std::memcpy(result, pointer, std::min<std::size_t>(capacity, size));
+        std::memcpy(GuestArena::HostRange(result, std::min<std::size_t>(capacity, size)), GuestArena::HostRange(pointer, std::min<std::size_t>(capacity, size)), std::min<std::size_t>(capacity, size));
         Release(*arena, arena->chunks.find(start));
     }
     return result;
@@ -280,7 +281,7 @@ void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void* handle, void* pointe
     if (needed <= capacity && (start & (effective - 1)) == 0) return pointer;
     void* result = Allocate(arena, size, effective);
     if (result) {
-        std::memcpy(result, pointer, std::min<std::size_t>(capacity, size));
+        std::memcpy(GuestArena::HostRange(result, std::min<std::size_t>(capacity, size)), GuestArena::HostRange(pointer, std::min<std::size_t>(capacity, size)), std::min<std::size_t>(capacity, size));
         Release(*arena, arena->chunks.find(start));
     }
     return result;

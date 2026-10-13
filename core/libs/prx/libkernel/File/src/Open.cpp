@@ -3,6 +3,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
@@ -116,10 +117,13 @@ static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
     const auto result = File::SeekSharedMemory_nid_no_patch(fd, offset, whence);
     return result == -2 ? ::lseek(fd, static_cast<off_t>(offset), whence) : result;
 }
+// Host system calls get the host address of a guest buffer: a displaced one (D31, D33) is a guard page at its guest
+// address, where the kernel returns EFAULT instead of raising the signal the fault handler redirects.
 static std::int64_t NativeRead(int fd, void* buf, std::size_t n) {
-    return ::read(fd, buf, n);
+    return ::read(fd, GuestArena::HostRange(buf, n), n);
 }
 static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
+    buf = GuestArena::HostRange(buf, n);
     const auto result = File::WriteSharedMemory_nid_no_patch(fd, buf, n);
     return result == -2 ? ::write(fd, buf, n) : result;
 }

@@ -27,6 +27,7 @@
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/ProgramCall.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #ifdef __linux__
 #include <stdio_ext.h>
@@ -359,7 +360,8 @@ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, File
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - reinterpret_cast<std::uintptr_t>(buffer)) throw std::overflow_error("fread: buffer address overflow");
     const GuestArena::HostWrite destination(buffer, bytes);
     if (!destination.Open()) throw std::runtime_error("fread: buffer is not writable");
-    const auto result = std::fread(buffer, size, count, handle);
+    // stdio reads large transfers straight into the buffer with read(2): a displaced guest buffer (D31, D33) goes by its alias.
+    const auto result = std::fread(GuestArena::HostRange(buffer, bytes), size, count, handle);
     stream->SyncStatus();
     return result;
 }
@@ -368,7 +370,8 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
     auto* handle = GetNativeStream(stream);
     if (size == 0 || count == 0) return 0;
     if (!buffer) throw std::runtime_error("fwrite: null buffer");
-    const auto result = std::fwrite(buffer, size, count, handle);
+    if (count > std::numeric_limits<std::size_t>::max() / size) throw std::overflow_error("fwrite: buffer size overflow");
+    const auto result = std::fwrite(GuestArena::HostRange(buffer, size * count), size, count, handle);
     stream->SyncStatus();
     return result;
 }

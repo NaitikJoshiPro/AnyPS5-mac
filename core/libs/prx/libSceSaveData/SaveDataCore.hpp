@@ -22,6 +22,7 @@
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
 
 namespace savedata {
@@ -290,7 +291,7 @@ std::filesystem::path save_blocks_path(const std::filesystem::path& directory) {
 }
 
 bool write_blob(const std::filesystem::path& path, const void* data, std::size_t size) {
-    if (!replace_file(path, data, size)) return false;
+    if (!replace_file(path, GuestArena::HostRange(data, size), size)) return false; // guest buffer: alias if displaced (D31, D33)
     RecordWrittenPath_nid_no_patch(path);
     return true;
 }
@@ -300,7 +301,7 @@ bool read_blob(const std::filesystem::path& path, void* data, std::size_t size) 
     if (!file) {
         return false;
     }
-    file.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+    file.read(static_cast<char*>(GuestArena::HostRange(data, size)), static_cast<std::streamsize>(size)); // guest buffer: alias if displaced (D31, D33)
     return static_cast<std::size_t>(file.gcount()) == size;
 }
 

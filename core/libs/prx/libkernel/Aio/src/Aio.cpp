@@ -9,6 +9,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
@@ -69,7 +70,8 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
     }
     return NativePositioned_nid_no_patch(fd, buf, nbyte, offset, false);
 #else
-    return static_cast<std::int64_t>(::pread(fd, buf, nbyte, static_cast<off_t>(offset)));
+    // The host address of the guest buffer: at a displaced guest address (D31, D33) pread would return EFAULT.
+    return static_cast<std::int64_t>(::pread(fd, GuestArena::HostRange(buf, nbyte), nbyte, static_cast<off_t>(offset)));
 #endif
 }
 
@@ -81,6 +83,7 @@ std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, s
     }
     return NativePositioned_nid_no_patch(fd, const_cast<void*>(buf), nbyte, offset, true);
 #else
+    buf = GuestArena::HostRange(buf, nbyte);
     const auto result = File::PwriteSharedMemory_nid_no_patch(fd, buf, nbyte, offset);
     return result == -2 ? static_cast<std::int64_t>(::pwrite(fd, buf, nbyte, static_cast<off_t>(offset))) : result;
 #endif

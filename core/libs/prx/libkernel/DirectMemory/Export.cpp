@@ -4,6 +4,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #ifdef _WIN32
@@ -297,14 +298,17 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  const bool writable = (host.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
  const bool executable = (host.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
  #elif defined(__APPLE__)
- mach_vm_address_t region = address;
+ // A displaced guest address (D31, D33) is backed at its alias; the guest address itself is a guard page.
+ const auto hostAddress = GuestArena::HostAddress(address);
+ mach_vm_address_t region = hostAddress;
  mach_vm_size_t regionSize = 0;
  vm_region_basic_info_data_64_t host{};
  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
  mach_port_t object = MACH_PORT_NULL;
- if (mach_vm_region(mach_task_self(), &region, &regionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&host), &count, &object) != KERN_SUCCESS || region > address || (host.protection & VM_PROT_READ) == 0) return SCE_KERNEL_ERROR_EACCES;
- info->start = region;
- info->end = region + regionSize;
+ if (mach_vm_region(mach_task_self(), &region, &regionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&host), &count, &object) != KERN_SUCCESS || region > hostAddress || (host.protection & VM_PROT_READ) == 0) return SCE_KERNEL_ERROR_EACCES;
+ info->start = GuestArena::GuestAddress(region);
+ info->end = info->start + regionSize;
+ if (GuestArena::IsDisplaced(address)) info->end = std::min<uintptr_t>(info->end, GuestArena::DisplacedEnd);
  const bool writable = (host.protection & VM_PROT_WRITE) != 0;
  const bool executable = (host.protection & VM_PROT_EXECUTE) != 0;
  #else
@@ -600,11 +604,14 @@ bool HasInaccessiblePages(std::uintptr_t start, std::uintptr_t end) {
 #endif
 
 int LockHostPages(std::uintptr_t start, std::uintptr_t end) {
-    auto* const address = reinterpret_cast<void*>(start);
     const std::size_t bytes = end - start;
 #ifdef __APPLE__
+    // A displaced guest range (D31, D33) is wired at its alias; a guest range never straddles the window's edges.
+    start = GuestArena::HostAddress(start);
+    end = start + bytes;
     if (HasInaccessiblePages(start, end)) return SCE_KERNEL_ERROR_ENOMEM;
 #endif
+    auto* const address = reinterpret_cast<void*>(start);
     if (::mlock(address, bytes) == 0) return 0;
     int error = errno;
     rlimit limit{};
@@ -625,7 +632,7 @@ int LockHostPages(std::uintptr_t start, std::uintptr_t end) {
 
 int UnlockHostPages(std::uintptr_t start, std::uintptr_t end) {
     if (!GuestRangeMapped(start, end)) return SCE_KERNEL_ERROR_ENOMEM;
-    if (::munlock(reinterpret_cast<void*>(start), end - start) == 0) return 0;
+    if (::munlock(reinterpret_cast<void*>(GuestArena::HostAddress(start)), end - start) == 0) return 0;
     const int error = errno;
     if (error == ENOMEM) return SCE_KERNEL_ERROR_ENOMEM;
     throw std::system_error(error, std::generic_category(), "munlock failed");

@@ -18,6 +18,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
 
@@ -418,7 +419,7 @@ static int getSaveDataMemory2(SaveDataMemoryGet2* get_param) {
             return SAVE_DATA_ERROR_INTERNAL;
         }
         f.seekg(static_cast<std::streamoff>(d->offset));
-        f.read(static_cast<char*>(d->buf), static_cast<std::streamsize>(d->buf_size));
+        f.read(static_cast<char*>(GuestArena::HostRange(d->buf, d->buf_size)), static_cast<std::streamsize>(d->buf_size)); // guest buffer: alias if displaced (D31, D33)
         if (!f) {
             return SAVE_DATA_ERROR_INTERNAL;
         }

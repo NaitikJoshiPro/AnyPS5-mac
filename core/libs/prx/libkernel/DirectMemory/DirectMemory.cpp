@@ -208,6 +208,28 @@ void* MapFixedNoReplace(void* addr, size_t len, int prot) {
     }
     return reinterpret_cast<void*>(address);
 }
+
+// Without the guest arena (it could not reserve the PS5 layout) the displaced window (D31, D33) may still be active:
+// its guest addresses are guard pages, so a fixed mapping there goes to the alias, which the window keeps reserved
+// PROT_NONE. Nothing tracks which alias pages hold mappings without the arena, so no-overwrite cannot be honoured.
+bool NativeDisplaced(const void* addr, size_t len) {
+    return GuestArena::GuestDisplacedActive_nid_no_patch() && GuestArena::OverlapsDisplaced(reinterpret_cast<std::uintptr_t>(addr), len);
+}
+
+void* MapFixedOutsideArena(void* addr, size_t len, int prot, bool noOverwrite) {
+    if (!NativeDisplaced(addr, len)) return noOverwrite ? MapFixedNoReplace(addr, len, prot) : mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    if (!GuestArena::IsDisplaced(start) || start + len > GuestArena::DisplacedEnd)
+        throw std::invalid_argument("fixed mapping straddles the edge of the displaced window");
+    if (noOverwrite) throw std::runtime_error("no-overwrite fixed mapping in the displaced window needs the guest arena, which is unavailable");
+    return mmap(GuestArena::HostPointer(addr), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED ? MAP_FAILED : addr;
+}
+
+// Unmapping a displaced range outside the arena puts the alias reservation back instead of leaving a hole in it.
+int UnmapOutsideArena(void* addr, size_t len) {
+    if (!NativeDisplaced(addr, len)) return munmap(addr, len);
+    return mmap(GuestArena::HostPointer(addr), len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED ? -1 : 0;
+}
 #endif
 
 // macOS on arm64 keeps the low 4 GiB as __PAGEZERO, where nothing can be mapped; a guest's fixed mapping
@@ -665,7 +687,11 @@ void Unmap(void* addr, size_t len) {
 #if defined(__linux__) || defined(__APPLE__)
     if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
         GuestArena::GuestArenaReset_nid_postfix(addr, len);
+#if defined(__APPLE__)
+    else if (UnmapOutsideArena(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+#else
     else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+#endif
     ArenaForget(addr, len);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
@@ -730,7 +756,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
         const int placement = (flags & GuestMapNoOverwrite) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
         void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | placement, -1, 0);
 #elif defined(__APPLE__)
-        void* result = (flags & GuestMapNoOverwrite) != 0 ? MapFixedNoReplace(addr, len, prot) : mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        void* result = MapFixedOutsideArena(addr, len, prot, (flags & GuestMapNoOverwrite) != 0);
 #else
         void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #endif
