@@ -1029,9 +1029,10 @@ std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch&)
 }
 
 void VulkanDevice::State::RequireDispatchable(const ShaderRecompiler::RecompileResult& shader) const {
+    // As upstream, an incompatible runtime ABI is the first refusal.
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     if (recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot dispatch");
     if (shader.msl.empty()) throw std::runtime_error("Metal device: the shader has no MSL form (recompile it for the device's Target(), whose backend is Msl)");
-    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     const auto& reflection = shader.msl.Reflection();
     if (reflection.abiVersion != Abi::Version) throw std::runtime_error("Metal device: the shader was emitted for MslAbi version " + std::to_string(reflection.abiVersion) + ", the device binds version " + std::to_string(Abi::Version));
     if (reflection.stage != Abi::Stage::Kernel) throw std::runtime_error("Metal device: Dispatch needs a kernel");

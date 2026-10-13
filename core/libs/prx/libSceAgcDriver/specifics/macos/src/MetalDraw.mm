@@ -25,6 +25,7 @@
 #include "MetalVulkanImages.h"
 #include "MetalDepthSurfaces.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -456,7 +457,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (fragmentReflection != nullptr && fragmentReflection->stage != Abi::Stage::Fragment) Fail("the pixel stage's MSL is not a fragment function");
     if (vertexReflection.workgroupMemoryStrideDwords != 0u || (fragmentReflection != nullptr && fragmentReflection->workgroupMemoryStrideDwords != 0u)) Fail("device-memory LDS in a draw stage");
     if (graphics.samples > 1u) Fail("multisampled draws (" + std::to_string(graphics.samples) + " samples)");
-    if (graphics.conservativeRasterization != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) Fail("conservative rasterization requires VK_EXT_conservative_rasterization, which has no Metal counterpart (the Metal API has no conservative rasterization)");
+    // Conservative rasterization is emulated (MslConservative.hpp, DECISIONS "conservative
+    // rasterization emulated"), and so are per-vertex fragment inputs and barycentrics (B6): both
+    // need every triangle's three vertices in the vertex function (the triangle-vertices mode).
+    const std::uint32_t conservativeMode = graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT ? 1u : graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT ? 2u : 0u;
+    const bool perVertex = fragmentReflection != nullptr && (fragmentReflection->perVertexLocations != 0u || fragmentReflection->emulatedBarycentrics != 0u);
+    const bool triangleVertices = conservativeMode != 0u || perVertex;
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
     // The draws to record: direct, or the indirect records read on the CPU (through the checked
@@ -487,6 +493,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (calls.empty()) return;
 
     const auto primitive = graphics.rectList ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
+    if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
     if (graphics.rectList && draw.indexed) Fail("indexed rect lists");
     if (draw.indexed && draw.indexSize != 2u && draw.indexSize != 4u) Fail("index size " + std::to_string(draw.indexSize));
 
@@ -640,6 +647,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     Graphics::Metal::RenderPipelineRequest request;
     request.vertex = Graphics::Metal::PipelineFunction::From(vertexResult);
     if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
+    if (triangleVertices) {
+        request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
+        if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
+        if (perVertex) {
+            request.vertex.macros.push_back({Abi::PerVertexLocationsMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations)) + "u"});
+            request.vertex.macros.push_back({Abi::PerVertexLocationsHighMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations >> 32u)) + "u"});
+            request.vertex.macros.push_back({Abi::BarycentricsMacro, std::to_string(fragmentReflection->emulatedBarycentrics) + "u"});
+        }
+    }
     if (graphics.negativeOneToOne) request.vertex.macros.push_back({Abi::DepthNegativeOneToOneMacro, "1"});
     if (fragmentResult != nullptr) {
         auto function = Graphics::Metal::PipelineFunction::From(*fragmentResult);
@@ -652,6 +668,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // Dual-source blending: the fragment function writes color(0) index(1) too.
         const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
         if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
+        if (conservativeMode != 0u) function.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
@@ -681,7 +698,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (HasStencil(depth->format)) request.stencilFormat = depth->format;
     }
     request.rasterSampleCount = 1u;
-    request.alphaToCoverage = graphics.alphaToCoverage;
+    // B6 emulates alpha-to-coverage in the fragment function's [[sample_mask]] (the guest's rule);
+    // Metal's own would apply on top.
+    request.alphaToCoverage = graphics.alphaToCoverage && !(fragmentReflection != nullptr && fragmentReflection->exportsSampleMask);
     request.topology = primitive.topologyClass;
     struct PipelinePass {
         id<MTLRenderPipelineState> pipeline;
@@ -697,6 +716,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const float biasConstant = graphics.depthBias ? graphics.depthBiasConstant : 0.0f;
     const float biasSlope = graphics.depthBias ? graphics.depthBiasSlope : 0.0f;
     if (Graphics::SplitsAlternateAlpha(graphics)) {
+        // Upstream Pipeline.cpp's limits of the second-channel split (the second pass would repeat
+        // the draw's other effects).
+        const auto keepsStencil = [](const VkStencilOpState& face) { return face.writeMask == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
+        if ((graphics.depth && (graphics.depthWrite || (graphics.stencilTest && (!keepsStencil(graphics.stencilFront) || !keepsStencil(graphics.stencilBack))))) || graphics.depthBiasPerFace) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order and a separate alpha blend from a draw that writes depth or stencil is not implemented");
+        const std::array<Graphics::CompiledShader, 2> stages {{vertex, fragment != nullptr ? *fragment : vertex}};
+        if (Graphics::ShadersWriteMemory(std::span(stages.data(), fragment != nullptr ? 2u : 1u))) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order and a separate alpha blend from a draw whose shaders write memory is not implemented");
         auto first = request;
         auto second = request;
         for (const auto& attachment : colors) {
@@ -742,7 +767,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
     // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
     const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
-    const bool expand = primitive.fan || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint);
+    const bool expand = primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint);
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
     if (expand) {
@@ -1036,8 +1061,29 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool expanded = expand;
     const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
     const auto& drawCalls = expanded ? fanCalls : calls;
-    const bool indexedDraw = draw.indexed || expanded;
-    if (expanded) {
+    const bool indexedDraw = (draw.indexed || expanded) && !triangleVertices;
+    if (triangleVertices) {
+        // The triangle-vertices table (MslAbi v5, vertex slot TriangleVertices): the header, then
+        // every triangle's guest vertex ids (the expansion's lists with each call's base vertex),
+        // drawn non-indexed: host vertex v of a call starting at table index f is v = f + i.
+        std::vector<std::byte> table(sizeof(Abi::TriangleVerticesHeader) + fanIndices.size() * 4u);
+        Abi::TriangleVerticesHeader header {};
+        header.viewport[0] = graphics.viewport.x;
+        header.viewport[1] = graphics.viewport.y;
+        header.viewport[2] = graphics.viewport.width;
+        header.viewport[3] = graphics.viewport.height;
+        header.depthRange[0] = graphics.viewport.minDepth;
+        header.depthRange[1] = graphics.viewport.maxDepth;
+        header.triangles = static_cast<std::uint32_t>(fanIndices.size() / 3u);
+        header.flags = (conservativeMode != 0u ? Abi::TriangleFlagConservative : 0u) | (perVertex ? Abi::TriangleFlagPerVertex : 0u);
+        std::memcpy(table.data(), &header, sizeof(header));
+        auto* ids = reinterpret_cast<std::uint32_t*>(table.data() + sizeof(header));
+        for (const auto& call : fanCalls) {
+            for (std::uint32_t index = call.first; index < call.first + call.count; ++index) ids[index] = fanIndices[index] + static_cast<std::uint32_t>(call.vertexOffset);
+        }
+        const auto upload = stream.Write(table, 16u);
+        [cache.vertexArguments setAddress:upload.address atIndex:Abi::Index(Abi::BufferIndex::TriangleVertices)];
+    } else if (expanded) {
         indexType = MTLIndexTypeUInt32;
         if (!fanIndices.empty()) {
             const auto upload = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
@@ -1161,7 +1207,9 @@ bool VulkanDevice::SamplerFilterMinmax() const {
 }
 
 bool VulkanDevice::ConservativeRasterization() const {
-    return false;
+    // Emulated: the triangle-vertices mode with MslConservative.hpp's expansion and exact coverage
+    // test (the Metal API has no conservative rasterization).
+    return true;
 }
 
 VkShaderStageFlags VulkanDevice::SubgroupStages() const {
