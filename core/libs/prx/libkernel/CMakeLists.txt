@@ -8,6 +8,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/NativeStat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Terminal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Open.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Link.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/FcntlAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/FileDuplicate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/OpenFileLimit.cpp
@@ -34,6 +35,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Barrier.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/CpuClock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Barrier.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Cond.cpp
@@ -64,6 +66,8 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Login.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SoftwareVersion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ThermalSensors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ThermalSensorsMacOs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/HardwareInfo.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Signals.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SigactionAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SignalSets.cpp
@@ -305,6 +309,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_sce_pthread_barrier PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_sce_pthread_barrier PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_kernel_host_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelHostInfo.cpp)
+    target_include_directories(guest_kernel_host_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_kernel_host_info_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_kernel_host_info_tests)
+    add_test(NAME guest_kernel_host_info COMMAND guest_kernel_host_info_tests)
+    set_tests_properties(guest_kernel_host_info PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_kernel_host_info PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_kernel_is_stack_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelIsStack.cpp)

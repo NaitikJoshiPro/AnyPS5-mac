@@ -25,6 +25,10 @@
 #include <wbemidl.h>
 #endif
 
+#ifdef __APPLE__
+void ReadMacOsThermalPressure(int celsius[3]);
+#endif
+
 namespace {
 
 std::optional<int> ReadCelsius(const std::filesystem::path& file) {
@@ -244,6 +248,8 @@ void ReadHostSensors(int celsius[3]) {
     ReadAcpiThermalZones(celsius);
 #elif defined(__linux__)
     ReadThermalSensors_nid_no_patch("/sys/class", celsius);
+#elif defined(__APPLE__)
+    ReadMacOsThermalPressure(celsius);
 #else
     celsius[0] = celsius[1] = celsius[2] = -1;
 #endif
