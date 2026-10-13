@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <span>
@@ -279,7 +280,16 @@ void RequireRecords(const Case& test, const Expectation& expected) {
     auto wanted = expected.points;
     std::sort(seen.begin(), seen.end());
     std::sort(wanted.begin(), wanted.end());
-    Require(seen == wanted, name + ": the domain locations differ from the tessellator's");
+    if (seen != wanted) {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> extra;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> missing;
+        std::set_difference(seen.begin(), seen.end(), wanted.begin(), wanted.end(), std::back_inserter(extra));
+        std::set_difference(wanted.begin(), wanted.end(), seen.begin(), seen.end(), std::back_inserter(missing));
+        std::string detail;
+        for (std::size_t i = 0; i < std::min<std::size_t>(extra.size(), 4); ++i) detail += " ran (" + std::to_string(std::bit_cast<float>(extra[i].first)) + ", " + std::to_string(std::bit_cast<float>(extra[i].second)) + ")";
+        for (std::size_t i = 0; i < std::min<std::size_t>(missing.size(), 4); ++i) detail += " expected (" + std::to_string(std::bit_cast<float>(missing[i].first)) + ", " + std::to_string(std::bit_cast<float>(missing[i].second)) + ")";
+        Require(false, name + ": the domain locations differ from the tessellator's (" + std::to_string(extra.size()) + " unexpected, " + std::to_string(missing.size()) + " missing):" + detail);
+    }
 }
 
 std::uint32_t LitPixels() {
