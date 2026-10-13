@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -374,7 +375,9 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     object += "    aps5_hs::aps5_stage(aps5_hs_table, aps5_push, *reinterpret_cast<constant aps5_hs::Aps5DriverData*>(&aps5_driver), aps5_tid, aps5_patch_id, aps5_lane, aps5_local, aps5_payload.words);\n";
     object += "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_object_data);\n";
     object += "    if (aps5_tid == 0u) {\n" + std::string(factors);
-    object += "        const int aps5_count = aps5_tess_primitive_count(aps5_patch, aps5_none);\n";
+    object += "        int aps5_count = aps5_tess_primitive_count(aps5_patch, aps5_none);\n";
+    // Debugging aid: APS5_TESS_DEBUG_ONLY=<patch> culls every other patch.
+    if (const char* only = std::getenv("APS5_TESS_DEBUG_ONLY")) object += "        if (aps5_patch_id != " + std::string(only) + "u) aps5_count = 0;\n";
     object += "        aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "] = aps5_patch_id;\n";
     object += "        aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "] = uint(aps5_count);\n";
     // A culled patch launches one mesh threadgroup that emits nothing: the MSL specification defines
