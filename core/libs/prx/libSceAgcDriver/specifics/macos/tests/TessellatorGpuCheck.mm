@@ -29,6 +29,7 @@ namespace T = ShaderRecompiler::MslTessellator;
 constexpr int Skipped = 77;
 constexpr int MaxCorners = 3 * 1400;
 constexpr int MaxPoints = 640;
+constexpr int Slices = 24;
 
 struct Case {
     std::uint32_t domain;
@@ -81,6 +82,40 @@ kernel void aps5_tess_gpu(device const Aps5TessCase* cases [[buffer(0)]], device
         points[(id * MAX_POINTS + uint(i)) * 2u + 1u] = as_type<uint>(point.v);
     }
 }
+
+)";
+
+constexpr const char* SlicedKernel = R"(
+// As the tessellation mesh function: one 256-thread threadgroup per (factor set, slice); thread 0
+// windows the slice into threadgroup memory, then every corner thread places its point.
+kernel void aps5_tess_gpu_sliced(device const Aps5TessCase* cases [[buffer(0)]], device uint* corners [[buffer(1)]], constant uint& total [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup int window[255];
+    threadgroup uint used[1];
+    threadgroup int none[1];
+    const uint id = group.x;
+    if (id >= total) return;
+    const Aps5TessCase c = cases[id];
+    Aps5TessFactors f;
+    for (uint i = 0u; i < 4u; ++i) f.outer[i] = c.outer[i];
+    for (uint i = 0u; i < 2u; ++i) f.inner[i] = c.inner[i];
+    const Aps5TessPatch p = aps5_tess_process(int(c.domain), int(c.partitioning), int(c.topology), f);
+    const int slice = c.topology == 0u ? 256 : c.topology == 1u ? 128 : 85;
+    const int k = c.topology == 0u ? 1 : c.topology == 1u ? 2 : 3;
+    if (tid == 0u) {
+        const int n = aps5_tess_primitive_count(p, none);
+        const int first = int(group.y) * slice;
+        used[0] = first < n ? uint(aps5_tess_window(p, first, min(slice, n - first), window) * k) : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint at = (id * SLICES + group.y) * 256u + tid;
+    if (tid < used[0]) {
+        const Aps5TessPoint point = aps5_tess_point(p, window[tid]);
+        corners[at * 3u] = uint(window[tid]);
+        corners[at * 3u + 1u] = as_type<uint>(point.u);
+        corners[at * 3u + 2u] = as_type<uint>(point.v);
+    }
+}
 )";
 
 std::vector<Case> Cases() {
@@ -131,7 +166,7 @@ int main() {
             const auto at = source.find(threadgroupOut);
             Require(at != std::string::npos, "the tessellator source lost its APS5_TESS_OUT definition");
             source.replace(at, threadgroupOut.size(), "#define APS5_TESS_OUT device\n");
-            source = "#include <metal_stdlib>\nusing namespace metal;\n#define MAX_CORNERS " + std::to_string(MaxCorners) + "\n#define MAX_POINTS " + std::to_string(MaxPoints) + "\n" + source + Kernel;
+            source = "#include <metal_stdlib>\nusing namespace metal;\n#define MAX_CORNERS " + std::to_string(MaxCorners) + "\n#define MAX_POINTS " + std::to_string(MaxPoints) + "\n#define SLICES " + std::to_string(Slices) + "\n" + source + Kernel;
             MTLCompileOptions* options = [MTLCompileOptions new];
             options.languageVersion = MTLLanguageVersion4_0;
             options.mathMode = MTLMathModeSafe;
@@ -210,6 +245,48 @@ int main() {
                     }
                 }
             }
+            // The mesh-function structure: threadgroup windows, one threadgroup per slice.
+            const std::string slicedSource = "#include <metal_stdlib>\nusing namespace metal;\n#define SLICES " + std::to_string(Slices) + "\n" + T::Source() + SlicedKernel;
+            id<MTLLibrary> slicedLibrary = [device newLibraryWithSource:[NSString stringWithUTF8String:slicedSource.c_str()] options:options error:&error];
+            Require(slicedLibrary != nil, std::string("the sliced tessellator kernel does not compile: ") + (error != nil ? error.localizedDescription.UTF8String : "no error"));
+            id<MTLComputePipelineState> sliced = [device newComputePipelineStateWithFunction:[slicedLibrary newFunctionWithName:@"aps5_tess_gpu_sliced"] error:&error];
+            Require(sliced != nil, "no sliced tessellator kernel pipeline");
+            id<MTLBuffer> slicedBuffer = [device newBufferWithLength:std::size_t(total) * Slices * 256u * 12u options:MTLResourceStorageModeShared];
+            std::memset(slicedBuffer.contents, 0xff, slicedBuffer.length);
+            commands = [queue commandBuffer];
+            encoder = [commands computeCommandEncoder];
+            [encoder setComputePipelineState:sliced];
+            [encoder setBuffer:caseBuffer offset:0 atIndex:0];
+            [encoder setBuffer:slicedBuffer offset:0 atIndex:1];
+            [encoder setBytes:&total length:sizeof(total) atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake(total, Slices, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [encoder endEncoding];
+            [commands commit];
+            [commands waitUntilCompleted];
+            Require(commands.status == MTLCommandBufferStatusCompleted, "the sliced tessellator kernel failed");
+            const auto* slicedWords = static_cast<const std::uint32_t*>(slicedBuffer.contents);
+            std::uint64_t slicedCorners = 0;
+            for (std::uint32_t id = 0; id < total; ++id) {
+                const auto& c = cases[id];
+                const T::Aps5TessFactors f{{c.outer[0], c.outer[1], c.outer[2], c.outer[3]}, {c.inner[0], c.inner[1]}};
+                const auto patch = T::aps5_tess_process(static_cast<int>(c.domain), static_cast<int>(c.partitioning), static_cast<int>(c.topology), f);
+                const int n = T::aps5_tess_primitive_count(patch, nullptr);
+                const int k = c.topology == 0 ? 1 : c.topology == 1 ? 2 : 3;
+                const int slice = T::SlicePrimitives(static_cast<int>(c.topology));
+                for (int s = 0; s < Slices && s * slice < n; ++s) {
+                    const int count = T::aps5_tess_window(patch, s * slice, std::min(slice, n - s * slice), window.data());
+                    for (int t = 0; t < count * k; ++t) {
+                        ++slicedCorners;
+                        const auto* word = &slicedWords[((std::size_t(id) * Slices + std::size_t(s)) * 256u + std::size_t(t)) * 3u];
+                        const auto point = T::aps5_tess_point(patch, window[std::size_t(t)]);
+                        if (static_cast<int>(word[0]) != window[std::size_t(t)] || word[1] != std::bit_cast<std::uint32_t>(point.u) || word[2] != std::bit_cast<std::uint32_t>(point.v)) {
+                            if (++mismatches <= 12) std::cerr << "sliced case " << id << " slice " << s << " corner " << t << ": GPU index " << static_cast<int>(word[0]) << " (" << std::bit_cast<float>(word[1]) << ", " << std::bit_cast<float>(word[2]) << "), CPU index " << window[std::size_t(t)] << " (" << point.u << ", " << point.v << ")\n";
+                            break;
+                        }
+                    }
+                }
+            }
+            std::printf("tessellator gpu: %llu sliced corners compared\n", static_cast<unsigned long long>(slicedCorners));
             std::printf("tessellator gpu: %u factor sets, %llu corners, %llu points compared, %d mismatching sets\n", total, static_cast<unsigned long long>(checkedCorners), static_cast<unsigned long long>(checkedPoints), mismatches);
             Require(mismatches == 0, "the GPU tessellator differs from the CPU tessellator");
             std::puts("Tessellator GPU tests passed");
