@@ -205,6 +205,23 @@ struct MeshTargetLimits {
     std::uint32_t outputPerPrimitiveGranularity;
 };
 
+// The VGT_TF_PARAM encodings and level clamps a target can draw (DECISIONS D26). Bit n of a mask is
+// encoding n: domain TYPE (0 isoline, 1 triangle, 2 quad), PARTITIONING (0 integer, 1 pow2,
+// 2 fractional_odd, 3 fractional_even), TOPOLOGY (0 point, 1 line, 2 triangle_cw, 3 triangle_ccw).
+// levelClamps: the target applies VGT_HOS_MIN/MAX_TESS_LEVEL to the factors; without it the
+// clamps must lie outside the fractional-odd range [1, 63] (they are then no-ops). The default is
+// the reference (SPIR-V) set: triangle, fractional_odd, triangle_cw, no clamps. Graphics state
+// decoding consumes it; it changes no compiled program, so it is neither serialized nor keyed.
+struct TessellationFeatures {
+    std::uint32_t domains = 1u << 1u;
+    std::uint32_t partitionings = 1u << 2u;
+    std::uint32_t topologies = 1u << 2u;
+    bool levelClamps = false;
+
+    static constexpr TessellationFeatures All() { return {0x7u, 0xfu, 0xfu, true}; }
+    bool operator==(const TessellationFeatures&) const = default;
+};
+
 struct TessellationTargetLimits {
     std::uint32_t maxPatchSize;
     std::uint32_t maxControlPerVertexInputComponents;
@@ -213,6 +230,7 @@ struct TessellationTargetLimits {
     std::uint32_t maxControlTotalOutputComponents;
     std::uint32_t maxEvaluationInputComponents;
     std::uint32_t maxEvaluationOutputComponents;
+    TessellationFeatures features{};
 };
 
 // The form the device consumes: SPIR-V for Vulkan, Metal Shading Language source for Metal.

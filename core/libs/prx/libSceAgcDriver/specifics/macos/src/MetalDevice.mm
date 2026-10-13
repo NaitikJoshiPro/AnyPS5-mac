@@ -717,7 +717,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.mesh = ShaderRecompiler::MeshTargetLimits{{static_cast<std::uint32_t>(threads.width), 1u, 1u}, static_cast<std::uint32_t>(threads.width), threadgroupMemory, 256u, 512u, 124u, threadgroupMemory, 1u, 1u};
     // Tessellation runs on object + mesh functions (DECISIONS D24, MetalTessellation.h): 32 control
     // points, hull outputs bounded by the 16 KiB object payload (LinkMslTessellation checks it).
-    target.tessellation = ShaderRecompiler::TessellationTargetLimits{32u, 128u, 128u, 120u, 4096u, 128u, 124u};
+    // The software tessellator draws every domain, partitioning and output topology and applies
+    // the VGT_HOS level clamps (DECISIONS D26).
+    target.tessellation = ShaderRecompiler::TessellationTargetLimits{32u, 128u, 128u, 120u, 4096u, 128u, 124u, ShaderRecompiler::TessellationFeatures::All()};
     return target;
 }
 

@@ -18,7 +18,11 @@ namespace {
 
 constexpr std::int64_t PatchIndexCount = 256;
 constexpr std::int64_t LocalVertexIndexCount = 8192;
-constexpr std::int64_t TriangleFactorBytes = 16;
+// The factor ring's per-patch records (RDNA2, as Mesa's ac_nir_lower_tess_io_to_mem lays them out):
+// isoline 2 dwords (detail, density), triangle 3 outer + 1 inner, quad 4 outer + 2 inner.
+constexpr std::int64_t FactorBytes(std::uint32_t domain) {
+    return domain == 0u ? 8 : domain == 1u ? 16 : 24;
+}
 constexpr std::int64_t AddressLimit = 0xffffffffll;
 
 struct Affine {
@@ -484,7 +488,7 @@ private:
                 if (address.constant < 0 || end > outputs * controlStride) Fail("the domain shader reads off-chip memory outside its patch's control points", access.pc);
                 break;
             case TessellationAttribute::Factor:
-                if (tessellation.domain != 1u || address.vertex != 0 || address.relative != TriangleFactorBytes || address.constant < 0 || end > TriangleFactorBytes) Fail("the hull shader writes tessellation factors outside its patch's triangle factors", access.pc);
+                if (tessellation.domain > 2u || address.vertex != 0 || address.relative != FactorBytes(tessellation.domain) || address.constant < 0 || end > FactorBytes(tessellation.domain)) Fail("the hull shader writes tessellation factors outside its patch's factor record", access.pc);
                 requireFirstInvocation(access);
                 break;
             case TessellationAttribute::PatchOutput:

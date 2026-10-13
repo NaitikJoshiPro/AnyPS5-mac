@@ -109,7 +109,10 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     auto product = std::make_shared<DrawDecode>();
-    product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders));
+    // The target's tessellation features gate the decoded VGT_TF_PARAM (DECISIONS D26).
+    const auto localDevice = device.Load();
+    const auto tessellation = localDevice != nullptr ? localDevice->Target().tessellation : std::nullopt;
+    product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders), tessellation ? tessellation->features : ShaderRecompiler::TessellationFeatures{});
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
     product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
     product->pixel.targetExportPacking = Graphics::ExportPackings(product->state);
