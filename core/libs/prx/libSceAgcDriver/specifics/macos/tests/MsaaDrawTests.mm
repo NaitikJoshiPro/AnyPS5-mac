@@ -22,6 +22,7 @@
 //   agc_metal_msaa_tests ranges    (a build binding an MSAA T# before single-sample T#s: each surface
 //                                   range keeps its own texture, so the pre-sync list is right)
 #include "../src/MetalDeviceState.h"
+#include "../src/MetalImages.h"
 #include "../src/MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
 #include "MslAbi.hpp"
@@ -53,7 +54,13 @@
 namespace AgcDriver {
 
 struct VulkanDeviceTestAccess {
-    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+    // The image cache's Context, the one the device's dispatches build their image bindings with
+    // (MetalTextures.mm ImageBindings::Prepare).
+    static const Graphics::Context& ImageContextOf(const VulkanDevice& device) {
+        const auto* context = device.state->images != nullptr ? device.state->images->ImageContext() : nullptr;
+        if (context == nullptr) throw std::runtime_error("the device's image cache is not attached");
+        return *context;
+    }
 };
 
 }
@@ -956,7 +963,7 @@ void CheckRanges(AgcDriver::VulkanDevice& device) {
     const auto target = Target(source.Address(), VK_FORMAT_R8G8B8A8_UNORM, Samples);
     Draw(device, BaseState(target), MakeShaders(vertices.Address(), 3u, 0u, "#define SAMPLE_COLOR 1\n"), 0u, 3u);
     device.WaitIdle();
-    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto& context = AgcDriver::VulkanDeviceTestAccess::ImageContextOf(device);
     Require(context.hostImportAlignment != 0u, "the Metal device's Context has no host imports");
     {
         ImportedSurfaces surfaces(context);
@@ -972,7 +979,7 @@ void CheckRanges(AgcDriver::VulkanDevice& device) {
         program.bindings.push_back(SampledBinding(2u, ShaderRecompiler::DescriptorImageShape::Image2D, plain));
         const AgcDriver::Graphics::CompiledShader shader {ShaderRecompiler::ShaderStage::Compute, &program, 0u};
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        AgcDriver::Graphics::ShaderResources resources(context, shader);
+        AgcDriver::Graphics::ShaderResources resources(context, shader, AgcDriver::Graphics::ShaderResources::MetalImagesOnly{});
         Require(resources.Completed(), "the test build did not complete");
         const auto& textures = resources.SampledTextures();
         Require(textures.size() == 3u, "the build holds " + std::to_string(textures.size()) + " sampled textures, not the MSAA view and two single-sample textures");
