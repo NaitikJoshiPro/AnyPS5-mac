@@ -40,7 +40,9 @@ void VKAPI_PTR ReportMetalBudget(VkPhysicalDevice, VkPhysicalDeviceMemoryPropert
 }
 
 // The Metal test device as upstream's Device: GetContext() is the image cache's Context (detiler, placeholders,
-// sampler and texture caches) with the device's recorder active.
+// sampler and texture caches). No recorder is active, as upstream's test has none: with one, the batch it records
+// keeps evicted storage images and rejected resources until it completes (MetalTextures.mm, ShaderResources.mm), as
+// on Vulkan, and the lifetime checks would see them alive; the image work runs in one-shot CommandBatches.
 class Device {
 public:
     Device() : cache(test.device, test.queue) {
@@ -56,14 +58,10 @@ public:
         context.memory.memoryHeaps[0] = {static_cast<VkDeviceSize>(test.device.recommendedMaxWorkingSetSize), VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
         reportingDevice = test.device;
         context.memoryProperties2 = &ReportMetalBudget;
-        recorder = std::make_unique<Recorder>(context, true);
-        context.recorder = recorder.get();
-        recorder->Activate();
         cache.Attach(context);
     }
     ~Device() {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-        recorder->Sync();
         cache.Teardown();
     }
     Device(const Device&) = delete;
@@ -73,7 +71,6 @@ public:
 private:
     MetalTest::Device test;
     mutable Metal::ImageCache cache;
-    std::unique_ptr<Recorder> recorder;
 };
 
 }
