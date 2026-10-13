@@ -1205,6 +1205,13 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
         case ShaderRecompiler::DescriptorRole::Gds: {
             if (binding.count != 1u || !binding.guestDescriptor.empty()) throw std::runtime_error("Metal device: invalid GDS descriptor contract");
             entries[0] = {Wrap(Pm4::GdsAddress(), Pm4::GdsBytes), static_cast<std::uint32_t>(Pm4::GdsBytes), 0u};
+            if (Trace()) {
+                std::uint64_t offset = 0;
+                id<MTLBuffer> import = ImportOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
+                id<MTLBuffer> wrapper = WrapperOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
+                const auto* first = reinterpret_cast<const std::uint32_t*>(Pm4::GdsAddress());
+                std::fprintf(stderr, "[metal] GDS 0x%llx bound at 0x%llx (%s, buffer contents %p), dwords 4-7 now %u %u %u %u\n", static_cast<unsigned long long>(Pm4::GdsAddress()), static_cast<unsigned long long>(entries[0].address), import != nil ? "host import" : wrapper != nil ? "page wrapper" : "neither", import != nil ? import.contents : wrapper != nil ? wrapper.contents : nullptr, first[4], first[5], first[6], first[7]);
+            }
             break;
         }
         case ShaderRecompiler::DescriptorRole::BdaPagetable: {
@@ -1388,6 +1395,13 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     }
     NoteBindings(plan);
     CheckFaultsOnComplete();
+    if (Trace() && std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::Gds; })) {
+        // After the dispatch completes: what the CPU sees in GDS dwords 4-7.
+        recorder.OnComplete([] {
+            const auto* first = reinterpret_cast<const std::uint32_t*>(Pm4::GdsAddress());
+            std::fprintf(stderr, "[metal] GDS after the batch: dwords 4-7 %u %u %u %u\n", first[4], first[5], first[6], first[7]);
+        });
+    }
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", plan.reads.size(), plan.writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
 }
 
