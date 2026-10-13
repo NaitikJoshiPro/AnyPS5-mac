@@ -3,7 +3,9 @@
 #include "ShaderCacheDirectory.hpp"
 
 #include <sys/sysctl.h>
+#include <atomic>
 #include <chrono>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -184,6 +186,18 @@ id<MTLLibrary> PipelineCache::Library(const ShaderRecompiler::MslShader& shader,
             NSMutableDictionary<NSString*, NSObject*>* defines = [NSMutableDictionary dictionary];
             for (const auto& [name, value] : macros) defines[@(name.c_str())] = @(value.c_str());
             options.preprocessorMacros = defines;
+        }
+        // Debug aid (APS5_METAL_DUMP_MSL=<dir>): every compiled library's source, its macros first
+        // as #defines, written to <dir>/library_<n>.metal.
+        if (const char* dumpDir = std::getenv("APS5_METAL_DUMP_MSL"); dumpDir != nullptr && *dumpDir != '\0') {
+            static std::atomic<unsigned> dumped{0};
+            const auto path = std::string(dumpDir) + "/library_" + std::to_string(dumped.fetch_add(1)) + ".metal";
+            if (std::FILE* file = std::fopen(path.c_str(), "w"); file != nullptr) {
+                for (const auto& [name, value] : macros) std::fprintf(file, "#define %s %s\n", name.c_str(), value.c_str());
+                std::fputs(shader.source.c_str(), file);
+                std::fclose(file);
+                std::fprintf(stderr, "[metal] MSL library written to %s\n", path.c_str());
+            }
         }
         MTL4LibraryDescriptor* descriptor = [MTL4LibraryDescriptor new];
         descriptor.source = [NSString stringWithUTF8String:shader.source.c_str()];
