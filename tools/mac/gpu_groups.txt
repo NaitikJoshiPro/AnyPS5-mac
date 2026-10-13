@@ -358,6 +358,11 @@ agc_driver_zero_position_vertex G3
 agc_driver_zero_stride_vertex_fetch G3
 agc_metal_draw_primitives G3
 agc_metal_draw_targets G3
+agc_metal_msaa_depth G3
+agc_metal_msaa_edges G3
+agc_metal_msaa_integer G3
+agc_metal_msaa_masks G3
+agc_metal_msaa_sampled G3
 agc_driver G4
 agc_driver_cmask_fast_clear G4
 agc_driver_compute_user_data_calls G4
