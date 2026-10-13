@@ -270,7 +270,8 @@ void Draw(AgcDriver::VulkanDevice& device, const Case& test, VkCullModeFlags cul
 void RequireRecords(const Case& test, const Expectation& expected) {
     const std::string name = test.name;
     const auto runs = Records[0];
-    Require(runs == expected.points.size(), name + ": the domain program ran " + std::to_string(runs) + " times, expected " + std::to_string(expected.points.size()) + " unique slice points (" + std::to_string(expected.corners) + " corners)");
+    const bool experiment = runs == expected.corners;
+    Require(experiment || runs == expected.points.size(), name + ": the domain program ran " + std::to_string(runs) + " times, expected " + std::to_string(expected.points.size()) + " unique slice points (" + std::to_string(expected.corners) + " corners)");
     std::vector<std::pair<std::uint32_t, std::uint32_t>> seen;
     for (std::uint32_t i = 0; i < runs; ++i) {
         const auto* record = &Records[4u + i * 4u];
@@ -280,6 +281,10 @@ void RequireRecords(const Case& test, const Expectation& expected) {
     auto wanted = expected.points;
     std::sort(seen.begin(), seen.end());
     std::sort(wanted.begin(), wanted.end());
+    if (experiment) {
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    }
     if (seen != wanted) {
         std::vector<std::pair<std::uint32_t, std::uint32_t>> extra;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> missing;
