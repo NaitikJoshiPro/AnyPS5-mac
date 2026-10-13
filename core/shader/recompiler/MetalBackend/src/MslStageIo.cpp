@@ -122,6 +122,28 @@ std::uint32_t PixelLocation(MslEmitterState& state, const IrValue& instruction, 
     return location;
 }
 
+// Alpha to coverage (DECISIONS D28): DB_ALPHA_TO_MASK 0xaa01, the undithered setting titles were
+// seen writing (offsets 2, no OFFSET_ROUND), as upstream measured it on RDNA2 hardware
+// (boykopovar/AnyPS5 PR 3228: 1 sample covers iff alpha >= 0.5, NaN and negatives cover nothing;
+// PR 4451: 8 samples cover floor(alpha * 8 + 0.5) samples in a fixed mask per 1/16 of alpha, not
+// the lowest bits). Other counts take floor(alpha * n + 0.5) of their lowest samples (not measured).
+// The guest sample count is APS5_SAMPLE_COUNT (the pass's own count unless it is emulated).
+constexpr std::string_view AlphaToMaskText = R"(#ifndef APS5_SAMPLE_COUNT
+#define APS5_SAMPLE_COUNT get_num_samples()
+#endif
+static uint aps5_alpha_to_mask(float alpha, uint samples) {
+    if (!(alpha > 0.0f)) return 0u;
+    if (samples <= 1u) return alpha >= 0.5f ? 0xffffffffu : 0u;
+    if (alpha >= 1.0f) return 0xffffffffu;
+    if (samples == 8u) {
+        const uint masks[16] = {0x00u, 0x10u, 0x04u, 0x14u, 0x12u, 0x32u, 0x16u, 0x36u, 0x35u, 0x75u, 0x3du, 0x7du, 0x77u, 0xf7u, 0x7fu, 0xffu};
+        return masks[min(uint(alpha * 16.0f), 15u)];
+    }
+    const uint count = min(uint(alpha * float(samples) + 0.5f), samples);
+    return count >= 32u ? 0xffffffffu : (1u << count) - 1u;
+}
+)";
+
 // EmitBuiltinU32 for vertex and pixel programs: the value's bits as a uint.
 std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
     const auto stage = StageOf(state);
@@ -146,7 +168,9 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
         case StageInputKind::SampleId:
             state.AddParameter("uint aps5_sample_id [[sample_id]]");
             state.reflection.perSample = true;
-            return "aps5_sample_id";
+            // MslAbi Version 9: APS5_SAMPLE_BASE is the guest index of host sample 0 (4 in the second
+            // half of an 8x target emulated as two 4x halves, DECISIONS D28).
+            return "(aps5_sample_id + APS5_SAMPLE_BASE)";
         case StageInputKind::PrimitiveId:
             state.AddParameter("uint aps5_primitive_id [[primitive_id]]");
             return "aps5_primitive_id";
@@ -202,7 +226,16 @@ std::string PixelAttribute(MslEmitterState& state, const IrValue& instruction, s
         for (std::uint32_t vertex = 1u; vertex < 3u; ++vertex) sum = "(" + sum + " + " + PerVertexValue(state, location, vertex, channel) + " * " + weights + "[" + std::to_string(vertex) + "])";
         return "as_type<uint>(" + sum + ")";
     }
-    state.fragmentInputs.emplace(location, flat ? ", flat" : linear ? ", center_no_perspective" : ", center_perspective");
+    // The interpolation location is the I/J pair the guest's v_interp_p2 reads (SPI_PS_INPUT_ENA
+    // PERSP/LINEAR_CENTER, _CENTROID, _SAMPLE; DECISIONS D28): sample_* inputs make Metal run the
+    // fragment function per sample, at that sample's position.
+    const auto bit = 1u << attribute;
+    const bool atSample = (metadata.pixelSampleInputs & bit) != 0u;
+    const bool atCentroid = (metadata.pixelCentroidInputs & bit) != 0u;
+    if (!flat && static_cast<unsigned>(atSample) + static_cast<unsigned>(atCentroid) + static_cast<unsigned>((metadata.pixelCenterInputs & bit) != 0u) > 1u) state.Fail(instruction, "interpolates pixel input " + std::to_string(attribute) + " at more than one of center, centroid and sample");
+    const std::string at = atSample ? "sample" : atCentroid ? "centroid" : "center";
+    if (!flat && atSample) state.reflection.perSample = true;
+    state.fragmentInputs.emplace(location, flat ? ", flat" : linear ? ", " + at + "_no_perspective" : ", " + at + "_perspective");
     return "aps5_input_" + std::to_string(location) + "(" + std::to_string(channel & 3u) + ")";
 }
 
@@ -498,7 +531,8 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
                 state.Line("const uint4 " + name + " = " + mapped + ");");
                 value = name;
                 if (exp.index == 0u && !uintOutput && PixelInfo(state).psAlphaToCoverage) {
-                    state.Line("aps5_out.aps5_sample_mask = !(as_type<float>(" + value + ".w) >= 0.5f) ? 0u : 0xffffffffu;");
+                    if (state.declarations.find("aps5_alpha_to_mask") == std::string::npos) state.AddDeclaration(AlphaToMaskText);
+                    state.Line("aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(" + value + ".w), APS5_SAMPLE_COUNT);");
                 }
                 if (!uintOutput && mode != 5u && mode != 6u) value = ExportPacking(state, exp.index, value);
                 state.Line("aps5_out.c" + std::to_string(output->location) + " = as_type<APS5_COLOR" + std::to_string(output->location) + "_TYPE>(" + value + ");");
@@ -703,6 +737,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     if (stage != IrShaderStage::Pixel) state.Fail("only vertex, mesh and pixel graphics stages are implemented in the MSL backend so far (work package B6)");
     const auto& pixel = PixelInfo(state);
     text += "#ifndef APS5_VERTEX_OUTPUTS\n#define APS5_VERTEX_OUTPUTS 0xffffffff\n#endif\n#ifndef APS5_VERTEX_OUTPUTS_HI\n#define APS5_VERTEX_OUTPUTS_HI 0xffffffff\n#endif\n";
+    text += "#ifndef APS5_SAMPLE_BASE\n#define APS5_SAMPLE_BASE 0\n#endif\n";
     text += "struct Aps5FragmentIn {\n    float4 aps5_position [[position]];\n";
     std::string accessors;
     for (const auto& [location, qualifier] : state.fragmentInputs) {
@@ -771,7 +806,13 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += "struct Aps5FragmentOut {\n" + members + "};\n\n";
         result.outputType = "Aps5FragmentOut";
     }
+    // PS_ITER_SAMPLE: the stage function takes [[sample_id]] (EmitMslEntryPoint).
     if (pixel.psSampleShading) state.reflection.perSample = true;
+    if (state.reflection.exportsSampleMask) {
+        // MslAbi Version 9: the guest mask's bits of this pass's host samples (APS5_SAMPLE_BASE,
+        // DECISIONS D28).
+        result.epilogue += "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";
+    }
     // Primitive-ordered pixel shaders (the SPIR-V path's PixelInterlockOrderedEXT around the whole
     // program): the stage function brackets the guest body with raster-order-group accesses
     // (EmitMslEntryPoint, BufferIndex::RasterOrder).

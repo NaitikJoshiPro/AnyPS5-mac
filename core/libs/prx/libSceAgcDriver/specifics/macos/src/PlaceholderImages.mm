@@ -17,6 +17,9 @@ PlaceholderImageShape MetalShapeOf(std::uint32_t heap) {
     if (heap >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding && shape.samples != VK_SAMPLE_COUNT_1_BIT) {
         shape.samples = VK_SAMPLE_COUNT_1_BIT;
         shape.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    } else if (shape.samples != VK_SAMPLE_COUNT_1_BIT && heap < ShaderRecompiler::RuntimeAbi::FirstComparisonImageBinding) {
+        // MslAbi Version 9: sampled heaps of both MSAA dimensions are texture2d_ms_array.
+        shape.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     }
     return shape;
 }
@@ -41,6 +44,7 @@ PlaceholderImages::PlaceholderImages(const Context& context) : context(context) 
             auto& image = images[index];
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             info.imageType = shape.type;
+            if (shape.samples != VK_SAMPLE_COUNT_1_BIT && shape.viewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY) info.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
             info.format = shape.format;
             info.extent = {1, 1, 1};
             info.mipLevels = 1;

@@ -44,7 +44,7 @@ namespace ShaderRecompiler::MslAbi {
 // texture2d_array<T, access::read_write> textures of layers * samples slices (sample s of layer l at
 // slice l * samples + s; Metal shaders cannot write texture2d_ms). The sample count is function
 // constant PipelineSpecialization::SampleCountBase + resource (direct images) or the T# LAST_LEVEL of
-// the resource metadata (table images). Sampled multisampled heaps stay texture2d_ms.
+// the resource metadata (table images). Sampled multisampled heaps stay texture2d_ms (until v9).
 // Version 7: tessellation (DECISIONS D24). The local, hull and domain programs are Stage::Local,
 // Stage::Hull and Stage::Domain libraries without a stage function: each defines
 // `aps5_stage(...)` with the fixed signature of its role (MslTessellation.cpp), and
@@ -56,7 +56,14 @@ namespace ShaderRecompiler::MslAbi {
 // TessellationDraw record carries the VGT_HOS level clamps (minLevel/maxLevel, were reserved), the
 // isoline payload factors are in the tessellator's (density, detail) order, and a culled patch
 // launches no mesh threadgroup.
-inline constexpr std::uint32_t Version = 8u;
+// Version 9: multisampling (DECISIONS D28). Sampled heaps of both MSAA dimensions are
+// texture2d_ms_array: guest layer l, sample s of a view whose texture holds h samples per slice is
+// slice l * (n / h) + s / h, sample s % h, n the guest sample count (SampleCountBase + resource,
+// now supplied for sampled MSAA views too, or the table metadata's T#); size queries return n in w.
+// Fragment functions take SampleBaseMacro (an 8x target emulated as two 4x halves draws each half
+// with base 0 and 4), interpolate inputs at the location the guest's I/J pair names
+// (center/centroid/sample) and take [[sample_id]] under PS_ITER_SAMPLE.
+inline constexpr std::uint32_t Version = 9u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -223,6 +230,14 @@ inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";
 // - fragment: the MSL type of colour output n (float4, uint4 or int4; default from pixelInfo),
 //   APS5_COLOR<n>_TYPE.
 inline constexpr const char* ColorTypeMacroPrefix = "APS5_COLOR";
+// Version 9: fragment: the guest index of host sample 0 (decimal, default 0): [[sample_id]] reads
+// add it and the exported [[sample_mask]] is shifted right by it, so one pass covers guest samples
+// base..base+h-1 of an emulated sample count (DECISIONS D28).
+inline constexpr const char* SampleBaseMacro = "APS5_SAMPLE_BASE";
+// Version 9: fragment: the guest sample count when the pass renders fewer samples than the guest's
+// (an emulated count, DECISIONS D28; default: the pass's get_num_samples()), for the alpha-to-
+// coverage mask.
+inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
 // Version 5: the triangle-vertices expansion, shared by conservative rasterization and the per-vertex
 // fragment value emulation (no Metal geometry stage; per-vertex fragment inputs are Apple10-only):
 // - vertex: 1 when the draw is non-indexed with 3 host vertices per guest triangle and binds

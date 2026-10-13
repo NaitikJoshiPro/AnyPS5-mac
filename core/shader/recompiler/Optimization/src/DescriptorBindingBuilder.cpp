@@ -320,10 +320,11 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
-        // MSL storage views of multisampled images are 2D arrays of layers * samples slices; the
-        // sample count is the T#'s LAST_LEVEL (log2 samples for MSAA types).
+        // MSL views of multisampled images need the guest sample count, the T#'s LAST_LEVEL (log2
+        // samples for MSAA types): storage views are 2D arrays of layers * samples slices (MslAbi
+        // v6), sampled views map guest samples onto host slices (v9, emulated 8x, DECISIONS D28).
         const auto& mode = info.runtimeImageModes.at(index).at(imageModes[index]);
-        if (mode.resourceClass == ImageResourceClass::Storage && (mode.dimension == RdnaImageDimension::Dim2DMsaa || mode.dimension == RdnaImageDimension::Dim2DMsaaArray)) {
+        if (mode.dimension == RdnaImageDimension::Dim2DMsaa || mode.dimension == RdnaImageDimension::Dim2DMsaaArray) {
             plan.specialization.push_back({PipelineSpecialization::SampleCountBase + index, 1u << ((snapshot.images.at(index).dwords[3] >> 16u) & 0xfu)});
         }
     }

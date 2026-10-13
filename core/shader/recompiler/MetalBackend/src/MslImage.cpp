@@ -449,7 +449,7 @@ std::string SampleIndex(MslEmitterState& state, const Access& access) {
 // layers * samples slices: sample s of layer l is slice l * samples + s. The sample count is a
 // function constant for direct images (SampleCountBase + resource, supplied by the binding plan from
 // the T#) and the T#'s LAST_LEVEL (log2 samples on MSAA types) of the resource metadata for table
-// images. Sampled multisampled views stay texture2d_ms.
+// images. Sampled multisampled views are texture2d_ms_array (Version 9, SampledMultisample).
 bool EmulatedMultisample(const Access& access) {
     return access.image.resourceClass == ImageResourceClass::Storage && Multisampled(access.image.dimension);
 }
@@ -460,6 +460,40 @@ std::string StorageSampleCount(MslEmitterState& state, const Access& access) {
         return "(1u << ((" + MetadataDword(state, index, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + 3u) + " >> 16u) & 0xfu))";
     }
     return state.FunctionConstant(PipelineSpecialization::SampleCountBase + access.mem.resource, 1u);
+}
+
+// MslAbi Version 9: sampled views of 2D MSAA (array) images are texture2d_ms_array heaps whose
+// guest layer l, sample s is host slice l * p + s / h, host sample s % h, where n is the guest
+// sample count (the T#'s, the SampleCountBase function constant or the table metadata), h the
+// texture's own sample count and p = n / h host slices per guest layer: 1 for a native target, 2
+// for an 8x target emulated as two 4x halves on a device that renders 4 at most (DECISIONS D28).
+// A missing constant (default 1) reads as the texture's own count.
+struct SampledMultisampleCoord {
+    TexelCoord coord;
+    std::string sample;
+    std::string inside;
+    std::string guestSamples;
+    std::string slicesPerLayer;
+};
+
+SampledMultisampleCoord SampledMultisample(MslEmitterState& state, const Access& access, const std::string& texture, bool withSample) {
+    const auto base = CoordU32(state, access);
+    const auto name = state.Temporary("aps5_mr");
+    state.Line("const uint " + name + "_h = " + texture + ".get_num_samples();");
+    state.Line("const uint " + name + "_n = max(" + StorageSampleCount(state, access) + ", " + name + "_h);");
+    state.Line("const uint " + name + "_p = max(" + name + "_n / max(" + name + "_h, 1u), 1u);");
+    SampledMultisampleCoord result;
+    result.guestSamples = name + "_n";
+    result.slicesPerLayer = name + "_p";
+    if (!withSample) return result;
+    state.Line("const uint2 " + name + "_xy = " + base.coord + ";");
+    state.Line("const uint " + name + "_s = " + SampleIndex(state, access) + ";");
+    state.Line("const uint " + name + "_l = " + (base.slice.empty() ? std::string("0u") : base.slice) + ";");
+    state.Line("const bool " + name + "_in = " + name + "_xy.x < " + texture + ".get_width() && " + name + "_xy.y < " + texture + ".get_height() && " + name + "_s < " + name + "_n && " + name + "_l < " + texture + ".get_array_size() / " + name + "_p;");
+    result.coord = {name + "_xy", name + "_l * " + name + "_p + " + name + "_s / " + name + "_h"};
+    result.sample = name + "_s % " + name + "_h";
+    result.inside = name + "_in";
+    return result;
 }
 
 // The 2D-array coordinate of the access's sample and whether x, y, the sample and the layer lie
@@ -731,6 +765,24 @@ void EmitRead(MslEmitterState& state, const Access& access) {
     // Reads are sampled-class resources (ResourceTracker: only writes and atomics are storage), so a
     // multisampled storage read never reaches the emitter.
     if (EmulatedMultisample(access)) state.Fail(access.inst, "reads a multisampled storage image");
+    if (Multisampled(access.image.dimension)) {
+        // MslAbi Version 9: texture2d_ms_array, emulated sample counts (SampledMultisample).
+        const auto ms = SampledMultisample(state, access, texture, true);
+        state.Line("if (" + ms.inside + ") {");
+        state.Indent();
+        const auto color = state.Temporary("aps5_tx");
+        state.Line("const " + VectorType(numeric) + " " + color + " = " + texture + ".read(" + ms.coord.coord + ", " + ms.coord.slice + ", " + ms.sample + ");");
+        if (access.mem.imagePacked) {
+            state.Line(result + " = " + PackedImageTexel(state, access, color) + ";");
+        } else {
+            state.Line(result + " = " + ResultVector(state, access, UnpackImageTexel(state, access, color), numeric, false, false) + ";");
+        }
+        state.Outdent();
+        state.Line("}");
+        state.Outdent();
+        state.Line("}");
+        return;
+    }
     const auto coord = CoordU32(state, access);
     const auto lod = state.Temporary("aps5_lod");
     state.Line("const uint " + lod + " = " + LodU32(state, access) + ";");
@@ -762,6 +814,17 @@ void EmitQueryDimensions(MslEmitterState& state, const Access& access) {
     if (EmulatedMultisample(access)) state.Fail(access.inst, "queries a multisampled storage image (queries are sampled-class resources)");
     const auto lodArg = ms ? std::string() : lod;
     result[0] = texture + ".get_width(" + lodArg + ")";
+    if (ms) {
+        // MslAbi Version 9: the guest's sample count in w (DECISIONS D28: the T#'s 1 << LAST_LEVEL,
+        // as Mesa's ac_nir_lower_resinfo derives the MSAA resinfo from the descriptor) and layers in
+        // guest layers (emulated 8x targets hold two host slices per layer).
+        const auto samples = SampledMultisample(state, access, texture, false);
+        result[1] = texture + ".get_height()";
+        if (dimension == RdnaImageDimension::Dim2DMsaaArray) result[2] = "(" + texture + ".get_array_size() / " + samples.slicesPerLayer + ")";
+        result[3] = samples.guestSamples;
+        state.Define(access.inst, "uint4(" + result[0] + ", " + result[1] + ", " + result[2] + ", " + result[3] + ")");
+        return;
+    }
     switch (dimension) {
     case RdnaImageDimension::Dim1D:
         break;

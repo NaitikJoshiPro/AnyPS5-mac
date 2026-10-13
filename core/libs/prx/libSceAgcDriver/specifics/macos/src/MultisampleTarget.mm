@@ -61,18 +61,23 @@ public:
         this->context.bufferPool.reset();
         id<MTLDevice> device = Metal::DeviceOf(context);
         Require(device != nil, "a multisampled color target needs a Context carrying a Metal device");
-        Require([device supportsTextureSampleCount:target.samples], "the device cannot render color with the target's sample count");
+        // Sample counts the device cannot render are slices of a 2D multisample array (DECISIONS D28:
+        // 8x on Apple9 is two 4x halves).
+        host = Metal::HostSamplesOf(device, target.samples);
         const auto format = Metal::PixelFormatOf(target.format);
         Require(format.format != MTLPixelFormatInvalid && format.blockWidth == 1u, "multisampled render-target format cannot be a color attachment");
         Require(target.extent.width <= 16384u && target.extent.height <= 16384u, "multisampled render target exceeds device image limits");
         try {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             info.imageType = VK_IMAGE_TYPE_2D;
+            // A 2D multisample array (MetalVulkanImages.mm CreateImage): sampled through
+            // texture2d_ms_array (MslAbi Version 9), rendered slice by slice (DECISIONS D28).
+            info.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
             info.format = target.format;
             info.extent = {target.extent.width, target.extent.height, 1};
             info.mipLevels = 1;
-            info.arrayLayers = 1;
-            info.samples = static_cast<VkSampleCountFlagBits>(target.samples);
+            info.arrayLayers = host.slices;
+            info.samples = static_cast<VkSampleCountFlagBits>(host.samples);
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
             info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -80,9 +85,9 @@ public:
             Check(Metal::Vk::CreateImage(context.device, &info, nullptr, &image), "vkCreateImage multisampled target");
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image;
-            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
             viewInfo.format = target.format;
-            viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, host.slices};
             Check(Metal::Vk::CreateImageView(context.device, &viewInfo, nullptr, &view), "vkCreateImageView multisampled target");
             // Metal cannot write a multisampled texture from compute: the zero clear is a render pass
             // that loads the clear value (MetalVulkanImages.mm ClearByRenderPass).
@@ -106,7 +111,7 @@ public:
         const auto clear = fastClearColor(use);
         recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, host.slices};
             Metal::Vk::CmdClearColorImage(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
             if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
@@ -117,6 +122,8 @@ public:
     ColorTarget target;
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    // The host layout of the guest sample count (DECISIONS D28).
+    Metal::HostSamples host;
     MultisampledCmask cmask;
     // Sampled views for guest MSAA T#s (DECISIONS D27), by component mapping.
     std::map<std::uint32_t, std::shared_ptr<Texture>> sampled;
@@ -276,6 +283,8 @@ std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::
     char described[192];
     std::snprintf(described, sizeof(described), " (T# 0x%llx, %ux%u, %u samples, format %u, type %u)", static_cast<unsigned long long>(address), width, height, samples, guestFormat, type);
     Require(baseLevel == 0u, std::string("AGC graphics: a 2D MSAA T# with a nonzero base level (fragment) is not modeled") + described);
+    // Type 15 (2D MSAA array) views of a target's single layer read the same texture2d_ms_array view
+    // (MslAbi Version 9); targets have one layer, as upstream's.
     Require(type == 14u || (layers == 1u && baseArray == 0u), std::string("AGC graphics: a 2D MSAA array T# over more than its first layer is not implemented (multisampled color targets have one layer)") + described);
     const auto format = ResolveTextureFormat(guestFormat);
     std::lock_guard lock(targetsMutex());
@@ -284,7 +293,6 @@ std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::
         if (target->context.device != context.device || color.address != address) continue;
         Require(color.extent.width == width && color.extent.height == height && color.samples == samples, std::string("AGC graphics: a 2D MSAA T# disagrees with the multisampled color target at its address in extent or sample count") + described);
         Require(color.format == format, std::string("AGC graphics: a 2D MSAA T# reads a multisampled color target in another format, which is not implemented") + described);
-        Require(type == 14u, std::string("AGC graphics: a 2D MSAA array T# (texture2d_ms_array view of a single-layer target) is not implemented") + described);
         target->ApplyFastClear(color);
         const auto swizzle = [](std::uint32_t select) {
             switch (select) {

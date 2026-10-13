@@ -115,6 +115,9 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         place(PixelInput::PerspectiveCentroid, pixel.perspectiveCentroid);
         place(PixelInput::LinearCenter, pixel.noPerspective);
         place(PixelInput::LinearCentroid, pixel.linearCentroid);
+        // PERSP/LINEAR_SAMPLE: their VGPRs exist whenever SPI_PS_INPUT_ADDR lays them out.
+        place(PixelInput::PerspectiveSample, (pixel.inputAddr & PixelInputBit(PixelInput::PerspectiveSample)) != 0u);
+        place(PixelInput::LinearSample, (pixel.inputAddr & PixelInputBit(PixelInput::LinearSample)) != 0u);
         place(PixelInput::PositionX, pixel.posX);
         place(PixelInput::PositionY, pixel.posY);
         place(PixelInput::PositionZ, pixel.posZ);

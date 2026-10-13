@@ -525,7 +525,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (vertexReflection.workgroupMemoryStrideDwords != 0u || (fragmentReflection != nullptr && fragmentReflection->workgroupMemoryStrideDwords != 0u)) Fail("device-memory LDS in a draw stage");
     // Multisampled draws (DECISIONS D27): the pipeline rasterizes graphics.samples samples into
     // MultisampleTarget host images and multisampled depth surfaces, at the guest's sample positions.
-    if (graphics.samples > 1u && ![state.device supportsTextureSampleCount:graphics.samples]) Fail(std::to_string(graphics.samples) + "-sample draws: the device renders 1, 2 and 4 samples (TechnicalDebt metal-msaa-8x)");
+    // Sample counts the device cannot render (8x on Apple9) are emulated (DECISIONS D28): the targets
+    // are 2D multisample arrays of `slices` slices of hostSamples.samples samples, and the draw is
+    // recorded once per slice, each pass at its slice's guest sample positions with the fragment
+    // function's sample ids and exported masks offset by the slice's first guest sample.
+    const auto hostSamples = graphics.samples > 1u ? Graphics::Metal::HostSamplesOf(state.device, graphics.samples) : Graphics::Metal::HostSamples{};
+    const std::uint32_t slices = hostSamples.slices;
     // Conservative rasterization is emulated (MslConservative.hpp, DECISIONS "conservative
     // rasterization emulated"), and so are per-vertex fragment inputs and barycentrics (B6): both
     // need every triangle's three vertices in the vertex function (the triangle-vertices mode).
@@ -649,7 +654,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (format.format == MTLPixelFormatInvalid) Fail("color target format " + std::to_string(target.format) + " has no Metal pixel format");
             ColorAttachment attachment {&target, format.format, target.address, target.address, nullptr, false, nullptr};
             attachment.multisample = Graphics::Metal::TextureOfView(Graphics::MultisampleTargetView(*imageContext, target));
-            if (attachment.multisample == nil || attachment.multisample.sampleCount != target.samples) Fail("the multisampled color target has no host image of its sample count");
+            if (attachment.multisample == nil || attachment.multisample.sampleCount != hostSamples.samples || attachment.multisample.arrayLength != slices) Fail("the multisampled color target has no host image of its sample count");
             colors.push_back(attachment);
             continue;
         }
@@ -839,7 +844,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (HasDepth(depth->format)) request.depthFormat = depth->format;
         if (HasStencil(depth->format)) request.stencilFormat = depth->format;
     }
-    request.rasterSampleCount = graphics.samples;
+    request.rasterSampleCount = hostSamples.samples;
     // B6 emulates alpha-to-coverage in the fragment function's [[sample_mask]] (the guest's rule);
     // Metal's own would apply on top.
     request.alphaToCoverage = graphics.alphaToCoverage && !(fragmentReflection != nullptr && fragmentReflection->exportsSampleMask);
@@ -850,44 +855,64 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         float biasConstant;
         float biasSlope;
     };
-    std::vector<PipelinePass> pipelinePasses;
     const auto cullOf = [](VkCullModeFlags mode) {
         return mode == VK_CULL_MODE_FRONT_BIT ? MTLCullModeFront : mode == VK_CULL_MODE_BACK_BIT ? MTLCullModeBack : MTLCullModeNone;
     };
     if (graphics.cullMode == VK_CULL_MODE_FRONT_AND_BACK) return;
     const float biasConstant = graphics.depthBias ? graphics.depthBiasConstant : 0.0f;
     const float biasSlope = graphics.depthBias ? graphics.depthBiasSlope : 0.0f;
-    if (Graphics::SplitsAlternateAlpha(graphics)) {
-        // Upstream Pipeline.cpp's limits of the second-channel split (the second pass would repeat
-        // the draw's other effects).
-        const auto keepsStencil = [](const VkStencilOpState& face) { return face.writeMask == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
-        if ((graphics.depth && (graphics.depthWrite || (graphics.stencilTest && (!keepsStencil(graphics.stencilFront) || !keepsStencil(graphics.stencilBack))))) || graphics.depthBiasPerFace) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order and a separate alpha blend from a draw that writes depth or stencil is not implemented");
-        const std::array<Graphics::CompiledShader, 2> stages {{vertex, fragment != nullptr ? *fragment : vertex}};
-        if (Graphics::ShadersWriteMemory(std::span(stages.data(), fragment != nullptr ? 2u : 1u))) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order and a separate alpha blend from a draw whose shaders write memory is not implemented");
-        auto first = request;
-        auto second = request;
-        for (const auto& attachment : colors) {
-            const auto index = attachment.target->exportIndex;
-            const bool split = attachment.target->componentMapping == 0xecu && index < graphics.blends.size() && graphics.blends[index].blendEnable;
-            if (!split) {
-                second.colors[index].writeMask = MTLColorWriteMaskNone;
-                continue;
+    const auto buildPipelinePasses = [&](const Graphics::Metal::RenderPipelineRequest& request) {
+        std::vector<PipelinePass> pipelinePasses;
+        if (Graphics::SplitsAlternateAlpha(graphics)) {
+            // Upstream Pipeline.cpp's limits of the second-channel split (the second pass would repeat
+            // the draw's other effects).
+            const auto keepsStencil = [](const VkStencilOpState& face) { return face.writeMask == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
+            if ((graphics.depth && (graphics.depthWrite || (graphics.stencilTest && (!keepsStencil(graphics.stencilFront) || !keepsStencil(graphics.stencilBack))))) || graphics.depthBiasPerFace) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order and a separate alpha blend from a draw that writes depth or stencil is not implemented");
+            const std::array<Graphics::CompiledShader, 2> stages {{vertex, fragment != nullptr ? *fragment : vertex}};
+            if (Graphics::ShadersWriteMemory(std::span(stages.data(), fragment != nullptr ? 2u : 1u))) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order and a separate alpha blend from a draw whose shaders write memory is not implemented");
+            auto first = request;
+            auto second = request;
+            for (const auto& attachment : colors) {
+                const auto index = attachment.target->exportIndex;
+                const bool split = attachment.target->componentMapping == 0xecu && index < graphics.blends.size() && graphics.blends[index].blendEnable;
+                if (!split) {
+                    second.colors[index].writeMask = MTLColorWriteMaskNone;
+                    continue;
+                }
+                first.colors[index].writeMask &= ~MTLColorWriteMaskGreen;
+                second.colors[index].writeMask &= MTLColorWriteMaskGreen;
+                second.colors[index].sourceRgb = second.colors[index].sourceAlpha;
+                second.colors[index].destinationRgb = second.colors[index].destinationAlpha;
+                second.colors[index].rgbOperation = second.colors[index].alphaOperation;
             }
-            first.colors[index].writeMask &= ~MTLColorWriteMaskGreen;
-            second.colors[index].writeMask &= MTLColorWriteMaskGreen;
-            second.colors[index].sourceRgb = second.colors[index].sourceAlpha;
-            second.colors[index].destinationRgb = second.colors[index].destinationAlpha;
-            second.colors[index].rgbOperation = second.colors[index].alphaOperation;
+            pipelinePasses.push_back({state.pipelines->Render(first), cullOf(graphics.cullMode), biasConstant, biasSlope});
+            pipelinePasses.push_back({state.pipelines->Render(second), cullOf(graphics.cullMode), biasConstant, biasSlope});
+        } else if (graphics.depthBiasPerFace) {
+            if (graphics.cullMode != VK_CULL_MODE_NONE) Fail("per-face depth bias with culling");
+            id<MTLRenderPipelineState> pipeline = state.pipelines->Render(request);
+            pipelinePasses.push_back({pipeline, MTLCullModeBack, biasConstant, biasSlope});
+            pipelinePasses.push_back({pipeline, MTLCullModeFront, graphics.backDepthBiasConstant, graphics.backDepthBiasSlope});
+        } else {
+            pipelinePasses.push_back({state.pipelines->Render(request), cullOf(graphics.cullMode), biasConstant, biasSlope});
         }
-        pipelinePasses.push_back({state.pipelines->Render(first), cullOf(graphics.cullMode), biasConstant, biasSlope});
-        pipelinePasses.push_back({state.pipelines->Render(second), cullOf(graphics.cullMode), biasConstant, biasSlope});
-    } else if (graphics.depthBiasPerFace) {
-        if (graphics.cullMode != VK_CULL_MODE_NONE) Fail("per-face depth bias with culling");
-        id<MTLRenderPipelineState> pipeline = state.pipelines->Render(request);
-        pipelinePasses.push_back({pipeline, MTLCullModeBack, biasConstant, biasSlope});
-        pipelinePasses.push_back({pipeline, MTLCullModeFront, graphics.backDepthBiasConstant, graphics.backDepthBiasSlope});
-    } else {
-        pipelinePasses.push_back({state.pipelines->Render(request), cullOf(graphics.cullMode), biasConstant, biasSlope});
+        return pipelinePasses;
+    };
+    // One pipeline set per slice of an emulated sample count (DECISIONS D28): slice k's fragment
+    // function sees guest samples k * h .. k * h + h - 1 (SampleBaseMacro); the guest sample count
+    // is SampleCountMacro (alpha-to-coverage). Functions that read no sample id and export no mask
+    // share slice 0's pipelines.
+    std::vector<std::vector<PipelinePass>> slicePipelines;
+    if (slices > 1u && request.fragment.has_value()) request.fragment->macros.push_back({Abi::SampleCountMacro, std::to_string(graphics.samples)});
+    slicePipelines.push_back(buildPipelinePasses(request));
+    const bool sliceSpecific = fragmentReflection != nullptr && (fragmentReflection->exportsSampleMask || fragmentReflection->perSample);
+    for (std::uint32_t slice = 1; slice < slices; ++slice) {
+        if (!sliceSpecific) {
+            slicePipelines.push_back(slicePipelines.front());
+            continue;
+        }
+        auto sliceRequest = request;
+        sliceRequest.fragment->macros.push_back({Abi::SampleBaseMacro, std::to_string(slice * hostSamples.samples)});
+        slicePipelines.push_back(buildPipelinePasses(sliceRequest));
     }
     id<MTLDepthStencilState> depthStencil = nil;
     if (depth != nullptr) {
@@ -1012,369 +1037,386 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     access.writes = passWrites;
     access.anyReads = !passReads.empty();
     access.anyWrites = !passWrites.empty();
-    // A pending depth/stencil clear is a load action: it needs a new pass.
-    const bool clears = depth != nullptr && (depth->clearDepth || depth->clearStencil);
-    const auto start = recorder.StartDrawPass(passKey, clears, false, access);
-    auto& stream = Graphics::Metal::Stream(start.commands);
-    const bool continued = start.continued && cache.passKey == passKey && !cache.passTextures.empty();
     auto held = std::make_shared<Held>();
-    id<MTL4RenderCommandEncoder> encoder = nil;
-    std::vector<std::shared_ptr<DrawCache::TiledTarget>> passTiled;
-    if (continued) {
-        encoder = stream.Render();
-        if (encoder == nil) Fail("the recorder continued a render pass that has no encoder");
-    } else {
-        // Tiled targets load from guest memory (CPU detile into upload memory, then a copy).
-        std::vector<id<MTLTexture>> textures;
-        cache.passTextures.clear();
-        MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
-        std::uint32_t width = graphics.renderExtent.width;
-        std::uint32_t height = graphics.renderExtent.height;
-        for (auto& attachment : colors) {
-            const auto& target = *attachment.target;
-            id<MTLTexture> texture = nil;
-            if (attachment.multisample != nil) {
-                texture = attachment.multisample;
-            } else if (attachment.resident != nullptr) {
-                texture = Graphics::Metal::TextureOfView(attachment.resident->AttachmentView(target.format, target.mip, target.depthSlice, target.arraySlice));
-                if (texture == nil) Fail("the resident color target has no attachment view");
-            } else if (attachment.tiled != nullptr) {
-                texture = attachment.tiled->texture;
-                if (attachment.load) {
+    std::uint64_t recorded = 0;
+    bool anyContinued = false;
+    // One pass per slice of the targets (one unless the sample count is emulated, DECISIONS D28).
+    const auto slicePassKeyOf = [&](std::uint32_t slice) { return slices > 1u ? Mix(passKey, 0x736c696365ull + slice) : passKey; };
+    const auto recordSlice = [&](std::uint32_t slice) {
+        const auto slicePassKey = slicePassKeyOf(slice);
+        // A pending depth/stencil clear is a load action: it needs a new pass.
+        const bool clears = depth != nullptr && (depth->clearDepth || depth->clearStencil);
+        const auto start = recorder.StartDrawPass(slicePassKey, clears, false, access);
+        auto& stream = Graphics::Metal::Stream(start.commands);
+        const bool continued = start.continued && cache.passKey == slicePassKey && !cache.passTextures.empty();
+        id<MTL4RenderCommandEncoder> encoder = nil;
+        std::vector<std::shared_ptr<DrawCache::TiledTarget>> passTiled;
+        if (continued) {
+            encoder = stream.Render();
+            if (encoder == nil) Fail("the recorder continued a render pass that has no encoder");
+        } else {
+            // Tiled targets load from guest memory (CPU detile into upload memory, then a copy).
+            std::vector<id<MTLTexture>> textures;
+            cache.passTextures.clear();
+            MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
+            std::uint32_t width = graphics.renderExtent.width;
+            std::uint32_t height = graphics.renderExtent.height;
+            for (auto& attachment : colors) {
+                const auto& target = *attachment.target;
+                id<MTLTexture> texture = nil;
+                if (attachment.multisample != nil) {
+                    texture = attachment.multisample;
+                } else if (attachment.resident != nullptr) {
+                    texture = Graphics::Metal::TextureOfView(attachment.resident->AttachmentView(target.format, target.mip, target.depthSlice, target.arraySlice));
+                    if (texture == nil) Fail("the resident color target has no attachment view");
+                } else if (attachment.tiled != nullptr) {
+                    texture = attachment.tiled->texture;
+                    if (attachment.load) {
+                        const Graphics::ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
+                        const auto pitch = static_cast<std::size_t>(target.extent.width) * target.elementBytes;
+                        const auto linearBytes = pitch * target.extent.height;
+                        auto upload = stream.Allocate(linearBytes, 256u);
+                        layout.Detile(std::span<const std::byte>(reinterpret_cast<const std::byte*>(target.address), layout.Bytes()), std::span<std::byte>(upload.host, linearBytes));
+                        id<MTL4ComputeCommandEncoder> copy = stream.Compute();
+                        [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:pitch sourceBytesPerImage:linearBytes sourceSize:MTLSizeMake(target.extent.width, target.extent.height, 1) toTexture:texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                        stream.CountCommand();
+                    }
+                    passTiled.push_back(attachment.tiled);
+                } else {
                     const Graphics::ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
-                    const auto pitch = static_cast<std::size_t>(target.extent.width) * target.elementBytes;
-                    const auto linearBytes = pitch * target.extent.height;
-                    auto upload = stream.Allocate(linearBytes, 256u);
-                    layout.Detile(std::span<const std::byte>(reinterpret_cast<const std::byte*>(target.address), layout.Bytes()), std::span<std::byte>(upload.host, linearBytes));
-                    id<MTL4ComputeCommandEncoder> copy = stream.Compute();
-                    [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:pitch sourceBytesPerImage:linearBytes sourceSize:MTLSizeMake(target.extent.width, target.extent.height, 1) toTexture:texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-                    stream.CountCommand();
+                    std::uint64_t offset = 0;
+                    id<MTLBuffer> buffer = state.BufferAt(attachment.begin, attachment.end - attachment.begin, &offset);
+                    const auto pitch = layout.BlocksPerRow() * static_cast<std::size_t>(target.elementBytes);
+                    const auto alignment = [state.device minimumLinearTextureAlignmentForPixelFormat:attachment.format];
+                    if (offset % alignment != 0u || pitch % alignment != 0u) Fail("a linear color target at offset " + std::to_string(offset) + " with pitch " + std::to_string(pitch) + " breaks the linear texture alignment " + std::to_string(alignment));
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:attachment.format width:target.extent.width height:target.extent.height mipmapped:NO];
+                    descriptor.storageMode = buffer.storageMode;
+                    descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+                    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                    texture = [buffer newTextureWithDescriptor:descriptor offset:offset bytesPerRow:pitch];
+                    if (texture == nil) Fail("cannot alias a linear color target");
+                    state.KeepWrapped(attachment.begin, attachment.end - attachment.begin);
+                    textures.push_back(texture);
                 }
-                passTiled.push_back(attachment.tiled);
-            } else {
-                const Graphics::ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
-                std::uint64_t offset = 0;
-                id<MTLBuffer> buffer = state.BufferAt(attachment.begin, attachment.end - attachment.begin, &offset);
-                const auto pitch = layout.BlocksPerRow() * static_cast<std::size_t>(target.elementBytes);
-                const auto alignment = [state.device minimumLinearTextureAlignmentForPixelFormat:attachment.format];
-                if (offset % alignment != 0u || pitch % alignment != 0u) Fail("a linear color target at offset " + std::to_string(offset) + " with pitch " + std::to_string(pitch) + " breaks the linear texture alignment " + std::to_string(alignment));
-                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:attachment.format width:target.extent.width height:target.extent.height mipmapped:NO];
-                descriptor.storageMode = buffer.storageMode;
-                descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
-                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-                texture = [buffer newTextureWithDescriptor:descriptor offset:offset bytesPerRow:pitch];
-                if (texture == nil) Fail("cannot alias a linear color target");
-                state.KeepWrapped(attachment.begin, attachment.end - attachment.begin);
-                textures.push_back(texture);
+                width = std::min<std::uint32_t>(width, target.extent.width);
+                height = std::min<std::uint32_t>(height, target.extent.height);
+                auto* color = pass.colorAttachments[attachment.target->exportIndex];
+                color.texture = texture;
+                if (attachment.multisample != nil) color.slice = slice;
+                color.loadAction = MTLLoadActionLoad;
+                color.storeAction = MTLStoreActionStore;
+                cache.passTextures.push_back(texture);
             }
-            width = std::min<std::uint32_t>(width, target.extent.width);
-            height = std::min<std::uint32_t>(height, target.extent.height);
-            auto* color = pass.colorAttachments[attachment.target->exportIndex];
-            color.texture = texture;
-            color.loadAction = MTLLoadActionLoad;
-            color.storeAction = MTLStoreActionStore;
-            cache.passTextures.push_back(texture);
+            if (depth != nullptr) {
+                width = std::min<std::uint32_t>(width, depth->target.extent.width);
+                height = std::min<std::uint32_t>(height, depth->target.extent.height);
+                cache.passTextures.push_back(depth->texture);
+                if (HasDepth(depth->format)) {
+                    pass.depthAttachment.texture = depth->texture;
+                    if (graphics.samples > 1u) pass.depthAttachment.slice = slice;
+                    pass.depthAttachment.loadAction = depth->clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
+                    pass.depthAttachment.clearDepth = depth->target.clearDepth;
+                    pass.depthAttachment.storeAction = MTLStoreActionStore;
+                }
+                if (HasStencil(depth->format)) {
+                    pass.stencilAttachment.texture = depth->texture;
+                    if (graphics.samples > 1u) pass.stencilAttachment.slice = slice;
+                    pass.stencilAttachment.loadAction = depth->clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
+                    pass.stencilAttachment.clearStencil = depth->target.clearStencil;
+                    pass.stencilAttachment.storeAction = MTLStoreActionStore;
+                }
+            }
+            if (width == 0u || height == 0u) Fail("a render pass without an extent");
+            pass.renderTargetWidth = width;
+            pass.renderTargetHeight = height;
+            if (colors.empty() && depth == nullptr) pass.defaultRasterSampleCount = hostSamples.samples;
+            // The guest's sample positions (standard or PA_SC_AA_SAMPLE_LOCS custom ones), as upstream's
+            // VK_EXT_sample_locations: Metal's are in [0, 1) from the pixel's top-left corner in 1/16
+            // steps, the same grid (Graphics::SampleLocations).
+            if (graphics.samples > 1u) {
+                if (!state.device.programmableSamplePositionsSupported) Fail("the device has no programmable sample positions");
+                [pass setSamplePositions:samplePositions.data() + slice * hostSamples.samples count:hostSamples.samples];
+            }
+            if (void* visibility = recorder.SampleVisibilityBuffer()) {
+                pass.visibilityResultBuffer = (__bridge id<MTLBuffer>)visibility;
+                pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+            }
+            cache.passKey = slicePassKey;
+            if (!textures.empty() || !cache.passTextures.empty()) {
+                const std::vector<id<MTLTexture>> passTextures = cache.passTextures;
+                state.images->MakeResident(passTextures);
+                held->objects.insert(held->objects.end(), passTextures.begin(), passTextures.end());
+                auto* images = state.images.get();
+                recorder.OnComplete([images, passTextures] { images->Release(passTextures); });
+            }
+            encoder = stream.BeginRender(pass);
+            if (encoder == nil) Fail("cannot begin the render pass");
+        }
+        recorder.NoteSampledDraw(start.commands);
+
+        // Bindings after the stream is taken: descriptor tables, push data, driver data, fetches.
+        std::array<std::byte, Abi::PushDataBytes> push {};
+        const auto copyPush = [&](const ShaderRecompiler::RecompileResult& result, std::uint32_t offset) {
+            if (result.pushConstants.empty()) return std::span<std::byte>();
+            if (offset > push.size() || result.pushConstants.size() > push.size() - offset) Fail("push constants exceed the push data block");
+            std::memcpy(push.data() + offset, result.pushConstants.data(), result.pushConstants.size());
+            return std::span<std::byte>(push).subspan(offset, result.pushConstants.size());
+        };
+        const auto vertexTable = state.WriteTable(vertexResult, snapshots, stream, vertexPlan, copyPush(vertexResult, vertex.pushConstantOffset));
+        const auto fragmentTable = fragmentResult != nullptr ? state.WriteTable(*fragmentResult, snapshots, stream, fragmentPlan, copyPush(*fragmentResult, fragment->pushConstantOffset)) : 0u;
+        const auto localTable = tess ? state.WriteTable(*tessellation->local->program, snapshots, stream, localPlan, copyPush(*tessellation->local->program, tessellation->local->pushConstantOffset)) : 0u;
+        const auto hullTable = tess ? state.WriteTable(*tessellation->hull->program, snapshots, stream, hullPlan, copyPush(*tessellation->hull->program, tessellation->hull->pushConstantOffset)) : 0u;
+        if (mesh) {
+            // The mesh draw words after the mesh function's own push data (pushDrawConstants).
+            if (vertexResult.pushConstants.size() > ShaderRecompiler::MeshDrawPushOffsetBytes) Fail("mesh push constants overlap the mesh draw words");
+            auto words = meshPlan.words;
+            if (!meshPlan.arguments.empty()) {
+                const auto arguments = stream.Write(std::span<const std::byte>(meshPlan.arguments), 16u).address;
+                words[4] = static_cast<std::uint32_t>(arguments);
+                words[5] = static_cast<std::uint32_t>(arguments >> 32u);
+            }
+            std::memcpy(push.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
+        }
+        const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
+        const auto driverAddress = state.WriteDriverData(stream, {0u, 0u, 0u});
+        std::uint64_t fetchAddress = driverAddress;
+        if (!fetches.empty()) {
+            std::uint32_t highest = 0;
+            for (const auto& fetch : fetches) highest = std::max(highest, fetch.location);
+            std::vector<Abi::VertexFetchRecord> records(highest + 1u);
+            for (auto& fetch : fetches) {
+                auto record = fetch.record;
+                if (fetch.end > fetch.begin) {
+                    record.address = state.WrapOrCopy(fetch.begin, fetch.end - fetch.begin, stream, false);
+                    state.KeepWrapped(fetch.begin, fetch.end - fetch.begin);
+                }
+                records[fetch.location] = record;
+            }
+            fetchAddress = stream.Write(std::as_bytes(std::span(records)), 16u).address;
+        }
+        [cache.vertexArguments setAddress:vertexTable != 0u ? vertexTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
+        [cache.vertexArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
+        [cache.vertexArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
+        [cache.vertexArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+        [cache.vertexArguments setAddress:fetchAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
+        [cache.fragmentArguments setAddress:fragmentTable != 0u ? fragmentTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
+        [cache.fragmentArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
+        [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
+        [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+        [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
+        std::uint64_t rasterOrderAddress = driverAddress;
+        if (fragmentReflection != nullptr && fragmentReflection->rasterOrder) {
+            if (cache.rasterOrder == nil) {
+                cache.rasterOrder = [state.device newBufferWithLength:Abi::RasterOrderBytes options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
+                if (cache.rasterOrder == nil) Fail("cannot allocate the raster order buffer");
+                [state.residency addAllocation:cache.rasterOrder];
+                [state.residency commit];
+            }
+            rasterOrderAddress = cache.rasterOrder.gpuAddress;
+        }
+        [cache.fragmentArguments setAddress:rasterOrderAddress atIndex:Abi::Index(Abi::BufferIndex::RasterOrder)];
+        if (tess) {
+            // The object stage (MetalTessellation.h): the local program's bindings, the hull program's
+            // table and, per call below, the TessellationDraw record.
+            [cache.objectArguments setAddress:localTable != 0u ? localTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
+            [cache.objectArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
+            [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
+            [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+            [cache.objectArguments setAddress:fetchAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
+            [cache.objectArguments setAddress:hullTable != 0u ? hullTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::TessellationHullTable)];
+            [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
+            [encoder setArgumentTable:cache.objectArguments atStages:MTLRenderStageObject];
+        }
+        [encoder setArgumentTable:cache.vertexArguments atStages:mesh || tess ? MTLRenderStageMesh : MTLRenderStageVertex];
+        [encoder setArgumentTable:cache.fragmentArguments atStages:MTLRenderStageFragment];
+
+        // Dynamic state. Vulkan's viewport transform is y_fb = y + (1 + y_ndc) h / 2, Metal's
+        // originY + (1 - y_ndc) height / 2: the same transform with originY = y + h, height = -h.
+        const auto& viewport = graphics.viewport;
+        [encoder setViewport:MTLViewport{viewport.x, static_cast<double>(viewport.y) + viewport.height, viewport.width, -static_cast<double>(viewport.height), viewport.minDepth, viewport.maxDepth}];
+        const auto passWidth = static_cast<std::int64_t>(colors.empty() ? (depth != nullptr ? depth->target.extent.width : graphics.renderExtent.width) : graphics.renderExtent.width);
+        const auto passHeight = static_cast<std::int64_t>(colors.empty() ? (depth != nullptr ? depth->target.extent.height : graphics.renderExtent.height) : graphics.renderExtent.height);
+        std::int64_t limitWidth = passWidth;
+        std::int64_t limitHeight = passHeight;
+        for (const auto& attachment : colors) {
+            limitWidth = std::min<std::int64_t>(limitWidth, attachment.target->extent.width);
+            limitHeight = std::min<std::int64_t>(limitHeight, attachment.target->extent.height);
         }
         if (depth != nullptr) {
-            width = std::min<std::uint32_t>(width, depth->target.extent.width);
-            height = std::min<std::uint32_t>(height, depth->target.extent.height);
-            cache.passTextures.push_back(depth->texture);
-            if (HasDepth(depth->format)) {
-                pass.depthAttachment.texture = depth->texture;
-                pass.depthAttachment.loadAction = depth->clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.depthAttachment.clearDepth = depth->target.clearDepth;
-                pass.depthAttachment.storeAction = MTLStoreActionStore;
-            }
-            if (HasStencil(depth->format)) {
-                pass.stencilAttachment.texture = depth->texture;
-                pass.stencilAttachment.loadAction = depth->clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.stencilAttachment.clearStencil = depth->target.clearStencil;
-                pass.stencilAttachment.storeAction = MTLStoreActionStore;
-            }
+            limitWidth = std::min<std::int64_t>(limitWidth, depth->target.extent.width);
+            limitHeight = std::min<std::int64_t>(limitHeight, depth->target.extent.height);
         }
-        if (width == 0u || height == 0u) Fail("a render pass without an extent");
-        pass.renderTargetWidth = width;
-        pass.renderTargetHeight = height;
-        if (colors.empty() && depth == nullptr) pass.defaultRasterSampleCount = graphics.samples;
-        // The guest's sample positions (standard or PA_SC_AA_SAMPLE_LOCS custom ones), as upstream's
-        // VK_EXT_sample_locations: Metal's are in [0, 1) from the pixel's top-left corner in 1/16
-        // steps, the same grid (Graphics::SampleLocations).
-        if (graphics.samples > 1u) {
-            if (!state.device.programmableSamplePositionsSupported) Fail("the device has no programmable sample positions");
-            [pass setSamplePositions:samplePositions.data() count:graphics.samples];
-        }
-        if (void* visibility = recorder.SampleVisibilityBuffer()) {
-            pass.visibilityResultBuffer = (__bridge id<MTLBuffer>)visibility;
-            pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
-        }
-        cache.passKey = passKey;
-        if (!textures.empty() || !cache.passTextures.empty()) {
-            const std::vector<id<MTLTexture>> passTextures = cache.passTextures;
-            state.images->MakeResident(passTextures);
-            held->objects.insert(held->objects.end(), passTextures.begin(), passTextures.end());
-            auto* images = state.images.get();
-            recorder.OnComplete([images, passTextures] { images->Release(passTextures); });
-        }
-        encoder = stream.BeginRender(pass);
-        if (encoder == nil) Fail("cannot begin the render pass");
-    }
-    recorder.NoteSampledDraw(start.commands);
-
-    // Bindings after the stream is taken: descriptor tables, push data, driver data, fetches.
-    std::array<std::byte, Abi::PushDataBytes> push {};
-    const auto copyPush = [&](const ShaderRecompiler::RecompileResult& result, std::uint32_t offset) {
-        if (result.pushConstants.empty()) return std::span<std::byte>();
-        if (offset > push.size() || result.pushConstants.size() > push.size() - offset) Fail("push constants exceed the push data block");
-        std::memcpy(push.data() + offset, result.pushConstants.data(), result.pushConstants.size());
-        return std::span<std::byte>(push).subspan(offset, result.pushConstants.size());
-    };
-    const auto vertexTable = state.WriteTable(vertexResult, snapshots, stream, vertexPlan, copyPush(vertexResult, vertex.pushConstantOffset));
-    const auto fragmentTable = fragmentResult != nullptr ? state.WriteTable(*fragmentResult, snapshots, stream, fragmentPlan, copyPush(*fragmentResult, fragment->pushConstantOffset)) : 0u;
-    const auto localTable = tess ? state.WriteTable(*tessellation->local->program, snapshots, stream, localPlan, copyPush(*tessellation->local->program, tessellation->local->pushConstantOffset)) : 0u;
-    const auto hullTable = tess ? state.WriteTable(*tessellation->hull->program, snapshots, stream, hullPlan, copyPush(*tessellation->hull->program, tessellation->hull->pushConstantOffset)) : 0u;
-    if (mesh) {
-        // The mesh draw words after the mesh function's own push data (pushDrawConstants).
-        if (vertexResult.pushConstants.size() > ShaderRecompiler::MeshDrawPushOffsetBytes) Fail("mesh push constants overlap the mesh draw words");
-        auto words = meshPlan.words;
-        if (!meshPlan.arguments.empty()) {
-            const auto arguments = stream.Write(std::span<const std::byte>(meshPlan.arguments), 16u).address;
-            words[4] = static_cast<std::uint32_t>(arguments);
-            words[5] = static_cast<std::uint32_t>(arguments >> 32u);
-        }
-        std::memcpy(push.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
-    }
-    const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
-    const auto driverAddress = state.WriteDriverData(stream, {0u, 0u, 0u});
-    std::uint64_t fetchAddress = driverAddress;
-    if (!fetches.empty()) {
-        std::uint32_t highest = 0;
-        for (const auto& fetch : fetches) highest = std::max(highest, fetch.location);
-        std::vector<Abi::VertexFetchRecord> records(highest + 1u);
-        for (auto& fetch : fetches) {
-            auto record = fetch.record;
-            if (fetch.end > fetch.begin) {
-                record.address = state.WrapOrCopy(fetch.begin, fetch.end - fetch.begin, stream, false);
-                state.KeepWrapped(fetch.begin, fetch.end - fetch.begin);
-            }
-            records[fetch.location] = record;
-        }
-        fetchAddress = stream.Write(std::as_bytes(std::span(records)), 16u).address;
-    }
-    [cache.vertexArguments setAddress:vertexTable != 0u ? vertexTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
-    [cache.vertexArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
-    [cache.vertexArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
-    [cache.vertexArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
-    [cache.vertexArguments setAddress:fetchAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
-    [cache.fragmentArguments setAddress:fragmentTable != 0u ? fragmentTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
-    [cache.fragmentArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
-    [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
-    [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
-    [cache.fragmentArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
-    std::uint64_t rasterOrderAddress = driverAddress;
-    if (fragmentReflection != nullptr && fragmentReflection->rasterOrder) {
-        if (cache.rasterOrder == nil) {
-            cache.rasterOrder = [state.device newBufferWithLength:Abi::RasterOrderBytes options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
-            if (cache.rasterOrder == nil) Fail("cannot allocate the raster order buffer");
-            [state.residency addAllocation:cache.rasterOrder];
-            [state.residency commit];
-        }
-        rasterOrderAddress = cache.rasterOrder.gpuAddress;
-    }
-    [cache.fragmentArguments setAddress:rasterOrderAddress atIndex:Abi::Index(Abi::BufferIndex::RasterOrder)];
-    if (tess) {
-        // The object stage (MetalTessellation.h): the local program's bindings, the hull program's
-        // table and, per call below, the TessellationDraw record.
-        [cache.objectArguments setAddress:localTable != 0u ? localTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::DescriptorTable)];
-        [cache.objectArguments setAddress:pushAddress atIndex:Abi::Index(Abi::BufferIndex::PushData)];
-        [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::WorkgroupMemory)];
-        [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
-        [cache.objectArguments setAddress:fetchAddress atIndex:Abi::Index(Abi::BufferIndex::VertexFetch)];
-        [cache.objectArguments setAddress:hullTable != 0u ? hullTable : driverAddress atIndex:Abi::Index(Abi::BufferIndex::TessellationHullTable)];
-        [cache.objectArguments setAddress:driverAddress atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
-        [encoder setArgumentTable:cache.objectArguments atStages:MTLRenderStageObject];
-    }
-    [encoder setArgumentTable:cache.vertexArguments atStages:mesh || tess ? MTLRenderStageMesh : MTLRenderStageVertex];
-    [encoder setArgumentTable:cache.fragmentArguments atStages:MTLRenderStageFragment];
-
-    // Dynamic state. Vulkan's viewport transform is y_fb = y + (1 + y_ndc) h / 2, Metal's
-    // originY + (1 - y_ndc) height / 2: the same transform with originY = y + h, height = -h.
-    const auto& viewport = graphics.viewport;
-    [encoder setViewport:MTLViewport{viewport.x, static_cast<double>(viewport.y) + viewport.height, viewport.width, -static_cast<double>(viewport.height), viewport.minDepth, viewport.maxDepth}];
-    const auto passWidth = static_cast<std::int64_t>(colors.empty() ? (depth != nullptr ? depth->target.extent.width : graphics.renderExtent.width) : graphics.renderExtent.width);
-    const auto passHeight = static_cast<std::int64_t>(colors.empty() ? (depth != nullptr ? depth->target.extent.height : graphics.renderExtent.height) : graphics.renderExtent.height);
-    std::int64_t limitWidth = passWidth;
-    std::int64_t limitHeight = passHeight;
-    for (const auto& attachment : colors) {
-        limitWidth = std::min<std::int64_t>(limitWidth, attachment.target->extent.width);
-        limitHeight = std::min<std::int64_t>(limitHeight, attachment.target->extent.height);
-    }
-    if (depth != nullptr) {
-        limitWidth = std::min<std::int64_t>(limitWidth, depth->target.extent.width);
-        limitHeight = std::min<std::int64_t>(limitHeight, depth->target.extent.height);
-    }
-    const auto x0 = std::clamp<std::int64_t>(graphics.scissor.offset.x, 0, limitWidth);
-    const auto y0 = std::clamp<std::int64_t>(graphics.scissor.offset.y, 0, limitHeight);
-    const auto x1 = std::clamp<std::int64_t>(static_cast<std::int64_t>(graphics.scissor.offset.x) + graphics.scissor.extent.width, x0, limitWidth);
-    const auto y1 = std::clamp<std::int64_t>(static_cast<std::int64_t>(graphics.scissor.offset.y) + graphics.scissor.extent.height, y0, limitHeight);
-    const bool empty = x1 == x0 || y1 == y0;
-    [encoder setScissorRect:MTLScissorRect{static_cast<NSUInteger>(x0), static_cast<NSUInteger>(y0), static_cast<NSUInteger>(std::max<std::int64_t>(x1 - x0, 1)), static_cast<NSUInteger>(std::max<std::int64_t>(y1 - y0, 1))}];
-    [encoder setFrontFacingWinding:graphics.frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE ? MTLWindingCounterClockwise : MTLWindingClockwise];
-    [encoder setDepthClipMode:graphics.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
-    [encoder setBlendColorRed:graphics.blendConstants[0] green:graphics.blendConstants[1] blue:graphics.blendConstants[2] alpha:graphics.blendConstants[3]];
-    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
-    if (depthStencil != nil) {
-        [encoder setDepthStencilState:depthStencil];
-        [encoder setStencilFrontReferenceValue:graphics.stencilFront.reference & 0xffu backReferenceValue:graphics.stencilBack.reference & 0xffu];
-        held->objects.push_back(depthStencil);
-    } else {
-        [encoder setDepthStencilState:nil];
-    }
-
-    // Index buffers: the guest indices in place (4-byte aligned), else a copy; fans their list.
-    std::uint64_t indexAddress = 0;
-    std::uint64_t indexLength = 0;
-    MTLIndexType indexType = draw.indexSize == 2u ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
-    const bool expanded = expand;
-    const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
-    const auto& drawCalls = expanded ? fanCalls : calls;
-    const bool indexedDraw = (draw.indexed || expanded) && !triangleVertices;
-    if (triangleVertices) {
-        // The triangle-vertices table (MslAbi v5, vertex slot TriangleVertices): the header, then
-        // every triangle's guest vertex ids (the expansion's lists with each call's base vertex),
-        // drawn non-indexed: host vertex v of a call starting at table index f is v = f + i.
-        std::vector<std::byte> table(sizeof(Abi::TriangleVerticesHeader) + fanIndices.size() * 4u);
-        Abi::TriangleVerticesHeader header {};
-        header.viewport[0] = graphics.viewport.x;
-        header.viewport[1] = graphics.viewport.y;
-        header.viewport[2] = graphics.viewport.width;
-        header.viewport[3] = graphics.viewport.height;
-        header.depthRange[0] = graphics.viewport.minDepth;
-        header.depthRange[1] = graphics.viewport.maxDepth;
-        header.triangles = static_cast<std::uint32_t>(fanIndices.size() / 3u);
-        header.flags = (conservativeMode != 0u ? Abi::TriangleFlagConservative : 0u) | (perVertex ? Abi::TriangleFlagPerVertex : 0u);
-        std::memcpy(table.data(), &header, sizeof(header));
-        auto* ids = reinterpret_cast<std::uint32_t*>(table.data() + sizeof(header));
-        for (const auto& call : fanCalls) {
-            for (std::uint32_t index = call.first; index < call.first + call.count; ++index) ids[index] = fanIndices[index] + static_cast<std::uint32_t>(call.vertexOffset);
-        }
-        const auto upload = stream.Write(table, 16u);
-        [cache.vertexArguments setAddress:upload.address atIndex:Abi::Index(Abi::BufferIndex::TriangleVertices)];
-    } else if (expanded) {
-        indexType = MTLIndexTypeUInt32;
-        if (!fanIndices.empty()) {
-            const auto upload = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
-            indexAddress = upload.address;
-            indexLength = fanIndices.size() * 4u;
-        }
-    } else if (draw.indexed) {
-        if (indexBegin % 4u == 0u) {
-            indexAddress = state.WrapOrCopy(indexBegin, indexBytes, stream, false);
-            state.KeepWrapped(indexBegin, indexBytes);
+        const auto x0 = std::clamp<std::int64_t>(graphics.scissor.offset.x, 0, limitWidth);
+        const auto y0 = std::clamp<std::int64_t>(graphics.scissor.offset.y, 0, limitHeight);
+        const auto x1 = std::clamp<std::int64_t>(static_cast<std::int64_t>(graphics.scissor.offset.x) + graphics.scissor.extent.width, x0, limitWidth);
+        const auto y1 = std::clamp<std::int64_t>(static_cast<std::int64_t>(graphics.scissor.offset.y) + graphics.scissor.extent.height, y0, limitHeight);
+        const bool empty = x1 == x0 || y1 == y0;
+        [encoder setScissorRect:MTLScissorRect{static_cast<NSUInteger>(x0), static_cast<NSUInteger>(y0), static_cast<NSUInteger>(std::max<std::int64_t>(x1 - x0, 1)), static_cast<NSUInteger>(std::max<std::int64_t>(y1 - y0, 1))}];
+        [encoder setFrontFacingWinding:graphics.frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE ? MTLWindingCounterClockwise : MTLWindingClockwise];
+        [encoder setDepthClipMode:graphics.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+        [encoder setBlendColorRed:graphics.blendConstants[0] green:graphics.blendConstants[1] blue:graphics.blendConstants[2] alpha:graphics.blendConstants[3]];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        if (depthStencil != nil) {
+            [encoder setDepthStencilState:depthStencil];
+            [encoder setStencilFrontReferenceValue:graphics.stencilFront.reference & 0xffu backReferenceValue:graphics.stencilBack.reference & 0xffu];
+            held->objects.push_back(depthStencil);
         } else {
-            state.SettleRange(indexBegin, indexBytes);
-            const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(indexBegin), indexBytes), 16u);
-            indexAddress = upload.address;
+            [encoder setDepthStencilState:nil];
         }
-        indexLength = indexBytes;
-    }
 
-    std::uint64_t recorded = 0;
-    if (!empty) {
-        for (const auto& pass : pipelinePasses) {
-            [encoder setRenderPipelineState:pass.pipeline];
-            [encoder setCullMode:pass.cull];
-            [encoder setDepthBias:pass.biasConstant slopeScale:pass.biasSlope clamp:graphics.depthBias ? graphics.depthBiasClamp : 0.0f];
-            if (tess) {
-                // One object threadgroup per patch and instance (MetalTessellation.h).
-                const auto controlPoints = graphics.stages.tessellation->inputControlPoints;
+        // Index buffers: the guest indices in place (4-byte aligned), else a copy; fans their list.
+        std::uint64_t indexAddress = 0;
+        std::uint64_t indexLength = 0;
+        MTLIndexType indexType = draw.indexSize == 2u ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        const bool expanded = expand;
+        const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
+        const auto& drawCalls = expanded ? fanCalls : calls;
+        const bool indexedDraw = (draw.indexed || expanded) && !triangleVertices;
+        if (triangleVertices) {
+            // The triangle-vertices table (MslAbi v5, vertex slot TriangleVertices): the header, then
+            // every triangle's guest vertex ids (the expansion's lists with each call's base vertex),
+            // drawn non-indexed: host vertex v of a call starting at table index f is v = f + i.
+            std::vector<std::byte> table(sizeof(Abi::TriangleVerticesHeader) + fanIndices.size() * 4u);
+            Abi::TriangleVerticesHeader header {};
+            header.viewport[0] = graphics.viewport.x;
+            header.viewport[1] = graphics.viewport.y;
+            header.viewport[2] = graphics.viewport.width;
+            header.viewport[3] = graphics.viewport.height;
+            header.depthRange[0] = graphics.viewport.minDepth;
+            header.depthRange[1] = graphics.viewport.maxDepth;
+            header.triangles = static_cast<std::uint32_t>(fanIndices.size() / 3u);
+            header.flags = (conservativeMode != 0u ? Abi::TriangleFlagConservative : 0u) | (perVertex ? Abi::TriangleFlagPerVertex : 0u);
+            std::memcpy(table.data(), &header, sizeof(header));
+            auto* ids = reinterpret_cast<std::uint32_t*>(table.data() + sizeof(header));
+            for (const auto& call : fanCalls) {
+                for (std::uint32_t index = call.first; index < call.first + call.count; ++index) ids[index] = fanIndices[index] + static_cast<std::uint32_t>(call.vertexOffset);
+            }
+            const auto upload = stream.Write(table, 16u);
+            [cache.vertexArguments setAddress:upload.address atIndex:Abi::Index(Abi::BufferIndex::TriangleVertices)];
+        } else if (expanded) {
+            indexType = MTLIndexTypeUInt32;
+            if (!fanIndices.empty()) {
+                const auto upload = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
+                indexAddress = upload.address;
+                indexLength = fanIndices.size() * 4u;
+            }
+        } else if (draw.indexed) {
+            if (indexBegin % 4u == 0u) {
+                indexAddress = state.WrapOrCopy(indexBegin, indexBytes, stream, false);
+                state.KeepWrapped(indexBegin, indexBytes);
+            } else {
+                state.SettleRange(indexBegin, indexBytes);
+                const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(indexBegin), indexBytes), 16u);
+                indexAddress = upload.address;
+            }
+            indexLength = indexBytes;
+        }
+
+        if (!empty) {
+            for (const auto& pass : slicePipelines[slice]) {
+                [encoder setRenderPipelineState:pass.pipeline];
+                [encoder setCullMode:pass.cull];
+                [encoder setDepthBias:pass.biasConstant slopeScale:pass.biasSlope clamp:graphics.depthBias ? graphics.depthBiasClamp : 0.0f];
+                if (tess) {
+                    // One object threadgroup per patch and instance (MetalTessellation.h).
+                    const auto controlPoints = graphics.stages.tessellation->inputControlPoints;
+                    for (const auto& call : drawCalls) {
+                        const auto patches = call.count / controlPoints;
+                        if (patches == 0u || call.instances == 0u) continue;
+                        Abi::TessellationDraw record {};
+                        record.indexAddress = draw.indexed ? indexAddress : 0u;
+                        record.indexSize = draw.indexed ? draw.indexSize : 0u;
+                        record.firstIndex = call.first;
+                        record.vertexOffset = call.vertexOffset;
+                        record.firstInstance = call.firstInstance;
+                        record.minLevel = graphics.stages.tessellationMinLevel;
+                        record.maxLevel = graphics.stages.tessellationMaxLevel;
+                        [cache.objectArguments setAddress:stream.Write(std::as_bytes(std::span(&record, 1)), 16u).address atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
+                        [encoder drawMeshThreadgroups:MTLSizeMake(patches, call.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(linked->objectThreads, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(linked->meshThreads, 1, 1)];
+                        stream.CountCommand();
+                        ++recorded;
+                    }
+                    held->objects.push_back(pass.pipeline);
+                    continue;
+                }
+                if (mesh) {
+                    // Grid (mesh groups, instances): the mesh function's WorkgroupId x and y.
+                    [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
+                    stream.CountCommand();
+                    ++recorded;
+                    held->objects.push_back(pass.pipeline);
+                    continue;
+                }
                 for (const auto& call : drawCalls) {
-                    const auto patches = call.count / controlPoints;
-                    if (patches == 0u || call.instances == 0u) continue;
-                    Abi::TessellationDraw record {};
-                    record.indexAddress = draw.indexed ? indexAddress : 0u;
-                    record.indexSize = draw.indexed ? draw.indexSize : 0u;
-                    record.firstIndex = call.first;
-                    record.vertexOffset = call.vertexOffset;
-                    record.firstInstance = call.firstInstance;
-                    record.minLevel = graphics.stages.tessellationMinLevel;
-                    record.maxLevel = graphics.stages.tessellationMaxLevel;
-                    [cache.objectArguments setAddress:stream.Write(std::as_bytes(std::span(&record, 1)), 16u).address atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
-                    [encoder drawMeshThreadgroups:MTLSizeMake(patches, call.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(linked->objectThreads, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(linked->meshThreads, 1, 1)];
+                    if (call.count == 0u || call.instances == 0u) continue;
+                    if (graphics.rectList) {
+                        // Rect lists (B6/D6 interface): 6 host vertices per rect from vertex 0, the
+                        // guest first vertex in the vertex stage's DriverData.workgroupBase[0].
+                        const auto rects = call.count / 3u;
+                        if (rects == 0u) continue;
+                        [cache.vertexArguments setAddress:state.WriteDriverData(stream, {call.first, 0u, 0u}) atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+                        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:static_cast<NSUInteger>(rects) * 6u instanceCount:call.instances baseInstance:call.firstInstance];
+                    } else if (indexedDraw) {
+                        const auto size = indexType == MTLIndexTypeUInt16 ? 2u : 4u;
+                        [encoder drawIndexedPrimitives:drawType indexCount:call.count indexType:indexType indexBuffer:indexAddress + static_cast<std::uint64_t>(call.first) * size indexBufferLength:indexLength - static_cast<std::uint64_t>(call.first) * size instanceCount:call.instances baseVertex:call.vertexOffset baseInstance:call.firstInstance];
+                    } else {
+                        [encoder drawPrimitives:drawType vertexStart:call.first vertexCount:call.count instanceCount:call.instances baseInstance:call.firstInstance];
+                    }
                     stream.CountCommand();
                     ++recorded;
                 }
                 held->objects.push_back(pass.pipeline);
-                continue;
             }
-            if (mesh) {
-                // Grid (mesh groups, instances): the mesh function's WorkgroupId x and y.
-                [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
-                stream.CountCommand();
-                ++recorded;
-                held->objects.push_back(pass.pipeline);
-                continue;
-            }
-            for (const auto& call : drawCalls) {
-                if (call.count == 0u || call.instances == 0u) continue;
-                if (graphics.rectList) {
-                    // Rect lists (B6/D6 interface): 6 host vertices per rect from vertex 0, the
-                    // guest first vertex in the vertex stage's DriverData.workgroupBase[0].
-                    const auto rects = call.count / 3u;
-                    if (rects == 0u) continue;
-                    [cache.vertexArguments setAddress:state.WriteDriverData(stream, {call.first, 0u, 0u}) atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
-                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:static_cast<NSUInteger>(rects) * 6u instanceCount:call.instances baseInstance:call.firstInstance];
-                } else if (indexedDraw) {
-                    const auto size = indexType == MTLIndexTypeUInt16 ? 2u : 4u;
-                    [encoder drawIndexedPrimitives:drawType indexCount:call.count indexType:indexType indexBuffer:indexAddress + static_cast<std::uint64_t>(call.first) * size indexBufferLength:indexLength - static_cast<std::uint64_t>(call.first) * size instanceCount:call.instances baseVertex:call.vertexOffset baseInstance:call.firstInstance];
-                } else {
-                    [encoder drawPrimitives:drawType vertexStart:call.first vertexCount:call.count instanceCount:call.instances baseInstance:call.firstInstance];
-                }
-                stream.CountCommand();
-                ++recorded;
-            }
-            held->objects.push_back(pass.pipeline);
         }
-    }
 
-    // Tiled targets written by this pass go back to guest memory when the batch completes: the
-    // pass's end copies them into upload memory, the completion retiles them.
-    std::function<void(VkCommandBuffer)> afterPass;
-    if (!continued && !passTiled.empty()) {
-        std::vector<std::pair<std::shared_ptr<DrawCache::TiledTarget>, bool>> targets;
-        for (const auto& tiled : passTiled) {
-            bool written = false;
-            for (const auto& attachment : colors) {
-                if (attachment.tiled == tiled) written = std::any_of(targetPlan.writes.begin(), targetPlan.writes.end(), [&](const auto& range) { return range.first == attachment.begin; });
+        // Tiled targets written by this pass go back to guest memory when the batch completes: the
+        // pass's end copies them into upload memory, the completion retiles them.
+        std::function<void(VkCommandBuffer)> afterPass;
+        if (!continued && !passTiled.empty()) {
+            std::vector<std::pair<std::shared_ptr<DrawCache::TiledTarget>, bool>> targets;
+            for (const auto& tiled : passTiled) {
+                bool written = false;
+                for (const auto& attachment : colors) {
+                    if (attachment.tiled == tiled) written = std::any_of(targetPlan.writes.begin(), targetPlan.writes.end(), [&](const auto& range) { return range.first == attachment.begin; });
+                }
+                targets.push_back({tiled, written});
             }
-            targets.push_back({tiled, written});
-        }
-        for (auto& [tiled, written] : targets) {
-            if (written) ++tiled->gpuNewer;
-        }
-        afterPass = [targets](VkCommandBuffer commands) {
-            auto& passStream = Graphics::Metal::Stream(commands);
-            auto* active = Recorder::Active();
-            for (const auto& [tiled, written] : targets) {
-                if (!written) continue;
-                const auto pitch = static_cast<std::size_t>(tiled->extent.width) * tiled->elementBytes;
-                const auto linearBytes = pitch * tiled->extent.height;
-                auto upload = passStream.Allocate(linearBytes, 256u);
-                id<MTL4ComputeCommandEncoder> copy = passStream.Compute();
-                [copy copyFromTexture:tiled->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(tiled->extent.width, tiled->extent.height, 1) toBuffer:upload.buffer destinationOffset:upload.offset destinationBytesPerRow:pitch destinationBytesPerImage:linearBytes];
-                passStream.CountCommand();
-                if (active == nullptr) continue;
-                auto target = tiled;
-                std::byte* host = upload.host;
-                active->OnComplete([target, host, linearBytes] {
-                    const Graphics::ColorTargetLayout layout(target->extent.width, target->extent.height, target->tileMode, target->elementBytes, target->pipeBankXor);
-                    layout.Tile(std::span<const std::byte>(host, linearBytes), std::span<std::byte>(reinterpret_cast<std::byte*>(target->address), layout.Bytes()));
-                    if (target->gpuNewer != 0u) --target->gpuNewer;
-                });
+            for (auto& [tiled, written] : targets) {
+                if (written) ++tiled->gpuNewer;
             }
-            passStream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        };
+            afterPass = [targets](VkCommandBuffer commands) {
+                auto& passStream = Graphics::Metal::Stream(commands);
+                auto* active = Recorder::Active();
+                for (const auto& [tiled, written] : targets) {
+                    if (!written) continue;
+                    const auto pitch = static_cast<std::size_t>(tiled->extent.width) * tiled->elementBytes;
+                    const auto linearBytes = pitch * tiled->extent.height;
+                    auto upload = passStream.Allocate(linearBytes, 256u);
+                    id<MTL4ComputeCommandEncoder> copy = passStream.Compute();
+                    [copy copyFromTexture:tiled->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(tiled->extent.width, tiled->extent.height, 1) toBuffer:upload.buffer destinationOffset:upload.offset destinationBytesPerRow:pitch destinationBytesPerImage:linearBytes];
+                    passStream.CountCommand();
+                    if (active == nullptr) continue;
+                    auto target = tiled;
+                    std::byte* host = upload.host;
+                    active->OnComplete([target, host, linearBytes] {
+                        const Graphics::ColorTargetLayout layout(target->extent.width, target->extent.height, target->tileMode, target->elementBytes, target->pipeBankXor);
+                        layout.Tile(std::span<const std::byte>(host, linearBytes), std::span<std::byte>(reinterpret_cast<std::byte*>(target->address), layout.Bytes()));
+                        if (target->gpuNewer != 0u) --target->gpuNewer;
+                    });
+                }
+                passStream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            };
+        }
+        recorder.LeaveRenderPassOpen(slicePassKey, Recorder::NoTiming, false, access, std::move(afterPass));
+        anyContinued |= continued;
+    };
+    // Begun at the slice whose pass the recorder holds open: consecutive draws then share passes
+    // (slices are independent targets, so their order between slices is free).
+    std::uint32_t firstSlice = 0;
+    for (std::uint32_t slice = 0; slice < slices; ++slice) {
+        if (cache.passKey == slicePassKeyOf(slice)) firstSlice = slice;
     }
-    recorder.LeaveRenderPassOpen(passKey, Recorder::NoTiming, false, access, std::move(afterPass));
+    for (std::uint32_t index = 0; index < slices; ++index) recordSlice((firstSlice + index) % slices);
 
     // Resident targets: the results stay on the GPU until something reads the target's memory.
     for (const auto& attachment : colors) {
@@ -1409,7 +1451,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             std::fprintf(stderr, "[metal]   color %u: 0x%llx %ux%u format %d tile %d element %u bytes 0x%llx mask 0x%x %s\n", target.exportIndex, static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), static_cast<int>(target.tileMode), target.elementBytes, static_cast<unsigned long long>(target.bytes), target.exportIndex < graphics.blends.size() ? graphics.blends[target.exportIndex].colorWriteMask : 0u, attachment.resident != nullptr ? "resident" : "in place");
         }
     }
-    if (Trace()) std::fprintf(stderr, "[metal] draw %s %zu calls (%llu recorded, %zu pipeline passes), %zu color targets, depth %s, pass %s\n", indexedDraw ? "indexed" : "direct", drawCalls.size(), static_cast<unsigned long long>(recorded), pipelinePasses.size(), colors.size(), depth != nullptr ? "yes" : "no", continued ? "continued" : "begun");
+    if (Trace()) std::fprintf(stderr, "[metal] draw %llu commands recorded in %u slice pass(es), %zu color targets, depth %s, pass %s\n", static_cast<unsigned long long>(recorded), slices, colors.size(), depth != nullptr ? "yes" : "no", anyContinued ? "continued" : "begun");
 }
 
 std::optional<ShaderRecompiler::GeometryStageLimits> VulkanDevice::GeometryLimits() const {
@@ -1506,7 +1548,15 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
         const bool tessellationStage = stage == ShaderRecompiler::ShaderStage::Local || stage == ShaderRecompiler::ShaderStage::TessellationControl || stage == ShaderRecompiler::ShaderStage::TessellationEvaluation;
         if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh && !(tessellationPath && tessellationStage)) return std::string("Metal draw (work package D6): only vertex, mesh, tessellation and pixel stages are implemented");
     }
-    if (graphics.samples > 1u && state->queue != nil && ![state->device supportsTextureSampleCount:graphics.samples]) return std::string("Metal draw (work package D6): ") + std::to_string(graphics.samples) + "-sample draws: the device renders 1, 2 and 4 samples (TechnicalDebt metal-msaa-8x)";
+    // Sample counts the device cannot render are emulated as slices (DECISIONS D28); only counts with
+    // no split into renderable slices are refused.
+    if (graphics.samples > 1u && state->queue != nil) {
+        try {
+            static_cast<void>(Graphics::Metal::HostSamplesOf(state->device, graphics.samples));
+        } catch (const std::exception& error) {
+            return std::string("Metal draw (work package D6): ") + error.what();
+        }
+    }
     return std::nullopt;
 }
 

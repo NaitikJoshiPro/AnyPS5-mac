@@ -125,11 +125,25 @@ inline bool MultisampledDescriptor(std::span<const std::uint32_t> words) {
     return type == 14u || type == 15u;
 }
 
+// How a guest sample count renders on `device` (DECISIONS D28): natively (slices 1), or, when the
+// device cannot render that many samples (8x on Apple9, which renders 1, 2 and 4), as `slices`
+// slices of `samples` samples each of a 2D multisample array texture, slice k holding guest samples
+// k * samples .. k * samples + samples - 1 (each slice rendered by its own pass with those samples'
+// positions). APS5_MSAA_HOST_SAMPLES (tests) lowers the most samples a slice may hold, so a 4x
+// target can be checked against its own 2 x 2x emulation. Throws when no split exists.
+struct HostSamples {
+    std::uint32_t samples = 1;
+    std::uint32_t slices = 1;
+};
+HostSamples HostSamplesOf(id<MTLDevice> device, std::uint32_t guestSamples);
+
 // A CB resolve (DECISIONS D27): every pixel of `destination` (single-sample, the same pixel format
 // and extent) becomes the box-filtered average of `source`'s samples, through a render pass whose
 // store action is MTLStoreActionMultisampleResolve; integer formats, which Metal does not resolve,
 // take sample 0 (VK_RESOLVE_MODE_SAMPLE_ZERO) through a fragment pass that reads the
 // texture2d_ms. Recorded into `commands`' stream; returns true when the sample-0 pass was used.
+// A 2D multisample array source is an emulated sample count (HostSamplesOf, DECISIONS D28): the
+// average of every sample of every slice (integer formats: sample 0 of slice 0), by a fragment pass.
 bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLTexture> destination);
 
 }

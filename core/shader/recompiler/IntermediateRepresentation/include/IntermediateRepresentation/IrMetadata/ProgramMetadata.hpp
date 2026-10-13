@@ -19,6 +19,11 @@ struct IrProgramMetadata {
     std::vector<ExportInfo> exportInfo;
     std::uint32_t pixelLinearInputs = 0;
     std::uint32_t pixelPerspectiveInputs = 0;
+    // Pixel inputs by the I/J pair their v_interp_p2 reads (SPI_PS_INPUT_ADDR PERSP/LINEAR_CENTER,
+    // _CENTROID, _SAMPLE): the location the host interpolates them at (DECISIONS D28).
+    std::uint32_t pixelCenterInputs = 0;
+    std::uint32_t pixelCentroidInputs = 0;
+    std::uint32_t pixelSampleInputs = 0;
     bool barycentricEmulation = false;
     bool invalidatesCaches = false;
     std::vector<IrValue*> dynamicReads;

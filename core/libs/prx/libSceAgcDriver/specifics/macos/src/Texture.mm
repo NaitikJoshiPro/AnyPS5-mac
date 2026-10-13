@@ -689,6 +689,12 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewFormat = depthFormat;
     viewInfo.components = components;
     viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    // Multisampled images (MultisampleSampledTexture, guest MSAA T#s): MSL reads them as
+    // texture2d_ms_array (MslAbi Version 9), every slice of an emulated sample count (DECISIONS D28).
+    if (id<MTLTexture> texture = Metal::TextureOfImage(depthImage); texture != nil && texture.sampleCount > 1u) {
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        viewInfo.subresourceRange.layerCount = static_cast<std::uint32_t>(texture.arrayLength);
+    }
     Check(Metal::Vk::CreateImageView(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }

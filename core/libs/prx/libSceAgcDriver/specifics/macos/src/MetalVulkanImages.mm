@@ -4,6 +4,7 @@
 #include "MetalImages.h"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -246,7 +247,10 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
     id<MTLDevice> device = DeviceOf(deviceHandle);
     if (device == nil) FailImages("CreateImage needs a Metal device");
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
-    const bool layered = info->arrayLayers > 1u || (info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0u;
+    // Multisampled images flagged 2D-array compatible are 2D multisample arrays even with one layer:
+    // MSL reads sampled multisampled views as texture2d_ms_array (MslAbi Version 9) and Metal
+    // documents no 2DMultisample -> 2DMultisampleArray view (DECISIONS D28).
+    const bool layered = info->arrayLayers > 1u || (info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0u || (info->samples > VK_SAMPLE_COUNT_1_BIT && (info->flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) != 0u);
     switch (info->imageType) {
     case VK_IMAGE_TYPE_1D:
     case VK_IMAGE_TYPE_2D:
@@ -763,6 +767,9 @@ struct ResolveArgs {
     texture2d_ms<float> f;
     texture2d_ms<uint> u;
     texture2d_ms<int> i;
+    texture2d_ms_array<float> af;
+    texture2d_ms_array<uint> au;
+    texture2d_ms_array<int> ai;
 };
 vertex float4 aps5_resolve_vertex(uint id [[vertex_id]]) {
     const float2 corner = float2(float((id << 1u) & 2u), float(id & 2u));
@@ -773,6 +780,23 @@ fragment uint4 aps5_resolve_uint(float4 position [[position]], constant ResolveA
 }
 fragment int4 aps5_resolve_sint(float4 position [[position]], constant ResolveArgs& args [[buffer(0)]]) {
     return args.i.read(uint2(position.xy), 0);
+}
+// Emulated sample counts (DECISIONS D28): every sample of every slice, as the guest's box filter.
+fragment float4 aps5_resolve_array_average(float4 position [[position]], constant ResolveArgs& args [[buffer(0)]]) {
+    const uint2 pixel = uint2(position.xy);
+    const uint samples = args.af.get_num_samples();
+    const uint slices = args.af.get_array_size();
+    float4 sum = float4(0.0f);
+    for (uint slice = 0; slice < slices; ++slice) {
+        for (uint sample = 0; sample < samples; ++sample) sum += args.af.read(pixel, slice, sample);
+    }
+    return sum / float(samples * slices);
+}
+fragment uint4 aps5_resolve_array_uint(float4 position [[position]], constant ResolveArgs& args [[buffer(0)]]) {
+    return args.au.read(uint2(position.xy), 0, 0);
+}
+fragment int4 aps5_resolve_array_sint(float4 position [[position]], constant ResolveArgs& args [[buffer(0)]]) {
+    return args.ai.read(uint2(position.xy), 0, 0);
 }
 )MSL";
 
@@ -790,16 +814,30 @@ ResolvePipelines& Resolves() {
 
 }
 
+HostSamples HostSamplesOf(id<MTLDevice> device, std::uint32_t guestSamples) {
+    if (guestSamples <= 1u) return {1u, 1u};
+    std::uint32_t limit = 64u;
+    if (const char* value = std::getenv("APS5_MSAA_HOST_SAMPLES"); value != nullptr && *value != '\0') limit = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+    for (std::uint32_t samples = guestSamples; samples >= 2u; samples /= 2u) {
+        if (samples > limit || guestSamples % samples != 0u || ![device supportsTextureSampleCount:samples]) continue;
+        return {samples, guestSamples / samples};
+    }
+    FailImages(std::to_string(guestSamples) + "-sample targets: the device renders no multisampled split of them (DECISIONS D28)");
+}
+
 bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLTexture> destination) {
     if (source == nil || destination == nil) FailImages("a resolve without its source or destination");
     if (source.sampleCount < 2u || destination.sampleCount != 1u) FailImages("a resolve needs a multisampled source and a single-sample destination");
     if (source.pixelFormat != destination.pixelFormat || source.width != destination.width || source.height != destination.height) FailImages("a resolve between different formats or extents");
+    // Several slices: an emulated sample count (HostSamplesOf); one slice of a 2D multisample array
+    // resolves like a 2D multisample texture (attachment slice 0).
+    const bool emulated = source.textureType == MTLTextureType2DMultisampleArray && source.arrayLength > 1u;
     auto& stream = Stream(commands);
     MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
     pass.renderTargetWidth = destination.width;
     pass.renderTargetHeight = destination.height;
     const auto numeric = NumericClass(source.pixelFormat);
-    if (numeric == 0u) {
+    if (numeric == 0u && !emulated) {
         pass.colorAttachments[0].texture = source;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
@@ -831,12 +869,13 @@ bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLT
             if (argumentTable == nil) FailImages("cannot create the sample-0 resolve's argument table: " + Describe(error));
         }
         table = argumentTable;
-        const auto name = std::to_string(reinterpret_cast<std::uintptr_t>(key)) + ":" + std::to_string(static_cast<std::uint64_t>(destination.pixelFormat));
+        const auto name = std::to_string(reinterpret_cast<std::uintptr_t>(key)) + ":" + std::to_string(static_cast<std::uint64_t>(destination.pixelFormat)) + (source.textureType == MTLTextureType2DMultisampleArray ? ":array" : "");
         auto& made = resolves.pipelines[name];
         if (made == nil) {
             MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
             descriptor.vertexFunction = [library newFunctionWithName:@"aps5_resolve_vertex"];
-            descriptor.fragmentFunction = [library newFunctionWithName:numeric == 1u ? @"aps5_resolve_uint" : @"aps5_resolve_sint"];
+            NSString* function = emulated || source.textureType == MTLTextureType2DMultisampleArray ? (numeric == 0u ? @"aps5_resolve_array_average" : numeric == 1u ? @"aps5_resolve_array_uint" : @"aps5_resolve_array_sint") : (numeric == 1u ? @"aps5_resolve_uint" : @"aps5_resolve_sint");
+            descriptor.fragmentFunction = [library newFunctionWithName:function];
             descriptor.colorAttachments[0].pixelFormat = destination.pixelFormat;
             made = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
             if (made == nil) FailImages("cannot build the sample-0 resolve pipeline: " + Describe(error));
@@ -844,9 +883,9 @@ bool ResolveMultisample(VkCommandBuffer commands, id<MTLTexture> source, id<MTLT
         pipeline = made;
     }
     struct Args {
-        std::uint64_t textures[3];
+        std::uint64_t textures[6];
     } args{};
-    args.textures[numeric] = source.gpuResourceID._impl;
+    args.textures[numeric + (source.textureType == MTLTextureType2DMultisampleArray ? 3u : 0u)] = source.gpuResourceID._impl;
     const auto upload = stream.Write(std::as_bytes(std::span(&args, 1)), 16u);
     pass.colorAttachments[0].texture = destination;
     pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;

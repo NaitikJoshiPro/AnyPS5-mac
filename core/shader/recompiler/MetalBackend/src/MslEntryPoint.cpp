@@ -28,7 +28,9 @@ std::string BuiltinParameter(MslBuiltin builtin) {
 // Image heaps follow DescriptorBindingForImage: per class 7 dimensions in this order. 1D images are
 // 2D textures one texel high (Metal's texture1d has no mipmaps and no sampling with LOD).
 constexpr std::uint32_t HeapDimensions = 7u;
-constexpr const char* TextureShapes[HeapDimensions] = {"texture2d", "texture2d_array", "texture2d", "texture2d_array", "texture2d_ms", "texture2d_ms_array", "texture3d"};
+// MslAbi Version 9: both multisampled dimensions are texture2d_ms_array (a 2D MSAA view is one
+// guest layer of host slices; emulated 8x targets hold two 4x slices per layer, DECISIONS D28).
+constexpr const char* TextureShapes[HeapDimensions] = {"texture2d", "texture2d_array", "texture2d", "texture2d_array", "texture2d_ms_array", "texture2d_ms_array", "texture3d"};
 constexpr const char* DepthShapes[HeapDimensions] = {"depth2d", "depth2d_array", "depth2d", "depth2d_array", "depth2d_ms", "depth2d_ms_array", "texture3d"};
 
 }
@@ -226,6 +228,8 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     for (std::size_t index = 0; index < state.builtins.size(); ++index) {
         if (state.builtins.test(index)) parameters.push_back(BuiltinParameter(static_cast<MslBuiltin>(index)));
     }
+    // PS_ITER_SAMPLE: a [[sample_id]] input makes Metal run the fragment function once per sample.
+    if (state.reflection.stage == MslAbi::Stage::Fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psSampleShading) state.AddParameter("uint aps5_sample_id [[sample_id]]");
     parameters.insert(parameters.end(), state.parameters.begin(), state.parameters.end());
 
     if (state.reflection.stage == MslAbi::Stage::Kernel) {
