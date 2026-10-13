@@ -410,6 +410,12 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     mesh += "        const float3 aps5_coord = float3(aps5_point.u, aps5_point.v, " + std::string(config.domain == T::Triangle ? "1.0f - aps5_point.u - aps5_point.v" : "0.0f") + ");\n";
     mesh += "        aps5_ds::Aps5VertexOut aps5_vertex = {};\n";
     mesh += "        aps5_ds::aps5_stage(aps5_ds_table, aps5_push, aps5_driver, aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "], aps5_coord, aps5_lane, aps5_payload.words + " + U32(HeaderWords) + ", aps5_vertex);\n";
+    // Debugging aid: APS5_TESS_DEBUG_POINT=1 places each vertex at its domain point in a [-1, 1] box
+    // (no domain program position), =2 at control point (corner % 3) from the payload.
+    if (const char* mode = std::getenv("APS5_TESS_DEBUG_POINT")) {
+        if (std::string(mode) == "1") mesh += "        aps5_vertex.aps5_position = float4(aps5_point.u * 2.0f - 1.0f, aps5_point.v * 2.0f - 1.0f, 0.0f, 1.0f);\n";
+        else mesh += "        aps5_vertex.aps5_position = float4(as_type<float>(aps5_payload.words[8u + (aps5_tid % 3u) * 4u]), as_type<float>(aps5_payload.words[9u + (aps5_tid % 3u) * 4u]), 0.0f, 1.0f);\n";
+    }
     mesh += "        aps5_mesh.set_vertex(aps5_tid, aps5_vertex);\n";
     mesh += "        aps5_mesh.set_index(aps5_tid, uchar(aps5_tid));\n    }\n";
     mesh += "    if (aps5_tid < aps5_primitives) {\n        Aps5TessPrimitive aps5_primitive = {};\n        aps5_primitive.aps5_culled = false;\n        aps5_mesh.set_primitive(aps5_tid, aps5_primitive);\n    }\n}\n";
