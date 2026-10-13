@@ -4,16 +4,12 @@
 // Work packages D4 (textures, detiling, formats) and D5 (descriptors, samplers): guest images and
 // samplers of a dispatch's MslAbi descriptor table (docs/mac/M2_DESIGN.md §4, §6).
 //
-// A guest T# becomes an MTLTexture holding its surface detiled (MetalTextureDetiler.mm), viewed per
-// image heap (type, numeric class, dst_sel swizzle, levels and layers of the descriptor); a guest S#
-// becomes an MTLSamplerState (argument-buffer capable, cached by its words). Storage images are
-// written back (re-tiled into guest memory) when the batch that wrote them completes. Absent
-// elements (an all-zero T#) get a 1x1 placeholder of the heap's type.
-//
-// Bring-up limits (TechnicalDebt `metal-d4-texture-uploads`): every dispatch uploads its sampled
-// and storage textures again (no cross-dispatch texture cache), detiling runs on the CPU, and
-// GPU writes to a storage image reach guest memory at batch completion, not before a later
-// dispatch of the same batch reads that memory as a buffer.
+// Guest T#s and S#s go through the Metal twins of upstream's image path (Texture.mm =
+// StorageTexture/TextureCache, ShaderResources.mm, PlaceholderImages, SamplerCache) over the
+// device's Context, attached to the per-device ImageCache: sampled textures are cached across
+// dispatches, storage results stay pending in their images until a reader needs guest memory. The
+// bring-up path (per-dispatch CPU upload, write-back at batch completion) was removed after the
+// upstream path matched or beat it on G1-G4 (M2_DESIGN "SHD3 results").
 // Objective-C++ only.
 
 #import <Foundation/Foundation.h>
@@ -98,69 +94,38 @@ void RetileCpu(const DetileLevel& level, std::byte* tiled, std::uint64_t tiledBy
 
 class ImageCache;
 
-// One guest texture surface uploaded into a Metal texture (all its levels and layers).
-struct GuestSurface {
-    GuestTextureResource resource;
-    SurfaceGeometry geometry;
-    TextureFormatInfo format;
-    id<MTLTexture> texture = nil;
-    // Depth twin for comparison heaps (Depth32Float / Depth16Unorm), made on first use.
-    id<MTLTexture> depth = nil;
-    bool storage = false;
-    bool atomic = false;
-    // Views made for heaps, kept with the surface.
-    std::vector<id<MTLTexture>> views;
-};
-
 // The images and samplers of one dispatch: Write() fills the table entries of each GuestImages and
 // GuestSamplers binding (MTLResourceID values), Commit() hands the textures to the batch.
 class ImageBindings {
 public:
-    // `settle(address, bytes)` makes recorded GPU writes over the range visible to the CPU before a
-    // texture upload reads it (the device syncs when they overlap).
+    // The second argument (a settle callback of the removed bring-up uploads) is ignored.
     ImageBindings(ImageCache& cache, std::function<void(std::uint64_t, std::uint64_t)> settle);
     ~ImageBindings();
     ImageBindings(const ImageBindings&) = delete;
     ImageBindings& operator=(const ImageBindings&) = delete;
 
-    // Optional, before the first Write: scans all of the dispatch's bindings for what the samplers
-    // depend on (the images paired with each sampler): ANISO_OVERRIDE samplers of single-level
-    // images lose their anisotropy, FORCE_DEGAMMA samplers require sRGB images (as
-    // ShaderResources::applyAnisoOverride / RequireDegammaFormat).
-    // Also validates the bindless table metadata in the shader data against the bound heaps
-    // (ShaderResources.cpp ValidateRuntimeResources).
+    // Before the first Write: the dispatch's ShaderResources build (a revalidated resource-cache
+    // entry or a new build) when the shader binds guest images or samplers.
     void Prepare(const ShaderRecompiler::RecompileResult& shader);
     // `entries`: the binding's first min(binding.count, range.count) table entries.
     void Write(const ShaderRecompiler::DescriptorBinding& binding, std::span<std::uint64_t> entries);
-    // After the dispatch is recorded into the recorder's open batch: keeps the textures alive with
-    // the batch, makes them resident, notes the storage images' guest ranges as pending GPU writes
-    // and writes them back when the batch completes.
+    // After the dispatch is recorded into the recorder's open batch: marks the written storage
+    // images pending (ShaderResources::MarkGpuWrites) and keeps the build with the batch.
     void Commit(Recorder& recorder);
 
-    bool Empty() const { return resources == nullptr && surfaces.empty() && samplers.empty(); }
+    bool Empty() const { return resources == nullptr; }
 
 private:
-    std::shared_ptr<GuestSurface> surface(std::span<const std::uint32_t> words, bool storage, bool atomic, std::uint32_t mip);
-    std::uint64_t view(GuestSurface& surface, std::uint32_t heap, bool firstLayer, std::uint32_t mip, bool baseLevelOnly = false);
-
     ImageCache& cache;
-    std::function<void(std::uint64_t, std::uint64_t)> settle;
-    std::vector<std::shared_ptr<GuestSurface>> surfaces;
-    std::vector<id<MTLSamplerState>> samplers;
-    // The upstream build (ShaderResources twin, MetalImagesOnly) once the cache is attached to the
-    // device's Context: the image and sampler entries come from it, and the pending/live storage
-    // registries, the texture caches and the resource cache are upstream's (Texture.mm,
-    // ShaderResources.mm). Null: the bring-up path above (no cache attached).
+    // The upstream build (ShaderResources twin, MetalImagesOnly) over the cache's attached Context:
+    // the image and sampler entries come from it, and the pending/live storage registries, the
+    // texture caches and the resource cache are upstream's (Texture.mm, ShaderResources.mm).
     std::shared_ptr<ShaderResources> resources;
-    // Storage surfaces and the levels the dispatch may write (written back at completion).
-    std::map<GuestSurface*, std::set<std::uint32_t>> writtenLevels;
-    // Prepare's adjusted sampler words per sampler element (empty: not prepared).
-    std::vector<std::array<std::uint32_t, 4>> samplerWords;
     bool committed = false;
 };
 
-// Per device: the residency set of image resources (attached to the device's queue), the sampler
-// cache and the placeholder textures.
+// Per device: the residency set of image resources (attached to the device's queue) and the
+// attached image Context with its detiler, placeholder images, sampler and texture caches.
 class ImageCache {
 public:
     ImageCache(id<MTLDevice> device, id<MTL4CommandQueue> queue);
@@ -173,16 +138,10 @@ public:
     void Teardown() noexcept;
 
     id<MTLDevice> Device() const { return device; }
-    // The sampler of an S# (4 words) with the shader's use of it.
-    id<MTLSamplerState> Sampler(std::span<const std::uint32_t> words, bool compare, bool unnormalized, bool integerBorder);
-    // A 1x1 (one layer) zero texture of an image heap's type (RuntimeAbi binding 1-56).
-    id<MTLTexture> Placeholder(std::uint32_t heap);
-
-    // `force`: attach even under APS5_METAL_UPSTREAM_IMAGES=0 (tests of the upstream path).
     // Attaches the device's Context (once it is complete): image bindings then build upstream's
     // ShaderResources over a copy of it that carries the cache's detiler, placeholder images and
     // sampler cache (D4/D5 twins). Teardown clears the texture and resource caches of the device.
-    void Attach(const Context& deviceContext, bool force = false);
+    void Attach(const Context& deviceContext);
     // The Context image builds use (null before Attach).
     const Context* ImageContext() const { return imageContext.get(); }
 
@@ -199,30 +158,18 @@ public:
     void MakeResident(std::span<const id<MTLTexture>> textures);
     void Release(std::span<const id<MTLTexture>> textures);
 
-    struct Statistics {
-        std::uint64_t textures = 0;
-        std::uint64_t uploadedBytes = 0;
-        std::uint64_t writtenBackBytes = 0;
-        std::uint64_t samplers = 0;
-        std::uint64_t samplerHits = 0;
-    };
-    Statistics Stats() const;
-
 private:
     friend class ImageBindings;
     id<MTLDevice> device = nil;
     id<MTL4CommandQueue> queue = nil;
     id<MTLResidencySet> residency = nil;
     mutable std::mutex mutex;
-    std::map<std::array<std::uint32_t, 5>, id<MTLSamplerState>> samplerCache;
-    std::map<std::uint32_t, id<MTLTexture>> placeholders;
     std::map<void*, std::uint32_t> residentCounts;
     std::unique_ptr<Context> imageContext;
     std::unique_ptr<TextureDetiler> detiler;
     std::unique_ptr<PlaceholderImages> placeholderImages;
     std::unique_ptr<SamplerCache> upstreamSamplers;
     std::unique_ptr<TextureCache> textureCache;
-    Statistics statistics;
     bool tornDown = false;
 };
 

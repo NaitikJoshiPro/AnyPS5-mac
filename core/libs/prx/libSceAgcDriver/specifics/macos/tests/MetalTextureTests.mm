@@ -280,40 +280,6 @@ int Images() {
         std::printf("skipped, the machine has no Metal 4 device\n");
         return 77;
     }
-    ImageCache cache(device, nil);
-    // A linear 32x8 RGBA8 texture with 2 levels: sampled float view, then its texels read back.
-    alignas(256) static std::array<std::uint8_t, 4096> texels{};
-    for (std::size_t index = 0; index < texels.size(); ++index) texels[index] = static_cast<std::uint8_t>(index * 13u + 7u);
-    const auto words = TextureWords(texels.data(), 56u, 32u, 8u, 2u, 0u, 9u);
-    const auto resource = DecodeTextureResource(words);
-    Check(resource.width == 32u && resource.height == 8u && resource.mipCount == 2u && resource.tileMode == TextureTileMode::kLinear, "test T# decodes as built");
-    std::uint64_t settled = 0;
-    {
-        ImageBindings bindings(cache, [&](std::uint64_t, std::uint64_t bytes) { settled += bytes; });
-        ShaderRecompiler::DescriptorBinding binding{};
-        binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
-        binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
-        binding.count = 1u;
-        binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + 2u;  // sampled float 2D
-        binding.guestDescriptor.assign(words.begin(), words.end());
-        binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-        std::array<std::uint64_t, 1> entries{};
-        bindings.Write(binding, entries);
-        Check(entries[0] != 0u, "a sampled view has a resource id");
-        Check(settled != 0u, "the upload settles the guest range first");
-        // The same T# through the sampled uint 2D heap reuses the uploaded surface.
-        binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + 7u + 2u;
-        bindings.Write(binding, entries);
-        Check(cache.Stats().textures == 1u, "one upload for two heaps of one T#");
-    }
-    // Placeholders of every heap class and dimension except multisampled storage.
-    for (std::uint32_t heap = ShaderRecompiler::RuntimeAbi::FirstImageBinding; heap < static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers); ++heap) {
-        try {
-            Check(cache.Placeholder(heap) != nil, "placeholder of heap " + std::to_string(heap));
-        } catch (const std::exception& error) {
-            Check(false, "placeholder of heap " + std::to_string(heap) + ": " + error.what());
-        }
-    }
     // What device creation does (MetalDevice.mm): a complete Context with its recorder, the image
     // cache attached to it (detiler, PlaceholderImages, sampler cache). Every heap's placeholder
     // must be a valid Metal texture of the heap's type: under MTL_DEBUG_LAYER a bad texture or
@@ -334,15 +300,6 @@ int Images() {
         recorder.Sync();
         attached.Teardown();
     }
-    // Samplers: equal words share one sampler state; different words do not.
-    const std::array<std::uint32_t, 4> pointClamp{0x00000092u, 0x00fff000u, 0x00000000u, 0x00000000u};
-    const std::array<std::uint32_t, 4> linearWrap{0x00000000u, 0x00fff000u, 0x05500000u, 0x00000000u};
-    auto first = cache.Sampler(pointClamp, false, false, false);
-    auto again = cache.Sampler(pointClamp, false, false, false);
-    auto other = cache.Sampler(linearWrap, false, false, false);
-    Check(first != nil && first == again && other != nil && other != first, "sampler cache by S# words");
-    Check(cache.Stats().samplers == 2u && cache.Stats().samplerHits == 1u, "sampler cache statistics");
-    cache.Teardown();
     if (failures != 0) return 1;
     std::printf("PASS: agc_metal_images\n");
     return 0;

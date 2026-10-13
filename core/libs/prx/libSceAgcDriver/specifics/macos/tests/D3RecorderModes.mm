@@ -75,7 +75,7 @@ public:
     test.context.limits.maxComputeWorkGroupCount[0] = test.context.limits.maxComputeWorkGroupCount[1] = test.context.limits.maxComputeWorkGroupCount[2] = 65535u;
         // Host imports as the device's setup enables them: no-copy buffers over whole 16 KiB pages.
         test.context.hostImportAlignment = 16384u;
-        cache.Attach(test.context, true);
+        cache.Attach(test.context);
     }
     const Context& GetContext() const { return *cache.ImageContext(); }
     void WaitQueue() const {
