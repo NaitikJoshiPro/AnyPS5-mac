@@ -27,6 +27,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/mach_time.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -665,6 +666,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.limits.maxComputeWorkGroupInvocations = 1024u;
             context.limits.maxComputeSharedMemorySize = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
             context.subgroup.subgroupSize = 32u;
+            // Upstream #423 / #3763 device features (they gate SPIR-V validation only; Metal draws
+            // never validate SPIR-V): MSL vertex functions write [[clip_distance]] and
+            // [[render_target_array_index]]; cull distances are emulated in one more clip distance
+            // (MslAbi v10, MetalDraw.mm: triangle-vertices draws, points; lines refused).
+            context.shaderClipDistance = true;
+            context.shaderCullDistance = true;
+            context.viewportIndexLayer = true;
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
             Graphics::Metal::DescribeMemory(context, state->device);
@@ -700,6 +708,38 @@ std::string VulkanDevice::DeviceName() const {
     return state->device.name.UTF8String;
 }
 
+// Upstream reports VK_KHR_driver_properties' name and info: Metal has no driver version, so the
+// OS build (the Metal framework ships with it) and the GPU family name it.
+std::string VulkanDevice::DriverInfo() const {
+    NSOperatingSystemVersion version = [NSProcessInfo processInfo].operatingSystemVersion;
+    std::string info = "Metal (macOS " + std::to_string(version.majorVersion) + "." + std::to_string(version.minorVersion) + "." + std::to_string(version.patchVersion) + ")";
+    if ([state->device supportsFamily:MTLGPUFamilyMetal4]) info += " Metal 4";
+    return info;
+}
+
+// Upstream calibrates through VK_KHR_calibrated_timestamps (device + CLOCK_MONOTONIC). Metal samples
+// a CPU timestamp (mach_absolute_time) and a GPU timestamp together; the CPU stamp's age gives the
+// steady_clock point, the GPU stamp is converted like the recorder's counter-heap timestamps.
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+    if (state->device == nil) return false;
+    MTLTimestamp cpuStamp = 0;
+    MTLTimestamp gpuStamp = 0;
+    [state->device sampleTimestamps:&cpuStamp gpuTimestamp:&gpuStamp];
+    const auto nowTicks = mach_absolute_time();
+    const auto now = std::chrono::steady_clock::now();
+    if (cpuStamp == 0u && gpuStamp == 0u) return false;
+    mach_timebase_info_data_t timebase {};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.denom == 0u) return false;
+    const double nsPerTick = static_cast<double>(timebase.numer) / static_cast<double>(timebase.denom);
+    // The GPU stamp in the unit the recorder's counter-heap ranges use (Recorder.mm: 1e9 /
+    // queryTimestampFrequency per tick); PerformanceTrace rescales between two samples anyway.
+    const auto frequency = [state->device queryTimestampFrequency];
+    gpuNs = static_cast<double>(gpuStamp) * (frequency != 0u ? 1e9 / static_cast<double>(frequency) : nsPerTick);
+    const double sinceNs = static_cast<double>(static_cast<std::int64_t>(nowTicks - cpuStamp)) * nsPerTick;
+    cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
+    return true;
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     const auto threadgroupMemory = static_cast<std::uint32_t>(state->device.maxThreadgroupMemoryLength);
     const auto threads = state->device.maxThreadsPerThreadgroup;
@@ -724,6 +764,14 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // The software tessellator draws every domain, partitioning and output topology and applies
     // the VGT_HOS level clamps (DECISIONS D26).
     target.tessellation = ShaderRecompiler::TessellationTargetLimits{32u, 128u, 128u, 120u, 4096u, 128u, 124u, ShaderRecompiler::TessellationFeatures::All()};
+    // Upstream 0bcff53b2 runs vertex programs as one-lane waves on devices without vertex-stage
+    // subgroups: on Metal the startup self-test decides (as SubgroupStages); a compile-only device
+    // has no profile and keeps 32-lane vertex programs (DECISIONS D25).
+    target.vertexSubgroups = state->queue == nil || Metal::Profile(state->device).vertexSimdGroups;
+    // Upstream e4f212b2e: float16DenormPreserve converts f16 operands in hardware (MSL
+    // aps5_f16_to_f32_native). Left false (exact decode) until agc_metal_alu_helpers' "f16->f32
+    // (native)" op has passed on the GPU (SHADERPORT, .mac-work/coord/upsync.md).
+    target.float16DenormPreserve = false;
     return target;
 }
 
@@ -957,7 +1005,9 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     CopyOutcome outcome {2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (state->recorder == nullptr || bytes == 0u) return outcome;
     auto& recorder = *state->recorder;
-    const auto completionStoreOverlaps = [&](std::uint64_t address) { return Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes); };
+    // Upstream 396b5189a (#4496): only a label a completion will store counts here; a label stored by
+    // the GPU stream is ordered by the copy's barrier.
+    const auto completionStoreOverlaps = [&](std::uint64_t address) { return Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes); };
     bool settledBySignal = false;
     // Pending resident-image results over either range are stored first (upstream copies between
     // the storage images instead, CopyOutcome path 3; not ported: TechnicalDebt metal-d6-bring-up-draws).

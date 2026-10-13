@@ -17,6 +17,8 @@
 #include "MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #include <algorithm>
@@ -311,6 +313,10 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     if (window.getDrawableSize != nullptr) window.getDrawableSize(window.context, &width, &height);
     presenter->width = width;
     presenter->height = height;
+    // ANYPS5_PRESENT_MODE (upstream #4106): a CAMetalLayer presents FIFO (display sync) or
+    // immediately (no display sync); Core Animation has no mailbox or latest-ready queue.
+    static constexpr VkPresentModeKHR layerModes[] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
+    const auto presentMode = presenter->layer != nil ? SelectPresentMode(std::getenv("ANYPS5_PRESENT_MODE"), layerModes) : VK_PRESENT_MODE_FIFO_KHR;
     if (presenter->layer != nil) {
         // Layer properties change off the main thread inside an explicit transaction (an implicit
         // one on a thread without a run loop is never committed).
@@ -320,7 +326,7 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
         presenter->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         presenter->layer.framebufferOnly = YES;
         presenter->layer.maximumDrawableCount = 3;
-        presenter->layer.displaySyncEnabled = YES;
+        presenter->layer.displaySyncEnabled = presentMode == VK_PRESENT_MODE_FIFO_KHR ? YES : NO;
         [CATransaction commit];
         // Metal 4: drawables are resident through the layer's own residency set on the queue.
         [queue addResidencySet:presenter->layer.residencySet];
@@ -542,6 +548,11 @@ void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std:
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     if (!Presentable()) return false;
+    // Upstream: APS5_STORE_AT_FLIP stores every pending resident image at each flip; otherwise the
+    // images an APS5 storage dump selects are stored (a70ec3946).
+    static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
+    if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
+    else Graphics::StorageTexture::FlushDumpSelected("flip");
     // The bring-up source: the display buffer decoded on the CPU (linear or tiled, the formats
     // DisplayBuffer.cpp decodes); the read waits for recorded GPU writes over it.
     const auto pixels = ReadDisplayBuffer(buffer);

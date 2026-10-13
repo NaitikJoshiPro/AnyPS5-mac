@@ -254,12 +254,12 @@ kernel void cmask_clear(constant CmaskParams& params [[buffer(0)]], uint2 pixel 
     const uint nibble = ((y / 512u) * params.blocksPerRow + x / 1024u) * 8192u + offset;
     const uint byteAddress = params.base + nibble / 2u;
     const uint code = (params.cmask[byteAddress / 4u] >> ((byteAddress % 4u) * 8u + (nibble % 2u) * 4u)) & 0xfu;
-    if (code == 0xfu) return;
-    if (code == 0u && params.write != 0u) {
+    if (code != 0u) return;
+    if (params.write != 0u) {
         params.target.write(uint4(params.clear0, params.clear1, 0u, 0u), pixel);
         return;
     }
-    if ((pixel.x & 7u) == 0u && (pixel.y & 7u) == 0u) atomic_fetch_or_explicit(params.errors, 1u << code, memory_order_relaxed);
+    if ((pixel.x & 7u) == 0u && (pixel.y & 7u) == 0u) atomic_fetch_or_explicit(params.errors, 1u, memory_order_relaxed);
 }
 )MSL";
 

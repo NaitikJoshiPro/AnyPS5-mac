@@ -264,8 +264,8 @@ struct DrawCache {
     };
     std::vector<std::shared_ptr<TiledTarget>> tiled;
 
-    // CMASK codes other than 0 (cleared) and 15 (expanded) a materialization met (bit per code),
-    // reported by the next one (as upstream's detiler reports its GPU pass's codes).
+    // Bit 0: a CMASK fast clear of a DCC target was met (as upstream's detiler reports its GPU
+    // pass's), reported by the next materialization.
     std::uint32_t cmaskErrors = 0;
 
     // The attachments of the render pass the recorder holds open (valid while its key matches).
@@ -328,37 +328,9 @@ struct ColorAttachment {
     id<MTLTexture> multisample = nil;
 };
 
-// The color buffer as a single-mip 2D surface descriptor (upstream Draw.cpp SurfaceForTarget).
-Graphics::GuestTextureResource SurfaceForTarget(const Graphics::ColorTarget& color) {
-    const bool chain = color.mipCount > 1;
-    Graphics::GuestTextureResource surface {};
-    surface.baseAddress = chain ? color.surfaceAddress : color.address;
-    surface.pipeBankXor = color.pipeBankXor;
-    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
-    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
-    surface.depthOrLastArray = color.depth - 1u;
-    surface.baseArray = 0;
-    surface.mipCount = color.mipCount;
-    surface.baseLevel = 0;
-    surface.lastLevel = color.mipCount - 1;
-    surface.tileMode = Graphics::ColorTextureTileMode(color.tileMode);
-    surface.dimension = color.depth > 1 ? Graphics::TextureDimension::k3D : Graphics::TextureDimension::k2D;
-    const auto guest = Graphics::FindGuestColorTargetFormat(color.format, color.elementBytes);
-    if (!guest) Fail("no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(color.format)));
-    surface.format = *guest;
-    surface.dstSelX = 4;
-    surface.dstSelY = 5;
-    surface.dstSelZ = 6;
-    surface.dstSelW = 7;
-    surface.dccAddress = color.dccAddress;
-    surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
-    surface.dccPipeAligned = color.dccPipeAligned;
-    return surface;
-}
-
 // A slice of a 2D array color target as the whole array (upstream ArraySurfaceForTarget).
 Graphics::GuestTextureResource ArraySurfaceForTarget(const Graphics::ColorTarget& color) {
-    auto surface = SurfaceForTarget(color);
+    auto surface = Graphics::SurfaceForTarget(color);
     surface.baseAddress = color.arrayAddress;
     surface.width = color.surfaceExtent.width;
     surface.height = color.surfaceExtent.height;
@@ -393,18 +365,12 @@ void VulkanDevice::State::SettleRange(std::uint64_t address, std::uint64_t bytes
 // The GPU buffer and offset holding guest memory [address, address + bytes) (wrapped in place).
 // CMASK fast clears (upstream Draw.cpp materializeCmaskClear, CPU path): the 8x8 tiles whose CMASK
 // code is 0 (fast-cleared) get the clear register's texel in guest memory, and the CMASK is left
-// expanded (all 0xff), before a draw or a CB fast-clear eliminate reads the target. Codes other than
-// 0 and 15 are recorded and reported by the next materialization, as upstream reports its GPU
-// pass's codes.
+// expanded (all 0xff), before a draw or a CB fast-clear eliminate reads the target. Tiles with any
+// other code keep their texels (upstream 51c043ba5).
 void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color, Graphics::StorageTexture* resident) {
     auto& cache = Draws();
     if (const auto codes = std::exchange(cache.cmaskErrors, 0u); codes != 0u) {
         if ((codes & 1u) != 0u) Fail("a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
-        std::string listed;
-        for (std::uint32_t code = 1; code < 15; ++code) {
-            if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
-        }
-        Fail("CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
     }
     if (color.cmaskAddress == 0u) return;
     const Graphics::CmaskLayout layout(color.extent.width, color.extent.height);
@@ -418,8 +384,9 @@ void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color, G
         for (std::uint32_t tileX = 0; tileX < layout.TilesX(); ++tileX) {
             const auto nibble = layout.Nibble(tileX, tileY);
             const auto code = (static_cast<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
+            // Upstream 51c043ba5: a code other than 0 (cleared) keeps its texels like an expanded tile
+            // (titles fast clear targets whose CMASK they never initialized).
             if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
-            else if (code != 0xfu) cache.cmaskErrors |= 1u << code;
         }
     }
     if (!cleared.empty()) {
@@ -541,7 +508,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // need every triangle's three vertices in the vertex function (the triangle-vertices mode).
     const std::uint32_t conservativeMode = graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT ? 1u : graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT ? 2u : 0u;
     const bool perVertex = fragmentReflection != nullptr && (fragmentReflection->perVertexLocations != 0u || fragmentReflection->emulatedBarycentrics != 0u);
-    const bool triangleVertices = conservativeMode != 0u || perVertex;
+    // Tessellated draws take patch lists, whose primitives the tessellator makes (the mesh pipeline
+    // has no topology class).
+    const auto primitive = graphics.rectList || tess ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
+    // Guest cull distances (upstream #423, MslAbi v10): Metal has none, so the vertex function
+    // emulates them in one more clip distance, which needs the whole primitive: triangles draw in
+    // the triangle-vertices mode, rect lists and points have their own macro, lines are refused.
+    const bool cullDistances = vertexReflection.cullDistances != 0u && !mesh && !tess;
+    if (cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassLine) Fail("cull distances on lines have no Metal emulation");
+    const bool cullTriangles = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassTriangle;
+    const bool cullPoints = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassPoint;
+    const bool triangleVertices = conservativeMode != 0u || perVertex || cullTriangles;
     if ((mesh || tess) && triangleVertices) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws"));
     if (tess && (draw.indirect || graphics.rectList)) Fail(draw.indirect ? "indirect tessellated draws (refused as upstream)" : "tessellated rect lists");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
@@ -584,9 +561,6 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
     }
 
-    // Tessellated draws take patch lists, whose primitives the tessellator makes (the mesh pipeline
-    // has no topology class).
-    const auto primitive = graphics.rectList || tess ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
     if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
     if (graphics.rectList && draw.indexed) Fail("indexed rect lists");
     if (draw.indexed && draw.indexSize != 2u && draw.indexSize != 4u) Fail("index size " + std::to_string(draw.indexSize));
@@ -675,7 +649,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 if (target.surfaceAddress != target.arrayAddress + target.arraySlice * Graphics::DescribeSurface(array).layerBytes) Fail("the array image's layer pitch differs from the color view's slice offset");
                 resident = Graphics::CachedStorageSurface(imageContext, array);
             } else {
-                resident = Graphics::CachedStorageSurface(imageContext, SurfaceForTarget(target));
+                resident = Graphics::CachedStorageSurface(imageContext, Graphics::SurfaceForTarget(target));
             }
             if (resident == nullptr || !resident->Attachable()) Fail("storage format cannot be a color attachment");
             // CMASK fast clears and DCC clear keys land in guest memory, which the image then picks
@@ -698,6 +672,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (written) targetPlan.writes.push_back({attachment.begin, attachment.end});
         }
         colors.push_back(attachment);
+    }
+
+    // Layered draws (upstream #3763, State::renderLayers) render into a resident 3D target's slice
+    // range; DecodeState already refuses a depth target and mixed slice counts.
+    if (graphics.renderLayers > 1u) {
+        for (const auto& attachment : colors) {
+            if (attachment.resident == nullptr || attachment.multisample != nil || attachment.target->depth <= 1u) Fail("a layered draw into a color target that is not a resident single-sample 3D image");
+        }
     }
 
     // CMASK fast clears land in guest memory before the targets load from it.
@@ -728,7 +710,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             continue;
         }
         if (attachment.resident != nullptr) {
-            passKey = Mix(passKey, reinterpret_cast<std::uint64_t>(attachment.resident.get()) ^ (static_cast<std::uint64_t>(target.mip) << 48u) ^ (static_cast<std::uint64_t>(target.arraySlice | target.depthSlice) << 32u));
+            passKey = Mix(passKey, reinterpret_cast<std::uint64_t>(attachment.resident.get()) ^ (static_cast<std::uint64_t>(target.mip) << 48u) ^ (static_cast<std::uint64_t>(target.arraySlice | target.depthSlice) << 32u) ^ (static_cast<std::uint64_t>(target.layers) << 56u));
             continue;
         }
         if (target.tileMode == Graphics::ColorTileMode::Linear) continue;
@@ -799,6 +781,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         request.meshGroups = linked->maxMeshThreadgroups;
     }
     if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
+    if (cullPoints) request.vertex.macros.push_back({Abi::CullPointsMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
         if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
@@ -864,7 +847,13 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         return mode == VK_CULL_MODE_FRONT_BIT ? MTLCullModeFront : mode == VK_CULL_MODE_BACK_BIT ? MTLCullModeBack : MTLCullModeNone;
     };
     if (graphics.cullMode == VK_CULL_MODE_FRONT_AND_BACK) return;
-    const float biasConstant = graphics.depthBias ? graphics.depthBiasConstant : 0.0f;
+    // Upstream 7d34a6aa8: a 16-bit depth with stencil is stored in a wider host format, whose
+    // constant-bias unit differs (HostDepthBiasConstant refuses what no constant reproduces).
+    const auto hostBias = [&](float constant) {
+        if (constant == 0.0f || !graphics.depth || state.images->ImageContext() == nullptr) return constant;
+        return Graphics::HostDepthBiasConstant(*state.images->ImageContext(), graphics.depth->format, constant);
+    };
+    const float biasConstant = graphics.depthBias ? hostBias(graphics.depthBiasConstant) : 0.0f;
     const float biasSlope = graphics.depthBias ? graphics.depthBiasSlope : 0.0f;
     const auto buildPipelinePasses = [&](const Graphics::Metal::RenderPipelineRequest& request) {
         std::vector<PipelinePass> pipelinePasses;
@@ -896,7 +885,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (graphics.cullMode != VK_CULL_MODE_NONE) Fail("per-face depth bias with culling");
             id<MTLRenderPipelineState> pipeline = state.pipelines->Render(request);
             pipelinePasses.push_back({pipeline, MTLCullModeBack, biasConstant, biasSlope});
-            pipelinePasses.push_back({pipeline, MTLCullModeFront, graphics.backDepthBiasConstant, graphics.backDepthBiasSlope});
+            pipelinePasses.push_back({pipeline, MTLCullModeFront, hostBias(graphics.backDepthBiasConstant), graphics.backDepthBiasSlope});
         } else {
             pipelinePasses.push_back({state.pipelines->Render(request), cullOf(graphics.cullMode), biasConstant, biasSlope});
         }
@@ -939,6 +928,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
     // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
     const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
+    // Upstream 99edf9435 (Pipeline.cpp ValidateProvokingVertex): P10 of a flat input reads the
+    // provoking vertex, measured only with the last vertex provoking.
+    if (graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT && fragment != nullptr && fragment->program != nullptr) {
+        const auto& parameters = fragment->program->fragmentParameters;
+        if (std::any_of(parameters.begin(), parameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flatP10; })) Fail("v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
+    }
     const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
@@ -1072,7 +1067,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 if (attachment.multisample != nil) {
                     texture = attachment.multisample;
                 } else if (attachment.resident != nullptr) {
-                    texture = Graphics::Metal::TextureOfView(attachment.resident->AttachmentView(target.format, target.mip, target.depthSlice, target.arraySlice));
+                    texture = Graphics::Metal::TextureOfView(attachment.resident->AttachmentView(target.format, target.mip, target.depthSlice, target.layers, target.arraySlice));
                     if (texture == nil) Fail("the resident color target has no attachment view");
                 } else if (attachment.tiled != nullptr) {
                     texture = attachment.tiled->texture;
@@ -1107,6 +1102,11 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 height = std::min<std::uint32_t>(height, target.extent.height);
                 auto* color = pass.colorAttachments[attachment.target->exportIndex];
                 color.texture = texture;
+                // A volume target's attachment view is the whole 3D mip (StorageTexture::AttachmentView):
+                // the pass starts at the view's first slice, and a layered draw's render target array
+                // index counts from it (upstream #3763; MoltenVK maps a 2D-array view of a 3D image the
+                // same way, depthPlane = baseArrayLayer).
+                if (texture.textureType == MTLTextureType3D) color.depthPlane = target.depthSlice;
                 if (attachment.multisample != nil) color.slice = slice;
                 color.loadAction = MTLLoadActionLoad;
                 color.storeAction = MTLStoreActionStore;
@@ -1134,6 +1134,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (width == 0u || height == 0u) Fail("a render pass without an extent");
             pass.renderTargetWidth = width;
             pass.renderTargetHeight = height;
+            // Layered draws (upstream #3763): the vertex stage's render_target_array_index picks
+            // one of the color view's slices.
+            if (graphics.renderLayers > 1u) pass.renderTargetArrayLength = graphics.renderLayers;
             if (colors.empty() && depth == nullptr) pass.defaultRasterSampleCount = hostSamples.samples;
             // The guest's sample positions (standard or PA_SC_AA_SAMPLE_LOCS custom ones), as upstream's
             // VK_EXT_sample_locations: Metal's are in [0, 1) from the pixel's top-left corner in 1/16
@@ -1334,8 +1337,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                         record.firstIndex = call.first;
                         record.vertexOffset = call.vertexOffset;
                         record.firstInstance = call.firstInstance;
-                        record.minLevel = graphics.stages.tessellationMinLevel;
-                        record.maxLevel = graphics.stages.tessellationMaxLevel;
+                        record.minLevel = graphics.stages.minTessellationLevel;
+                        record.maxLevel = graphics.stages.maxTessellationLevel;
                         [cache.objectArguments setAddress:stream.Write(std::as_bytes(std::span(&record, 1)), 16u).address atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
                         [encoder drawMeshThreadgroups:MTLSizeMake(patches, call.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(linked->objectThreads, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(linked->meshThreads, 1, 1)];
                         stream.CountCommand();
@@ -1590,9 +1593,9 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
         const auto& destination = pass.targets.front();
         const auto* imageContext = state->images->ImageContext();
         if (destination.tileMode == Graphics::ColorTileMode::Linear || imageContext == nullptr) Fail("a CB resolve into a linear target (upstream resolves into resident images only)");
-        const auto resident = Graphics::CachedStorageSurface(*imageContext, SurfaceForTarget(destination));
+        const auto resident = Graphics::CachedStorageSurface(*imageContext, Graphics::SurfaceForTarget(destination));
         if (resident == nullptr || !resident->Attachable()) Fail("a CB resolve into a storage format that cannot be a color attachment");
-        Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, destination.arraySlice));
+        Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, 1u, destination.arraySlice));
         return;
     }
     for (const auto& color : pass.targets) {

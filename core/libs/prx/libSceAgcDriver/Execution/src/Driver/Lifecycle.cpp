@@ -39,6 +39,15 @@ bool StackHoldsImport() {
         std::uintptr_t low = 0;
         std::uintptr_t high = 0;
         Bounds() {
+#ifdef __APPLE__
+            // macOS has no pthread_getattr_np: the stack address is the top (highest) address.
+            const auto top = reinterpret_cast<std::uintptr_t>(pthread_get_stackaddr_np(pthread_self()));
+            const auto size = pthread_get_stacksize_np(pthread_self());
+            if (top != 0 && size != 0 && size <= top) {
+                low = top - size;
+                high = top;
+            }
+#else
             pthread_attr_t attributes;
             if (pthread_getattr_np(pthread_self(), &attributes) != 0) return;
             void* base = nullptr;
@@ -48,6 +57,7 @@ bool StackHoldsImport() {
                 high = low + size;
             }
             pthread_attr_destroy(&attributes);
+#endif
         }
     };
     thread_local const Bounds bounds;
