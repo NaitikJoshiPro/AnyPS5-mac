@@ -98,7 +98,10 @@ int main() {
                 return Skipped;
             }
             id<MTLCommandQueue> queue = [device newCommandQueue];
-            id<MTLTexture> target = [device newTextureWithDescriptor:[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO]];
+            MTLTextureDescriptor* targetDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+            targetDescriptor.usage = MTLTextureUsageRenderTarget;
+            targetDescriptor.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> target = [device newTextureWithDescriptor:targetDescriptor];
             const Variant variants[] = {{"sub-word (ushort first, uchar slot)", "ushort", "uchar"}, {"32-bit words", "uint", "uint"}};
             const std::uint32_t sizes[] = {256u, 255u, 256u};
             const int distinct[] = {97, 85, 129};
