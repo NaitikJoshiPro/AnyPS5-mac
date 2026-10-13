@@ -86,6 +86,15 @@ kernel void aps5_tess_gpu(device const Aps5TessCase* cases [[buffer(0)]], device
 )";
 
 constexpr const char* SlicedKernel = R"(
+struct Aps5TessCase {
+    uint domain;
+    uint partitioning;
+    uint topology;
+    uint pad;
+    float outer[4];
+    float inner[2];
+    float pad2[2];
+};
 // As the tessellation mesh function: one 256-thread threadgroup per (factor set, slice); thread 0
 // windows the slice into threadgroup memory, then every corner thread places its point.
 kernel void aps5_tess_gpu_sliced(device const Aps5TessCase* cases [[buffer(0)]], device uint* corners [[buffer(1)]], constant uint& total [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
