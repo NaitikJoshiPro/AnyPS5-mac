@@ -568,7 +568,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
     }
 
-    const auto primitive = graphics.rectList ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
+    // Tessellated draws take patch lists, whose primitives the tessellator makes (the mesh pipeline
+    // has no topology class).
+    const auto primitive = graphics.rectList || tess ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
     if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
     if (graphics.rectList && draw.indexed) Fail("indexed rect lists");
     if (draw.indexed && draw.indexSize != 2u && draw.indexSize != 4u) Fail("index size " + std::to_string(draw.indexSize));
