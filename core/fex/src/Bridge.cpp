@@ -284,6 +284,7 @@ constexpr VariadicExport VariadicExports[] = {
     {"wprintf_nid_postfix", GuestList, 1},
     {"_open_nid_postfix", Integers, 2},
     {"fcntl_nid_postfix", Integers, 2},
+    {"_fcntl_nid_postfix", Integers, 2},
 };
 
 constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix"};
