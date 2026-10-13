@@ -322,6 +322,9 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     id<MTLResidencySet> residency = residencySetFor(context);
     static const bool trace = std::getenv("APS5_METAL_TRACE") != nullptr;
     if (trace) std::fprintf(stderr, "[metal] host import 0x%llx+0x%llx before: %s\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), AgcDriver::Metal::VmRegionInfo(entry.base).c_str());
+    if (trace) {
+        for (auto page = entry.base; page < entry.base + entry.bytes; page += 0x4000u) std::fprintf(stderr, "[metal] host import page 0x%llx: %s\n", static_cast<unsigned long long>(page), AgcDriver::Metal::VmWiredInfo(page).c_str());
+    }
     id<MTLBuffer> buffer = [Metal::DeviceOf(context) newBufferWithBytesNoCopy:reinterpret_cast<void*>(entry.base) length:entry.bytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil];
     if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(entry.base).c_str());
     if (buffer == nil) {

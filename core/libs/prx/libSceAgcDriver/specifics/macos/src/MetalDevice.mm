@@ -1404,12 +1404,16 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         std::uint64_t offset = 0;
         id<MTLBuffer> mapping = ImportOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
         if (mapping == nil) mapping = WrapperOf(Pm4::GdsAddress(), Pm4::GdsBytes, &offset);
-        id<MTLBuffer> probe = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> probe = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        // CPU -> GPU direction: a CPU store after the import exists, read back by the GPU copy.
+        auto* last = reinterpret_cast<volatile std::uint32_t*>(Pm4::GdsAddress() + Pm4::GdsBytes - 4u);
+        *last = 0xc0ffee00u;
         if (mapping != nil && probe != nil) {
             [residency addAllocation:probe];
             [residency commit];
             stream.Barrier();
             [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + 16u toBuffer:probe destinationOffset:0 size:16];
+            [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + Pm4::GdsBytes - 4u toBuffer:probe destinationOffset:16 size:4];
             stream.Barrier();
         }
         if (std::getenv("APS5_METAL_GDS_WATCH") != nullptr) Metal::WatchWrites(Pm4::GdsAddress());
@@ -1419,6 +1423,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
             const auto* gpu = probe != nil ? static_cast<const std::uint32_t*>(probe.contents) : first;
             std::fprintf(stderr, "[metal] GDS pages after: %s\n", Metal::VmRegionInfo(Pm4::GdsAddress()).c_str());
             std::fprintf(stderr, "[metal] GDS after the batch: CPU dwords 4-7 %u %u %u %u, GPU copy %u %u %u %u\n", first[4], first[5], first[6], first[7], gpu[0], gpu[1], gpu[2], gpu[3]);
+            if (probe != nil) std::fprintf(stderr, "[metal] GDS last dword: CPU stored 0xc0ffee00 after the import, GPU copy reads 0x%08x\n", gpu[4]);
         });
     }
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", plan.reads.size(), plan.writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
