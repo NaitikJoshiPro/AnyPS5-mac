@@ -182,3 +182,9 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - G5 headless pass: 12/13. frame_dump_queue still HOLD: the hang is fixed (frame dump worker) and the remaining FIFO write is being debugged.
 - Agents now: DRAW2 (frame_dump_queue, windowed decode/overlay, msaa_enable_single_sample), SHD4 (pixel_interlock fault stop, conservative raster verification, G7 unbuilt tests, MSL mesh functions), MSIMG (multisampled storage-write emulation, 4 prepared_shaders tests).
 - Remaining to emulate: mesh (SHD4), tessellation (design pending), MS storage writes (MSIMG).
+
+## 2026-10-13 ~10:30 — M2: mesh shaders, conservative raster and G5 done
+- DRAW2: G3 34/34, G4 35/39, G5 headless 14/14 (frame_dump_queue fixed: a0a16d65d, 8d9b4e68e), windowed present/decode/overlay rc=0 with 0 validation errors, msaa_enable_single_sample fixed (2f43c6ab9). G5 released from HOLD and gpu_suite now forces SDL_VIDEODRIVER=offscreen (d3e582be7); HOLD is now only lds_atomics64.
+- SHD4: pixel_interlock passes (d80f1643a). Conservative raster is emulated and passes (D21, f27bde0f7). MSL mesh functions + MTL4 mesh pipelines (D23: 76b008405, f940c9b7d) make agc_driver_mesh pass. G3 34/34, G4 36/39 (gpu-suite/shd4-g3g4-v2). D19 slip: one direct test-binary run (0.04 s, harmless).
+- Tessellation: MTL4 has no drawPatches. Design: object stage (LS+HS) + mesh stage (software tessellator + DS). Agent TESS is implementing it.
+- Running: TESS (tessellation), MSIMG (MS storage writes, D22), T1 (agc_driver_graphics Vulkan-internal split + BdaDeviceTwin.mm).
