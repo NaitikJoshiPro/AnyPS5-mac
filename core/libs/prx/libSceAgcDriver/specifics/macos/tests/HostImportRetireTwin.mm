@@ -55,6 +55,12 @@ void NoteDestroyed(const void* buffer) {
     destroyed.insert(buffer);
 }
 
+// A handle can be reused by a later import once its buffer is gone: a scenario forgets it when it takes the import.
+void Track(VkBuffer buffer) {
+    std::lock_guard lock(destroyedMutex);
+    destroyed.erase(buffer);
+}
+
 bool Live(VkBuffer buffer) {
     std::lock_guard lock(destroyedMutex);
     return buffer != VK_NULL_HANDLE && !destroyed.contains(buffer);
@@ -171,6 +177,7 @@ void IdleRetireOutlivesTheHold(const Device& device) {
         Expect(taken != nullptr, "the first range was not imported");
         if (taken == nullptr) return;
         retired = taken->buffer;
+        Track(retired);
         Expect(recorder.Idle(), "the recorder is not idle before the drop");
         heap.Grow();
         const auto* grown = HostImportFor(context, heap.Address(RangeBytes), 4096);
@@ -215,6 +222,7 @@ void BusyRetireOutlivesALaterBatch(const Device& device) {
         Expect(taken != nullptr, "the first range was not imported");
         if (taken == nullptr) return;
         retired = taken->buffer;
+        Track(retired);
         heap.Grow();
         Expect(HostImportFor(context, heap.Address(RangeBytes), 4096) != nullptr, "the grown run was not imported");
         first = recorder.Submissions();
