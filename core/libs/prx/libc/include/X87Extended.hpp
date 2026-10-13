@@ -244,10 +244,9 @@ inline X87Extended ParseX87(const char* text, char** end) {
         if (*cursor == '(') {
             const char* close = cursor + 1;
             while ((*close >= '0' && *close <= '9') || ((*close | 0x20) >= 'a' && (*close | 0x20) <= 'z') || *close == '_') ++close;
-            if (*close == ')') {
-                if (close != cursor + 1) NotImplemented_nid_no_patch("strtold NaN payload");
-                cursor = close + 1;
-            }
+            // The guest's strtod/strtof/strtold consume an n-char-sequence and return the
+            // default quiet NaN without its payload (guest_math CheckNanConversions).
+            if (*close == ')') cursor = close + 1;
         }
         return finish({std::uint64_t(3) << 62, 0x7fff}, cursor);
     }

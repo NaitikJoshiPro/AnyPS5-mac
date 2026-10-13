@@ -479,7 +479,9 @@ static void* APS5_VABI DestroyPad(void* arg) {
     return nullptr;
 }
 
-#ifndef _WIN32
+// macOS: libc's guest exception runtime unwinds guest (ELF) frames only; a guest exception thrown
+// through this host-compiled (Mach-O) test aborts, as exception_runtime is not built there.
+#if !defined(_WIN32) && !defined(__APPLE__)
 static void APS5_VABI ExitWithSystemErrorCode() {
     const auto* type = __cxa_current_exception_type_nid_postfix();
     const auto* error = static_cast<const GuestSystemError*>(__cxa_current_primary_exception_nid_postfix());
@@ -514,7 +516,7 @@ static void TestPadErrors() {
     ConstructPad(pad, order, destroyed, 0, 0);
     Require(Throws<std::invalid_argument>([&] { _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(&pad, nullptr); }));
     Require(!pad.started && order.load() == 0);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     Require(GuestSystemErrorCode([&] { _ZNSt4_Pad8_ReleaseEv_nid_postfix(&pad); }) == GuestEbusy);
 #endif
     Require(!pad.started);
