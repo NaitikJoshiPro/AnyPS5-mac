@@ -109,9 +109,18 @@ MALLOC_SMALL                600000000-600800000    [ 8192K   512K   512K     0K]
         self.assertEqual(len(title_run.vmmap_x86_findings(text)), 1)
         self.assertEqual(title_run.vmmap_code_type("Code Type: X86-64 (translated)\n"), "X86-64 (translated)")
 
+    def test_baseline_stub_is_not_rosetta(self):
+        stub = "__TEXT   2b756a000-2b7571000 [ 28K 12K 0K 0K] r-x/r-x SM=COW          /usr/lib/libRosetta.dylib"
+        runtime = "__TEXT   7ff000-7ff100 [ 1K ] r-x/r-x SM=COW  /Library/Apple/usr/libexec/oah/libRosettaRuntime"
+        new, baseline = title_run.split_findings([stub, runtime], stub + "\n" + runtime + "\n")
+        self.assertEqual((new, baseline), ([runtime], [stub]))
+        new, baseline = title_run.split_findings([stub], "")
+        self.assertEqual((new, baseline), ([stub], []))
+
     def test_file_verdict(self):
         self.assertEqual(title_run.file_verdict("Mach-O 64-bit executable arm64"), "arm64")
-        self.assertEqual(title_run.file_verdict("Mach-O universal binary with 2 architectures: [x86_64] [arm64]"), "x86")
+        self.assertEqual(title_run.file_verdict("Mach-O universal binary with 2 architectures: [x86_64] [arm64]"), "universal")
+        self.assertEqual(title_run.file_verdict("Mach-O 64-bit executable x86_64"), "x86")
         self.assertEqual(title_run.file_verdict("ELF 64-bit LSB executable, x86-64"), "other")
         self.assertEqual(title_run.file_verdict("data"), "other")
 

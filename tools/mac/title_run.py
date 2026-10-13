@@ -183,6 +183,25 @@ def leak_slope_mib_per_min(samples):
 # ---- native proof --------------------------------------------------------------------------------------------
 
 X86_VMMAP = re.compile(r"rosetta|oahd|libRosetta|x86_64|x86-64|\bi386\b", re.IGNORECASE)
+# The translator itself (/Library/Apple/usr/libexec/oah/libRosettaRuntime) and translated code types. Every native
+# arm64 process on macOS 27 also maps the 28 KiB shared-cache stub /usr/lib/libRosetta.dylib (Finder, Dock and
+# python3 do too, measured 2026-10-13), so a match is only evidence when a native reference process lacks it.
+ROSETTA_RUNTIME = re.compile(r"/oah/|libRosettaRuntime|RosettaLinux|\(translated\)", re.IGNORECASE)
+
+
+def vmmap_path(line):
+    match = re.search(r"SM=\S+\s+(/.*\S)\s*$", line)
+    return match.group(1) if match else None
+
+
+def split_findings(findings, baseline_text):
+    """(new, baseline): findings whose mapped path a native reference process also maps go to baseline."""
+    base_paths = {vmmap_path(line) for line in baseline_text.splitlines()} - {None}
+    new, baseline = [], []
+    for line in findings:
+        path = vmmap_path(line)
+        (baseline if path is not None and path in base_paths and not ROSETTA_RUNTIME.search(line) else new).append(line)
+    return new, baseline
 
 
 def vmmap_images(text):
@@ -190,9 +209,8 @@ def vmmap_images(text):
     images = []
     for line in text.splitlines():
         if line.lstrip().startswith("__TEXT"):
-            match = re.search(r"SM=\S+\s+(/.*\S)\s*$", line)
-            if match:
-                path = match.group(1).strip()
+            path = vmmap_path(line)
+            if path:
                 if path not in images:
                     images.append(path)
     return images
@@ -203,12 +221,14 @@ def vmmap_x86_findings(text):
 
 
 def file_verdict(text):
-    """`file` output for a Mach-O → "arm64", "x86" (any x86 slice), or "other"."""
-    if re.search(r"x86_64|i386", text):
+    """`file` output for a Mach-O → "arm64" (arm64 only), "universal" (arm64 and x86 slices: dyld maps the arm64
+    one in an arm64 process), "x86" (no arm64 slice) or "other"."""
+    x86, arm = bool(re.search(r"x86_64|i386", text)), bool(re.search(r"arm64", text))
+    if x86 and arm:
+        return "universal"
+    if x86:
         return "x86"
-    if re.search(r"arm64", text):
-        return "arm64"
-    return "other"
+    return "arm64" if arm else "other"
 
 
 def vmmap_code_type(text):
@@ -228,9 +248,15 @@ def native_proof(pid, out_path):
     lines.append(f"vmmap Code Type: {code_type}")
     ok &= code_type is not None and "ARM64" in code_type.upper()
     findings = vmmap_x86_findings(vm)
-    lines.append(f"vmmap lines matching {X86_VMMAP.pattern}: {len(findings)}")
-    lines += ["  " + f for f in findings[:50]]
-    ok &= not findings
+    reference = subprocess.run(["vmmap", str(os.getpid())], capture_output=True, text=True).stdout
+    new, baseline = split_findings(findings, reference)
+    lines.append(f"vmmap lines matching {X86_VMMAP.pattern}: {len(findings)}; also mapped by the native reference "
+                 f"process (this python3, Code Type {vmmap_code_type(reference)}): {len(baseline)}; title-only: {len(new)}")
+    lines += ["  [baseline] " + f for f in baseline[:50]]
+    lines += ["  [TITLE-ONLY] " + f for f in new[:50]]
+    runtime = [line for line in vm.splitlines() if ROSETTA_RUNTIME.search(line)]
+    lines.append(f"Rosetta runtime (oah/libRosettaRuntime) mappings: {len(runtime)}")
+    ok &= not new and not runtime
     images = vmmap_images(vm)
     lines.append(f"loaded Mach-O images (__TEXT): {len(images)}")
     verdicts = {}
@@ -238,10 +264,10 @@ def native_proof(pid, out_path):
         if os.path.exists(image):
             text = subprocess.run(["file", "-b", image], capture_output=True, text=True).stdout.strip()
         else:
-            text = "(not on disk: dyld shared cache) arm64e shared cache image"
+            text = "(not on disk: an image of the arm64e dyld shared cache this ARM64 process maps)"
         verdict = file_verdict(text)
         verdicts[verdict] = verdicts.get(verdict, 0) + 1
-        ok &= verdict != "x86"
+        ok &= verdict not in ("x86", "other") or not os.path.exists(image)
         lines.append(f"  [{verdict}] {image}: {text}")
     lines.append(f"file verdicts: {verdicts}")
     lsof = subprocess.run(["lsof", "-p", str(pid)], capture_output=True, text=True).stdout
