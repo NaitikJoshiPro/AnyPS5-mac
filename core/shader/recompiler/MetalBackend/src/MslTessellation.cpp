@@ -408,7 +408,10 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     mesh += "    constant aps5_ds::Aps5DriverData& aps5_driver [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DriverData)) + ")]],\n";
     mesh += "    uint3 aps5_slice [[threadgroup_position_in_grid]],\n    uint aps5_tid [[thread_index_in_threadgroup]],\n    uint aps5_lane [[thread_index_in_simdgroup]])\n{\n";
     mesh += "    threadgroup int aps5_corners[" + U32(slice * corners) + "];\n    threadgroup uint aps5_count[1];\n";
-    mesh += "    threadgroup uchar aps5_slot[" + U32(slice * corners) + "];\n    threadgroup ushort aps5_first[" + U32(slice * corners) + "];\n    threadgroup atomic_uint aps5_vertices[1];\n";
+    // Per corner: its owner corner (bits 0-15) and, for an owner, its vertex (bits 16-23). One 32-bit
+    // word per corner: sub-word threadgroup arrays here had their stores land in aps5_corners on the
+    // M3 (agc_metal_tessellation_domains, macOS 27.0.1).
+    mesh += "    threadgroup uint aps5_sharing[" + U32(slice * corners) + "];\n    threadgroup atomic_uint aps5_vertices[1];\n";
     mesh += factors;
     mesh += "    if (aps5_tid == 0u) {\n";
     mesh += "        const int aps5_total = int(aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "]);\n";
@@ -421,22 +424,24 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     // Vertex sharing within the slice: the first corner that uses a domain point owns its vertex
     // (the domain program runs once per unique point); later corners index the owner's vertex.
     mesh += "    const uint aps5_used = aps5_primitives * " + U32(corners) + ";\n";
+    mesh += "    const int aps5_corner = aps5_tid < aps5_used ? aps5_corners[aps5_tid] : 0;\n";
     mesh += "    if (aps5_tid < aps5_used) {\n";
     mesh += "        uint aps5_owner = aps5_tid;\n";
-    mesh += "        for (uint s = 0u; s < aps5_tid; ++s) {\n            if (aps5_corners[s] == aps5_corners[aps5_tid]) { aps5_owner = s; break; }\n        }\n";
-    mesh += "        aps5_first[aps5_tid] = ushort(aps5_owner);\n";
-    mesh += "        if (aps5_owner == aps5_tid) aps5_slot[aps5_tid] = uchar(atomic_fetch_add_explicit(&aps5_vertices[0], 1u, memory_order_relaxed));\n";
+    mesh += "        for (uint s = 0u; s < aps5_tid; ++s) {\n            if (aps5_corners[s] == aps5_corner) { aps5_owner = s; break; }\n        }\n";
+    mesh += "        aps5_sharing[aps5_tid] = aps5_owner == aps5_tid ? aps5_owner | (atomic_fetch_add_explicit(&aps5_vertices[0], 1u, memory_order_relaxed) << 16u) : aps5_owner;\n";
     mesh += "    }\n";
     mesh += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    mesh += "    if (aps5_tid < aps5_used && aps5_first[aps5_tid] == aps5_tid) {\n";
-    mesh += "        const Aps5TessPoint aps5_point = aps5_tess_point(aps5_patch, aps5_corners[aps5_tid]);\n";
+    mesh += "    const uint aps5_owned = aps5_tid < aps5_used ? aps5_sharing[aps5_tid] : 0u;\n";
+    mesh += "    const uint aps5_index = aps5_tid < aps5_used ? aps5_sharing[aps5_owned & 0xffffu] >> 16u : 0u;\n";
+    mesh += "    if (aps5_tid < aps5_used && (aps5_owned & 0xffffu) == aps5_tid) {\n";
+    mesh += "        const Aps5TessPoint aps5_point = aps5_tess_point(aps5_patch, aps5_corner);\n";
     // Domain locations as the D3D11 reference: (u, v) and, for triangles, w = 1 - u - v.
     mesh += "        const float3 aps5_coord = float3(aps5_point.u, aps5_point.v, " + std::string(config.domain == T::Triangle ? "1.0f - aps5_point.u - aps5_point.v" : "0.0f") + ");\n";
     mesh += "        aps5_ds::Aps5VertexOut aps5_vertex = {};\n";
     mesh += "#ifdef APS5_TESS_POINT_SIZE_FIELD\n        aps5_vertex.aps5_tess_point_size = 1.0f;\n#endif\n";
     mesh += "        aps5_ds::aps5_stage(aps5_ds_table, aps5_push, aps5_driver, aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "], aps5_coord, aps5_lane, aps5_payload.words, aps5_vertex);\n";
-    mesh += "        aps5_mesh.set_vertex(aps5_slot[aps5_tid], aps5_vertex);\n    }\n";
-    mesh += "    if (aps5_tid < aps5_used) aps5_mesh.set_index(aps5_tid, aps5_slot[aps5_first[aps5_tid]]);\n";
+    mesh += "        aps5_mesh.set_vertex(aps5_index, aps5_vertex);\n    }\n";
+    mesh += "    if (aps5_tid < aps5_used) aps5_mesh.set_index(aps5_tid, uchar(aps5_index));\n";
     mesh += "    if (aps5_tid < aps5_primitives) {\n        Aps5TessPrimitive aps5_primitive = {};\n        aps5_primitive.aps5_culled = false;\n        aps5_mesh.set_primitive(aps5_tid, aps5_primitive);\n    }\n}\n";
 
     result.object.source = std::move(object);
