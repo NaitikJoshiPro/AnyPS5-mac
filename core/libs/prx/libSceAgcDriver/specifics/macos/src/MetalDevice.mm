@@ -609,6 +609,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             }
             // Multisampled storage images are emulated as 2D arrays of layers * samples slices (DECISIONS D22, MslAbi v6).
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityStorageImageMultisample));
+            // s_memtime / s_memrealtime read an emulated clock: a device-wide count of clock reads in the
+            // atomic lock table (MslAbi::ClockCounterWord, MslFlowEmitter.cpp EmitClock; CORPUS).
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityShaderClockKHR));
             // f64 is IEEE binary64 in software in the MSL backend (MslFloat64.cpp, package B2).
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityFloat64));
             // half arithmetic rounds to nearest even and keeps f16 denormals on Apple GPUs (probe_float_b2),

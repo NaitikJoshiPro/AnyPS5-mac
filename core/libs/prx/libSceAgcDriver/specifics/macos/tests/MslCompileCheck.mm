@@ -2,7 +2,8 @@
 // recompiled for the Metal device's target, its MSL is compiled with newLibraryWithSource and a
 // compute pipeline is built with the result's function constants. Also checks that the checker
 // itself rejects invalid MSL, that the reflection matches the MslAbi table layout and the lane
-// mapping (wave64 programs run two guest lanes per host invocation), and that every descriptor
+// mapping (wave64 programs run two guest lanes per host invocation, also when the request claims a
+// 64-lane host), that s_memtime/s_memrealtime read the emulated clock, and that every descriptor
 // table member type compiles with the layout MslAbi gives it.
 
 #import <Foundation/Foundation.h>
@@ -49,6 +50,21 @@ alignas(256) constexpr std::array<std::uint32_t, 18> LoopBodyCode{
     0x80010401, 0xbf810000, 0x4a080881, 0x80098109, 0xbf0a0809, 0xbf85fffc, 0xe0702000, 0x80010401, 0xbf810000,
 };
 
+// tests/execution/ShaderClock.cpp: s_memtime and s_memrealtime around a loop (MSL reads the emulated
+// clock, MslFlowEmitter.cpp EmitClock).
+alignas(256) constexpr std::array<std::uint32_t, 49> ClockCode{
+    0x34020084, 0x34060086, 0xe0301000, 0x80000401, 0xf4900200, 0x00000000, 0xf4940280, 0x00000000,
+    0xbf8c0070, 0x7e0a0280, 0xbe9003ff, 0x000007d0, 0xd5430005, 0x04110705, 0x80908110, 0xbf078010,
+    0xbf85fffb, 0xf4900300, 0x00000000, 0xf4940380, 0x00000000, 0xbf8cc07f, 0x7e140208, 0x7e160209,
+    0x7e18020a, 0x7e1a020b, 0x7e1c020c, 0x7e1e020d, 0x7e20020e, 0x7e22020f, 0xe0701000, 0x80010a03,
+    0xe0701004, 0x80010b03, 0xe0701008, 0x80010c03, 0xe070100c, 0x80010d03, 0xe0701010, 0x80010e03,
+    0xe0701014, 0x80010f03, 0xe0701018, 0x80011003, 0xe070101c, 0x80011103, 0xe0701020, 0x80010503,
+    0xbf810000,
+};
+
+// tests/execution/ShaderMemory.cpp computeLane63: v_readlane_b32 of lane 63 in a wave64 program.
+alignas(256) constexpr std::array<std::uint32_t, 6> Lane63Code{0xd7600006u, 0x00017f00u, 0x7e020206u, 0xe0700000u, 0x80000100u, 0xbf810000u};
+
 struct Program {
     const char* name;
     std::span<const std::uint32_t> code;
@@ -56,9 +72,14 @@ struct Program {
     std::uint32_t buffers;
     std::uint32_t waveSize;
     std::uint32_t userDataCount;
+    // Host subgroup width the request claims instead of the device's (0: the device's). MSL programs
+    // are laid out for 32 lanes whatever the claim (Recompiler.cpp HostSubgroupSize).
+    std::uint32_t claimedSubgroupSize = 0u;
+    // Text the MSL must contain.
+    const char* expect = nullptr;
 };
 
-constexpr std::array<Program, 7> Programs{{
+constexpr std::array<Program, 10> Programs{{
     {"vop1_control", Vop1ControlCode, 64u, 2u, 32u, 8u},
     {"vop1_control_wave64", Vop1ControlCode, 64u, 2u, 64u, 8u},
     {"vop1_control_wave64_partial", Vop1ControlCode, 96u, 2u, 64u, 8u},
@@ -66,6 +87,9 @@ constexpr std::array<Program, 7> Programs{{
     {"tail_blocks_wave64", TailBlockCode, 64u, 2u, 64u, 9u},
     {"loop_body", LoopBodyCode, 64u, 2u, 32u, 9u},
     {"loop_body_wave64", LoopBodyCode, 128u, 2u, 64u, 9u},
+    {"shader_clock", ClockCode, 32u, 2u, 32u, 8u, 0u, "aps5_clock_reads"},
+    {"shader_clock_wave64", ClockCode, 64u, 2u, 64u, 8u, 0u, "aps5_clock_reads"},
+    {"readlane63_wave64_claimed_64_lanes", Lane63Code, 64u, 1u, 64u, 4u, 64u, "simd_shuffle"},
 }};
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t count) {
@@ -88,6 +112,7 @@ ShaderRecompiler::RecompileResult Recompile(const AgcDriver::VulkanDevice& devic
         {0, 0, 0, 128}
     };
     request.useCache = false;
+    if (program.claimedSubgroupSize != 0u) request.target.subgroupSize = program.claimedSubgroupSize;
     return ShaderRecompiler::Recompile(request);
 }
 
@@ -117,6 +142,7 @@ void CompileCheck(id<MTLDevice> device, const Program& program, const ShaderReco
     const auto* buffers = reflection.table.Find(ShaderRecompiler::RuntimeAbi::Binding::Buffers);
     Require(buffers != nullptr && buffers->count == program.buffers && buffers->offset == 0u, std::string(program.name) + ": the descriptor table lacks the guest buffers");
     Require(reflection.table.bytes == program.buffers * sizeof(ShaderRecompiler::MslAbi::BufferEntry), std::string(program.name) + ": unexpected descriptor table size");
+    if (program.expect != nullptr) Require(result.msl.Source().find(program.expect) != std::string::npos, std::string(program.name) + ": the MSL lacks " + program.expect);
     id<MTLLibrary> library = CompileLibrary(device, program.name, result.msl.Source());
     MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
     for (const auto& constant : result.specialization) {
