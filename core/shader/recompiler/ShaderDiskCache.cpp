@@ -335,6 +335,8 @@ void encodeMsl(Writer& writer, const SharedMsl& msl) {
     writer.Values(std::span<const std::uint32_t>(reflection.samplerModeUses));
     writer.Value(reflection.samplerUnconditional);
     writer.Value(reflection.rasterOrder);
+    writer.Value(reflection.perVertexLocations);
+    writer.Value(reflection.emulatedBarycentrics);
 }
 
 void decodeMsl(Reader& reader, SharedMsl& msl) {
@@ -374,6 +376,8 @@ void decodeMsl(Reader& reader, SharedMsl& msl) {
     reader.Values(reflection.samplerModeUses);
     reader.Value(reflection.samplerUnconditional);
     reader.Value(reflection.rasterOrder);
+    reader.Value(reflection.perVertexLocations);
+    reader.Value(reflection.emulatedBarycentrics);
     msl = SharedMsl(std::move(shader));
 }
 

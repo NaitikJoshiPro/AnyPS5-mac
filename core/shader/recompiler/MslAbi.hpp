@@ -40,7 +40,7 @@
 
 namespace ShaderRecompiler::MslAbi {
 
-inline constexpr std::uint32_t Version = 4u;
+inline constexpr std::uint32_t Version = 5u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -64,7 +64,10 @@ enum class BufferIndex : std::uint32_t {
     // shaders): any device buffer of at least RasterOrderBytes, declared [[raster_order_group(0)]].
     // Its contents are ignored and never read back; it may be shared by every draw.
     RasterOrder = 5u,
-    Count = 6u
+    // Version 5: vertex functions compiled with TriangleVerticesMacro only: a TriangleVerticesHeader
+    // followed by `uint guestVertex[3 * triangles]` (see TriangleVerticesHeader).
+    TriangleVertices = 6u,
+    Count = 7u
 };
 
 inline constexpr std::uint32_t Index(BufferIndex index) {
@@ -200,6 +203,36 @@ inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";
 // - fragment: the MSL type of colour output n (float4, uint4 or int4; default from pixelInfo),
 //   APS5_COLOR<n>_TYPE.
 inline constexpr const char* ColorTypeMacroPrefix = "APS5_COLOR";
+// Version 5: the triangle-vertices expansion, shared by conservative rasterization and the per-vertex
+// fragment value emulation (no Metal geometry stage; per-vertex fragment inputs are Apple10-only):
+// - vertex: 1 when the draw is non-indexed with 3 host vertices per guest triangle and binds
+//   BufferIndex::TriangleVertices; host vertex v runs the guest program for the 3 guest vertices
+//   guestVertex[3 * (v / 3) + 0..2] and emits corner v % 3;
+inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
+// - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
+inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
+// - vertex (with TriangleVerticesMacro): the fragment function's Reflection::perVertexLocations,
+//   decimal, bits 0-31 and 32-63: each location is also emitted as three flat values (one per
+//   corner, user(aps5_pv<L>_<j>));
+inline constexpr const char* PerVertexLocationsMacro = "APS5_PER_VERTEX_LOCATIONS";
+inline constexpr const char* PerVertexLocationsHighMacro = "APS5_PER_VERTEX_LOCATIONS_HI";
+// - vertex (with TriangleVerticesMacro): the fragment function's Reflection::emulatedBarycentrics
+//   (bit 0 perspective, bit 1 linear): one-hot corner weights interpolated as the barycentrics.
+inline constexpr const char* BarycentricsMacro = "APS5_BARYCENTRICS";
+
+// Version 5: the buffer at BufferIndex::TriangleVertices. guestVertex follows the header: per guest
+// triangle its 3 guest vertex ids (index buffer, base vertex, strips, fans and restart resolved),
+// corner 0 being the provoking vertex, then the primitive's order (Vulkan's, rotated for
+// last-vertex provoking), so flat outputs and P0 come from corner 0.
+inline constexpr std::uint32_t TriangleFlagConservative = 1u;
+inline constexpr std::uint32_t TriangleFlagPerVertex = 2u;
+struct TriangleVerticesHeader {
+    float viewport[4];   // Vulkan viewport x, y, width, height (pixels)
+    float depthRange[2]; // minDepth, maxDepth
+    std::uint32_t triangles;
+    std::uint32_t flags; // TriangleFlag*
+};
+static_assert(std::is_standard_layout_v<TriangleVerticesHeader> && sizeof(TriangleVerticesHeader) == 32u && offsetof(TriangleVerticesHeader, triangles) == 24u);
 
 // Version 4: minimum size of the buffer at BufferIndex::RasterOrder. A primitive-ordered fragment
 // function reads one dword of it (picked by the pixel position) before the guest program and writes
@@ -267,6 +300,13 @@ struct Reflection {
     // BufferIndex::WorkgroupMemory (graphics-stage LDS is per invocation, in thread memory, as the
     // SPIR-V path's Function-storage LDS), so workgroupMemoryStrideDwords stays 0 for them.
     bool rasterOrder = false;
+    // Version 5, fragment functions: parameter locations read per vertex (v_interp_mov, 16-bit
+    // interpolation, raw P0/P10/P20 reads: StageInput::perVertex), and the barycentrics the function
+    // interpolates them with (bit 0 perspective, bit 1 linear). Either nonzero: the driver draws
+    // with TriangleVerticesMacro and passes these as PerVertexLocationsMacro / BarycentricsMacro to
+    // the vertex function.
+    std::uint64_t perVertexLocations = 0;
+    std::uint32_t emulatedBarycentrics = 0;
 
     bool operator==(const Reflection& other) const = default;
 };
