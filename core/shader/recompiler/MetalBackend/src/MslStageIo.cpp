@@ -633,6 +633,11 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             default: break;
             }
         }
+        // Tessellation point output (LinkMslTessellation defines APS5_TESS_POINTS): Metal needs a
+        // point size, and a domain program without one draws 1-pixel points (TechnicalDebt
+        // metal-tessellation: PA_SU_POINT_SIZE is not applied).
+        const bool pointSize = std::any_of(state.program.Info().outputs.begin(), state.program.Info().outputs.end(), [](const auto& output) { return output.kind == StageOutputKind::PointSize; });
+        if (stage == IrShaderStage::TessellationEvaluation && !pointSize) text += "#ifdef APS5_TESS_POINTS\n    float aps5_tess_point_size [[point_size]];\n#define APS5_TESS_POINT_SIZE_FIELD 1\n#endif\n";
         // Metal's compiler fails past 124 scalar varyings (M2_DESIGN §4).
         if (scalars > 124u) state.Fail("the vertex function exceeds 124 scalar varyings");
         // MslAbi Version 5, triangle-vertices draws: each per-vertex location the fragment function

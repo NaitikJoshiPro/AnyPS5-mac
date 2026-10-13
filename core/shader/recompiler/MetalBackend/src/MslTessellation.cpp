@@ -139,8 +139,11 @@ void Set(MslEmitterState& state, const IrValue& instruction) {
         const auto domain = Tessellation(state).domain;
         const auto count = domain == 0u ? 2u : domain == 1u ? 4u : 6u;
         if (factor >= count) state.Fail(instruction, "tessellation factor index out of range");
-        // Payload factors: outer 0-3, inner 0-1 (the triangle's inner factor follows its 3 outer ones).
-        const auto slot = domain == 1u && factor == 3u ? 4u : factor;
+        // Payload factors in the tessellator's order: outer 0-3, inner 0-1. The triangle's inner factor
+        // follows its 3 outer ones in the ring; the isoline ring record is (detail, density), the
+        // reverse of the tessellator's (density, detail) (radeonsi and r600 swap GL's outer[0] and
+        // outer[1] for isolines; DECISIONS D26).
+        const auto slot = domain == 1u && factor == 3u ? 4u : domain == 0u ? factor ^ 1u : factor;
         state.AddParameter("object_data uint* aps5_tess_payload");
         state.Line("aps5_tess_payload[" + U32(slot) + "] = " + value + ";");
         break;
@@ -341,6 +344,17 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
                          "    for (uint i = 0u; i < 4u; ++i) aps5_factors.outer[i] = as_type<float>(aps5_payload.words[i]);\n"
                          "    for (uint i = 0u; i < 2u; ++i) aps5_factors.inner[i] = as_type<float>(aps5_payload.words[4u + i]);\n"
                          "    Aps5TessPatch aps5_patch = aps5_tess_process(" + configuration + ", aps5_factors);\n";
+    // DECISIONS D26: VGT_HOS_MIN/MAX_TESS_LEVEL (the TessellationDraw record) clamp the factors of a
+    // patch the raw factors do not cull; the clamped factors replace the raw ones in the payload, so
+    // the mesh threadgroups tessellate exactly what the object stage counted.
+    const auto clamp = "        if (aps5_patch.culled == 0) {\n"
+                       "            for (uint i = 0u; i < " + U32(MslAbi::TessellationPayloadFactorWords) + "u; ++i) {\n"
+                       "                const float aps5_raw = as_type<float>(aps5_payload.words[i]);\n"
+                       "                aps5_payload.words[i] = as_type<uint>(isnan(aps5_raw) ? aps5_raw : fmin(fmax(aps5_raw, aps5_draw.minLevel), aps5_draw.maxLevel));\n"
+                       "                if (i < 4u) aps5_factors.outer[i] = as_type<float>(aps5_payload.words[i]); else aps5_factors.inner[i - 4u] = as_type<float>(aps5_payload.words[i]);\n"
+                       "            }\n"
+                       "            aps5_patch = aps5_tess_process(" + configuration + ", aps5_factors);\n"
+                       "        }\n";
 
     MslTessellationPipeline result;
     result.objectThreads = threads;
@@ -350,7 +364,7 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     result.topology = config.outputTopology;
 
     std::string object = common + Namespaced(local, "aps5_ls") + Namespaced(hull, "aps5_hs");
-    object += "struct Aps5TessDraw {\n    ulong indexAddress;\n    uint indexSize;\n    uint firstIndex;\n    int vertexOffset;\n    uint firstInstance;\n    uint reserved[2];\n};\n\n";
+    object += "struct Aps5TessDraw {\n    ulong indexAddress;\n    uint indexSize;\n    uint firstIndex;\n    int vertexOffset;\n    uint firstInstance;\n    float minLevel;\n    float maxLevel;\n};\n\n";
     object += "[[object]] void " + std::string(MslAbi::EntryPoint) + "(\n";
     object += "    object_data Aps5TessPayload& aps5_payload [[payload]],\n    mesh_grid_properties aps5_grid,\n";
     object += "    device const aps5_ls::Aps5Table& aps5_ls_table [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DescriptorTable)) + ")]],\n";
@@ -373,17 +387,18 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     object += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     object += "    aps5_hs::aps5_stage(aps5_hs_table, aps5_push, *reinterpret_cast<constant aps5_hs::Aps5DriverData*>(&aps5_driver), aps5_tid, aps5_patch_id, aps5_lane, aps5_local, aps5_payload.words);\n";
     object += "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_object_data);\n";
-    object += "    if (aps5_tid == 0u) {\n" + std::string(factors);
+    object += "    if (aps5_tid == 0u) {\n" + std::string(factors) + clamp;
     object += "        const int aps5_count = aps5_tess_primitive_count(aps5_patch, aps5_none);\n";
     object += "        aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "] = aps5_patch_id;\n";
     object += "        aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "] = uint(aps5_count);\n";
-    // A culled patch launches one mesh threadgroup that emits nothing: the MSL specification defines
-    // only the uncalled case, and calling it always keeps every object threadgroup on one path.
+    // A culled patch (no primitives) leaves the mesh grid unset, which launches no mesh threadgroup
+    // (MSL specification 4.1, section 5.1.8: mesh_grid_properties).
     object += "    }\n    threadgroup_barrier(mem_flags::mem_object_data);\n";
-    object += "    if (aps5_tid == 0u) aps5_grid.set_threadgroups_per_grid(uint3(max((aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "] + " + U32(slice - 1u) + ") / " + U32(slice) + ", 1u), 1u, 1u));\n}\n";
+    object += "    const uint aps5_primitives = aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "];\n";
+    object += "    if (aps5_tid == 0u && aps5_primitives != 0u) aps5_grid.set_threadgroups_per_grid(uint3((aps5_primitives + " + U32(slice - 1u) + ") / " + U32(slice) + ", 1u, 1u));\n}\n";
 
     const char* topologyName = topology == T::Point ? "point" : topology == T::Line ? "line" : "triangle";
-    std::string mesh = common + Namespaced(domain, "aps5_ds");
+    std::string mesh = common + (topology == T::Point ? "#define APS5_TESS_POINTS 1\n" : "") + Namespaced(domain, "aps5_ds");
     mesh += "struct Aps5TessPrimitive {\n    bool aps5_culled [[primitive_culled]];\n};\n\n";
     mesh += "using Aps5TessMesh = metal::mesh<aps5_ds::Aps5VertexOut, Aps5TessPrimitive, " + std::to_string(slice * corners) + ", " + std::to_string(slice) + ", metal::topology::" + topologyName + ">;\n\n";
     mesh += "[[mesh]] void " + std::string(MslAbi::EntryPoint) + "(\n    Aps5TessMesh aps5_mesh,\n";
@@ -393,22 +408,35 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     mesh += "    constant aps5_ds::Aps5DriverData& aps5_driver [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::DriverData)) + ")]],\n";
     mesh += "    uint3 aps5_slice [[threadgroup_position_in_grid]],\n    uint aps5_tid [[thread_index_in_threadgroup]],\n    uint aps5_lane [[thread_index_in_simdgroup]])\n{\n";
     mesh += "    threadgroup int aps5_corners[" + U32(slice * corners) + "];\n    threadgroup uint aps5_count[1];\n";
+    mesh += "    threadgroup uchar aps5_slot[" + U32(slice * corners) + "];\n    threadgroup ushort aps5_first[" + U32(slice * corners) + "];\n    threadgroup atomic_uint aps5_vertices[1];\n";
     mesh += factors;
     mesh += "    if (aps5_tid == 0u) {\n";
     mesh += "        const int aps5_total = int(aps5_payload.words[" + U32(MslAbi::TessellationPayloadPrimitivesWord) + "]);\n";
-    mesh += "        const int aps5_first = int(aps5_slice.x) * " + std::to_string(slice) + ";\n";
-    mesh += "        aps5_count[0] = uint(aps5_tess_window(aps5_patch, aps5_first, min(" + std::to_string(slice) + ", aps5_total - aps5_first), aps5_corners));\n";
+    mesh += "        const int aps5_begin = int(aps5_slice.x) * " + std::to_string(slice) + ";\n";
+    mesh += "        aps5_count[0] = uint(aps5_tess_window(aps5_patch, aps5_begin, min(" + std::to_string(slice) + ", aps5_total - aps5_begin), aps5_corners));\n";
+    mesh += "        atomic_store_explicit(&aps5_vertices[0], 0u, memory_order_relaxed);\n";
     mesh += "        aps5_mesh.set_primitive_count(aps5_count[0]);\n    }\n";
     mesh += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     mesh += "    const uint aps5_primitives = aps5_count[0];\n";
-    mesh += "    if (aps5_tid < aps5_primitives * " + U32(corners) + ") {\n";
+    // Vertex sharing within the slice: the first corner that uses a domain point owns its vertex
+    // (the domain program runs once per unique point); later corners index the owner's vertex.
+    mesh += "    const uint aps5_used = aps5_primitives * " + U32(corners) + ";\n";
+    mesh += "    if (aps5_tid < aps5_used) {\n";
+    mesh += "        uint aps5_owner = aps5_tid;\n";
+    mesh += "        for (uint s = 0u; s < aps5_tid; ++s) {\n            if (aps5_corners[s] == aps5_corners[aps5_tid]) { aps5_owner = s; break; }\n        }\n";
+    mesh += "        aps5_first[aps5_tid] = ushort(aps5_owner);\n";
+    mesh += "        if (aps5_owner == aps5_tid) aps5_slot[aps5_tid] = uchar(atomic_fetch_add_explicit(&aps5_vertices[0], 1u, memory_order_relaxed));\n";
+    mesh += "    }\n";
+    mesh += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    mesh += "    if (aps5_tid < aps5_used && aps5_first[aps5_tid] == aps5_tid) {\n";
     mesh += "        const Aps5TessPoint aps5_point = aps5_tess_point(aps5_patch, aps5_corners[aps5_tid]);\n";
     // Domain locations as the D3D11 reference: (u, v) and, for triangles, w = 1 - u - v.
     mesh += "        const float3 aps5_coord = float3(aps5_point.u, aps5_point.v, " + std::string(config.domain == T::Triangle ? "1.0f - aps5_point.u - aps5_point.v" : "0.0f") + ");\n";
     mesh += "        aps5_ds::Aps5VertexOut aps5_vertex = {};\n";
+    mesh += "#ifdef APS5_TESS_POINT_SIZE_FIELD\n        aps5_vertex.aps5_tess_point_size = 1.0f;\n#endif\n";
     mesh += "        aps5_ds::aps5_stage(aps5_ds_table, aps5_push, aps5_driver, aps5_payload.words[" + U32(MslAbi::TessellationPayloadPatchWord) + "], aps5_coord, aps5_lane, aps5_payload.words, aps5_vertex);\n";
-    mesh += "        aps5_mesh.set_vertex(aps5_tid, aps5_vertex);\n";
-    mesh += "        aps5_mesh.set_index(aps5_tid, uchar(aps5_tid));\n    }\n";
+    mesh += "        aps5_mesh.set_vertex(aps5_slot[aps5_tid], aps5_vertex);\n    }\n";
+    mesh += "    if (aps5_tid < aps5_used) aps5_mesh.set_index(aps5_tid, aps5_slot[aps5_first[aps5_tid]]);\n";
     mesh += "    if (aps5_tid < aps5_primitives) {\n        Aps5TessPrimitive aps5_primitive = {};\n        aps5_primitive.aps5_culled = false;\n        aps5_mesh.set_primitive(aps5_tid, aps5_primitive);\n    }\n}\n";
 
     result.object.source = std::move(object);

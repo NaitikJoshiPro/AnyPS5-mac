@@ -1254,6 +1254,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     record.firstIndex = call.first;
                     record.vertexOffset = call.vertexOffset;
                     record.firstInstance = call.firstInstance;
+                    record.minLevel = graphics.stages.tessellationMinLevel;
+                    record.maxLevel = graphics.stages.tessellationMaxLevel;
                     [cache.objectArguments setAddress:stream.Write(std::as_bytes(std::span(&record, 1)), 16u).address atIndex:Abi::Index(Abi::BufferIndex::TessellationDraw)];
                     [encoder drawMeshThreadgroups:MTLSizeMake(patches, call.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(linked->objectThreads, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(linked->meshThreads, 1, 1)];
                     stream.CountCommand();

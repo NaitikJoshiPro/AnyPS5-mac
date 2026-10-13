@@ -52,7 +52,11 @@ namespace ShaderRecompiler::MslAbi {
 // a mesh function (software tessellator + domain program). The object stage binds the hull
 // program's descriptor table at BufferIndex::TessellationHullTable and the TessellationDraw record
 // at BufferIndex::TessellationDraw; both stages read the object payload (TessellationPayload*).
-inline constexpr std::uint32_t Version = 7u;
+// Version 8: every tessellation domain, partitioning and output topology (DECISIONS D26): the
+// TessellationDraw record carries the VGT_HOS level clamps (minLevel/maxLevel, were reserved), the
+// isoline payload factors are in the tessellator's (density, detail) order, and a culled patch
+// launches no mesh threadgroup.
+inline constexpr std::uint32_t Version = 8u;
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -284,19 +288,23 @@ enum class Stage : std::uint32_t {
 // instance i: its local invocations fetch control point c's vertex id from the guest index buffer at
 // indexAddress (element firstIndex + p * inputControlPoints + c, plus vertexOffset) or, for a
 // non-indexed draw (indexSize 0), as firstIndex + p * inputControlPoints + c; the instance id is
-// firstInstance + i.
+// firstInstance + i. Version 8: minLevel and maxLevel are VGT_HOS_MIN/MAX_TESS_LEVEL; the object
+// stage clamps the factors of every patch its raw factors do not cull to [minLevel, maxLevel] (NaN
+// factors stay NaN) before the tessellator's own per-partitioning clamp.
 struct TessellationDraw {
     std::uint64_t indexAddress;
     std::uint32_t indexSize;
     std::uint32_t firstIndex;
     std::int32_t vertexOffset;
     std::uint32_t firstInstance;
-    std::uint32_t reserved[2];
+    float minLevel;
+    float maxLevel;
 };
 static_assert(std::is_standard_layout_v<TessellationDraw> && sizeof(TessellationDraw) == 32u);
 
-// Version 7: the object payload, in dwords: the raw tessellation factors as the hull program wrote
-// them (outer 0-3, inner 0-1; triangle inner at 4), the patch id, the patch's tessellated primitive
+// Version 7: the object payload, in dwords: the tessellation factors as the hull program wrote
+// them in the tessellator's order (outer 0-3, inner 0-1; triangle inner at 4; isoline density at 0
+// and detail at 1, the reverse of the ring; Version 8: clamped by the object stage), the patch id, the patch's tessellated primitive
 // count, then the hull outputs at TessellationPayloadHeaderWords + byte address / 4 (control point c
 // at c * control stride, patch constants at their own addresses).
 inline constexpr std::uint32_t TessellationPayloadFactorWords = 6u;
