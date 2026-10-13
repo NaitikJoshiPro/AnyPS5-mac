@@ -4,8 +4,9 @@
 // Metal recorder's snapshot cache (Recorder.mm ReusableDrawSnapshot) over a host import of write-watched memory
 // (GuestBufferMemory.mm: no-copy Metal buffers over 16 KiB pages). An input over the cap is bound in place and
 // sees CPU writes, one under it is snapshotted and does not, and the cap is cumulative over the layout's bindings.
-// Upstream's exits for a device without host imports or write watching (and its watched-only reuse check) are
-// requirements here: the Metal device has both, so a pass means every check ran.
+// Upstream's exits for a device without host imports or write watching are requirements here: the Metal device
+// has both, so a pass means every check ran. Its imports are compared, not watched (DECISIONS D19), so upstream's
+// watched-only reuse check becomes the check that no snapshot of the unwatched block is kept.
 // Expected values are upstream's.
 
 #include "RecorderTwinHarness.h"
@@ -108,8 +109,13 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Require(bindings->snapshots.size() == 1, "an input exceeding the draw snapshot cap was snapshotted");
         Require(bindings->snapshots[0].address == smallAddress, "the snapshotted input does not match the smaller buffer below the cap");
         Require(snapshotRecorder.ReusableDrawSnapshot(largeAddress, largeBytes) == nullptr, "an input exceeding the draw snapshot cap was kept in the snapshot cache");
-        Require(Watched(address, bytes), "the watched block is not watched: snapshot cache reuse not tested");
-        Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) != nullptr, "an input below the draw snapshot cap was not kept in the snapshot cache");
+        if (Watched(address, bytes)) {
+            Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) != nullptr, "an input below the draw snapshot cap was not kept in the snapshot cache");
+        } else {
+            // Metal host imports are compared, not watched (DECISIONS D19): the import unwatched the block, so no
+            // write generation proves a kept snapshot current and none may be kept.
+            Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) == nullptr, "a snapshot of unwatched memory was kept in the snapshot cache, where no write generation proves it current");
+        }
         const auto contents = bindings->snapshots[0].buffer->Bytes();
         Require(contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [](std::byte value) { return value == std::byte{0x11}; }), "a draw snapshot does not hold the guest bytes of its draw");
         std::memset(reinterpret_cast<void*>(smallAddress), 0x22, smallBytes);

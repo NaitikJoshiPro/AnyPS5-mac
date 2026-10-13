@@ -6,7 +6,8 @@
 // pending GPU writes and queued label stores; its read is noted on the open batch and retired with it; the highest
 // index of a kept index range is reused until a guest write changes it. Expected values are upstream's.
 // Upstream's "not tested" exits (no host imports, no write watching) are requirements here: the Metal device
-// has both, so a pass means every check ran.
+// has both. Its imports are compared, not watched (DECISIONS D19), so instead of upstream's kept-highest-index
+// checks (watched memory only) the twin checks that unwatched index ranges are rescanned at every use.
 // The Metal draw path (MetalDraw.mm) reads vertex and index memory through the device's guest page table rather
 // than through these primitives (TechnicalDebt metal-vulkan-internal-tests).
 
@@ -70,7 +71,31 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(unrecorded, vertices, 256, 4) == nullptr, "a draw without a recorder bound its input in place");
     recorder.Sync();
     Require(!recorder.PendingReadOverlaps(vertices, 256), "an in-place draw input's read outlived its batch");
-    Require(AgcDriver::GuestMemory::Watched(address, bytes), "host imports are compared, not watched: kept highest indices not tested");
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        // Metal host imports are compared, not watched (DECISIONS D19): the import unwatched the block, so no write
+        // generation proves a kept highest index current. Every use rescans, and sees guest writes.
+        const auto indices = address + 20480;
+        constexpr std::size_t kept = Recorder::KeptIndexRangeIndices * 2;
+        std::vector<std::uint16_t> first(Recorder::KeptIndexRangeIndices * 2, 1);
+        first[0] = 3;
+        first[1] = 9;
+        first[2] = 0xffff;
+        std::memcpy(reinterpret_cast<void*>(indices), first.data(), kept * 2);
+        auto range = InPlaceIndexRange(recorder, indices, kept, 2, false);
+        Require(!range.reused && range.highest == 0xffffu, "an in-place index range was not scanned at its first use");
+        range = InPlaceIndexRange(recorder, indices, kept, 2, false);
+        Require(!range.reused && range.highest == 0xffffu, "an in-place index range of unwatched memory was kept");
+        range = InPlaceIndexRange(recorder, indices, kept, 2, true);
+        Require(!range.reused && range.highest == 9u, "an in-place index range under the restart rule has the wrong highest index");
+        const std::uint16_t raised = 12;
+        std::memcpy(reinterpret_cast<void*>(indices + 2), &raised, sizeof(raised));
+        range = InPlaceIndexRange(recorder, indices, kept, 2, true);
+        Require(!range.reused && range.highest == 12u, "an in-place index range of unwatched memory missed a guest write");
+        range = InPlaceIndexRange(recorder, indices, kept * 2, 4, false);
+        Require(!range.reused && range.highest == 0x000c0003u, "a 32-bit in-place index range has the wrong highest index");
+        std::cout << "host imports are compared, not watched: kept highest indices are rescanned at every use\n";
+        return;
+    }
     const auto indices = address + 20480;
     constexpr std::size_t kept = Recorder::KeptIndexRangeIndices * 2;
     std::vector<std::uint16_t> first(Recorder::KeptIndexRangeIndices * 2, 1);
