@@ -208,3 +208,7 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Excluded: agc_driver_f16_denormal_flush_tests (caused the 2026-10-12 kernel panic). It needs a supervised run with the user warned.
 - Running: MSAA (MSAA render targets + resolves; draws still refuse samples>1, a gap the suite didn't catch), BUDGET (Metal device memory heap and budget).
 - Next: the f16 supervised run, merge mac-native-metal into mac-native, M3.
+
+## 2026-10-13 — supervised rerun of agc_driver_f16_denormal_flush_tests (user approved: "go")
+- This test caused the 2026-10-12 IOGPUFamily kernel panic. It now runs once, alone, via gpu_suite --validation, with the result in .mac-work/logs/gpu-suite/main-f16-supervised.
+- IF THE MAC REBOOTED and this is the last entry: the test panicked again. Quarantine it in tools/mac/gpu_quarantine.txt, keep .mac-work/feedback/FEEDBACK_REPORT.md current (a second occurrence), and tell the user.
