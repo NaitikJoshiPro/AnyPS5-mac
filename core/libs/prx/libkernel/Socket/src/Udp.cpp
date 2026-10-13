@@ -452,13 +452,23 @@ bool GuestSockets::Ready(int descriptor, bool write, std::int64_t* data, bool* e
     return true;
 }
 
-namespace {
-int socketFcntl(int descriptor, int command, int flags) {
+extern "C" {
+int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     std::lock_guard lock(socket->modeMutex);
     if (command == 3) return 2 | (socket->nonblocking ? 4 : 0); // F_GETFL, O_RDWR
     if (command != 4) return Fail(22);
+#if !APS5_GUEST_VA_LIST_IS_HOST
+    APS5_VA_BEGIN(command);
+    const int flags = LibcDetail::FormatArguments(args).Next<int>();
+    APS5_VA_END();
+#else
+    std::va_list arguments;
+    va_start(arguments, command);
+    const int flags = va_arg(arguments, int);
+    va_end(arguments);
+#endif
     if ((flags & ~7) != 0) return Fail(45);
 #ifdef _WIN32
     unsigned long enabled = (flags & 4) != 0;
@@ -469,38 +479,6 @@ int socketFcntl(int descriptor, int command, int flags) {
 #endif
     socket->nonblocking = enabled != 0;
     return 0;
-}
-}
-
-// The F_SETFL flags argument; the other commands socketFcntl takes have none.
-#if !APS5_GUEST_VA_LIST_IS_HOST
-#define APS5_FCNTL_FLAGS(command) \
-    int flags = 0; \
-    if ((command) == 4) { \
-        APS5_VA_BEGIN(command); \
-        flags = LibcDetail::FormatArguments(args).Next<int>(); \
-        APS5_VA_END(); \
-    }
-#else
-#define APS5_FCNTL_FLAGS(command) \
-    int flags = 0; \
-    if ((command) == 4) { \
-        std::va_list arguments; \
-        va_start(arguments, command); \
-        flags = va_arg(arguments, int); \
-        va_end(arguments); \
-    }
-#endif
-
-extern "C" {
-int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
-    APS5_FCNTL_FLAGS(command)
-    return socketFcntl(descriptor, command, flags);
-}
-// libkernel's _fcntl, the FreeBSD libc name of fcntl (the oops-sdk's fcntl wrapper calls it).
-int APS5_VABI _fcntl_nid_postfix(int descriptor, int command, ...) {
-    APS5_FCNTL_FLAGS(command)
-    return socketFcntl(descriptor, command, flags);
 }
 int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
                                     const void* value, std::uint32_t length) {
