@@ -35,6 +35,7 @@
 #include "PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
@@ -435,6 +436,58 @@ void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color, G
     GuestMemory::Write(color.cmaskAddress, expanded, Graphics::CmaskLayout::Alignment);
 }
 
+// DCC color targets (upstream Draw.cpp storeClearTexels / storeSingleTexels, CPU path): keys that
+// encode a fast clear (the clear register or a clear code) get the clear texel in guest memory,
+// comp-to-single keys get each 256-byte block's first texel, and the keys are left uncompressed
+// (0xff) before the draw loads the target, as upstream leaves them after its draw. Per-block
+// compressed keys are not modeled (upstream rejects them too).
+void VulkanDevice::State::MaterializeDcc(const Graphics::ColorTarget& color, Graphics::StorageTexture* resident) {
+    if (color.dccAddress == 0u) return;
+    const auto keyBytes = Graphics::DccKeyBytes(color.bytes);
+    const auto keyCount = color.mipCount != 1u || color.depth != 1u || !color.dccPipeAligned ? keyBytes : Graphics::DccKeyCount(Graphics::ColorTextureTileMode(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, color.bytes);
+    SettleRange(color.dccAddress, keyBytes);
+    const auto keys = Graphics::CurrentDccKeys(color.dccAddress, color.bytes);
+    if (keys == Graphics::DccKeys::Uncompressed) return;
+    const bool single = keys == Graphics::DccKeys::ClearSingle;
+    if (!single && !Graphics::IsDccClear(keys)) Fail(std::string("DCC keys that are ") + Graphics::DccKeysName(keys) + " (per-block metadata is not modeled)");
+    const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
+    if (elementBytes == 0u || elementBytes > 16u) Fail("unexpected color element size");
+    Graphics::StorageTexture::FlushPending(color.address, color.bytes, nullptr, "DCC materialization");
+    if (recorder->PendingWriteOverlaps(color.address, color.bytes)) {
+        Recorder::CountSync(2);
+        recorder->SyncThrough(color.address, color.bytes);
+    }
+    if (single) {
+        if (color.tileMode == Graphics::ColorTileMode::Linear) Fail("comp-to-single DCC keys of a linear color target");
+        const Graphics::ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, color.pipeBankXor);
+        if (surface.Bytes() != color.bytes) Fail("comp-to-single DCC keys over a color target whose layout differs from its surface");
+        std::vector<std::byte> texels(color.bytes);
+        GuestMemory::Read(color.address, texels, surface.Alignment());
+        constexpr std::size_t BlockBytes = 256;
+        for (std::uint32_t y = 0; y < color.extent.height; ++y) {
+            for (std::uint32_t x = 0; x < color.extent.width; ++x) {
+                const auto offset = surface.Offset(x, y);
+                const auto first = offset / BlockBytes * BlockBytes;
+                if (offset != first) std::memcpy(texels.data() + offset, texels.data() + first, elementBytes);
+            }
+        }
+        GuestMemory::Write(color.address, texels, surface.Alignment());
+    } else {
+        std::array<std::byte, 16> texel {};
+        if (keys == Graphics::DccKeys::ClearRegister) {
+            if (elementBytes > sizeof(color.clearWords)) Fail("the DCC register clear of a texel over 64 bits is not modeled");
+            std::memcpy(texel.data(), color.clearWords.data(), elementBytes);
+        } else if (!Graphics::FillDccClear(color.format, keys, color.dccAlphaOnMsb, std::span(texel.data(), elementBytes))) {
+            Fail("the target's format has no encoding of its DCC clear code");
+        }
+        std::vector<std::byte> texels(color.bytes);
+        for (std::size_t offset = 0; offset + elementBytes <= texels.size(); offset += elementBytes) std::memcpy(texels.data() + offset, texel.data(), elementBytes);
+        GuestMemory::Write(color.address, texels);
+    }
+    Graphics::MarkDccUncompressed(context, color.dccAddress, color.bytes, keyCount);
+    if (resident != nullptr) resident->Refresh();
+}
+
 id<MTLBuffer> VulkanDevice::State::BufferAt(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) {
     auto& state = *this;
     state.Wrap(address, bytes);
@@ -545,7 +598,6 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     for (const auto& target : graphics.colors) {
         if (target.exportIndex >= 8u) Fail("color target location " + std::to_string(target.exportIndex));
         if (target.samples > 1u) Fail("multisampled color targets");
-        if (target.dccAddress != 0u) Fail("DCC-compressed color targets");
         // Tiled targets are the image cache's resident images (upstream image path): their writes
         // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
         std::shared_ptr<Graphics::StorageTexture> resident;
@@ -561,7 +613,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 resident = Graphics::CachedStorageSurface(imageContext, SurfaceForTarget(target));
             }
             if (resident == nullptr || !resident->Attachable()) Fail("storage format cannot be a color attachment");
-            // CMASK fast clears land in guest memory, which the image then picks up (Refresh).
+            // CMASK fast clears and DCC clear keys land in guest memory, which the image then picks
+            // up (Refresh).
+            state.MaterializeDcc(target, resident.get());
             state.MaterializeCmask(target, resident.get());
         } else if (target.depth > 1u || target.arrayAddress != 0u || target.mip != 0u || target.mipCount > 1u) {
             Fail("linear color targets with mips, slices or array layers");
@@ -583,7 +637,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
 
     // CMASK fast clears land in guest memory before the targets load from it.
     for (const auto& attachment : colors) {
-        if (attachment.resident == nullptr) state.MaterializeCmask(*attachment.target, nullptr);
+        if (attachment.resident != nullptr) continue;
+        state.MaterializeDcc(*attachment.target, nullptr);
+        state.MaterializeCmask(*attachment.target, nullptr);
     }
 
     const StageBindings* plans[] = {&vertexPlan, &fragmentPlan, &targetPlan};
