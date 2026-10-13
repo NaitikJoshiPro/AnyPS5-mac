@@ -31,14 +31,14 @@ inline constexpr const char* Macro = "APS5_CONSERVATIVE";
 
 // Fields of the vertex output struct.
 inline std::string VertexOutputFields() {
-    return "    float4 aps5_cr01 [[user(aps5_cr01)]];\n"
-           "    float2 aps5_cr2 [[user(aps5_cr2)]];\n";
+    return "    float4 aps5_cr_01 [[user(aps5_cr_01)]];\n"
+           "    float2 aps5_cr_2 [[user(aps5_cr_2)]];\n";
 }
 
 // Fields of the fragment input struct (the same user names, flat).
 inline std::string FragmentInputFields() {
-    return "    float4 aps5_cr01 [[user(aps5_cr01), flat]];\n"
-           "    float2 aps5_cr2 [[user(aps5_cr2), flat]];\n";
+    return "    float4 aps5_cr_01 [[user(aps5_cr_01), flat]];\n"
+           "    float2 aps5_cr_2 [[user(aps5_cr_2), flat]];\n";
 }
 
 // Vertex stage, after aps5_out = aps5_v[aps5_corner].
@@ -55,8 +55,8 @@ inline std::string VertexText() {
             const float2 ndc = p.xy / p.w;
             aps5_s[i] = aps5_vp.xy + aps5_vp.zw * (1.0f + ndc) * 0.5f;
         }
-        aps5_out.aps5_cr01 = float4(aps5_s[0], aps5_s[1]);
-        aps5_out.aps5_cr2 = aps5_s[2];
+        aps5_out.aps5_cr_01 = float4(aps5_s[0], aps5_s[1]);
+        aps5_out.aps5_cr_2 = aps5_s[2];
 #if APS5_CONSERVATIVE == 1
         if (aps5_projected) {
             const float2 e1 = aps5_s[1] - aps5_s[0];
@@ -100,7 +100,7 @@ inline std::string VertexText() {
 // Fragment stage, before the guest body: discard the fragments the mode excludes.
 inline std::string FragmentText() {
     return R"(    {
-        const float2 aps5_t[3] = {aps5_in.aps5_cr01.xy, aps5_in.aps5_cr01.zw, aps5_in.aps5_cr2};
+        const float2 aps5_t[3] = {aps5_in.aps5_cr_01.xy, aps5_in.aps5_cr_01.zw, aps5_in.aps5_cr_2};
         const float2 aps5_c = aps5_in.aps5_position.xy;
         const float2 e1 = aps5_t[1] - aps5_t[0];
         const float2 e2 = aps5_t[2] - aps5_t[0];
@@ -145,6 +145,12 @@ inline std::string FragmentText() {
     }
 )";
 }
+
+// The names SHD3's MslEntryPoint.cpp calls (coord/m2.md ~06:20).
+inline std::string MslConservativeVertex() { return VertexText(); }
+inline std::string MslConservativeFragment() { return FragmentText(); }
+inline std::string MslConservativeVertexOutputFields() { return VertexOutputFields(); }
+inline std::string MslConservativeFragmentInputFields() { return FragmentInputFields(); }
 
 }
 
