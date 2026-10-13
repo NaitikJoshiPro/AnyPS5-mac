@@ -619,6 +619,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // half arithmetic rounds to nearest even and keeps f16 denormals on Apple GPUs (probe_float_b2),
             // so packed f16 add/mul run natively (FPAdd16x2/FPMul16x2, MslAluMath.cpp).
             for (const auto capability : {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve}) state->capabilities.push_back(static_cast<std::uint32_t>(capability));
+            // Vertex and mesh functions write [[render_target_array_index]] (layered draws, upstream #3763; the SPIR-V
+            // header names the layer export through SPV_EXT_shader_viewport_index_layer, as upstream's devices do).
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityShaderViewportIndexLayerEXT));
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
