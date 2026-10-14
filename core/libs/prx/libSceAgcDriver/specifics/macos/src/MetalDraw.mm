@@ -607,8 +607,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool cullTriangles = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassTriangle;
     const bool cullPoints = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassPoint;
     const bool triangleVertices = conservativeMode != 0u || perVertex || cullTriangles;
-    if ((mesh || tess) && triangleVertices) {
-        // The triangle-vertices mode (D20/D21) exists for vertex functions only; name what the draw needed.
+    // Mesh draws run per-vertex fragment inputs in the mesh function's triangle-vertices mode (MslAbi
+    // Version 13: unshared vertices, the subgroup split over the grid's z). Its conservative
+    // rasterization (D21's corner math needs the viewport record) is not written; mesh cull
+    // distances throw in the recompiler.
+    if ((mesh && conservativeMode != 0u) || (tess && triangleVertices)) {
+        // Name what the draw needed.
         char detail[160];
         std::snprintf(detail, sizeof(detail), " (per-vertex locations 0x%llx, emulated barycentrics 0x%x, conservative mode %u, cull distances %u)", static_cast<unsigned long long>(fragmentReflection != nullptr ? fragmentReflection->perVertexLocations : 0u), fragmentReflection != nullptr ? fragmentReflection->emulatedBarycentrics : 0u, conservativeMode, vertexReflection.cullDistances);
         Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws") + detail);
@@ -643,6 +647,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
     if (calls.empty()) return;
     Graphics::Metal::MeshDrawPlan meshPlan;
+    std::uint32_t meshSplits = 1u;
     if (mesh) {
         std::span<const std::byte> indices;
         if (draw.indexed) {
@@ -652,6 +657,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
         meshPlan = Graphics::Metal::PlanMeshDraw(graphics, draw, indices);
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
+        if (triangleVertices) {
+            meshSplits = Abi::MeshTriangleVerticesSplits(graphics.stages.mesh->maxPrimitives);
+            if (static_cast<std::uint64_t>(meshPlan.groups) * meshPlan.instances * meshSplits > Graphics::Metal::MaxMeshThreadgroupsPerGrid) Fail("a triangle-vertices mesh draw of " + std::to_string(meshPlan.groups) + " groups x " + std::to_string(meshPlan.instances) + " instances x " + std::to_string(meshSplits) + " splits exceeds the mesh grid");
+        }
     }
 
     if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
@@ -901,12 +910,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             request.vertex.macros.push_back({Abi::PerVertexLocationsHighMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations >> 32u)) + "u"});
             request.vertex.macros.push_back({Abi::BarycentricsMacro, std::to_string(fragmentReflection->emulatedBarycentrics) + "u"});
         }
+        // The vertex path rotates its expansion on the CPU; the mesh function rotates each primitive.
+        if (mesh && graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT) request.vertex.macros.push_back({Abi::ProvokingLastMacro, "1"});
     }
     if (graphics.negativeOneToOne) request.vertex.macros.push_back({Abi::DepthNegativeOneToOneMacro, "1"});
     if (graphics.windowSpacePosition) {
         // The window-space epilogue is in the vertex and mesh stage functions; the tessellation
         // pipeline's domain output and the triangle-vertices corner math work on clip positions.
-        if (tess || triangleVertices) throw std::runtime_error(std::string("Metal draw: window-space positions (PA_CL_VTE_CNTL 0x300) with ") + (tess ? "tessellation" : "a triangle-vertices draw") + " are not implemented");
+        // The mesh function's triangle-vertices mode remaps each staged vertex before it is copied.
+        if (tess || (triangleVertices && !mesh)) throw std::runtime_error(std::string("Metal draw: window-space positions (PA_CL_VTE_CNTL 0x300) with ") + (tess ? "tessellation" : "a triangle-vertices draw") + " are not implemented");
         request.vertex.macros.push_back({Abi::WindowSpaceMacro, "1"});
         request.vertex.macros.push_back({Abi::WindowSpaceWidthMacro, std::to_string(static_cast<std::uint32_t>(graphics.viewport.width))});
         request.vertex.macros.push_back({Abi::WindowSpaceHeightMacro, std::to_string(static_cast<std::uint32_t>(graphics.viewport.height))});
@@ -1398,7 +1410,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
         const auto& drawCalls = expanded ? fanCalls : calls;
         const bool indexedDraw = (draw.indexed || expanded) && !triangleVertices;
-        if (triangleVertices) {
+        if (triangleVertices && !mesh) {
             // The triangle-vertices table (MslAbi v5, vertex slot TriangleVertices): the header, then
             // every triangle's guest vertex ids (the expansion's lists with each call's base vertex),
             // drawn non-indexed: host vertex v of a call starting at table index f is v = f + i.
@@ -1466,8 +1478,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     continue;
                 }
                 if (mesh) {
-                    // Grid (mesh groups, instances): the mesh function's WorkgroupId x and y.
-                    [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
+                    // Grid (mesh groups, instances, splits): the mesh function's WorkgroupId x and y;
+                    // z splits each subgroup's triangles in the triangle-vertices mode (MslAbi v13).
+                    [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, meshSplits) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
                     stream.CountCommand();
                     ++recorded;
                     held->objects.push_back(pass.pipeline);
