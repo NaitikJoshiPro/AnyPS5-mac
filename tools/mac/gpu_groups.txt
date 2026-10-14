@@ -239,6 +239,7 @@ agc_driver_permlane16 G1
 agc_driver_read_first_lane G1
 agc_driver_read_lane G1
 agc_driver_relative_indexing G1
+agc_driver_replaced_device_imports G1
 agc_driver_runtime_images G1
 agc_driver_scalar_bit_count G1
 agc_driver_scalar_getreg G1

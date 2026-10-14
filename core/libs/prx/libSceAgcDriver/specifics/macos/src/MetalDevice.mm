@@ -187,6 +187,26 @@ id<MTLDevice> SelectDevice() {
     throw std::runtime_error(std::string("Metal device: no usable device whose name contains ANYPS5_GPU=\"") + requested + "\"; devices: " + names);
 }
 
+// One Metal 4 command queue per MTLDevice, shared by every VulkanDevice made on it. The driver
+// replaces its windowless device with a windowed one when VideoOut attaches a window
+// (Driver::AttachWindow), and state keyed by the MTLDevice outlives the replacement: the host
+// imports (GuestBufferMemory.mm) and the objects the first device made attach their residency sets
+// to the queue that was current when they were made. With a queue per device, the replacement's
+// command buffers ran without those sets: its label stores and every other access through such an
+// import went to non-resident memory (reads 0, writes lost; PPSA99005's completion markers never
+// reached the CPU). Upstream's VkDevice differs per VulkanDevice, which resets that state instead.
+id<MTL4CommandQueue> SharedQueue(id<MTLDevice> device) {
+    static std::mutex mutex;
+    static std::vector<std::pair<id<MTLDevice>, id<MTL4CommandQueue>>> queues;
+    std::lock_guard lock(mutex);
+    for (const auto& [owner, queue] : queues) {
+        if (owner == device) return queue;
+    }
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    if (queue != nil) queues.emplace_back(device, queue);
+    return queue;
+}
+
 std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
     return shader.msl.Reflection().workgroupMemoryStrideDwords;
 }
@@ -629,7 +649,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
-            state->queue = [state->device newMTL4CommandQueue];
+            state->queue = SharedQueue(state->device);
             MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
             residency.initialCapacity = 64;
             state->residency = [state->device newResidencySetWithDescriptor:residency error:&error];
