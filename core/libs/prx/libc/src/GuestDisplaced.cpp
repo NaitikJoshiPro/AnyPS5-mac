@@ -11,6 +11,7 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <dlfcn.h>
 #include <mutex>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -369,21 +370,35 @@ void Chain(int signal, siginfo_t* info, void* context) {
     std::signal(signal, SIG_DFL);
 }
 
+// One frame as image+offset (dladdr: not async-signal-safe, acceptable for this opt-in debug aid) or a bare address
+// (JIT code). Symbolize the offsets offline with atos -l 0 against the image.
+int Frame(char* out, std::size_t size, std::uintptr_t address) {
+    Dl_info image{};
+    if (dladdr(reinterpret_cast<const void*>(address), &image) != 0 && image.dli_fname != nullptr && image.dli_fbase != nullptr) {
+        const char* name = std::strrchr(image.dli_fname, '/');
+        return std::snprintf(out, size, " %s+0x%llx", name != nullptr ? name + 1 : image.dli_fname,
+            static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(image.dli_fbase)));
+    }
+    return std::snprintf(out, size, " 0x%llx", static_cast<unsigned long long>(address));
+}
+
 // Who drives a fault storm: pc, lr and the frame-pointer chain of the faulting thread, walked only inside its own
-// stack (JIT code may use x29 for anything). Symbolize offline with atos against the binary images of a sample.
+// stack (JIT code may use x29 for anything).
 void Backtrace(std::uint64_t fault, std::uintptr_t pc, std::uint32_t insn, const siginfo_t* info, const __darwin_mcontext64* machine) {
-    char line[640];
-    int length = std::snprintf(line, sizeof(line), "[displaced] stack of fault %llu: insn 0x%08x addr 0x%llx pc 0x%llx lr 0x%llx", static_cast<unsigned long long>(fault), insn,
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)), static_cast<unsigned long long>(pc),
-        static_cast<unsigned long long>(arm_thread_state64_get_lr(machine->__ss)));
+    char line[1536];
+    int length = std::snprintf(line, sizeof(line), "[displaced] stack of fault %llu: insn 0x%08x addr 0x%llx pc", static_cast<unsigned long long>(fault), insn,
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
+    length += Frame(line + length, sizeof(line) - static_cast<std::size_t>(length), pc);
+    length += std::snprintf(line + length, sizeof(line) - static_cast<std::size_t>(length), " lr");
+    length += Frame(line + length, sizeof(line) - static_cast<std::size_t>(length), static_cast<std::uintptr_t>(arm_thread_state64_get_lr(machine->__ss)));
     const auto self = pthread_self();
     const auto top = reinterpret_cast<std::uintptr_t>(pthread_get_stackaddr_np(self));
     const auto bottom = top - pthread_get_stacksize_np(self);
     auto fp = static_cast<std::uintptr_t>(arm_thread_state64_get_fp(machine->__ss));
-    for (int depth = 0; depth < 16 && length > 0 && length < static_cast<int>(sizeof(line)) - 24; ++depth) {
+    for (int depth = 0; depth < 16 && length > 0 && length < static_cast<int>(sizeof(line)) - 96; ++depth) {
         if (fp < bottom || fp + 16 > top || (fp & 15u) != 0) break;
         const auto* frame = reinterpret_cast<const std::uintptr_t*>(fp);
-        length += std::snprintf(line + length, sizeof(line) - static_cast<std::size_t>(length), " 0x%llx", static_cast<unsigned long long>(frame[1]));
+        length += Frame(line + length, sizeof(line) - static_cast<std::size_t>(length), frame[1]);
         if (frame[0] <= fp) break;
         fp = frame[0];
     }
