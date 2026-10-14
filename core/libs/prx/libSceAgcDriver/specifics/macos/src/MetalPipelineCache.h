@@ -15,14 +15,20 @@
 //   APS5_NO_PIPELINE_CACHE=1         no archive (memory cache only)
 //   APS5_PROFILE_PIPELINES=1         one line per compiled pipeline and a summary at destruction
 //   MTL_SHADER_VALIDATION=1          no archive (instrumented binaries do not reload on 27.0.1)
+//   APS5_METAL_UNIQUE_LIBRARIES=1    measurement aid: library sources made unique per process (cold)
+// and the library store's (MetalLibraryStore.h, DECISIONS D55): every MSL library source is kept
+// under <dir>/libraries and compiled again on a background thread when the next process creates
+// the device, so libraries reach the system compiler cache (and this cache) before they are used.
 // Objective-C++ only.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "MetalLibraryStore.h"
 #include "Recompiler.hpp"
 #include <array>
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -63,6 +69,13 @@ struct PipelineCacheStatistics {
     std::string archivePath;
     // Why there is no archive although a directory was given (empty: there is one, or none asked).
     std::string archiveDisabled;
+    // The library store (D55): libraries read from it at startup, compiled ahead of use by the
+    // prewarm thread, and requests that found their library compiled or compiling by it.
+    std::string libraryStorePath;
+    std::uint64_t librariesStored = 0;
+    std::uint64_t librariesPrewarmed = 0;
+    std::uint64_t prewarmHits = 0;
+    bool prewarmFinished = false;
 };
 
 // One shader function of a pipeline: an emitted MSL library, the values of the function constants
@@ -148,8 +161,14 @@ public:
     // The device's compiler (created here, with the archive serializer attached).
     id<MTL4Compiler> Compiler() const { return compiler; }
 
-    // The library of an emitted shader (compiled once per source + macro set).
+    // The library of an emitted shader (compiled once per source + macro set; a compile the prewarm
+    // thread runs is waited for, not repeated).
     id<MTLLibrary> Library(const ShaderRecompiler::MslShader& shader, const std::vector<std::pair<std::string, std::string>>& macros = {});
+    // Waits until the prewarm thread has compiled every stored library (tests).
+    void WaitForPrewarm();
+    // Libraries and prewarms are shared by every cache on one MTLDevice (process-wide); tests that
+    // stand for a new process forget them.
+    static void ForgetSharedLibraries();
 
     // The compute pipeline of a kernel with its function constants; waits for a background task
     // that builds it, compiles it on this thread otherwise. Throws std::runtime_error naming D5.
@@ -188,7 +207,12 @@ public:
 
 private:
     struct Entry;
+    struct LibraryTask;
     std::shared_ptr<Entry> entryFor(const std::string& key, bool* created);
+    // Library(): `prewarm` compiles a stored library ahead of use (returns nil instead of throwing,
+    // and skips sources another thread compiles).
+    id<MTLLibrary> library(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool prewarm);
+    void prewarm(std::vector<StoredLibrary> stored);
     id<MTLComputePipelineState> buildCompute(const PipelineFunction& function);
     id<MTLRenderPipelineState> buildRender(const RenderPipelineRequest& request);
     id<MTLRenderPipelineState> buildMeshRender(const RenderPipelineRequest& request);
@@ -218,6 +242,10 @@ private:
     // ASTRO BOT, once saves became eager). Compiles hold this gate shared, the flush exclusively.
     std::shared_mutex serializerGate;
     std::unordered_map<std::string, id<MTLLibrary>> libraries;
+    std::unique_ptr<MetalLibraryStore> store;
+    std::thread prewarmThread;
+    std::atomic<bool> prewarmStop{false};
+    std::condition_variable prewarmDone;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries;
     std::vector<std::pair<DepthStencilRequest, id<MTLDepthStencilState>>> depthStencilStates;
     // Every pipeline this cache built or took from the archive (D51). The serializer only captures

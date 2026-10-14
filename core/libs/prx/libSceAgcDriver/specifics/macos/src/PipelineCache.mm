@@ -4,8 +4,11 @@
 
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <condition_variable>
 #include <algorithm>
 #include <atomic>
+#include <unordered_set>
 #include <memory>
 #include <chrono>
 #include <string>
@@ -96,11 +99,6 @@ std::filesystem::path DefaultDirectory() {
     return shaders / "metal";
 }
 
-MTLLanguageVersion Language(const ShaderRecompiler::MslShader&) {
-    // The MSL version the backend emits (MslAbi::LanguageMajor/Minor), as MetalDevice.mm's ShaderLanguage().
-    return static_cast<MTLLanguageVersion>((ShaderRecompiler::MslAbi::LanguageMajor << 16u) | ShaderRecompiler::MslAbi::LanguageMinor);
-}
-
 void AppendColor(std::string& key, const ColorAttachmentState& color) {
     key += std::to_string(color.format);
     if (color.format == MTLPixelFormatInvalid) {
@@ -128,6 +126,34 @@ void AppendFunction(std::string& key, const PipelineFunction& function) {
 
 }
 
+struct PipelineCache::LibraryTask {
+    std::mutex mutex;
+    std::condition_variable done;
+    bool finished = false;
+    id<MTLLibrary> library = nil;
+    std::string failure;
+};
+
+namespace {
+
+// Libraries compiled or compiling for an MTLDevice, shared by every PipelineCache on it (a replaced
+// windowless device and its windowed replacement, D43): neither compiles a library the other has,
+// and one prewarm per MTLDevice. Never destroyed (exit handlers tear devices down after static
+// destructors).
+struct SharedLibraries {
+    std::mutex mutex;
+    std::unordered_map<std::string, id<MTLLibrary>> libraries;
+    std::unordered_map<std::string, std::shared_ptr<void>> tasks;
+    std::unordered_set<std::uint64_t> prewarmed;
+};
+
+SharedLibraries& Shared() {
+    static auto* shared = new SharedLibraries;
+    return *shared;
+}
+
+}
+
 struct PipelineCache::Entry {
     std::mutex mutex;
     std::condition_variable done;
@@ -149,6 +175,9 @@ PipelineFunction PipelineFunction::From(const ShaderRecompiler::RecompileResult&
 PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directory) : device(device) {
     if (device == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no Metal device");
     if (directory.empty()) directory = DefaultDirectory();
+    // The library store keeps sources, which shader validation does not change (it instruments
+    // pipelines), so it is used under MTL_SHADER_VALIDATION too.
+    const auto storeDirectory = MetalLibraryStore::DefaultDirectory(directory);
     if (ShaderValidation()) {
         if (!directory.empty() && Profile()) std::fprintf(stderr, "[metal-pipelines] no archive under MTL_SHADER_VALIDATION\n");
         directory.clear();
@@ -202,6 +231,29 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
     compiler = [device newCompilerWithDescriptor:compilerDescriptor error:&error];
     if (compiler == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no shader compiler: " + Describe(error));
 
+    // The library store (D55) and its prewarm thread: one thread at background QoS, so it neither
+    // takes the pipeline workers from the guest's draws nor a performance core from the guest.
+    store = std::make_unique<MetalLibraryStore>(storeDirectory, MetalLibraryStore::DefaultByteLimit());
+    if (store->Enabled()) {
+        statistics.libraryStorePath = store->Directory().string();
+        auto stored = store->Load();
+        statistics.librariesStored = stored.size();
+        if (Profile()) std::fprintf(stderr, "[metal-pipelines] library store %s: %zu libraries\n", store->Directory().c_str(), stored.size());
+        bool first = false;
+        if (!stored.empty() && MetalLibraryStore::PrewarmEnabled()) {
+            auto& shared = Shared();
+            std::lock_guard lock(shared.mutex);
+            first = shared.prewarmed.insert(device.registryID).second;
+        }
+        if (first) {
+            prewarmThread = std::thread([this, stored = std::move(stored)]() mutable { prewarm(std::move(stored)); });
+        } else {
+            statistics.prewarmFinished = true;
+        }
+    } else {
+        statistics.prewarmFinished = true;
+    }
+
     // Background workers: as many as the device compiles concurrently, at most 3 (the guest's own
     // threads keep the performance cores), at utility QoS so they prefer the efficiency cores.
     const auto count = std::clamp<std::size_t>(device.maximumConcurrentCompilationTaskCount, 1u, 3u);
@@ -210,6 +262,8 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
 }
 
 PipelineCache::~PipelineCache() {
+    prewarmStop.store(true, std::memory_order_release);
+    if (prewarmThread.joinable()) prewarmThread.join();
     {
         std::lock_guard lock(queueMutex);
         stopping = true;
@@ -229,22 +283,66 @@ PipelineCache::~PipelineCache() {
             static_cast<unsigned long long>(stats.librariesCompiled), static_cast<unsigned long long>(stats.libraryHits), static_cast<unsigned long long>(stats.pipelinesCompiled), static_cast<unsigned long long>(stats.archiveHits),
             static_cast<unsigned long long>(stats.memoryHits), static_cast<unsigned long long>(stats.backgroundTasks), static_cast<unsigned long long>(stats.waits), stats.waitMilliseconds, stats.compileMilliseconds,
             stats.archivePath.empty() ? "(none)" : stats.archivePath.c_str(), stats.archiveLoaded ? " (loaded)" : "", static_cast<unsigned long long>(stats.archiveSaves));
+        std::fprintf(stderr, "[metal-pipelines] library store %s: %llu stored at start, %llu prewarmed, %llu requests served by the prewarm\n", stats.libraryStorePath.empty() ? "(none)" : stats.libraryStorePath.c_str(),
+            static_cast<unsigned long long>(stats.librariesStored), static_cast<unsigned long long>(stats.librariesPrewarmed), static_cast<unsigned long long>(stats.prewarmHits));
     }
 }
 
 id<MTLLibrary> PipelineCache::Library(const ShaderRecompiler::MslShader& shader, const std::vector<std::pair<std::string, std::string>>& macros) {
-    std::string key = "msl" + std::to_string(ShaderRecompiler::MslAbi::LanguageMajor) + "." + std::to_string(ShaderRecompiler::MslAbi::LanguageMinor) + "\n" + shader.source;
+    return library(shader.source, macros, false);
+}
+
+id<MTLLibrary> PipelineCache::library(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool prewarm) {
+    std::string key = "msl" + std::to_string(ShaderRecompiler::MslAbi::LanguageMajor) + "." + std::to_string(ShaderRecompiler::MslAbi::LanguageMinor) + "\n" + source;
     for (const auto& [name, value] : macros) key += "\n#" + name + "=" + value;
+    std::shared_ptr<LibraryTask> task;
+    bool owner = false;
     {
         std::lock_guard lock(mutex);
         if (const auto found = libraries.find(key); found != libraries.end()) {
-            ++statistics.libraryHits;
+            if (!prewarm) ++statistics.libraryHits;
             return found->second;
         }
     }
+    const std::string sharedKey = std::to_string(device.registryID) + "\n" + key;
+    {
+        auto& shared = Shared();
+        std::lock_guard lock(shared.mutex);
+        if (const auto found = shared.libraries.find(sharedKey); found != shared.libraries.end()) {
+            id<MTLLibrary> library = found->second;
+            std::lock_guard own(mutex);
+            if (!prewarm) ++statistics.libraryHits;
+            libraries.emplace(key, library);
+            return library;
+        }
+        if (const auto running = shared.tasks.find(sharedKey); running != shared.tasks.end()) {
+            task = std::static_pointer_cast<LibraryTask>(running->second);
+        } else {
+            task = std::make_shared<LibraryTask>();
+            shared.tasks.emplace(sharedKey, task);
+            owner = true;
+        }
+    }
+    if (!owner) {
+        // Another thread (the prewarm thread, or a draw) compiles this library: wait for it.
+        if (prewarm) return nil;
+        std::unique_lock wait(task->mutex);
+        task->done.wait(wait, [&] { return task->finished; });
+        if (task->library == nil) throw std::runtime_error(task->failure);
+        std::lock_guard lock(mutex);
+        ++statistics.prewarmHits;
+        libraries.emplace(key, task->library);
+        return task->library;
+    }
+    const StoredLibrary stored{ShaderRecompiler::MslAbi::LanguageMajor, ShaderRecompiler::MslAbi::LanguageMinor, macros, source};
+    // Recorded before the compile: a guest that gives up while it runs still leaves it for the next
+    // process to compile ahead of use.
+    if (!prewarm) store->Record(stored);
+    id<MTLLibrary> compiled = nil;
+    std::string failure;
     @autoreleasepool {
         MTLCompileOptions* options = [MTLCompileOptions new];
-        options.languageVersion = Language(shader);
+        options.languageVersion = static_cast<MTLLanguageVersion>((ShaderRecompiler::MslAbi::LanguageMajor << 16u) | ShaderRecompiler::MslAbi::LanguageMinor);
         options.mathMode = MTLMathModeSafe;
         options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
         if (!macros.empty()) {
@@ -254,33 +352,111 @@ id<MTLLibrary> PipelineCache::Library(const ShaderRecompiler::MslShader& shader,
         }
         // Debug aid (APS5_METAL_DUMP_MSL=<dir>): every compiled library's source, its macros first
         // as #defines, written to <dir>/library_<n>.metal.
-        if (const char* dumpDir = std::getenv("APS5_METAL_DUMP_MSL"); dumpDir != nullptr && *dumpDir != '\0') {
+        if (const char* dumpDir = std::getenv("APS5_METAL_DUMP_MSL"); !prewarm && dumpDir != nullptr && *dumpDir != '\0') {
             static std::atomic<unsigned> dumped{0};
             const auto path = std::string(dumpDir) + "/library_" + std::to_string(dumped.fetch_add(1)) + ".metal";
             if (std::FILE* file = std::fopen(path.c_str(), "w"); file != nullptr) {
                 for (const auto& [name, value] : macros) std::fprintf(file, "#define %s %s\n", name.c_str(), value.c_str());
-                std::fputs(shader.source.c_str(), file);
+                std::fputs(source.c_str(), file);
                 std::fclose(file);
                 std::fprintf(stderr, "[metal] MSL library written to %s\n", path.c_str());
             }
         }
         MTL4LibraryDescriptor* descriptor = [MTL4LibraryDescriptor new];
-        descriptor.source = [NSString stringWithUTF8String:shader.source.c_str()];
+        // Measurement aid (APS5_METAL_UNIQUE_LIBRARIES=1): every compiled source gets a comment unique
+        // to the process, so neither the system compiler cache nor an earlier run serves it (cold
+        // compile times; combine with APS5_NO_LIBRARY_CACHE=1).
+        static const bool unique = [] {
+            const char* value = std::getenv("APS5_METAL_UNIQUE_LIBRARIES");
+            return value != nullptr && value[0] == '1';
+        }();
+        static const std::string uniqueComment = "\n// aps5 unique " + std::to_string(::getpid()) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "\n";
+        descriptor.source = [NSString stringWithUTF8String:(unique ? source + uniqueComment : source).c_str()];
         descriptor.options = options;
         NSError* error = nil;
         const auto start = std::chrono::steady_clock::now();
-        const SlowCompileReport report("an MSL library", shader.source.size());
-        std::shared_lock gate(serializerGate);
-        id<MTLLibrary> library = [compiler newLibraryWithDescriptor:descriptor error:&error];
-        if (library == nil) {
-            std::fprintf(stderr, "[metal] MSL compile failed:\n%s\n", shader.source.c_str());
-            throw std::runtime_error("Metal device: MSL compile failed: " + Describe(error));
+        const SlowCompileReport report(prewarm ? "a stored MSL library (prewarm)" : "an MSL library", source.size());
+        {
+            std::shared_lock gate(serializerGate);
+            compiled = [compiler newLibraryWithDescriptor:descriptor error:&error];
+        }
+        if (compiled == nil) {
+            failure = "Metal device: MSL compile failed: " + Describe(error);
+            store->Forget(stored);
+            if (!prewarm) std::fprintf(stderr, "[metal] MSL compile failed:\n%s\n", source.c_str());
+            else std::fprintf(stderr, "[metal-pipelines] a stored library no longer compiles (dropped): %s\n", Describe(error).c_str());
+        }
+        {
+            auto& shared = Shared();
+            std::lock_guard lock(shared.mutex);
+            if (compiled != nil) shared.libraries.emplace(sharedKey, compiled);
+            shared.tasks.erase(sharedKey);
         }
         std::lock_guard lock(mutex);
-        ++statistics.librariesCompiled;
-        statistics.compileMilliseconds += Milliseconds(start);
-        return libraries.emplace(std::move(key), library).first->second;
+        if (compiled != nil) {
+            if (prewarm) ++statistics.librariesPrewarmed;
+            else ++statistics.librariesCompiled;
+            statistics.compileMilliseconds += Milliseconds(start);
+            libraries.emplace(key, compiled);
+        }
     }
+    {
+        std::lock_guard lock(task->mutex);
+        task->library = compiled;
+        task->failure = failure;
+        task->finished = true;
+    }
+    task->done.notify_all();
+    if (compiled == nil && !prewarm) throw std::runtime_error(failure);
+    return compiled;
+}
+
+void PipelineCache::prewarm(std::vector<StoredLibrary> stored) {
+    // Library compiles run concurrently in the compiler service (agc_metal_msl_corpus parallel
+    // probe: 1.9x with 2 threads, about 3x with 4 through one MTL4Compiler), so the stored libraries
+    // are compiled by as many background threads as the device compiles at once, at most 4.
+    const auto start = std::chrono::steady_clock::now();
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> compiled{0};
+    auto run = [&] {
+        pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+        for (std::size_t index = next.fetch_add(1); index < stored.size(); index = next.fetch_add(1)) {
+            if (prewarmStop.load(std::memory_order_acquire)) break;
+            const auto& library = stored[index];
+            if (library.languageMajor != ShaderRecompiler::MslAbi::LanguageMajor || library.languageMinor != ShaderRecompiler::MslAbi::LanguageMinor) {
+                store->Forget(library);
+                continue;
+            }
+            try {
+                if (this->library(library.source, library.macros, true) != nil) compiled.fetch_add(1);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[metal-pipelines] prewarm: %s\n", error.what());
+            }
+        }
+    };
+    const auto threads = std::clamp<std::size_t>(std::min<std::size_t>(device.maximumConcurrentCompilationTaskCount, stored.size()), 1u, 4u);
+    std::vector<std::thread> helpers;
+    for (std::size_t index = 1; index < threads; ++index) helpers.emplace_back(run);
+    run();
+    for (auto& helper : helpers) helper.join();
+    if (Profile()) std::fprintf(stderr, "[metal-pipelines] prewarm compiled %zu of %zu stored libraries on %zu threads in %.1f ms\n", compiled.load(), stored.size(), threads, Milliseconds(start));
+    {
+        std::lock_guard lock(mutex);
+        statistics.prewarmFinished = true;
+    }
+    prewarmDone.notify_all();
+}
+
+void PipelineCache::ForgetSharedLibraries() {
+    auto& shared = Shared();
+    std::lock_guard lock(shared.mutex);
+    shared.libraries.clear();
+    shared.prewarmed.clear();
+}
+
+void PipelineCache::WaitForPrewarm() {
+    std::unique_lock lock(mutex);
+    prewarmDone.wait(lock, [&] { return statistics.prewarmFinished; });
 }
 
 MTL4FunctionDescriptor* PipelineCache::functionDescriptor(const PipelineFunction& function) {
