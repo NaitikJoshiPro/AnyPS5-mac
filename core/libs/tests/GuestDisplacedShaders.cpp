@@ -30,6 +30,8 @@ int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_
 int APS5_VABI sceAgcLinkShaders(ShaderRegister* context, ShaderRegister* primitive, const void* reserved, const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType);
 int APS5_VABI sceAgcGetGsPrimPayload(std::uint32_t* payload, const Shader* gs);
 int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, std::uint32_t budget, float factor);
+std::uint32_t APS5_VABI sceAgcDriverWaitUntilSafeForRendering(std::uint32_t** command, std::uint32_t capacity, std::uint32_t mode, std::uint32_t handle, int index);
+std::uint32_t APS5_VABI sceAgcDriverGetWaitRenderingPacketSizeInDwords();
 }
 
 namespace {
@@ -357,6 +359,20 @@ int main() {
             std::snprintf(where, sizeof(where), "0x%llx: ", static_cast<unsigned long long>(base));
             Require(faults == 0, std::string(where) + std::to_string(faults) + " displaced faults: a shader function read guest memory through the guest address");
             Require(results.bytes == expected.bytes, std::string(where) + "results differ from the same shaders in ordinary memory");
+            // The driver's rendering-wait packet: the command slot and the packet both in displaced memory.
+            {
+                auto** slot = reinterpret_cast<std::uint32_t**>(base + Bytes - 0x100);
+                auto* packet = reinterpret_cast<std::uint32_t*>(base + Bytes - 0x80);
+                auto** slotHost = GuestArena::HostPointer(slot);
+                *slotHost = packet;
+                const auto words = sceAgcDriverGetWaitRenderingPacketSizeInDwords();
+                const auto waitBefore = Faults();
+                Require(sceAgcDriverWaitUntilSafeForRendering(slot, words, 0, 7, 2) == 0, "sceAgcDriverWaitUntilSafeForRendering failed");
+                Require(Faults() == waitBefore, std::string(where) + "sceAgcDriverWaitUntilSafeForRendering faulted on displaced memory");
+                Require(*slotHost == packet + words, "the command pointer did not advance by the packet (as a guest pointer)");
+                const auto* packetHost = GuestArena::HostPointer(packet);
+                Require(packetHost[1] == 7 && packetHost[2] == 2 && packetHost[3] == 0, "the rendering-wait packet has the wrong payload");
+            }
             Require(sceKernelMunmap(fixed, Bytes) == 0, "munmap");
             std::printf("displaced shaders at 0x%llx: 0 faults, results match ordinary memory\n", static_cast<unsigned long long>(base));
         }

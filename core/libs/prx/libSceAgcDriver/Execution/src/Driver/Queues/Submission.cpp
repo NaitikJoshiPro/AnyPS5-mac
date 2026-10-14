@@ -393,8 +393,9 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
         if (std::find(submission.labelWrites.begin(), submission.labelWrites.end(), dword) != submission.labelWrites.end()) return;
         if (worker != workers.end() && worker->second.unfinishedWrites.contains(dword)) return;
     }
-    std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(address);
-    if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address + 4)) << 32u;
+    const auto label = GuestArena::HostRange(static_cast<std::uintptr_t>(address), bytes); // alias if displaced (D31, D33)
+    std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(label);
+    if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(label + 4)) << 32u;
     if (Pm4::WaitComparesValue(packet, value)) submission.heldAtSubmit.insert(cursor);
 }
 
