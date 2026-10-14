@@ -54,18 +54,20 @@ std::uint32_t available(const CommandBuffer& buffer, const char* function) {
 
 void Reserve(CommandBuffer* buffer, std::uint32_t count, const char* function) {
     Require(buffer != nullptr && count != 0, function, "null command buffer or empty allocation");
-    if (available(*buffer, function) < count) {
-        Require(buffer->callback != nullptr, function, "command buffer exhausted");
-        Require(count <= std::numeric_limits<std::uint32_t>::max() - buffer->reserved_dw, function, "command buffer allocation overflow");
-        Require(buffer->callback(buffer, count + buffer->reserved_dw, buffer->user_data), function, "command buffer allocation callback failed");
-        Require(available(*buffer, function) >= count, function, "command buffer allocation callback returned insufficient space");
+    auto* host = Host(buffer);
+    if (available(*host, function) < count) {
+        Require(host->callback != nullptr, function, "command buffer exhausted");
+        Require(count <= std::numeric_limits<std::uint32_t>::max() - host->reserved_dw, function, "command buffer allocation overflow");
+        Require(host->callback(buffer, count + host->reserved_dw, host->user_data), function, "command buffer allocation callback failed");
+        Require(available(*host, function) >= count, function, "command buffer allocation callback returned insufficient space");
     }
 }
 
 std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function) {
     Reserve(buffer, count, function);
-    auto* result = buffer->cursor_up;
-    buffer->cursor_up += count;
+    auto* host = Host(buffer);
+    auto* result = host->cursor_up;
+    host->cursor_up += count;
     return result;
 }
 
@@ -73,23 +75,25 @@ std::uint32_t* Emit(CommandBuffer* buffer, std::uint32_t opcode, std::initialize
     Require(payload.size() <= 0x4000u, function, "packet payload exceeds maximum size");
     const auto count = static_cast<std::uint32_t>(payload.size()) + 1u;
     const auto header = Header(opcode, count);
-    auto* packet = Allocate(buffer, count, function);
+    auto* const guest = Allocate(buffer, count, function);
+    auto* packet = Host(guest);
     packet[0] = header;
     std::copy(payload.begin(), payload.end(), packet + 1);
-    return packet;
+    return guest;
 }
 
 void ValidatePacket(const std::uint32_t* packet, std::uint32_t opcode, std::uint32_t count, const char* function) {
     CheckAddress(reinterpret_cast<std::uintptr_t>(packet), 4, function);
-    Require(packet[0] == Header(opcode, count), function, "unexpected packet type, size or flags");
+    Require(Host(packet)[0] == Header(opcode, count), function, "unexpected packet type, size or flags");
 }
 
 std::uint32_t* WriteNop(CommandBuffer* buffer, std::uint32_t count, const char* function) {
     const auto header = count == 1 ? 0xffff1000u : Header(0x10u, count);
-    auto* packet = Allocate(buffer, count, function);
+    auto* const guest = Allocate(buffer, count, function);
+    auto* packet = Host(guest);
     packet[0] = header;
     std::fill_n(packet + 1, count - 1u, 0u);
-    return packet;
+    return guest;
 }
 
 std::uint32_t* WriteRegisterRange(CommandBuffer* buffer, std::uint32_t opcode, std::uint32_t offset, const std::uint32_t* values, std::uint32_t count, const char* function) {
@@ -97,18 +101,21 @@ std::uint32_t* WriteRegisterRange(CommandBuffer* buffer, std::uint32_t opcode, s
     std::vector<std::uint32_t> snapshot;
     if (values != nullptr) {
         CheckAddress(reinterpret_cast<std::uintptr_t>(values), 4, function);
-        snapshot.assign(values, values + count);
+        const auto* host = Host(values);
+        snapshot.assign(host, host + count);
     }
-    auto* packet = Allocate(buffer, count + 2u, function);
+    auto* const guest = Allocate(buffer, count + 2u, function);
+    auto* packet = Host(guest);
     packet[0] = Header(opcode, count + 2u);
     packet[1] = offset;
     std::copy(snapshot.begin(), snapshot.end(), packet + 2);
-    return packet;
+    return guest;
 }
 
 std::uint32_t* WriteRegisters(CommandBuffer* buffer, std::uint32_t opcode, const volatile ShaderRegister* registers, std::uint32_t count, bool snapshotAll, const char* function) {
     Require(count != 0, function, "empty register list");
     CheckAddress(reinterpret_cast<std::uintptr_t>(registers), 4, function);
+    registers = Host(registers);
     std::vector<ShaderRegister> snapshot;
     if (snapshotAll) {
         snapshot.reserve(count);
@@ -146,6 +153,7 @@ std::uint32_t* WriteIndirectRegisters(CommandBuffer* buffer, std::uint32_t opcod
 
 void PatchIndirectAddress(std::uint32_t* packet, std::uint32_t opcode, const volatile ShaderRegister* registers, const char* function) {
     ValidatePacket(packet, opcode, 5, function);
+    packet = Host(packet);
     Require(packet[3] == 0x80000000u && (packet[4] & ~0x3fffu) == 0, function, "invalid indirect register packet");
     const auto address = reinterpret_cast<std::uintptr_t>(registers);
     CheckAddress(address, 4, function);
@@ -155,12 +163,14 @@ void PatchIndirectAddress(std::uint32_t* packet, std::uint32_t opcode, const vol
 
 void PatchIndirectCount(std::uint32_t* packet, std::uint32_t opcode, std::uint32_t count, const char* function) {
     ValidatePacket(packet, opcode, 5, function);
+    packet = Host(packet);
     Require(packet[3] == 0x80000000u && packet[4] <= 0x3fffu && count <= 0x3fffu - packet[4], function, "indirect register count overflow or invalid packet");
     packet[4] += count;
 }
 
 void SetIndirectCount(std::uint32_t* packet, std::uint32_t opcode, std::uint32_t count, const char* function) {
     ValidatePacket(packet, opcode, 5, function);
+    packet = Host(packet);
     Require(packet[3] == 0x80000000u && packet[4] <= 0x3fffu, function, "invalid indirect register packet");
     CheckBits(count, 0x3fffu, function);
     packet[4] = count;

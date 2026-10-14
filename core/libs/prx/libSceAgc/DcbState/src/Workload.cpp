@@ -17,10 +17,11 @@ constexpr std::uint32_t MaxWorkloadId = 63;
 constexpr std::uint32_t MaxActiveCount = 63;
 
 uint32_t* NewPacket(CommandBuffer* buf, std::uint32_t words, const char* function) {
- auto* packet = Agc::Command::Allocate(buf, words, function);
+ auto* const guestPacket = Agc::Command::Allocate(buf, words, function);
+ auto* packet = Agc::Command::Host(guestPacket);
  std::memset(packet, 0, words * sizeof(std::uint32_t));
  packet[0] = Agc::Command::Header(OpcodeNop, words, 0);
- return packet;
+ return guestPacket;
 }
 
 }

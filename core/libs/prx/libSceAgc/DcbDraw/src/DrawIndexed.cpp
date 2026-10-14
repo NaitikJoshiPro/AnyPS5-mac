@@ -69,7 +69,8 @@ uint32_t* APS5_VABI sceAgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_
     Agc::Command::CheckAddress(geometry, 2, __func__);
     Agc::Command::Require(object_ids == nullptr, __func__, "per-object id base has no executor contract; expanding to one instanced draw");
     const auto initiator = Agc::Command::DrawInitiator(modifier, true, __func__);
-    auto* packet = Agc::Command::Allocate(buf, 8, __func__);
+    auto* const guestPacket = Agc::Command::Allocate(buf, 8, __func__);
+    auto* packet = Agc::Command::Host(guestPacket);
     packet[0] = Agc::Command::Header(0x2fu, 2);
     packet[1] = instance_count;
     packet[2] = Agc::Command::Header(0x27u, 6);
@@ -78,7 +79,7 @@ uint32_t* APS5_VABI sceAgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_
     packet[5] = static_cast<std::uint32_t>(static_cast<std::uint64_t>(geometry) >> 32u);
     packet[6] = index_count;
     packet[7] = initiator;
-    return packet;
+    return guestPacket;
 }
 
 uint32_t APS5_VABI sceAgcDcbDrawIndexMultiInstancedGetSize(void) {

@@ -48,10 +48,11 @@ uint32_t* APS5_VABI sceAgcAcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_
     Agc::Command::Require(buf != nullptr, __func__, "null command buffer");
     constexpr std::uint32_t OpcodeNop = 0x10;
     constexpr std::uint32_t CustomDispatchReset = 0x09;
-    auto* packet = Agc::Command::Allocate(buf, 2, __func__);
+    auto* const guestPacket = Agc::Command::Allocate(buf, 2, __func__);
+    auto* packet = Agc::Command::Host(guestPacket);
     packet[0] = Agc::Command::Header(OpcodeNop, 2, CustomDispatchReset << 2);
     packet[1] = op;
-    return packet;
+    return guestPacket;
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbRewind(CommandBuffer* buf, std::uint32_t initialState) {
@@ -63,12 +64,13 @@ std::uint32_t APS5_VABI sceAgcAcbRewindGetSize() {
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbWaitUntilSafeForRendering(CommandBuffer* buf, std::uint32_t videoOutHandle, std::uint32_t displayBufferIndex) {
-    auto* packet = Agc::Command::Allocate(buf, AgcDriver::RenderingWaitPacketWords, __func__);
+    auto* const guestPacket = Agc::Command::Allocate(buf, AgcDriver::RenderingWaitPacketWords, __func__);
+    auto* packet = Agc::Command::Host(guestPacket);
     packet[0] = AgcDriver::RenderingWaitPacketHeader;
     packet[1] = videoOutHandle;
     packet[2] = displayBufferIndex;
     packet[3] = 0;
-    return packet;
+    return guestPacket;
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbSetFlip(CommandBuffer* buf, std::uint32_t videoOutHandle, std::int32_t displayBufferIndex, std::uint32_t flipMode, std::int64_t flipArg) {
