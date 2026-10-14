@@ -15,6 +15,9 @@
 #if defined(__x86_64__)
 #include <xmmintrin.h>
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "prx/libc/include/GuestMachineState.hpp"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -257,14 +260,16 @@ asm(".text\n"
     ud2
 )" APS5_ASM_FUNCTION_END("Aps5FiberTrampoline_nid_no_patch"));
 #else
+// Host stack switching exists for x86-64 hosts only. On arm64 macOS fibers switch guest state through the
+// FEXCore bridge instead (Enter/Continue below), so these are never reached there.
 extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void* load) {
     (void)save;
     (void)load;
-    NotImplemented_nid_no_patch(__func__);
+    throw std::runtime_error("sceFiber: host stack switching needs an x86-64 host");
 }
 
 extern "C" void Aps5FiberTrampoline_nid_no_patch() {
-    NotImplemented_nid_no_patch(__func__);
+    throw std::runtime_error("sceFiber: host stack switching needs an x86-64 host");
 }
 #endif
 
@@ -461,12 +466,34 @@ void Save(GuestContext& context, std::uint64_t* transfer) {
     bridgeControl(&context.mxcsr, &context.fcw);
 }
 
+// Resumes context with its own MXCSR and x87 control word, as the x86-64 stack switch does (ldmxcsr/fldcw):
+// both are callee-saved in the SysV ABI, so each fiber and the thread keep theirs across switches. The
+// register-only resume cannot set them, so this goes through the runner's whole-state hooks.
+[[noreturn]] void ContinueWithControl(const GuestContext& context) {
+    if (!LibcHasMachineState_nid_no_patch())
+        throw std::runtime_error("sceFiber: resuming a context with a different MXCSR or x87 control word needs the runner's machine-state hooks");
+    GuestMachineState state {};
+    LibcGetMachineState_nid_no_patch(&state);
+    state.gregs[GuestMachine::Rax] = SCE_OK;
+    state.gregs[GuestMachine::Rbx] = context.rbx;
+    state.gregs[GuestMachine::Rbp] = context.rbp;
+    state.gregs[GuestMachine::Rsp] = context.rsp;
+    state.gregs[GuestMachine::R12] = context.r12;
+    state.gregs[GuestMachine::R13] = context.r13;
+    state.gregs[GuestMachine::R14] = context.r14;
+    state.gregs[GuestMachine::R15] = context.r15;
+    state.rip = context.rip;
+    std::memcpy(state.fxsave, &context.fcw, sizeof(context.fcw));
+    std::memcpy(state.fxsave + GuestMachine::FxsaveMxcsr, &context.mxcsr, sizeof(context.mxcsr));
+    LibcSetMachineState_nid_no_patch(&state);
+}
+
 [[noreturn]] void Continue(const GuestContext& context, std::uint64_t transfer) {
     std::uint32_t mxcsr = 0;
     std::uint16_t fcw = 0;
     bridgeControl(&mxcsr, &fcw);
-    if (mxcsr != context.mxcsr || fcw != context.fcw) NotImplemented_nid_no_patch("sceFiber switching to a different MXCSR or x87 control word");
     if (context.transfer) *context.transfer = transfer;
+    if (mxcsr != context.mxcsr || fcw != context.fcw) ContinueWithControl(context);
     std::uintptr_t registers[GuestRegisters];
     bridgeCapture(registers);
     registers[Rax] = SCE_OK;
