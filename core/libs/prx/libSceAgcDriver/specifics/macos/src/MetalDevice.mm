@@ -360,7 +360,15 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         ranges.reserve(acquired->size());
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
+        static const bool traceTable = std::getenv("APS5_TRACE_GPU") != nullptr;
+        std::uint64_t importedBytes = 0;
+        std::uint64_t wrappedBytes = 0;
         for (const auto& range : *acquired) {
+            if (traceTable) {
+                std::uint64_t ignored = 0;
+                if (context.hostImportAlignment != 0u && ImportOf(range->address, range->bytes, &ignored) != nil) importedBytes += range->bytes;
+                else wrappedBytes += range->bytes;
+            }
             const auto gpu = TryWrap(range->address, range->bytes);
             if (gpu == 0) {
                 ++skipped;
@@ -375,6 +383,15 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         }
         if (skipped != 0u && addressTable.skipped != skipped) {
             std::fprintf(stderr, "[metal] BDA page table: %zu of %zu guest allocations cannot be wrapped in place and are left out (mirrors: work package D3)\n", skipped, acquired->size());
+        }
+        if (traceTable) {
+            std::uint64_t wrapperBytes = 0;
+            std::uint64_t largest = 0;
+            for (const auto& wrapper : wrappers) {
+                wrapperBytes += wrapper.end - wrapper.begin;
+                largest = std::max(largest, wrapper.end - wrapper.begin);
+            }
+            std::fprintf(stderr, "[gpu] BDA page table: %zu ranges, %.1f MiB of them in host imports, %.1f MiB outside; %zu page wrappers hold %.1f MiB (largest %.1f MiB)\n", ranges.size(), importedBytes / 1048576.0, wrappedBytes / 1048576.0, wrappers.size(), wrapperBytes / 1048576.0, largest / 1048576.0);
         }
         // TryWrap may have created wrappers but never drops any, so the epoch is still current.
         const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
