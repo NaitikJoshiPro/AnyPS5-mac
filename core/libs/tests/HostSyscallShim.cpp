@@ -272,12 +272,31 @@ void Run(std::uintptr_t base, const std::filesystem::path& file) {
 
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+extern "C" void Aps5HostSyscallShimResolution(std::size_t* resolved, std::size_t* total); // the shim archive's
+
+namespace {
+
+// Every libSystem function the shim forwards to is resolved at load, before main runs any of them: a first call can
+// come from a signal handler, where a lazy dlsym could deadlock on a lock the interrupted thread holds (D35).
+void ResolvedAtLoad() {
+    std::size_t resolved = 0, total = 0;
+    Aps5HostSyscallShimResolution(&resolved, &total);
+    if (total < 70) throw std::runtime_error("the shim forwards to only " + std::to_string(total) + " libSystem functions");
+    if (resolved != total) throw std::runtime_error(std::to_string(total - resolved) + " of " + std::to_string(total) + " forwarded libSystem functions were not resolved at load");
+    std::printf("host system call shim: %zu of %zu forwarded functions resolved at load\n", resolved, total);
+}
+
+}
+#endif
+
 int main() {
 #if !(defined(__APPLE__) && defined(__aarch64__))
     std::puts("host system call shim: no displaced window on this host, skipped");
     return 0;
 #else
     try {
+        ResolvedAtLoad(); // first: nothing in main has called a shimmed function yet
         if (!GuestArena::GuestDisplacedActive_nid_no_patch()) throw std::runtime_error("the displaced window is not active on macOS arm64");
         const auto file = std::filesystem::path("anyps5-host-syscall-shim-" + std::to_string(::getpid()));
         std::int64_t physical = 0;

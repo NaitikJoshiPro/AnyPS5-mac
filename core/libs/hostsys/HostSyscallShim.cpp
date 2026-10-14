@@ -12,6 +12,7 @@
 // are translated without scanning them.
 #include "prx/libc/include/GuestDisplaced.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdarg>
 #include <cstddef>
@@ -79,12 +80,47 @@ void* LibSystem(const char* name) {
     return symbol;
 }
 
-// libSystem's definition of `name`, resolved once (inside this library the name binds to the hidden definition below).
-#define APS5_REAL(name) \
-    ([]() -> decltype(&::name) { \
-        static const auto real = reinterpret_cast<decltype(&::name)>(LibSystem(#name)); \
-        return real; \
-    }())
+// Every libSystem function a definition below forwards to. Each is resolved once, at load (ResolveShimmedCalls), never
+// on first use: a definition can first run inside a signal handler (the displaced fault handler's trace and crash
+// paths write; guest signal handlers reach read/write/nanosleep...), and dlsym there could deadlock on a dyld or
+// malloc lock the interrupted thread holds. A call that runs before the constructor (another initializer of the
+// same image) resolves its own slot, outside any signal handler.
+#define APS5_SHIMMED_CALLS(X) \
+    X(accept) X(access) X(bind) X(chmod) X(clock_getres) X(clock_gettime) X(connect) X(dlopen) X(execv) X(faccessat) \
+    X(fcntl) X(fgets) X(fopen) X(fputs) X(fread) X(freopen) X(fsgetpath) X(fstat) X(fstatat) X(fstatfs) X(fstatvfs) \
+    X(futimes) X(fwrite) X(getentropy) X(getpeername) X(getrlimit) X(getrusage) X(getsockname) X(getsockopt) \
+    X(gettimeofday) X(ioctl) X(kevent) X(lstat) X(lutimes) X(mach_msg) X(mach_timebase_info) X(mkdir) X(mkstemp) \
+    X(nanosleep) X(open) X(openat) X(opendir) X(pipe) X(pipe2) X(poll) X(pread) X(preadv) X(pthread_setname_np) \
+    X(pthread_sigmask) X(puts) X(pwrite) X(pwritev) X(read) X(readv) X(recv) X(recvfrom) X(remove) X(rename) X(rmdir) \
+    X(select) X(send) X(sendto) X(setrlimit) X(setsockopt) X(setvbuf) X(shm_open) X(shm_unlink) X(sigaction) \
+    X(socketpair) X(stat) X(sysctl) X(sysctlbyname) X(truncate) X(uname) X(unlink) X(utimes) X(write) X(writev)
+
+enum class Shimmed : std::size_t {
+#define APS5_SHIMMED_SLOT(name) name,
+    APS5_SHIMMED_CALLS(APS5_SHIMMED_SLOT)
+#undef APS5_SHIMMED_SLOT
+    Count
+};
+
+constexpr const char* ShimmedNames[] = {
+#define APS5_SHIMMED_NAME(name) #name,
+    APS5_SHIMMED_CALLS(APS5_SHIMMED_NAME)
+#undef APS5_SHIMMED_NAME
+};
+
+std::atomic<void*> g_real[static_cast<std::size_t>(Shimmed::Count)];
+
+void* Real(Shimmed slot) {
+    const auto index = static_cast<std::size_t>(slot);
+    void* symbol = g_real[index].load(std::memory_order_acquire);
+    if (symbol != nullptr) return symbol;
+    symbol = LibSystem(ShimmedNames[index]); // only before the constructor ran, or for a symbol this host lacks (throws)
+    g_real[index].store(symbol, std::memory_order_release);
+    return symbol;
+}
+
+// libSystem's definition of `name` (inside this library the name binds to the hidden definition below).
+#define APS5_REAL(name) (reinterpret_cast<decltype(&::name)>(Real(Shimmed::name)))
 
 template <typename TCall>
 ssize_t WithVectors(const iovec* vectors, int count, TCall&& call) {
@@ -553,12 +589,28 @@ APS5_HOST_SHIM int fprintf(FILE* __restrict stream, const char* __restrict forma
 
 namespace {
 
-// libSystem's functions are resolved on first use (dlsym). write is resolved at load instead: the fault handler's
-// trace and crash paths call it inside signal handlers, where dlsym could deadlock on a lock the thread holds.
-__attribute__((constructor)) void ResolveSignalSafeCalls() {
+// Resolves every forwarded libSystem function at load (see APS5_SHIMMED_CALLS). A symbol this host's libSystem lacks
+// stays unresolved and throws on use, as before.
+__attribute__((constructor)) void ResolveShimmedCalls() {
     const int saved = errno;
-    (void)!write(-1, nullptr, 0);
+    for (std::size_t index = 0; index < static_cast<std::size_t>(Shimmed::Count); ++index) {
+        if (g_real[index].load(std::memory_order_relaxed) != nullptr) continue;
+        try { g_real[index].store(LibSystem(ShimmedNames[index]), std::memory_order_release); }
+        catch (const std::exception&) {}
+    }
     errno = saved;
+}
+
+}
+
+extern "C" {
+
+// For tests: how many forwarded functions the shim has, and how many are resolved (all of them, after load).
+__attribute__((visibility("hidden"))) void Aps5HostSyscallShimResolution(std::size_t* resolved, std::size_t* total) {
+    std::size_t count = 0;
+    for (const auto& slot : g_real) count += slot.load(std::memory_order_acquire) != nullptr ? 1 : 0;
+    *resolved = count;
+    *total = static_cast<std::size_t>(Shimmed::Count);
 }
 
 }
