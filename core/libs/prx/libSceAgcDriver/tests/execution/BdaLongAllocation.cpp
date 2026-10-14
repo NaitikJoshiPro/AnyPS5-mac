@@ -1,4 +1,4 @@
-// The BDA page table serves a guest allocation longer than 1 GiB piece by piece through host imports (D48). It used to
+// The BDA page table serves a guest allocation longer than 1 GiB piece by piece through host imports (D52). It used to
 // wrap such an allocation whole in one no-copy page wrapper beside the imports, outside the import budget; Metal wires
 // a no-copy buffer in full when a command buffer uses it, so ASTRO BOT's first address-based dispatch over its 3.1 +
 // 4.6 GiB of direct memory failed on the GPU with kIOGPUCommandBufferCallbackErrorOutOfMemory (reported as

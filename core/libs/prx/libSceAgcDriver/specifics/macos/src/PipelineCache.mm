@@ -156,7 +156,7 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
     }
     if (Profile()) std::fprintf(stderr, "[metal-pipelines] archive directory: %s\n", directory.empty() ? "(none)" : directory.c_str());
     if (!directory.empty()) {
-        // Archive generations (D47): <stem>.<ns>-<pid>.mtl4archive. The newest readable one is
+        // Archive generations (D51): <stem>.<ns>-<pid>.mtl4archive. The newest readable one is
         // loaded and never written by this process (Metal resolves a lookup archive through its
         // file, so the file a hit came from must stay as it was); this process writes its own
         // generation, a superset of its hits and its compiles, which the next process loads. Older
@@ -745,7 +745,7 @@ void PipelineCache::Save() {
         }
     }
     @autoreleasepool {
-        // Replays (D47): serializeAsArchiveAndFlushToURL empties the serializer, so the pipelines an
+        // Replays (D51): serializeAsArchiveAndFlushToURL empties the serializer, so the pipelines an
         // earlier save flushed and the archive's hits are captured again, looked up (not compiled) in
         // the archive they came from.
         NSMutableArray<id<MTL4Archive>>* lookups = [NSMutableArray array];

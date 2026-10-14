@@ -183,7 +183,7 @@ struct VulkanDevice::State {
         // The writable ranges (a dispatch binding the table may store anywhere in them).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
-        // Bytes of long allocations the host-import budget left out (D48).
+        // Bytes of long allocations the host-import budget left out (D52).
         std::uint64_t refusedBytes = 0;
     } addressTable;
 

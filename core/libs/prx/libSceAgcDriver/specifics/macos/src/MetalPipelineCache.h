@@ -57,7 +57,7 @@ struct PipelineCacheStatistics {
     // Archive persistence.
     bool archiveLoaded = false;
     std::uint64_t archiveSaves = 0;
-    // Pipelines replayed into the serializer before saves (D47) and the time the replays took.
+    // Pipelines replayed into the serializer before saves (D51) and the time the replays took.
     std::uint64_t archiveReplays = 0;
     double replayMilliseconds = 0.0;
     std::string archivePath;
@@ -220,7 +220,7 @@ private:
     std::unordered_map<std::string, id<MTLLibrary>> libraries;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries;
     std::vector<std::pair<DepthStencilRequest, id<MTLDepthStencilState>>> depthStencilStates;
-    // Every pipeline this cache built or took from the archive (D47). The serializer only captures
+    // Every pipeline this cache built or took from the archive (D51). The serializer only captures
     // what its compiler builds, and each save's flush empties it: entries not `captured` (archive
     // hits, and everything once flushed) are replayed through the compiler, with the loaded and the
     // last written archive as lookup archives, before the next save. Guarded by `mutex`; entries are

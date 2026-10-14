@@ -104,7 +104,7 @@ std::uint32_t LoopGuardLimit() {
     return limit;
 }
 
-// The guest memory the BDA page table may add through new page wrappers (D48): wrappers are no-copy
+// The guest memory the BDA page table may add through new page wrappers (D52): wrappers are no-copy
 // buffers Metal wires in full when a command buffer uses them, outside the live-import budget.
 std::uint64_t BdaWrapperBudget() {
     static const std::uint64_t bytes = [] {
@@ -394,7 +394,7 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
                 // buffer in full when a command buffer uses it, and a table holding ASTRO BOT's
                 // 3.1 + 4.6 GiB direct memory as wrappers beside the imports made the GPU fail the
                 // first BDA dispatch with kIOGPUCommandBufferCallbackErrorOutOfMemory (reported as
-                // MTL4CommandQueueErrorTimeout, D48). A piece the budget refuses is left out of the
+                // MTL4CommandQueueErrorTimeout, D52). A piece the budget refuses is left out of the
                 // table: an access there records an Unmapped fault instead.
                 for (auto begin = range->address; begin < end;) {
                     const auto pieceEnd = std::min(end, (begin / Graphics::HostImportPieceBytes + 1u) * Graphics::HostImportPieceBytes);
