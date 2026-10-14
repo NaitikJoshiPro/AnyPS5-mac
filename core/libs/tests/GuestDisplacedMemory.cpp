@@ -185,6 +185,33 @@ int main() {
         }
         Require(refused, "a range straddling the window edge was accepted");
 
+        // D37: a fixed request inside the dyld shared cache (readable host memory, neither mappable nor displaceable)
+        // is served at request + 0xD000000000 and the address comes back through the in/out argument.
+        constexpr std::uintptr_t CacheRequest = 0x300000000ull; // ASTRO BOT's first mapping
+        constexpr std::uintptr_t Relocated = CacheRequest + 0xD000000000ull;
+        Require(GuestArena::DisplacedStart() > CacheRequest + Bytes, "0x300000000 is not inside the shared cache on this host");
+        void* cached = reinterpret_cast<void*>(CacheRequest);
+        Require(sceKernelMapDirectMemory(&cached, Bytes, CpuGpuReadWrite, MapFixed, physical, 0x200000) == 0, "a fixed mapping in the shared cache failed");
+        Require(cached == reinterpret_cast<void*>(Relocated), "a fixed mapping in the shared cache was not relocated by the constant offset");
+        Require(Load<std::uint32_t>(Relocated + 0x104) == 0xa5a5a5a5u, "the relocated mapping does not show the direct memory");
+        Store<std::uint64_t>(Relocated + 0x3000, 0x5566778899aabbccull);
+        Require(Load<std::uint64_t>(viewAddress + 0x3000) == 0x5566778899aabbccull, "the relocated mapping does not share the pages");
+        // Deterministic: the same request again meets the first, as on the console (no-overwrite fails, replace works).
+        void* second = reinterpret_cast<void*>(CacheRequest);
+        Require(sceKernelMapDirectMemory(&second, Bytes, CpuGpuReadWrite, MapFixed | 0x80, physical, 0x200000) != 0, "a no-overwrite request over a relocated mapping succeeded");
+        second = reinterpret_cast<void*>(CacheRequest + 0x200000);
+        Require(sceKernelMapDirectMemory(&second, 0x200000, CpuGpuReadWrite, MapFixed, physical, 0x200000) == 0 && second == reinterpret_cast<void*>(Relocated + 0x200000),
+            "a fixed request overlapping a relocated mapping did not land at the same offset");
+        Require(Load<std::uint32_t>(Relocated + 0x200000 + 0x104) == 0xa5a5a5a5u, "the overlapping relocated mapping does not show the direct memory");
+        Require(sceKernelMunmap(cached, Bytes) == 0, "munmap of the relocated mapping");
+        Require(HostProtection(Relocated) == VM_PROT_NONE, "the unmapped relocated range is still accessible");
+        // A request that runs from the cache into the tail (ASTRO's 0x300000000+0x79800000 does) is relocated whole.
+        void* across = reinterpret_cast<void*>((GuestArena::DisplacedStart() - 1) & ~std::uintptr_t{0x1fffff});
+        Require(sceKernelMapDirectMemory(&across, Bytes, CpuGpuReadWrite, MapFixed, physical, 0x200000) == 0 &&
+                    across == reinterpret_cast<void*>(((GuestArena::DisplacedStart() - 1) & ~std::uintptr_t{0x1fffff}) + 0xD000000000ull),
+            "a fixed request across the shared cache's end was not relocated");
+        Require(sceKernelMunmap(across, Bytes) == 0, "munmap of the relocated straddling mapping");
+
         Require(sceKernelMunmap(again, Bytes) == 0 && sceKernelMunmap(view, Bytes) == 0, "final munmap");
         Require(sceKernelReleaseDirectMemory(physical, Bytes) == 0, "release direct memory");
         std::puts("guest displaced memory tests passed");

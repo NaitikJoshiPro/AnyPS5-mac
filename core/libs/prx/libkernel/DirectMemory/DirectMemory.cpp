@@ -935,6 +935,62 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
     return flags | GuestMapFixedFlag;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+// D37. The dyld shared cache sits at [0x180000000, ~0x344364000) in every arm64 process (slide-dependent) and is
+// readable host memory, so a guest mapping there can be neither made (the cache cannot be moved or overwritten,
+// D33, D35) nor displaced (D31/D33 rely on a fault). A fixed request that overlaps it is mapped at a constant offset
+// instead, request + RelocationOffset, and the real address goes back through the in/out address, as for a hint.
+// The offset is the same for every request and run, so repeated and overlapping requests keep their relative
+// layout (a second MAP_FIXED|MAP_NO_OVERWRITE request meets the first, as on the console). Titles must use the
+// returned address: ASTRO BOT reads it back (D37's disassembly); code that keeps using the requested constant
+// reads the shared cache and faults on writes. APS5_FIXED_RELOCATE=0 restores the refusal.
+constexpr std::uintptr_t SharedRegionBase = 0x180000000ull; // SHARED_REGION_BASE_ARM64
+constexpr std::uintptr_t SharedRegionEnd = 0xFC0000000ull;  // + SHARED_REGION_SIZE_ARM64
+// [0xD180000000, 0xDFC0000000): free arena between first fit (from 512 GiB up) and the AMM ranges (top 64 GiB).
+constexpr std::uintptr_t RelocationOffset = 0xD000000000ull;
+
+std::mutex g_relocationLock;
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> g_relocations; // relocated ranges handed out so far
+
+bool InRelocations(std::uintptr_t start, std::size_t len) {
+    for (const auto& [from, to] : g_relocations)
+        if (start >= from && start + len <= to) return true;
+    return false;
+}
+
+// The guest address a fixed request is served at; also clears MAP_FIXED when the constant-offset place is taken by
+// an unrelated mapping (then the arena places it at or above that address, like a hint).
+void* RelocateUnservableFixed(const GuestAllocations::Mutation& mutation, void* addr, size_t len, int& flags) {
+    constexpr int GuestMapNoOverwrite = 0x80;
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    if (addr == nullptr || (flags & GuestMapFixedFlag) == 0 || len == 0 || !ArenaAvailable()) return addr;
+    const auto cacheEnd = std::min(GuestArena::DisplacedStart(), SharedRegionEnd);
+    if (start >= cacheEnd || start + len <= SharedRegionBase) return addr;
+    if (start < SharedRegionBase || len > SharedRegionEnd - start) return addr; // not inside the shared region: refused as before
+    if (const char* setting = std::getenv("APS5_FIXED_RELOCATE"); setting != nullptr && std::strcmp(setting, "0") == 0) return addr;
+    const auto target = start + RelocationOffset;
+    std::lock_guard lock(g_relocationLock);
+    const bool taken = mutation.Overlaps(reinterpret_cast<void*>(target), len) && !InRelocations(target, len);
+    if (taken) flags &= ~(GuestMapFixedFlag | GuestMapNoOverwrite);
+    bool known = false;
+    for (auto& [from, to] : g_relocations) {
+        if (from == target) {
+            to = std::max(to, target + len);
+            known = true;
+        }
+    }
+    if (!known) g_relocations.emplace_back(target, target + len);
+    std::fprintf(stderr, "[libkernel] fixed mapping 0x%llx+0x%zx overlaps the host's dyld shared cache (ends 0x%llx): %s 0x%llx (D37)\n",
+        static_cast<unsigned long long>(start), len, static_cast<unsigned long long>(cacheEnd),
+        taken ? "constant-offset place taken, placing at or above" : "relocated to", static_cast<unsigned long long>(target));
+    return reinterpret_cast<void*>(target);
+}
+#else
+void* RelocateUnservableFixed(const GuestAllocations::Mutation&, void* addr, size_t, int&) {
+    return addr;
+}
+#endif
+
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     // Traced before validation as well, so a request that fails or throws still shows its address and flags.
@@ -945,6 +1001,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     }
     GuestAllocations::Mutation mutation;
     flags = PlaceHintInReservation(*addr, len, flags);
+    *addr = RelocateUnservableFixed(mutation, *addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
         EraseReservations(*addr, len);
@@ -976,6 +1033,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
     flags = PlaceHintInReservation(*addr, len, flags);
+    *addr = RelocateUnservableFixed(mutation, *addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
         EraseReservations(*addr, len);
@@ -1185,6 +1243,7 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
+    *addr = RelocateUnservableFixed(mutation, *addr, len, flags);
     const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
     if (fixed && mutation.Covers(*addr, len)) {
         constexpr int GuestMapNoOverwrite = 0x80;
