@@ -6,6 +6,7 @@
 #include "MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "MetalResidency.h"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -26,7 +27,7 @@ struct PoolObjects {
     std::uint64_t made = 0;
     std::uint64_t destroyed = 0;
     ~PoolObjects() {
-        if (queue != nil && residency != nil) [queue removeResidencySet:residency];
+        if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
     }
 };
 
@@ -64,7 +65,7 @@ BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(
     metal->residency = [metal->device newResidencySetWithDescriptor:descriptor error:&error];
     if (metal->residency == nil) Metal::Fail("the buffer pool's residency set: " + Metal::Describe(error));
     // A compile-only device has no queue: its buffers are never used by the GPU.
-    if (metal->queue != nil) [metal->queue addResidencySet:metal->residency];
+    if (metal->queue != nil) ::AgcDriver::Metal::Residency::Attach(metal->queue, metal->residency);
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
     // The device-local heap of a unified-memory Mac is its recommended working set.
@@ -96,8 +97,8 @@ BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags u
     if (buffer == nil) Metal::Fail("cannot allocate a " + std::to_string(length) + "-byte " + (host ? "shared" : "private") + " buffer (reclaimed " + std::to_string(reclaimed) + " bytes first)");
     {
         std::lock_guard lock(metal->residencyMutex);
-        [metal->residency addAllocation:buffer];
-        [metal->residency commit];
+        ::AgcDriver::Metal::Residency::Add(metal->residency, buffer);
+        ::AgcDriver::Metal::Residency::Commit(metal->residency);
         ++metal->made;
     }
     BufferAllocation allocation{};
@@ -134,8 +135,8 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     id<MTLBuffer> buffer = CFBridgingRelease(reinterpret_cast<CFTypeRef>(allocation.buffer));
     {
         std::lock_guard lock(metal->residencyMutex);
-        [metal->residency removeAllocation:buffer];
-        [metal->residency commit];
+        ::AgcDriver::Metal::Residency::Remove(metal->residency, buffer);
+        ::AgcDriver::Metal::Residency::Commit(metal->residency);
         ++metal->destroyed;
     }
     return allocation.allocationBytes;

@@ -3,6 +3,7 @@
 
 #include "MetalCommandStream.h"
 #include "RecorderKernels.h"
+#include "MetalResidency.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -38,11 +39,11 @@ UploadArena::UploadArena(id<MTLDevice> device, id<MTL4CommandQueue> queue) : dev
     NSError* error = nil;
     residency = [device newResidencySetWithDescriptor:descriptor error:&error];
     if (residency == nil) Fail("the upload arena's residency set: " + Describe(error));
-    [queue addResidencySet:residency];
+    ::AgcDriver::Metal::Residency::Attach(queue, residency);
 }
 
 UploadArena::~UploadArena() {
-    if (queue != nil && residency != nil) [queue removeResidencySet:residency];
+    if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
 }
 
 id<MTLBuffer> UploadArena::Take(std::size_t bytes) {
@@ -56,8 +57,8 @@ id<MTLBuffer> UploadArena::Take(std::size_t bytes) {
     id<MTLBuffer> buffer = [device newBufferWithLength:length options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
     if (buffer == nil) Fail("cannot allocate " + std::to_string(length) + " bytes of upload memory");
     if (residency != nil) {
-        [residency addAllocation:buffer];
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Add(residency, buffer);
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
     ++made;
     return buffer;
@@ -73,11 +74,11 @@ void UploadArena::Give(std::vector<id<MTLBuffer>>& buffers) {
             continue;
         }
         if (residency != nil) {
-            [residency removeAllocation:buffer];
+            ::AgcDriver::Metal::Residency::Remove(residency, buffer);
             removed = true;
         }
     }
-    if (removed) [residency commit];
+    if (removed) ::AgcDriver::Metal::Residency::Commit(residency);
     buffers.clear();
 }
 

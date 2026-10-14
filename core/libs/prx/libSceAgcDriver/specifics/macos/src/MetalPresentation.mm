@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "MetalResidency.h"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #include <algorithm>
@@ -262,21 +263,21 @@ struct Presenter {
     FrameDumpWriter dumpWriter;
 
     ~Presenter() {
-        if (queue != nil && residency != nil) [queue removeResidencySet:residency];
-        if (queue != nil && layer != nil) [queue removeResidencySet:layer.residencySet];
+        if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
+        if (queue != nil && layer != nil) ::AgcDriver::Metal::Residency::Detach(queue, layer.residencySet);
     }
 
     void Resident(id<MTLAllocation> allocation) {
-        [residency addAllocation:allocation];
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Add(residency, allocation);
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
 
     void MakeOffscreen() {
         for (auto& texture : offscreen) {
-            if (texture != nil) [residency removeAllocation:texture];
+            if (texture != nil) ::AgcDriver::Metal::Residency::Remove(residency, texture);
             texture = nil;
         }
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Commit(residency);
         if (layer != nil || width == 0u || height == 0u) return;
         for (auto& texture : offscreen) {
             MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
@@ -284,9 +285,9 @@ struct Presenter {
             descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             texture = [device newTextureWithDescriptor:descriptor];
             if (texture == nil) Fail("cannot create the headless presentation targets");
-            [residency addAllocation:texture];
+            ::AgcDriver::Metal::Residency::Add(residency, texture);
         }
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
 };
 
@@ -303,7 +304,7 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     NSError* error = nil;
     presenter->residency = [device newResidencySetWithDescriptor:descriptor error:&error];
     if (presenter->residency == nil) Fail("cannot create the presentation residency set: " + Metal::Describe(error));
-    [queue addResidencySet:presenter->residency];
+    ::AgcDriver::Metal::Residency::Attach(queue, presenter->residency);
     // The Metal view first: the drawable size is the view's (pixels, HiDPI) once it exists.
 #ifdef __APPLE__
     if (window.metalLayer != nullptr) presenter->layer = (__bridge CAMetalLayer*)window.metalLayer(window.context);
@@ -329,7 +330,7 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
         presenter->layer.displaySyncEnabled = presentMode == VK_PRESENT_MODE_FIFO_KHR ? YES : NO;
         [CATransaction commit];
         // Metal 4: drawables are resident through the layer's own residency set on the queue.
-        [queue addResidencySet:presenter->layer.residencySet];
+        ::AgcDriver::Metal::Residency::Attach(queue, presenter->layer.residencySet);
     }
     presenter->MakeOffscreen();
     if (PresentTrace()) std::fprintf(stderr, "[metal] present attach: %s, drawable %ux%u%s\n", presenter->layer != nil ? "CAMetalLayer" : "headless (offscreen target)", width, height, presenter->layer != nil ? (presenter->layer.displaySyncEnabled ? ", display sync" : ", no display sync") : "");
@@ -461,7 +462,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                 if (presenter->source != nil) {
                     // Earlier presents read the old source: they finish first.
                     RetirePresents(0);
-                    [presenter->residency removeAllocation:presenter->source];
+                    ::AgcDriver::Metal::Residency::Remove(presenter->residency, presenter->source);
                 }
                 MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
                 descriptor.storageMode = MTLStorageModePrivate;
@@ -517,8 +518,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             auto* residency = presenter;
             recorder.OnComplete([residency, readback] {
                 // The slot keeps the buffer; it only leaves the residency set here.
-                [residency->residency removeAllocation:readback];
-                [residency->residency commit];
+                ::AgcDriver::Metal::Residency::Remove(residency->residency, readback);
+                ::AgcDriver::Metal::Residency::Commit(residency->residency);
             });
         }
         // Metal 4 drawables: the queue waits for the drawable before the batch and signals it after.

@@ -98,7 +98,8 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
-    void KeepThroughHold(std::shared_ptr<void> object);
+    // bytes: counted in the open batch's kept bytes (BoundKeptBytes), as Keep's.
+    void KeepThroughHold(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();

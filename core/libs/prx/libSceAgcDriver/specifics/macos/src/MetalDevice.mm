@@ -25,6 +25,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "MetalResidency.h"
+
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -64,6 +66,13 @@ namespace Bda = ShaderRecompiler::BdaAbi;
 using Graphics::Recorder;
 
 constexpr std::uint64_t HostPage = 16384u;
+
+// The host-import join window (SetHostImportWindow): 8 MiB as upstream's Vulkan device, or
+// APS5_HOST_IMPORT_WINDOW_MIB (0 = unbounded spans, the behaviour before D44).
+std::uint64_t HostImportWindowBytes() {
+    const char* value = std::getenv("APS5_HOST_IMPORT_WINDOW_MIB");
+    return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 8ull) << 20u;
+}
 constexpr std::uint64_t ArenaGranule = 1u << 20u;
 // Workgroups per grid dimension the device reports (WorkGroupCountLimit). Metal ran 2^24
 // threadgroups in x and 2^20 in y and z on the M3 (no limit is documented); dispatches beyond this
@@ -248,8 +257,8 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
     }
     id<MTLBuffer> buffer = Metal::NewNoCopyBuffer(device, pageBegin, pageEnd - pageBegin, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (buffer == nil) return 0;
-    [residency addAllocation:buffer];
-    [residency commit];
+    ::AgcDriver::Metal::Residency::Add(residency, buffer);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     wrappers.push_back({pageBegin, pageEnd, buffer});
     return buffer.gpuAddress + (address - pageBegin);
 }
@@ -311,8 +320,8 @@ void VulkanDevice::State::KeepWrapped(std::uint64_t address, std::uint64_t bytes
 
 void VulkanDevice::State::DropWrappersIfIdle() {
     if (recorder == nullptr || !recorder->Idle() || wrappers.empty()) return;
-    for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
-    [residency commit];
+    for (const auto& wrapper : wrappers) ::AgcDriver::Metal::Residency::Remove(residency, wrapper.buffer);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     wrappers.clear();
     ++wrapperEpoch;
     // The cached BDA table points into the dropped wrappers and its lease pins the registry.
@@ -334,9 +343,9 @@ id<MTLBuffer> VulkanDevice::State::WorkgroupArena(std::uint64_t groups, std::uin
     if (arena == nil) throw std::runtime_error("Metal device: cannot allocate " + std::to_string(size) + " bytes of device-memory LDS");
     // The LDS lock dword of every workgroup slot starts unlocked.
     std::memset(arena.contents, 0, arena.length);
-    if (workgroupArena != nil) [residency removeAllocation:workgroupArena];
-    [residency addAllocation:arena];
-    [residency commit];
+    if (workgroupArena != nil) ::AgcDriver::Metal::Residency::Remove(residency, workgroupArena);
+    ::AgcDriver::Metal::Residency::Add(residency, arena);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     workgroupArena = arena;
     return arena;
 }
@@ -577,16 +586,16 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         //    the cached BDA table holding their addresses.
         report.wrappersDropped = std::max(heldWrappers, wrappers.size());
         if (residency != nil) {
-            for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
+            for (const auto& wrapper : wrappers) ::AgcDriver::Metal::Residency::Remove(residency, wrapper.buffer);
         }
         wrappers.clear();
         ++wrapperEpoch;
         addressTable = {};
         // 4. The device's own residency set leaves the queue before it is released.
         if (queue != nil && residency != nil) {
-            [queue removeResidencySet:residency];
-            [residency removeAllAllocations];
-            [residency commit];
+            ::AgcDriver::Metal::Residency::Detach(queue, residency);
+            ::AgcDriver::Metal::Residency::RemoveAll(residency);
+            ::AgcDriver::Metal::Residency::Commit(residency);
             report.residencyRemoved = true;
         }
         // The image cache's residency set leaves the queue (D4/D5, MetalImages.h).
@@ -596,6 +605,9 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         presenter.reset();
         if (images != nullptr) images->Teardown();
         images.reset();
+        // Allocations removed from residency sets since the last queue commit (MetalResidency.h):
+        // the queue is idle and its sets are gone, so they go now.
+        ::AgcDriver::Metal::Residency::Drain();
         // The pipeline cache after the recorder: joins its background workers, saves the archive.
         pipelines.reset();
         compiler = nil;
@@ -661,14 +673,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->faults = [state->device newBufferWithLength:Bda::FaultBufferBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
             if (state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the fault buffer");
             std::memset(state->faults.contents, 0, state->faults.length);
-            [state->residency addAllocation:state->faults];
+            ::AgcDriver::Metal::Residency::Add(state->residency, state->faults);
             state->atomicLocks = [state->device newBufferWithLength:Abi::AtomicLockAllocationBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
             if (state->atomicLocks == nil) throw std::runtime_error("Metal device: cannot allocate the 64-bit atomic lock table");
             // Every lock word starts released; only the GPU touches the table after this.
             std::memset(state->atomicLocks.contents, 0, state->atomicLocks.length);
-            [state->residency addAllocation:state->atomicLocks];
-            [state->residency commit];
-            [state->queue addResidencySet:state->residency];
+            ::AgcDriver::Metal::Residency::Add(state->residency, state->atomicLocks);
+            ::AgcDriver::Metal::Residency::Commit(state->residency);
+            ::AgcDriver::Metal::Residency::Attach(state->queue, state->residency);
             MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
             table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
             state->images = std::make_unique<Graphics::Metal::ImageCache>(state->device, state->queue);
@@ -682,6 +694,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.bufferDeviceAddress = true;
             // Host imports (D3): no-copy buffers over whole 16 KiB pages of guest allocations.
             context.hostImportAlignment = HostPage;
+            // Adjacent allocations join one import only over whole aligned 8 MiB windows, as on
+            // upstream's Vulkan device (a94730373): a heap growing 16 KiB at a time otherwise re-imports
+            // the whole chain at every growth, and the retired no-copy buffers stay in the import
+            // residency set until their batch completes (SuperTuxKart: ~20 GiB of them in one batch,
+            // which Metal refused at commit with MTL4CommandQueueErrorTimeout; DECISIONS D44).
+            Graphics::SetHostImportWindow(HostImportWindowBytes());
             const auto bufferLength = static_cast<std::uint64_t>(state->device.maxBufferLength);
             context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
             context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
@@ -1535,8 +1553,8 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         auto* last = reinterpret_cast<volatile std::uint32_t*>(Pm4::GdsAddress() + Pm4::GdsBytes - 4u);
         *last = 0xc0ffee00u;
         if (mapping != nil && probe != nil) {
-            [residency addAllocation:probe];
-            [residency commit];
+            ::AgcDriver::Metal::Residency::Add(residency, probe);
+            ::AgcDriver::Metal::Residency::Commit(residency);
             stream.Barrier();
             [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + 16u toBuffer:probe destinationOffset:0 size:16];
             [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + Pm4::GdsBytes - 4u toBuffer:probe destinationOffset:16 size:4];

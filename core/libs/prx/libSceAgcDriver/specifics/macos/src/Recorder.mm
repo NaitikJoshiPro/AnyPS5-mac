@@ -40,6 +40,7 @@
 #include <thread>
 #include <tuple>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#include "MetalResidency.h"
 
 namespace AgcDriver::Graphics {
 
@@ -220,8 +221,8 @@ struct SamplePoolCache {
             free.push_back(pool);
             return;
         }
-        [residency removeAllocation:pool];
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Remove(residency, pool);
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
     id<MTLBuffer> take() {
         std::lock_guard lock(mutex);
@@ -233,8 +234,8 @@ struct SamplePoolCache {
     void close() {
         std::lock_guard lock(mutex);
         closed = true;
-        for (id<MTLBuffer> pool : free) [residency removeAllocation:pool];
-        if (!free.empty()) [residency commit];
+        for (id<MTLBuffer> pool : free) ::AgcDriver::Metal::Residency::Remove(residency, pool);
+        if (!free.empty()) ::AgcDriver::Metal::Residency::Commit(residency);
         free.clear();
     }
 };
@@ -322,7 +323,7 @@ struct RecorderObjects {
     // Two-entry timestamp heaps of the batch stamps, reused when only those are taken.
     std::vector<id<MTL4CounterHeap>> spareHeaps;
     ~RecorderObjects() {
-        if (queue != nil && residency != nil) [queue removeResidencySet:residency];
+        if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
     }
 };
 
@@ -1202,7 +1203,7 @@ Recorder::Recorder(const Context& context, bool) : context(context), id(nextReco
     NSError* error = nil;
     objects->residency = [objects->device newResidencySetWithDescriptor:residency error:&error];
     if (objects->residency == nil) Metal::Fail("the recorder's residency set: " + Metal::Describe(error));
-    [objects->queue addResidencySet:objects->residency];
+    ::AgcDriver::Metal::Residency::Attach(objects->queue, objects->residency);
     objects->arena = std::make_shared<Metal::UploadArena>(objects->device, objects->queue);
     const auto frequency = [objects->device queryTimestampFrequency];
     objects->nanosecondsPerTick = frequency != 0 ? 1e9 / static_cast<double>(frequency) : 1.0;
@@ -2241,8 +2242,8 @@ void Recorder::takeSegmentPool(Batch& batch) {
         pool = [metal->device newBufferWithLength:8u * SegmentSlots options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         if (pool == nil) Metal::Fail("cannot allocate an occlusion visibility buffer");
         // Kept resident for the recorder's life: the cache bounds how many there are.
-        [metal->residency addAllocation:pool];
-        [metal->residency commit];
+        ::AgcDriver::Metal::Residency::Add(metal->residency, pool);
+        ::AgcDriver::Metal::Residency::Commit(metal->residency);
     }
     std::memset(pool.contents, 0, pool.length);
     try {
@@ -2556,13 +2557,13 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
-void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
+void Recorder::KeepThroughHold(std::shared_ptr<void> object, std::size_t bytes) {
     GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
     if (const auto hold = GuestMemory::GpuHoldSerial(); hold != holdKeptSerial) {
         holdKept.clear();
         holdKeptSerial = hold;
     }
-    Keep(object);
+    Keep(object, bytes);
     holdKept.push_back(std::move(object));
 }
 
@@ -3288,8 +3289,12 @@ void Recorder::Submit() {
     }];
     const auto submitStart = std::chrono::steady_clock::now();
     MetalCommandBuffer commandBuffers[1] = {commandBuffer};
-    [metal->queue commit:commandBuffers count:1 options:options];
-    [metal->queue signalEvent:metal->timeline value:serial];
+    // Under the residency lock: the commit walks the queue's residency sets, which the release
+    // thread changes (MetalResidency.h, D44).
+    ::AgcDriver::Metal::Residency::CommitQueue([&] {
+        [metal->queue commit:commandBuffers count:1 options:options];
+        [metal->queue signalEvent:metal->timeline value:serial];
+    });
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();

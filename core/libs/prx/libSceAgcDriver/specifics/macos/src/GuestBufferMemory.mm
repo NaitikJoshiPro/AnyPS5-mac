@@ -23,6 +23,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "MetalCommandStream.h"
+#include "MetalResidency.h"
 #import <Metal/Metal.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
@@ -220,7 +221,7 @@ id<MTLResidencySet> residencySetFor(const Context& context) {
         NSError* error = nil;
         entry.set = [device newResidencySetWithDescriptor:descriptor error:&error];
         if (entry.set == nil) throw std::runtime_error(std::string("AGC graphics: cannot create the host-import residency set: ") + (error != nil ? error.localizedDescription.UTF8String : "unknown error"));
-        [queue addResidencySet:entry.set];
+        ::AgcDriver::Metal::Residency::Attach(queue, entry.set);
         entry.queue = queue;
     }
     return entry.set;
@@ -240,8 +241,8 @@ void VKAPI_CALL MetalDestroyImportBuffer(VkDevice device, VkBuffer buffer, const
     auto& residency = Residency();
     std::lock_guard lock(residency.mutex);
     if (const auto found = residency.devices.find(device); found != residency.devices.end() && found->second.set != nil) {
-        [found->second.set removeAllocation:released];
-        [found->second.set commit];
+        ::AgcDriver::Metal::Residency::Remove(found->second.set, released);
+        ::AgcDriver::Metal::Residency::Commit(found->second.set);
     }
 }
 
@@ -255,11 +256,13 @@ void dropImportResidency(VkDevice device) {
     const auto found = residency.devices.find(device);
     if (found == residency.devices.end()) return;
     if (found->second.set != nil) {
-        [found->second.set removeAllAllocations];
-        [found->second.set commit];
-        if (found->second.queue != nil) [found->second.queue removeResidencySet:found->second.set];
+        ::AgcDriver::Metal::Residency::RemoveAll(found->second.set);
+        ::AgcDriver::Metal::Residency::Commit(found->second.set);
+        if (found->second.queue != nil) ::AgcDriver::Metal::Residency::Detach(found->second.queue, found->second.set);
     }
     residency.devices.erase(found);
+    // The imports' buffers kept past their removal (MetalResidency.h) go with the set.
+    ::AgcDriver::Metal::Residency::Drain();
 }
 
 // Why [begin, end) cannot back a no-copy buffer, null when it can: every page mapped, readable and
@@ -322,11 +325,15 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
+    // The retired no-copy buffer stays in the import residency set until the holder goes, so its
+    // bytes count against the batch's kept-byte budget: BoundKeptBytes then submits and retires the
+    // batches holding them instead of letting the residency set grow without bound (D44).
+    const std::size_t retiredBytes = it->second.bytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return;
-    if (hold) recorder->KeepThroughHold(std::move(holder));
-    else if (!recorder->Idle()) recorder->Keep(std::move(holder));
+    if (hold) recorder->KeepThroughHold(std::move(holder), retiredBytes);
+    else if (!recorder->Idle()) recorder->Keep(std::move(holder), retiredBytes);
 }
 
 bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -376,8 +383,8 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     }
     {
         std::lock_guard lock(Residency().mutex);
-        [residency addAllocation:buffer];
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Add(residency, buffer);
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
     entry.memory = VK_NULL_HANDLE;
     entry.address = buffer.gpuAddress;

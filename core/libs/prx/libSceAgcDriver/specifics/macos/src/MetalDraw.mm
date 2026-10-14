@@ -41,6 +41,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "MetalResidency.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1329,8 +1330,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (cache.rasterOrder == nil) {
                 cache.rasterOrder = [state.device newBufferWithLength:Abi::RasterOrderBytes options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
                 if (cache.rasterOrder == nil) Fail("cannot allocate the raster order buffer");
-                [state.residency addAllocation:cache.rasterOrder];
-                [state.residency commit];
+                ::AgcDriver::Metal::Residency::Add(state.residency, cache.rasterOrder);
+                ::AgcDriver::Metal::Residency::Commit(state.residency);
             }
             rasterOrderAddress = cache.rasterOrder.gpuAddress;
         }
