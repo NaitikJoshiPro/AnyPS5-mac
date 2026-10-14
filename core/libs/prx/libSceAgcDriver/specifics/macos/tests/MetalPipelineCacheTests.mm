@@ -5,7 +5,7 @@
 //                                       same results (MISSION §8, M2_DESIGN.md §7.6); a third adds two
 //                                       pipelines with a save between them, and a fourth must find
 //                                       the old and the new ones in the archive (each save flushes the
-//                                       serializer, D46: the archive used to keep only the pipelines
+//                                       serializer, D47: the archive used to keep only the pipelines
 //                                       since the previous save)
 //   agc_metal_pipeline_cache_background background preparation, concurrent requests for one pipeline,
 //                                       failure reporting, key separation
