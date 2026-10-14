@@ -14,7 +14,9 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <csignal>
 #include <sys/mman.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 
 #if !defined(__APPLE__)
@@ -228,11 +230,53 @@ void CheckThreads() {
     Require(region.Collect().empty(), "writes are reported after the writers stopped");
 }
 
+// An ordered load crossing 16 bytes raises SIGBUS/BUS_ADRALN, as a protection fault does. On a watched page that a
+// write already unprotected, the watch must leave it to the next handler (FEX or the displaced stubs emulate it):
+// claiming it retried the load forever (ASTRO BOT's main thread spun in this loop, run astro3-s4).
+std::atomic<int> alignmentFaults{0};
+std::atomic<bool> expectAlignment{false};
+
+void SkipAlignmentFault(int signal, siginfo_t*, void* context) {
+    if (!expectAlignment.load()) {
+        ::signal(signal, SIG_DFL); // any other fault: the default action, as without this handler
+        return;
+    }
+    alignmentFaults.fetch_add(1);
+    auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
+    arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(arm_thread_state64_get_pc(machine->__ss) + 4));
+}
+
+// Runs before the watch's static initializer (g_opened, default priority), so the watch chains to this handler.
+__attribute__((constructor(101))) void InstallBeforeWatch() {
+    struct sigaction action {};
+    action.sa_sigaction = &SkipAlignmentFault;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGBUS, &action, nullptr);
+}
+
+void CheckAlignment() {
+    struct sigaction current {};
+    Require(sigaction(SIGBUS, nullptr, &current) == 0 && current.sa_sigaction != &SkipAlignmentFault, "the watch's handler is not installed in front");
+    expectAlignment = true;
+    ::alarm(10); // a watch that claims the fault retries the load forever
+    Region region(2);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    region.base[0] = 1; // unprotects page 0 (state: written, writable)
+    std::uint64_t value = 0;
+    __asm__ volatile("ldar %0, [%1]" : "=r"(value) : "r"(region.base + 0x14c) : "memory");
+    Require(alignmentFaults.load() == 1, "an alignment fault on a written watched page did not reach the next handler");
+    region.base[region.page + 3] = 2;
+    Require(region.Collect() == std::set<std::size_t>({0, 1}), "writes around the alignment fault are not reported");
+    ::alarm(0);
+    expectAlignment = false;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection or threads");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection, threads or alignment");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -242,6 +286,7 @@ int main(int argc, char** argv) {
         else if (mode == "host") CheckHostWrite();
         else if (mode == "protection") CheckProtection();
         else if (mode == "threads") CheckThreads();
+        else if (mode == "alignment") CheckAlignment();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;

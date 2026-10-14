@@ -32,6 +32,7 @@
 #include <mach/mach_vm.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -319,6 +320,21 @@ private:
 
 const bool g_opened = (Watch::Get(), true);
 #elif defined(__APPLE__)
+// macOS raises an alignment fault (an ordered access or an atomic crossing 16 bytes, which FEX and the displaced
+// stubs emulate further down the chain) as SIGBUS/BUS_ADRALN, the same signal and code as a protection fault on a
+// watched page. Only the ESR tells them apart: a data abort (EC 0x24/0x25) with fault status 0b100001 is an
+// alignment fault, never a write to a watched page. Claiming one would retry the access forever.
+bool IsAlignmentFault(const void* context) {
+#if defined(__aarch64__)
+    const std::uint64_t esr = static_cast<const ucontext_t*>(context)->uc_mcontext->__es.__esr;
+    const std::uint64_t exceptionClass = esr >> 26;
+    return (exceptionClass == 0x24 || exceptionClass == 0x25) && (esr & 0x3f) == 0x21;
+#else
+    (void)context;
+    return false;
+#endif
+}
+
 class Watch {
 public:
     static Watch& Get() {
@@ -499,7 +515,7 @@ private:
 
     static void fault(int signal, siginfo_t* info, void* context) {
         auto& watch = Get();
-        if (watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
+        if (!IsAlignmentFault(context) && watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
         const auto& previous = signal == SIGBUS ? watch._previousBus : watch._previousSegv;
         if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
             previous.sa_sigaction(signal, info, context);
