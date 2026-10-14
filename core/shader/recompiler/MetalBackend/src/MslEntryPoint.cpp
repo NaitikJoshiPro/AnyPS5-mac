@@ -190,7 +190,7 @@ std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& ou
 }
 
 // The triangle-vertices mode of mesh functions (APS5_TRIANGLE_VERTICES, MslAbi Version 13; DECISIONS
-// "per-vertex fragment inputs of mesh draws"), the mesh counterpart of the vertex function's D20
+// D46), the mesh counterpart of the vertex function's D20
 // emulation: per-vertex fragment values need each triangle's three corners, and the emulated
 // barycentrics need one-hot corner weights, which a vertex shared between triangles cannot carry.
 // So every output triangle gets three unshared vertices (weights (1,0,0), (0,1,0), (0,0,1)) and the
