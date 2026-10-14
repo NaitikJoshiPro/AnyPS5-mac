@@ -1718,6 +1718,44 @@ void Recorder::flushPendingStore() {
     run.bytes.clear();
 }
 
+namespace {
+
+// APS5_TRACE_LABEL_LANDING: the label copies a batch recorded, reported when the GPU finishes it.
+struct LandingCopy {
+    id<MTLBuffer> source;
+    NSUInteger sourceOffset;
+    id<MTLBuffer> destination;
+    NSUInteger destinationOffset;
+    std::size_t bytes;
+    std::uint64_t address;
+};
+std::mutex landingMutex;
+std::multimap<std::uint64_t, LandingCopy> landingCopies;
+
+void NoteLandingCopy(std::uint64_t serial, LandingCopy copy) {
+    std::lock_guard lock(landingMutex);
+    landingCopies.emplace(serial, std::move(copy));
+}
+
+void ReportLandingCopies(std::uint64_t serial) {
+    std::vector<LandingCopy> copies;
+    {
+        std::lock_guard lock(landingMutex);
+        const auto [first, last] = landingCopies.equal_range(serial);
+        for (auto it = first; it != last; ++it) copies.push_back(it->second);
+        landingCopies.erase(first, last);
+    }
+    for (const auto& copy : copies) {
+        std::uint64_t source = 0, destination = 0, guest = 0;
+        std::memcpy(&source, static_cast<const std::byte*>(copy.source.contents) + copy.sourceOffset, copy.bytes);
+        std::memcpy(&destination, static_cast<const std::byte*>(copy.destination.contents) + copy.destinationOffset, copy.bytes);
+        std::memcpy(&guest, reinterpret_cast<const void*>(::GuestArena::HostAddress(copy.address)), copy.bytes);
+        std::fprintf(stderr, "[landing] batch %llu done: copy of 0x%llx: upload holds 0x%llx, destination buffer %p holds 0x%llx, guest memory holds 0x%llx\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(copy.address), static_cast<unsigned long long>(source), (__bridge void*)copy.destination, static_cast<unsigned long long>(destination), static_cast<unsigned long long>(guest));
+    }
+}
+
+}
+
 bool Recorder::closeStoreRun(bool atSubmit) {
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
@@ -1779,7 +1817,15 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                         ::AgcDriver::Metal::WatchWrites(host);
                     }
                 }
-                stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
+                if (traceLanding && store.address != 0 && store.bytes.size() <= 8) {
+                    // The same copy UpdateBuffer records, with its source kept so the batch's completion
+                    // can report what the GPU copied from and what the destination holds afterwards.
+                    const auto upload = stream.Write(store.bytes, 4);
+                    [stream.Compute() copyFromBuffer:upload.buffer sourceOffset:upload.offset toBuffer:Metal::BufferOf(store.buffer) destinationOffset:store.offset size:store.bytes.size()];
+                    NoteLandingCopy(submissions + 1, LandingCopy{upload.buffer, upload.offset, Metal::BufferOf(store.buffer), store.offset, store.bytes.size(), store.address});
+                } else {
+                    stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
+                }
                 run.recorded.emplace_back(store.buffer, store.offset, storeEnd);
                 storedBytes += store.bytes.size();
             }
@@ -3213,6 +3259,8 @@ void Recorder::Submit() {
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] recorder commits batch %llu\n", static_cast<unsigned long long>(serial));
     [options addFeedbackHandler:^(MetalFeedback commitFeedback) {
+        static const bool traceLandingCopies = std::getenv("APS5_TRACE_LABEL_LANDING") != nullptr;
+        if (traceLandingCopies) ReportLandingCopies(serial);
         if (traceGpu) std::fprintf(stderr, "[gpu] recorder batch %llu completed on the GPU (%.2f ms)%s%s\n", static_cast<unsigned long long>(serial), (commitFeedback.GPUEndTime - commitFeedback.GPUStartTime) * 1e3, commitFeedback.error != nil ? ": " : "", commitFeedback.error != nil ? Metal::Describe(commitFeedback.error).c_str() : "");
         feedback->gpuStartSeconds = commitFeedback.GPUStartTime;
         feedback->gpuEndSeconds = commitFeedback.GPUEndTime;
