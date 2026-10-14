@@ -1620,6 +1620,7 @@ void Recorder::ensureOpen() {
             throw;
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
+        batch->openedAt = std::chrono::steady_clock::now();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
@@ -3274,11 +3275,13 @@ void Recorder::Submit() {
     std::shared_ptr<BatchFeedback> feedback = batch->metal->feedback;
     std::shared_ptr<FeedbackSink> sink = metal->sink;
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
-    if (traceGpu) std::fprintf(stderr, "[gpu] recorder commits batch %llu\n", static_cast<unsigned long long>(serial));
+    const auto committedAt = std::chrono::steady_clock::now();
+    if (traceGpu) std::fprintf(stderr, "[gpu] recorder commits batch %llu (open %.1f ms)\n", static_cast<unsigned long long>(serial), std::chrono::duration<double, std::milli>(committedAt - batch->openedAt).count());
     [options addFeedbackHandler:^(MetalFeedback commitFeedback) {
         static const bool traceLandingCopies = std::getenv("APS5_TRACE_LABEL_LANDING") != nullptr;
         if (traceLandingCopies) ReportLandingCopies(serial);
-        if (traceGpu) std::fprintf(stderr, "[gpu] recorder batch %llu completed on the GPU (%.2f ms)%s%s\n", static_cast<unsigned long long>(serial), (commitFeedback.GPUEndTime - commitFeedback.GPUStartTime) * 1e3, commitFeedback.error != nil ? ": " : "", commitFeedback.error != nil ? Metal::Describe(commitFeedback.error).c_str() : "");
+        if (traceGpu) std::fprintf(stderr, "[gpu] recorder batch %llu completed on the GPU (%.2f ms; feedback %.1f ms after the commit)%s%s\n", static_cast<unsigned long long>(serial), (commitFeedback.GPUEndTime - commitFeedback.GPUStartTime) * 1e3,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committedAt).count(), commitFeedback.error != nil ? ": " : "", commitFeedback.error != nil ? Metal::Describe(commitFeedback.error).c_str() : "");
         feedback->gpuStartSeconds = commitFeedback.GPUStartTime;
         feedback->gpuEndSeconds = commitFeedback.GPUEndTime;
         if (commitFeedback.error != nil) {

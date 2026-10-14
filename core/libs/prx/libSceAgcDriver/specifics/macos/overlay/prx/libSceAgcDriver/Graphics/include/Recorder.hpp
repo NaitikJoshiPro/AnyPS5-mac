@@ -561,6 +561,9 @@ private:
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
+        // When its command buffer began (ensureOpen): an MTL4 command buffer committed long after it
+        // began fails with MTL4CommandQueueErrorTimeout (see Recorder::BeforeLongWait).
+        std::chrono::steady_clock::time_point openedAt{};
         // macOS: occlusion samples are counted in segment mode only (see SampleVisibilityBuffer):
         // `segments` identifies the visibility result buffer `segmentPool` holds.
         std::shared_ptr<void> samplePool;
