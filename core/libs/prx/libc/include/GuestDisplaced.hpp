@@ -116,6 +116,21 @@ void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint6
 void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t start, std::uintptr_t end);
 // The active displaced ranges in ascending order (empty when inactive).
 void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count);
+// Code in [start, end) is about to be freed (the CPU backend's code buffer, a module's code): forget every patched
+// site in it and free their stubs (and the sites inside those stubs) for reuse. The caller guarantees that no thread
+// runs the code any more (FEX frees a code buffer only once every thread has left it), so none runs their stubs
+// either: a stub is entered only from its site and returns into its site's code. Safe against concurrent faults on
+// other threads (one lock, signals blocked while it is held). Returns the number of sites forgotten.
+std::size_t GuestDisplacedCodeFreed_nid_no_patch(std::uintptr_t start, std::uintptr_t end);
+// Site table and stub memory occupancy: live sites, sites forgotten so far, stub slots in use, stub slots on free
+// lists, stub chunks reserved, and sites whose pc lies inside a stub (a stub's own access that faulted).
+struct DisplacedSiteStats {
+    std::uint64_t liveSites = 0, forgottenSites = 0, slotsInUse = 0, slotsFree = 0, chunks = 0, stubSites = 0;
+};
+void GuestDisplacedSiteStats_nid_no_patch(DisplacedSiteStats* stats);
+// Tests: cap the live sites and the stub chunks below their built-in limits (0 restores the default), so churn
+// beyond the cap shows whether sites and stubs are reclaimed.
+void GuestDisplacedTestLimits_nid_no_patch(std::size_t maxSites, std::size_t maxChunks);
 }
 
 }

@@ -36,8 +36,9 @@ extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsyst
 //            lsr xA, xN, #36           ; xN >= DisplacedEnd (7 << 36): ordinary memory (the arena), leave
 //            sub xA, xA, #7
 //            tbz xA, #63, plain
-//            movz/movk/movk xA, start  ; the window's start, as immediates
-//            sub xA, xN, xA
+//            lsr xA, xN, #14           ; the window's start is 16 KiB aligned: compare in pages
+//            sub xA, xA, #hi, lsl #12  ; (start >> 14) as two 12-bit immediates
+//            sub xA, xA, #lo
 //            tbnz xA, #63, plain       ; xN < start: ordinary memory
 //   flip:    eor xA, xN, #(1 << 40)
 //            [nop]                     ; barrier slot before an ordered store
@@ -51,6 +52,15 @@ extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsyst
 //            b next                    ; (far stubs: tail)
 //   forced:  str xA, [sp, #-144]!
 //            b flip
+//
+// A register-offset access ([xN, xM, ext #s]) checks the address it really accesses: each `lsr` above reads
+// xA = xN + ext(xM) << s (an `add` of the same extend first), so a small base plus a displaced index takes the flip
+// path (eor of xN then adds 1 << 40 to the sum) and a displaced base plus an index that leaves the window does not.
+// Before, the check looked at xN alone, so `[small + pointer]` sites went down the plain path, faulted inside the
+// stub, and every execution built one more stub for that copy (a chain that grew by one site per execution).
+//
+// Sites are forgotten and their stubs freed when the code they patch is freed (GuestDisplacedCodeFreed: FEX's
+// code buffers, through the code pool), so the table and the stub chunks hold only live code's sites.
 //
 // The signal path resumes at `forced` (the base need not be the displaced operand of a register-offset form); a JIT
 // site is then patched to `b checked`, so later executions cost a few instructions and no signal (ordinary pointers
@@ -72,7 +82,7 @@ namespace {
 
 std::uintptr_t g_start = CarveoutStart;
 
-constexpr std::uint32_t kSlotWords = 36; // longest stub: 9 check + 7 flip + 4 plain + 8 tail + 2 forced + 1 pad + 2 literal words (+ spare); 16-byte multiple
+constexpr std::uint32_t kSlotWords = 36; // longest stub: 10 check + 7 flip + 4 plain + 8 tail + 2 forced + 1 pad + 2 literal words (+ spare); 16-byte multiple
 constexpr std::size_t kChunkBytes = 1u << 20;
 constexpr std::size_t kMaxChunks = 512; // 64K stubs per chunk: chunks are reserved lazily, 1 MiB each
 // Patched sites, open addressing. ASTRO BOT keeps most of its heap in displaced memory and patched 32k JIT sites
@@ -87,7 +97,11 @@ struct Chunk {
     std::size_t used = 0;
     bool far = false; // out of branch range: stubs return through BRK and the SIGTRAP handler
     std::size_t bytes = kChunkBytes;
+    std::uintptr_t freeHead = 0; // freed slots (rx addresses), linked through their writable view
+    std::size_t freeSlots = 0;
 };
+
+constexpr std::uint32_t kFreedSlotBrk = 0xd4200000u | (0xd16u << 5); // first word of a freed slot: a stray entry traps
 
 constexpr std::uint32_t kReturnBrk = 0xd4200000u | (0xd15u << 5);
 
@@ -97,6 +111,7 @@ struct Site {
     std::uint32_t forcedOffset = 0;
     std::uint32_t instruction = 0; // JIT code at pc can be freed and reused for another instruction
     bool far = false;
+    bool inStub = false; // pc is inside another site's stub
 };
 
 constexpr std::size_t kMaxRanges = 4;
@@ -114,6 +129,13 @@ std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
 Chunk g_chunks[kMaxChunks];
 std::size_t g_chunkCount = 0;
 Site g_sites[kTableSize];
+// Live sites are capped below the table size: linear probing degrades sharply near full, and every probe runs in a
+// signal handler under the lock. Tests lower both caps (GuestDisplacedTestLimits) to show reclamation.
+constexpr std::size_t kDefaultSiteLimit = kTableSize - kTableSize / 8;
+std::size_t g_siteLimit = kDefaultSiteLimit;
+std::size_t g_chunkLimit = kMaxChunks;
+std::size_t g_liveSites = 0, g_liveStubSites = 0; // under the lock
+std::atomic<std::uint64_t> g_forgotten{0};
 struct sigaction g_previousBus {}, g_previousSegv {};
 std::once_flag g_once;
 bool g_trace = false;
@@ -134,12 +156,15 @@ std::atomic<std::uint64_t> g_farBranchSites{0}; // far stubs that return by bran
 void ReportMilestone(std::uint64_t count, const char* what = "faults") {
     if (count < 1024 || ((count & (count - 1)) != 0 && (count & 8191) != 0)) return;
     const auto seconds = static_cast<double>(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_enabledAt) / 1e9;
-    char line[256];
+    char line[384];
     const int length = std::snprintf(line, sizeof(line),
-        "[displaced] %llu %s %.1f s after enable (faults %llu, sites patched %llu, unpatched faults %llu, far-stub SIGTRAP returns %llu, branch-return far sites %llu)\n",
+        "[displaced] %llu %s %.1f s after enable (faults %llu, sites patched %llu, unpatched faults %llu, far-stub SIGTRAP returns %llu, branch-return far sites %llu, "
+        "live sites %llu, sites in stubs %llu, forgotten %llu)\n",
         static_cast<unsigned long long>(count), what, seconds, static_cast<unsigned long long>(g_faults.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_patches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_unpatched.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(g_farReturns.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_farBranchSites.load(std::memory_order_relaxed)));
+        static_cast<unsigned long long>(g_farReturns.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_farBranchSites.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(__atomic_load_n(&g_liveSites, __ATOMIC_RELAXED)), static_cast<unsigned long long>(__atomic_load_n(&g_liveStubSites, __ATOMIC_RELAXED)),
+        static_cast<unsigned long long>(g_forgotten.load(std::memory_order_relaxed)));
     if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
 }
 
@@ -163,7 +188,7 @@ std::uint32_t Branch(std::uintptr_t from, std::uintptr_t to) {
 
 // A chunk with an RW view and an RX view of the same pages; the RX view is placed near `pc`.
 Chunk* NewChunkNear(std::uintptr_t pc) {
-    if (g_chunkCount == kMaxChunks) return nullptr;
+    if (g_chunkCount >= g_chunkLimit) return nullptr;
     // JIT code: the code pool hands out memory near its own code (the arena and the pool leave nothing free nearby).
     if (auto* allocator = g_allocator.load(std::memory_order_acquire)) {
         std::uintptr_t writable = 0;
@@ -200,7 +225,7 @@ Chunk* NewChunkNear(std::uintptr_t pc) {
 
 // Native code in the dyld shared cache sits far from any free memory; its stubs go anywhere.
 Chunk* NewFarChunk() {
-    if (g_chunkCount == kMaxChunks) return nullptr;
+    if (g_chunkCount >= g_chunkLimit) return nullptr;
     mach_vm_address_t rw = 0;
     if (mach_vm_allocate(mach_task_self(), &rw, kChunkBytes, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return nullptr;
     mach_vm_address_t rx = 0;
@@ -225,12 +250,23 @@ bool InTestFarCode(std::uintptr_t pc) {
     return pc >= g_testFarStart && pc < g_testFarEnd;
 }
 
+bool HasRoom(const Chunk& chunk) {
+    return chunk.freeHead != 0 || chunk.used + kSlotWords * 4 <= chunk.bytes;
+}
+
+Chunk* ChunkOf(std::uintptr_t pc) {
+    for (std::size_t i = 0; i < g_chunkCount; ++i)
+        if (pc >= g_chunks[i].rx && pc < g_chunks[i].rx + g_chunks[i].bytes) return &g_chunks[i];
+    return nullptr;
+}
+
+// Freed slots first (a stub whose code was freed), then fresh space. Caller holds the lock.
 std::uintptr_t AllocateSlot(std::uintptr_t pc, std::uint32_t*& writable, bool& far) {
     Chunk* chunk = nullptr;
     const bool forceFar = InTestFarCode(pc);
     for (std::size_t i = 0; i < g_chunkCount && !forceFar; ++i) {
         auto& candidate = g_chunks[i];
-        if (!candidate.far && candidate.used + kSlotWords * 4 <= candidate.bytes && InBranchRange(pc, candidate.rx) && InBranchRange(pc, candidate.rx + candidate.bytes)) {
+        if (!candidate.far && HasRoom(candidate) && InBranchRange(pc, candidate.rx) && InBranchRange(pc, candidate.rx + candidate.bytes)) {
             chunk = &candidate;
             break;
         }
@@ -238,16 +274,36 @@ std::uintptr_t AllocateSlot(std::uintptr_t pc, std::uint32_t*& writable, bool& f
     if (chunk == nullptr && !forceFar) chunk = NewChunkNear(pc);
     if (chunk == nullptr) {
         for (std::size_t i = 0; i < g_chunkCount && chunk == nullptr; ++i) {
-            if (g_chunks[i].far && g_chunks[i].used + kSlotWords * 4 <= g_chunks[i].bytes) chunk = &g_chunks[i];
+            if (g_chunks[i].far && HasRoom(g_chunks[i])) chunk = &g_chunks[i];
         }
         if (chunk == nullptr) chunk = NewFarChunk();
     }
     if (chunk == nullptr) return 0;
     far = chunk->far;
+    if (chunk->freeHead != 0) {
+        const auto slot = chunk->freeHead;
+        writable = reinterpret_cast<std::uint32_t*>(chunk->rw + (slot - chunk->rx));
+        std::memcpy(&chunk->freeHead, writable + 2, sizeof(chunk->freeHead));
+        --chunk->freeSlots;
+        return slot;
+    }
     const auto offset = chunk->used;
     chunk->used += kSlotWords * 4;
     writable = reinterpret_cast<std::uint32_t*>(chunk->rw + offset);
     return chunk->rx + offset;
+}
+
+// Puts a stub's slot on its chunk's free list; its first word becomes a BRK so a stray branch into it traps instead
+// of running a stale access. Caller holds the lock.
+void FreeSlot(std::uintptr_t stub) {
+    auto* chunk = ChunkOf(stub);
+    if (chunk == nullptr) return;
+    auto* writable = reinterpret_cast<std::uint32_t*>(chunk->rw + (stub - chunk->rx));
+    __atomic_store_n(writable, kFreedSlotBrk, __ATOMIC_RELEASE);
+    std::memcpy(writable + 2, &chunk->freeHead, sizeof(chunk->freeHead));
+    sys_icache_invalidate(reinterpret_cast<void*>(stub), 4);
+    chunk->freeHead = stub;
+    ++chunk->freeSlots;
 }
 
 // A64 loads and stores: op0 = x1x0. Literal loads (PC-relative) cannot move into a stub.
@@ -291,18 +347,118 @@ bool HasWriteback(std::uint32_t insn) {
     return false;
 }
 
+std::size_t Home(std::uintptr_t pc) {
+    return (pc >> 2) & (kTableSize - 1);
+}
+
+// Open addressing with linear probing; entries are removed by backward shift (no tombstones), so lookups stay short
+// however many sites come and go. Caller holds the lock.
 Site* FindSite(std::uintptr_t pc, bool insert) {
-    auto index = (pc >> 2) & (kTableSize - 1);
+    auto index = Home(pc);
     for (std::size_t probe = 0; probe < kTableSize; ++probe, index = (index + 1) & (kTableSize - 1)) {
         auto& site = g_sites[index];
         if (site.pc == pc) return &site;
         if (site.pc == 0) {
-            if (!insert) return nullptr;
+            if (!insert || g_liveSites >= g_siteLimit) return nullptr;
+            site = Site{};
             site.pc = pc;
+            ++g_liveSites;
             return &site;
         }
     }
     return nullptr;
+}
+
+// Empties slot `hole` and moves later entries of its probe run back so that every entry stays reachable from its home.
+void Erase(std::size_t hole) {
+    if (g_sites[hole].inStub) --g_liveStubSites;
+    --g_liveSites;
+    for (auto next = (hole + 1) & (kTableSize - 1);; next = (next + 1) & (kTableSize - 1)) {
+        const auto& candidate = g_sites[next];
+        if (candidate.pc == 0) break;
+        const auto home = Home(candidate.pc);
+        // The candidate may fill the hole unless its home lies cyclically in (hole, next].
+        const bool homeAfterHole = hole <= next ? (home > hole && home <= next) : (home > hole || home <= next);
+        if (homeAfterHole) continue;
+        g_sites[hole] = candidate;
+        hole = next;
+    }
+    g_sites[hole] = Site{};
+}
+
+// Forgets the sites with pc in [start, end) and frees their stubs; then the sites inside those stubs (a stub's own
+// copied access that faulted), down to a small depth. Caller holds the lock with signals blocked.
+std::size_t ForgetLocked(std::uintptr_t start, std::uintptr_t end, unsigned depth) {
+    if (end <= start) return 0;
+    constexpr std::size_t kNested = 64;
+    std::uintptr_t freed[kNested];
+    std::size_t freedCount = 0, forgotten = 0;
+    bool nestedOverflow = false;
+    // Every site in range has its home in the `span` slots from Home(start) and lies in the probe run that starts at
+    // its home, so the scan covers those slots and then runs on to the first empty one. Erase only moves entries
+    // into the hole being examined or into later holes, so rechecking the hole finds everything.
+    const std::size_t span = std::min<std::size_t>(kTableSize, (end - start + 3) / 4);
+    auto index = Home(start);
+    for (std::size_t visited = 0; visited < kTableSize + span;) {
+        auto& site = g_sites[index];
+        if (site.pc == 0 && visited >= span) break;
+        if (site.pc != 0 && site.pc >= start && site.pc < end) {
+            if (site.stub != 0) {
+                FreeSlot(site.stub);
+                if (freedCount < kNested) freed[freedCount++] = site.stub;
+                else nestedOverflow = true;
+            }
+            Erase(index);
+            ++forgotten;
+            continue;
+        }
+        index = (index + 1) & (kTableSize - 1);
+        ++visited;
+    }
+    if (depth < 4) {
+        for (std::size_t i = 0; i < freedCount; ++i)
+            if (g_liveStubSites != 0) forgotten += ForgetLocked(freed[i], freed[i] + kSlotWords * 4, depth + 1);
+        if (nestedOverflow && g_liveStubSites != 0) {
+            // More freed stubs than recorded: forget every site inside a free slot (chunks are few, slots small).
+            for (std::size_t c = 0; c < g_chunkCount; ++c)
+                for (auto slot = g_chunks[c].freeHead; slot != 0;) {
+                    forgotten += ForgetLocked(slot, slot + kSlotWords * 4, depth + 1);
+                    std::memcpy(&slot, reinterpret_cast<const void*>(g_chunks[c].rw + (slot - g_chunks[c].rx) + 8), sizeof(slot));
+                }
+        }
+    }
+    return forgotten;
+}
+
+// The lock from ordinary (non-signal) code: block every signal first, or a fault handled on this thread while the
+// lock is held would spin on it forever.
+struct BlockedSpinLock {
+    sigset_t previous{};
+    BlockedSpinLock() {
+        sigset_t all;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &previous);
+        while (g_lock.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+    ~BlockedSpinLock() {
+        g_lock.clear(std::memory_order_release);
+        pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    }
+};
+
+// Load/store register (register offset): [xN, xM, <extend> #s]. The address it uses is xN + (ext(xM) << s).
+bool RegisterOffset(std::uint32_t insn) {
+    return (insn & 0x3b200c00u) == 0x38200800u;
+}
+
+// add xD, xN, xM, <extend> #s: the register-offset form's address (the load's option field is ADD's extend).
+std::uint32_t AddressOf(std::uint32_t insn, unsigned rd) {
+    const unsigned size = insn >> 30;
+    const bool simd = (insn & 0x04000000u) != 0;
+    const unsigned scale = simd && size == 0 && (insn & 0x00800000u) != 0 ? 4u : size; // 128-bit SIMD: Q
+    const unsigned amount = (insn & 0x1000u) != 0 ? scale : 0u;
+    return 0x8b200000u | (insn & (31u << 16)) | (insn & (7u << 13)) | (amount << 10) | (insn & (31u << 5)) | rd;
 }
 
 // Registers an instruction reads (bit per register; 31 is the zero register or SP, never a dead candidate) and the one
@@ -392,20 +548,21 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     const auto push = 0xf8170fe0u | a; // str xA, [sp, #-144]!   (clear of the 128-byte red zone)
     const auto pop = 0xf84907e0u | a;  // ldr xA, [sp], #144
     const auto eorFlip = [](unsigned dst, unsigned src) { return 0xd2400000u | (24u << 16) | (src << 5) | dst; };
-    const auto movz = [](unsigned reg, std::uint64_t value, unsigned hw, bool keep) {
-        return (keep ? 0xf2800000u : 0xd2800000u) | (hw << 21) | (static_cast<std::uint32_t>((value >> (16 * hw)) & 0xffffu) << 5) | reg;
-    };
     // checked: ordinary memory above the window (the arena, first fit from 512 GiB) leaves after three instructions.
+    // A register-offset access checks its full address (xA = xN + ext(xM) << s first).
+    const bool indexed = RegisterOffset(insn);
+    const unsigned source = indexed ? a : rn;
     words[n++] = push;
-    words[n++] = 0xd364fc00u | (rn << 5) | a; // lsr xA, xN, #36       (DisplacedEnd = 7 << 36)
-    words[n++] = 0xd1001c00u | (a << 5) | a;  // sub xA, xA, #7
-    const auto aboveAt = n++;                 // tbz xA, #63, plain   (xN >= DisplacedEnd)
-    const std::uint64_t start = DisplacedStart();
-    words[n++] = movz(a, start, 0, false);
-    words[n++] = movz(a, start, 1, true);
-    words[n++] = movz(a, start, 2, true);
-    words[n++] = 0xcb000000u | (a << 16) | (rn << 5) | a; // sub xA, xN, xA
-    const auto belowAt = n++;                             // tbnz xA, #63, plain (xN < start)
+    if (indexed) words[n++] = AddressOf(insn, a);
+    words[n++] = 0xd364fc00u | (source << 5) | a; // lsr xA, src, #36      (DisplacedEnd = 7 << 36)
+    words[n++] = 0xd1001c00u | (a << 5) | a;      // sub xA, xA, #7
+    const auto aboveAt = n++;                     // tbz xA, #63, plain   (src >= DisplacedEnd)
+    const std::uint64_t page = DisplacedStart() >> 14; // 16 KiB aligned (checked at Enable)
+    if (indexed) words[n++] = AddressOf(insn, a);
+    words[n++] = 0xd34efc00u | (source << 5) | a;                                          // lsr xA, src, #14
+    words[n++] = 0xd1400000u | (static_cast<std::uint32_t>((page >> 12) & 0xfffu) << 10) | (a << 5) | a; // sub xA, xA, #hi, lsl #12
+    words[n++] = 0xd1000000u | (static_cast<std::uint32_t>(page & 0xfffu) << 10) | (a << 5) | a;         // sub xA, xA, #lo
+    const auto belowAt = n++;                                                              // tbnz xA, #63, plain (src < start)
     const auto flipAt = n;
     const auto ordered = OrderedAccess(insn);
     const auto access = [&](std::uint32_t copy) {
@@ -462,7 +619,12 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     auto* site = FindSite(pc, true);
     if (site == nullptr) {
         (void)!write(2, "[displaced] site table full\n", 28); // fatal for this access: always said
+        FreeSlot(stub);
         return nullptr;
+    }
+    if (!site->inStub && ChunkOf(pc) != nullptr) {
+        site->inStub = true;
+        ++g_liveStubSites;
     }
     site->stub = stub;
     site->forcedOffset = forcedAt * 4;
@@ -823,6 +985,10 @@ bool Enable() {
     for (std::size_t i = 0; i < count; ++i) g_ranges[i] = found[count - 1 - i];
     g_rangeCount = count;
     g_start = g_ranges[0].guestStart;
+    if ((g_start & 0x3fffu) != 0 || (g_start >> 38) != 0) { // the stub compares 16 KiB pages as two 12-bit immediates
+        std::fprintf(stderr, "[memory] the displaced window start 0x%llx is not a 16 KiB page below 256 GiB; displacement disabled\n", static_cast<unsigned long long>(g_start));
+        return false;
+    }
     if (std::uint64_t cache = 0; __shared_region_check_np(&cache) == 0 && cache >= DisplacedLowest && cache < g_start &&
                                  std::strcmp(g_ranges[0].name, "shared region tail") == 0) {
         g_cacheStart = static_cast<std::uintptr_t>(cache);
@@ -874,12 +1040,46 @@ void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patc
 }
 
 void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t start, std::uintptr_t end) {
-    SpinLock lock;
-    // Sites recorded for the old or new range describe code a test may since have replaced: forget their stubs.
-    for (auto& site : g_sites)
-        if (site.pc != 0 && ((site.pc >= g_testFarStart && site.pc < g_testFarEnd) || (site.pc >= start && site.pc < end))) site.stub = 0;
+    BlockedSpinLock lock;
+    // Sites recorded for the old or new range describe code a test may since have replaced: forget them.
+    g_forgotten.fetch_add(ForgetLocked(g_testFarStart, g_testFarEnd, 0) + ForgetLocked(start, end, 0), std::memory_order_relaxed);
     g_testFarStart = start;
     g_testFarEnd = end;
+}
+
+std::size_t GuestDisplacedCodeFreed_nid_no_patch(std::uintptr_t start, std::uintptr_t end) {
+    if (!g_enabled.load(std::memory_order_acquire)) return 0;
+    BlockedSpinLock lock;
+    const auto forgotten = ForgetLocked(start, end, 0);
+    g_forgotten.fetch_add(forgotten, std::memory_order_relaxed);
+    static std::atomic<int> reported{0}; // APS5_DISPLACED_TRACE: the first frees that released sites
+    if (g_trace && forgotten != 0 && reported.fetch_add(1) < 16) {
+        char line[160];
+        const int length = std::snprintf(line, sizeof(line), "[displaced] code freed 0x%llx-0x%llx: %zu sites forgotten\n", static_cast<unsigned long long>(start),
+            static_cast<unsigned long long>(end), forgotten);
+        if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
+    }
+    return forgotten;
+}
+
+void GuestDisplacedSiteStats_nid_no_patch(DisplacedSiteStats* stats) {
+    if (stats == nullptr) return;
+    BlockedSpinLock lock;
+    *stats = DisplacedSiteStats{};
+    stats->liveSites = g_liveSites;
+    stats->forgottenSites = g_forgotten.load(std::memory_order_relaxed);
+    stats->stubSites = g_liveStubSites;
+    stats->chunks = g_chunkCount;
+    for (std::size_t i = 0; i < g_chunkCount; ++i) {
+        stats->slotsInUse += g_chunks[i].used / (kSlotWords * 4) - g_chunks[i].freeSlots;
+        stats->slotsFree += g_chunks[i].freeSlots;
+    }
+}
+
+void GuestDisplacedTestLimits_nid_no_patch(std::size_t maxSites, std::size_t maxChunks) {
+    BlockedSpinLock lock;
+    g_siteLimit = maxSites == 0 ? kDefaultSiteLimit : std::min(maxSites, kDefaultSiteLimit);
+    g_chunkLimit = maxChunks == 0 ? kMaxChunks : std::min(maxChunks, kMaxChunks);
 }
 
 void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint64_t* trapReturns, std::uint64_t* branchSites) {
@@ -906,6 +1106,11 @@ void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patc
     if (patches != nullptr) *patches = 0;
 }
 void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t, std::uintptr_t) {}
+std::size_t GuestDisplacedCodeFreed_nid_no_patch(std::uintptr_t, std::uintptr_t) { return 0; }
+void GuestDisplacedSiteStats_nid_no_patch(DisplacedSiteStats* stats) {
+    if (stats != nullptr) *stats = DisplacedSiteStats{};
+}
+void GuestDisplacedTestLimits_nid_no_patch(std::size_t, std::size_t) {}
 void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint64_t* trapReturns, std::uint64_t* branchSites) {
     if (unpatched != nullptr) *unpatched = 0;
     if (trapReturns != nullptr) *trapReturns = 0;

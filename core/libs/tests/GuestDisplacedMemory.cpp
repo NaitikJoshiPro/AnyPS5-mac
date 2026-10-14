@@ -10,6 +10,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 #if defined(__APPLE__)
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
@@ -100,6 +102,8 @@ void ManySites(std::uintptr_t displaced) {
     const auto value = reinterpret_cast<std::uint32_t (*)(std::uintptr_t)>(code)(displaced);
     Require(value == Load<std::uint32_t>(GuestArena::HostAddress(displaced)), "the many-sites loads read the wrong value");
     Require(Faults() - before >= Sites, "the many-sites loads did not each go through the fault handler");
+    Require(GuestArena::GuestDisplacedCodeFreed_nid_no_patch(reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(code) + bytes) == Sites,
+        "freeing the many-sites code did not forget its sites");
     munmap(code, bytes);
 }
 
@@ -152,6 +156,7 @@ void PatchedSiteRace(std::uintptr_t displaced) {
     const auto resumed = static_cast<std::uintptr_t>(arm_thread_state64_get_pc(machine.__ss));
     Require(!chained && resumed != reinterpret_cast<std::uintptr_t>(code),
         "a fault at a site another thread already patched was not redirected to its stub");
+    GuestArena::GuestDisplacedCodeFreed_nid_no_patch(reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(code) + 0x4000);
     munmap(code, 0x4000);
 }
 
@@ -168,7 +173,10 @@ struct GeneratedCode {
         pthread_jit_write_protect_np(1);
         sys_icache_invalidate(code, 0x4000);
     }
-    ~GeneratedCode() { munmap(code, 0x4000); }
+    ~GeneratedCode() {
+        GuestArena::GuestDisplacedCodeFreed_nid_no_patch(Begin(), Begin() + 0x4000);
+        munmap(code, 0x4000);
+    }
     std::uintptr_t Begin() const { return reinterpret_cast<std::uintptr_t>(code); }
     template <typename F>
     F As() const { return reinterpret_cast<F>(code); }
@@ -257,6 +265,126 @@ void PatchedSitePointers(std::uintptr_t displaced) {
     Require(after.faults == before.faults, "a patched site faulted again");
     Require(reinterpret_cast<std::uintptr_t>(heap) >= GuestArena::DisplacedEnd || reinterpret_cast<std::uintptr_t>(heap) < GuestArena::DisplacedStart(), "the heap is displaced");
     delete heap;
+}
+
+GuestArena::DisplacedSiteStats SiteStats() {
+    GuestArena::DisplacedSiteStats stats;
+    GuestArena::GuestDisplacedSiteStats_nid_no_patch(&stats);
+    return stats;
+}
+
+// Register-offset accesses ([xN, xM, ext #s]) check the address they really use. Before, the stub checked xN alone:
+// `[small + displaced]` took the plain path, faulted inside the stub, and every execution built one more stub (a
+// chain one site longer per call); a displaced base with an index leaving the window was flipped wrongly.
+void RegisterOffsetSites(std::uintptr_t displaced) {
+    Store<std::uint64_t>(GuestArena::HostAddress(displaced), 0x1234);
+    Store<std::uint32_t>(GuestArena::HostAddress(displaced) + 12, 0x5678);
+    auto* heap = new std::uint64_t[4]{7, 8, 9, 10};
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(&WriteCode, nullptr);
+    {
+        // ldr x9, [x1, x0]; mov x0, x9; ret   (x1 small, x0 the pointer: the base is not the displaced operand)
+        GeneratedCode code({0xf8606829u, 0xaa0903e0u, 0xd65f03c0u});
+        const auto run = code.As<std::uint64_t (*)(std::uintptr_t, std::uintptr_t)>();
+        const auto before = SiteStats();
+        const auto faults = Faults();
+        for (int i = 0; i < 200; ++i) {
+            Require(run(displaced - 8, 8) == 0x1234, "[small + displaced]: wrong value");
+            Require(run(reinterpret_cast<std::uintptr_t>(heap) - 8, 8) == 7, "[small + heap] through the patched site: wrong value");
+        }
+        const auto after = SiteStats();
+        std::printf("register offset [small + displaced]: faults %llu, live sites +%lld, sites in stubs %llu\n", static_cast<unsigned long long>(Faults() - faults),
+            static_cast<long long>(after.liveSites - before.liveSites), static_cast<unsigned long long>(after.stubSites));
+        Require(Faults() - faults == 1, "[small + displaced] faulted more than once: the stub does not check the full address");
+        Require(after.liveSites == before.liveSites + 1 && after.stubSites == 0, "[small + displaced] built sites inside its stub");
+    }
+    {
+        // ldr w9, [x0, w1, sxtw #2]; mov x0, x9; ret   (displaced base, scaled signed index)
+        GeneratedCode code({0xb861d809u, 0xaa0903e0u, 0xd65f03c0u});
+        const auto run = code.As<std::uint64_t (*)(std::uintptr_t, std::int64_t)>();
+        const auto faults = Faults();
+        for (int i = 0; i < 200; ++i) {
+            Require(run(displaced, 3) == 0x5678, "[displaced + w1 sxtw #2]: wrong value");
+            Require(run(reinterpret_cast<std::uintptr_t>(heap) + 16, -2) == 8, "[heap + negative index] through the patched site: wrong value");
+        }
+        Require(Faults() - faults == 1, "[displaced + scaled index] faulted more than once");
+    }
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(nullptr, nullptr);
+    delete[] heap;
+}
+
+// One churner: a JIT-like code region rewritten every round with `sites` loads, run on a displaced pointer (one fault
+// and one patch per site), run again (patched: no fault) and on an ordinary pointer, then freed the way the CPU backend
+// frees a code buffer. Without reclamation the live sites and the stub slots grow by `sites` every round.
+void Churn(std::uintptr_t displaced, std::size_t sites, std::size_t rounds, const char* name, std::size_t* patched) {
+    const std::size_t bytes = ((sites + 2) * 4 + 0x3fff) & ~std::size_t{0x3fff};
+    void* code = mmap(nullptr, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    Require(code != MAP_FAILED, "MAP_JIT for the churn code");
+    const auto begin = reinterpret_cast<std::uintptr_t>(code);
+    auto* words = static_cast<std::uint32_t*>(code);
+    std::uint32_t ordinary = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        const unsigned reg = 9 + static_cast<unsigned>(round % 3); // a different instruction at every pc each round
+        pthread_jit_write_protect_np(0);
+        for (std::size_t i = 0; i < sites; ++i) words[i] = 0xb9400000u | reg;   // ldr wR, [x0]
+        words[sites] = 0x2a0003e0u | (reg << 16);                               // mov w0, wR
+        words[sites + 1] = 0xd65f03c0u;                                         // ret
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(code, bytes);
+        const auto run = reinterpret_cast<std::uint32_t (*)(std::uintptr_t)>(code);
+        const auto expected = Load<std::uint32_t>(GuestArena::HostAddress(displaced));
+        if (run(displaced) != expected) throw std::runtime_error(std::string(name) + ": the faulting run read the wrong value");
+        if (run(displaced) != expected) throw std::runtime_error(std::string(name) + ": the patched run read the wrong value");
+        ordinary = static_cast<std::uint32_t>(round);
+        if (run(reinterpret_cast<std::uintptr_t>(&ordinary)) != ordinary) throw std::runtime_error(std::string(name) + ": the patched run on ordinary memory read the wrong value");
+        if ((__atomic_load_n(&words[0], __ATOMIC_ACQUIRE) & 0xfc000000u) != 0x14000000u) throw std::runtime_error(std::string(name) + ": the first site was not patched");
+        const auto forgotten = GuestArena::GuestDisplacedCodeFreed_nid_no_patch(begin, begin + bytes);
+        if (forgotten != sites) throw std::runtime_error(std::string(name) + ": freeing the code forgot " + std::to_string(forgotten) + " sites, expected " + std::to_string(sites));
+        *patched += sites;
+    }
+    munmap(code, bytes);
+}
+
+// Sites and stubs are reclaimed when code is freed (cache flush, SMC, unload): churn far past the caps, on two
+// threads at once (faults and patches on one thread while the other frees its code), first under small test caps
+// (the sites and the stub chunks alive before plus 2048 sites and 2 chunks, 7281 stubs each), then past the real
+// table (1M entries, 7/8 of them usable) at the built-in caps.
+void SiteReclamation(std::uintptr_t displaced) {
+    Store<std::uint32_t>(GuestArena::HostAddress(displaced), 0xc0ffee);
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(&WriteCode, nullptr);
+    const auto before = SiteStats();
+    const auto faults = Faults();
+    std::printf("site reclamation: before live %llu, slots in use %llu, free %llu, chunks %llu\n", static_cast<unsigned long long>(before.liveSites),
+        static_cast<unsigned long long>(before.slotsInUse), static_cast<unsigned long long>(before.slotsFree), static_cast<unsigned long long>(before.chunks));
+    const auto churnPair = [&](std::size_t sites, std::size_t rounds) {
+        std::size_t first = 0, second = 0;
+        std::string error;
+        std::thread other([&] {
+            try {
+                Churn(displaced, sites, rounds, "churn thread 2", &second);
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+        });
+        Churn(displaced, sites, rounds, "churn thread 1", &first);
+        other.join();
+        if (!error.empty()) throw std::runtime_error(error);
+        return first + second;
+    };
+    GuestArena::GuestDisplacedTestLimits_nid_no_patch(before.liveSites + 2048, before.chunks + 2);
+    const auto small = churnPair(1000, 100); // 200k sites patched through a 2048-site table and 14.5k stub slots
+    GuestArena::GuestDisplacedTestLimits_nid_no_patch(0, 0);
+    const auto mid = SiteStats();
+    Require(mid.liveSites == before.liveSites && mid.slotsInUse == before.slotsInUse && mid.stubSites == before.stubSites, "sites or stubs leaked under the small caps");
+    Require(mid.chunks <= before.chunks + 2, "the small-cap churn reserved more stub chunks than its cap");
+    const auto large = churnPair(4000, 160); // 1.28M sites: more than the whole table
+    const auto after = SiteStats();
+    std::printf("site reclamation: %zu + %zu sites patched and forgotten, %llu faults; after live %llu, slots in use %llu, free %llu, chunks %llu, forgotten %llu\n", small, large,
+        static_cast<unsigned long long>(Faults() - faults), static_cast<unsigned long long>(after.liveSites), static_cast<unsigned long long>(after.slotsInUse),
+        static_cast<unsigned long long>(after.slotsFree), static_cast<unsigned long long>(after.chunks), static_cast<unsigned long long>(after.forgottenSites));
+    Require(small + large > (std::size_t{1} << 20), "the churn did not exceed the table size");
+    Require(after.liveSites == before.liveSites && after.slotsInUse == before.slotsInUse, "sites or stubs leaked under the built-in caps");
+    Require(after.chunks <= mid.chunks + 2, "the churn kept reserving stub chunks");
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(nullptr, nullptr);
 }
 #endif
 
@@ -355,6 +483,8 @@ int main() {
         FarStubReturns(TailBase + 0x200, Base + 0x300);
         PatchedSitePointers(TailBase + 0x400);
         PatchedSitePointers(Base + 0x408);
+        RegisterOffsetSites(TailBase + 0x600);
+        SiteReclamation(Base + 0x700);
         {
             // Mutex and condition slots in displaced memory (ASTRO BOT's are at 0x10xxxxxxxx): libkernel resolves them
             // through the slot's host view, so locking takes no fault (VA6's second storm: scePthreadMutexTrylock).
