@@ -7,7 +7,7 @@ set_target_properties(agc_metal_device_tests PROPERTIES CXX_EXTENSIONS OFF OBJCX
 if(CMAKE_CXX_COMPILER_LAUNCHER)
     set_property(TARGET agc_metal_device_tests PROPERTY OBJCXX_COMPILER_LAUNCHER ${CMAKE_CXX_COMPILER_LAUNCHER})
 endif()
-foreach(agcMetalDeviceMode IN ITEMS bindings submission profile imports memory)
+foreach(agcMetalDeviceMode IN ITEMS bindings submission profile imports memory residency import_window)
     add_test(NAME agc_metal_device_${agcMetalDeviceMode} COMMAND agc_metal_device_tests ${agcMetalDeviceMode})
     set_tests_properties(agc_metal_device_${agcMetalDeviceMode} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
 endforeach()
