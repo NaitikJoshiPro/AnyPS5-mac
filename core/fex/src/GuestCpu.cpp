@@ -75,6 +75,9 @@ bool HasFeature(const char* name) {
     return sysctlbyname((std::string("hw.optional.arm.") + name).c_str(), &value, &size, nullptr, 0) == 0 && value != 0;
 }
 
+// MIDR_EL1 with Apple's implementer code (0x61) and part number 0.
+constexpr std::uint32_t AppleSiliconMidr = 0x61000000;
+
 FEXCore::HostFeatures HostFeatures() {
     FEXCore::HostFeatures features {};
     features.DCacheLineLog2 = 4; // 64-byte lines: DCacheSize() is 4 << DCacheLineLog2
@@ -100,6 +103,14 @@ FEXCore::HostFeatures HostFeatures() {
     features.SupportsDotProd = HasFeature("FEAT_DotProd");
     features.SupportsAVX = true;
     features.SupportsAES256 = features.SupportsAES;
+    // FEX sizes its per-CPU CPUID data (the brand string of leaves 0x80000002-0x80000004, big/little flags) from
+    // CPUMIDRs, which only Linux fills (sysfs midr_el1); left empty, those leaves read past an empty vector and the
+    // guest crashes on a null product name. macOS does not expose MIDR_EL1 to user code, so every core gets Apple's
+    // implementer code with part 0, which FEX's table names "Apple Silicon" (one kind of core: not hybrid).
+    int cores = 0;
+    std::size_t coresSize = sizeof(cores);
+    if (sysctlbyname("hw.logicalcpu", &cores, &coresSize, nullptr, 0) != 0 || cores < 1) cores = 1;
+    features.CPUMIDRs.assign(static_cast<std::size_t>(cores), AppleSiliconMidr);
     return features;
 }
 

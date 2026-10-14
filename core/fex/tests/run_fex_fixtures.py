@@ -212,6 +212,7 @@ COMPILED = {
                             "scePthreadJoin"]}, ["-O2"]), 43),
     "guest-guards": (lambda d: with_exports(d, [str(HERE / "guest_guards.cpp")], {"libc.prx": ["exit"],
                      "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 43),
+    "cpuid-brand": (lambda d: compiled_executable(d, [str(HERE / "cpuid_brand.cpp")], {"libc.prx": ["exit"]}), 43),
     "kernel-sys": (lambda d: compiled_executable(d, [str(HERE / "kernel_sys.cpp")], {"libc.prx": ["exit"],
                    "libkernel.prx": ["pathconf"]}), 43),
     "pc-sample": (lambda d: compiled_executable(d, [str(HERE / "pc_sample.cpp")], {"libc.prx": ["exit"]}, ["-O2"]), 43),
