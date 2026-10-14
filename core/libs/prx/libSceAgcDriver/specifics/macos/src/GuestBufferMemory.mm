@@ -24,6 +24,7 @@
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "MetalCommandStream.h"
 #import <Metal/Metal.h>
+#include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #ifdef _WIN32
@@ -694,6 +695,14 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
 
 std::atomic<std::uint64_t> importWindow{0};
 
+// The largest no-copy import (D42). Metal wires a newBufferWithBytesNoCopy buffer in full at its first GPU use,
+// touched pages or not (M3 16 GB, macOS 27: an 8 GiB import over 64-256 MiB of touched pages took host wired memory
+// up by 8.1 GiB, free memory to ~100 MiB, pressure to warn; 1, 2 and 4 GiB imports wired 1, 2 and 4 GiB). So one
+// import of a long run (ASTRO BOT's 7.8 GiB of direct memory) wires all of it, or is refused whole. A run longer
+// than this is imported in pieces, the aligned 1 GiB window around the requested address, so the GPU wires the
+// windows it uses and the live-import budget can serve part of the run in place.
+constexpr std::uint64_t MaxImportBytes = std::uint64_t{1} << 30u;
+
 ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
     const auto index = leasedIndexContaining(lease, address);
     if (index == lease.size()) return {};
@@ -716,6 +725,14 @@ ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address)
     if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
     if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
     ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
+    if (run.bytes > MaxImportBytes) {
+        // One piece of a long run (MaxImportBytes): its aligned window, and the ranges that reach into it.
+        const auto pieceLow = std::max(run.base, address / MaxImportBytes * MaxImportBytes);
+        const auto pieceHigh = std::min(run.base + run.bytes, address / MaxImportBytes * MaxImportBytes + MaxImportBytes);
+        while (lease[first]->address + lease[first]->bytes <= pieceLow) ++first;
+        while (lease[last]->address >= pieceHigh) --last;
+        run = {pieceLow, pieceHigh - pieceLow, {}};
+    }
     run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
     return run;
 }
@@ -777,12 +794,17 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         if (sameRun(failed->second, run)) return nullptr;
         state.failed.erase(failed);
     }
-    // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
+    // Live imports are wired memory on Metal (see MaxImportBytes), so they stop at APS5_HOST_IMPORT_MIB,
+    // by default 3/8 of physical memory (D42): 6 GiB on a 16 GB Mac, upstream's figure, which leaves the
+    // title, the system and Metal's own allocations room; it scales with larger Macs. Not the device working
+    // set (recommendedMaxWorkingSetSize, 12 GiB here): wiring that much of 16 GB pushed the machine to
+    // pressure warn with ~100 MiB free in the probe.
     static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        std::uint64_t memory = 0;
+        std::size_t size = sizeof(memory);
+        if (sysctlbyname("hw.memsize", &memory, &size, nullptr, 0) != 0 || memory == 0) return std::uint64_t{6144} << 20u;
+        return memory / 8 * 3;
     }();
     const auto live = state.liveBytes;
     if (live + bytes > budget) {
@@ -2070,8 +2092,14 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
         try {
-            if (!GuestMemory::GpuMutex().HeldByThisThread() && wouldRetireImport(state, importRun(current, range->address))) return false;
-            if (importAllocation(context, state, range->address, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
+            // Every piece of a range longer than MaxImportBytes.
+            for (std::uint64_t cursor = range->address; cursor < range->address + range->bytes;) {
+                const auto run = importRun(current, cursor);
+                if (run.ranges.empty()) break;
+                if (!GuestMemory::GpuMutex().HeldByThisThread() && wouldRetireImport(state, run)) return false;
+                if (importAllocation(context, state, cursor, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(run.base);
+                cursor = run.base + run.bytes;
+            }
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
         }
@@ -2226,18 +2254,38 @@ void GuestBufferMemory::AcquireRegistered() {
             if (!range->readable || !range->gpu) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
-            const HostImport* entry = nullptr;
+            // A range longer than MaxImportBytes is imported in pieces, one region each; it is served by
+            // imports only when every piece imports (a mirror or a copy covers the whole range otherwise).
+            std::vector<const HostImport*> pieces;
             if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease);
+                for (std::uint64_t cursor = range->address; cursor < range->address + range->bytes;) {
+                    const auto* entry = importAllocation(context, state, cursor, lease);
+                    if (entry == nullptr || entry->base > cursor || entry->base + entry->bytes <= cursor) {
+                        pieces.clear();
+                        break;
+                    }
+                    pieces.push_back(entry);
+                    cursor = entry->base + entry->bytes;
+                }
+                // A later piece's import may have retired an earlier one (a run that changed meanwhile).
+                for (const auto* entry : pieces) {
+                    if (findImport(state, std::max(entry->base, range->address), std::min(entry->base + entry->bytes, range->address + range->bytes)) != entry) {
+                        pieces.clear();
+                        break;
+                    }
+                }
             }
             lap(timing.importsUs, at);
-            if (entry != nullptr) {
-                region.hostBacked = true;
-                // Reused by Upload while no import was dropped since (see importsEpoch).
-                region.direct = entry;
-                regions.push_back(std::move(region));
+            if (!pieces.empty()) {
+                for (const auto* entry : pieces) {
+                    Region piece{std::max(entry->base, range->address), std::min(entry->base + entry->bytes, range->address + range->bytes), range->writable, {}, nullptr};
+                    piece.hostBacked = true;
+                    // Reused by Upload while no import was dropped since (see importsEpoch).
+                    piece.direct = entry;
+                    regions.push_back(std::move(piece));
+                }
                 imported.push_back(range->address);
                 continue;
             }
