@@ -395,6 +395,10 @@ int Frame(char* out, std::size_t size, std::uintptr_t address) {
     Dl_info image{};
     if (dladdr(reinterpret_cast<const void*>(address), &image) != 0 && image.dli_fname != nullptr && image.dli_fbase != nullptr) {
         const char* name = std::strrchr(image.dli_fname, '/');
+        if (image.dli_sname != nullptr && image.dli_saddr != nullptr)
+            return std::snprintf(out, size, " %s+0x%llx(%s+0x%llx)", name != nullptr ? name + 1 : image.dli_fname,
+                static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(image.dli_fbase)), image.dli_sname,
+                static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(image.dli_saddr)));
         return std::snprintf(out, size, " %s+0x%llx", name != nullptr ? name + 1 : image.dli_fname,
             static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(image.dli_fbase)));
     }
@@ -583,6 +587,7 @@ void OnFault(int signal, siginfo_t* info, void* context) {
             static_cast<unsigned long long>(pc), insn, static_cast<unsigned long long>(machine->__es.__esr),
             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
         if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
+        Backtrace(0, pc, insn, info, machine); // who made the access (image+offset(symbol+offset) frames)
     }
     errno = saved;
     if (!handled) Chain(signal, info, context);
