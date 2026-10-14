@@ -30,38 +30,38 @@ extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsyst
 // guest | DisplacedFlip, reserved here up front. The ranges are found at startup (the cache moves with its slide).
 //
 // A guest (or native) load/store to a displaced address faults with si_addr in the window. The handler builds a
-// stub for that instruction that runs it with its base register flipped into the alias:
+// stub for that instruction that runs it with its base register flipped into the alias (one scratch register):
 //
-//   checked: sub sp, sp, #144          ; keep clear of the 128-byte red zone
-//            stp xA, xB, [sp]
-//            ldr xB, start             ; d = xN - start
-//            sub xA, xN, xB
-//            ldr xB, size              ; displaced iff d < size (unsigned): d - size borrows and d >= 0
-//            sub xB, xA, xB
-//            bic xB, xB, xA
-//            tbz xB, #63, plain
+//   checked: str xA, [sp, #-144]!      ; keep clear of the 128-byte red zone
+//            lsr xA, xN, #36           ; xN >= DisplacedEnd (7 << 36): ordinary memory (the arena), leave
+//            sub xA, xA, #7
+//            tbz xA, #63, plain
+//            movz/movk/movk xA, start  ; the window's start, as immediates
+//            sub xA, xN, xA
+//            tbnz xA, #63, plain       ; xN < start: ordinary memory
 //   flip:    eor xA, xN, #(1 << 40)
 //            [nop]                     ; barrier slot before an ordered store
 //            <instruction with Rn = xA>
 //            [nop]                     ; barrier slot after an ordered load
 //            [eor xN, xA, #(1 << 40)]  ; only for writeback forms
-//            ldp xA, xB, [sp]
-//            add sp, sp, #144
-//            b next
-//   plain:   ldp xA, xB, [sp]
-//            add sp, sp, #144
+//            ldr xA, [sp], #144
+//            b next                    ; (far stubs: b tail)
+//   plain:   ldr xA, [sp], #144
 //            [nop] <instruction> [nop]
-//            b next
-//   forced:  sub sp, sp, #144
-//            stp xA, xB, [sp]
+//            b next                    ; (far stubs: tail)
+//   forced:  str xA, [sp, #-144]!
 //            b flip
-//   start:   .quad window start
-//   size:    .quad window size
 //
 // The signal path resumes at `forced` (the base need not be the displaced operand of a register-offset form); a JIT
-// site is then patched to `b checked`, so later executions cost ~12 instructions and no signal. Nothing in the stub
-// touches NZCV. xA/xB are chosen outside every register field of the instruction. Stubs live in an RX view of
-// memory written through an RW view (no MAP_JIT toggling), within branch range of the faulting instruction.
+// site is then patched to `b checked`, so later executions cost a few instructions and no signal (ordinary pointers
+// above the window: 6 plus the access). Nothing in the stub touches NZCV. xA is chosen outside every register field
+// of the instruction. Stubs live in an RX view of memory written through an RW view (no MAP_JIT toggling), within
+// branch range of the faulting instruction.
+//
+// Native code in the dyld shared cache has no free memory within branch range, so its stubs are "far". A far stub
+// returns by branch when the native code ahead overwrites a register without reading it within a few relocatable
+// instructions (FarReturn): the tail runs those instructions, loads the return address into that dead register and
+// `br`s to it. Otherwise the tail is BRK #0xd15 + the return address, and the SIGTRAP handler sets the pc.
 //
 // FEX's TSO emulation emits ordered accesses (LDAPUR/STLUR, LDAR/LDAPR/STLR), which raise SIGBUS (BUS_ADRALN) on
 // the M3 when they cross 16 bytes. FEX's own handler only rewrites code in its code buffers, so a copy in a stub
@@ -72,7 +72,7 @@ namespace {
 
 std::uintptr_t g_start = CarveoutStart;
 
-constexpr std::uint32_t kSlotWords = 32; // longest stub: 8 check + 9 flip + 7 plain + 3 forced + 1 pad + 4 literal words
+constexpr std::uint32_t kSlotWords = 36; // longest stub: 9 check + 7 flip + 4 plain + 8 tail + 2 forced + 1 pad + 2 literal words (+ spare); 16-byte multiple
 constexpr std::size_t kChunkBytes = 1u << 20;
 constexpr std::size_t kMaxChunks = 512; // 64K stubs per chunk: chunks are reserved lazily, 1 MiB each
 // Patched sites, open addressing. ASTRO BOT keeps most of its heap in displaced memory and patched 32k JIT sites
@@ -117,6 +117,10 @@ struct sigaction g_previousBus {}, g_previousSegv {};
 std::once_flag g_once;
 bool g_trace = false;
 std::uint64_t g_stackEvery = 0; // APS5_DISPLACED_STACKS=N: a frame-pointer backtrace of every Nth fault (32 at most)
+std::uint64_t g_nativeStackEvery = 0; // APS5_DISPLACED_STACKS_NATIVE=N: the same, counting only unpatched faults
+std::atomic<std::uint64_t> g_farBranchSites{0}; // far stubs that return by branch through a dead register
+std::uintptr_t g_cacheStart = 0, g_cacheEnd = 0; // the dyld shared cache's immutable code: [cache, DisplacedStart())
+std::atomic<std::uint64_t> g_unpatched{0}; // faults at sites that stay unpatched (native code): one signal each, every time
 std::uint64_t g_enabledAt = 0;  // CLOCK_MONOTONIC_RAW ns when the handler was installed
 
 // Fault-rate milestones, always on: a line at 1024 faults and every power of two after it, then every 2^22. Native
@@ -209,16 +213,23 @@ Chunk* NewFarChunk() {
     return &chunk;
 }
 
+std::uintptr_t g_testFarStart = 0, g_testFarEnd = 0; // tests: code treated like the shared cache (far, immutable)
+
+bool InTestFarCode(std::uintptr_t pc) {
+    return pc >= g_testFarStart && pc < g_testFarEnd;
+}
+
 std::uintptr_t AllocateSlot(std::uintptr_t pc, std::uint32_t*& writable, bool& far) {
     Chunk* chunk = nullptr;
-    for (std::size_t i = 0; i < g_chunkCount; ++i) {
+    const bool forceFar = InTestFarCode(pc);
+    for (std::size_t i = 0; i < g_chunkCount && !forceFar; ++i) {
         auto& candidate = g_chunks[i];
         if (!candidate.far && candidate.used + kSlotWords * 4 <= kChunkBytes && InBranchRange(pc, candidate.rx) && InBranchRange(pc, candidate.rx + kChunkBytes)) {
             chunk = &candidate;
             break;
         }
     }
-    if (chunk == nullptr) chunk = NewChunkNear(pc);
+    if (chunk == nullptr && !forceFar) chunk = NewChunkNear(pc);
     if (chunk == nullptr) {
         for (std::size_t i = 0; i < g_chunkCount && chunk == nullptr; ++i) {
             if (g_chunks[i].far && g_chunks[i].used + kSlotWords * 4 <= kChunkBytes) chunk = &g_chunks[i];
@@ -288,15 +299,78 @@ Site* FindSite(std::uintptr_t pc, bool insert) {
     return nullptr;
 }
 
+// Registers an instruction reads (bit per register; 31 is the zero register or SP, never a dead candidate) and the one
+// general register it overwrites without reading, for the instruction classes FarReturn looks through. Anything not
+// decoded here is not used as a return point.
+int OverwrittenWithoutRead(std::uint32_t insn) {
+    const unsigned rd = insn & 31u, rn = (insn >> 5) & 31u, rm = (insn >> 16) & 31u, ra = (insn >> 10) & 31u;
+    const auto unless = [&](std::initializer_list<unsigned> reads) {
+        if (rd == 31) return -1;
+        for (const auto read : reads)
+            if (read == rd) return -1;
+        return static_cast<int>(rd);
+    };
+    if ((insn & 0x1f000000u) == 0x10000000u) return unless({});                           // ADR, ADRP
+    if ((insn & 0x7f800000u) == 0x12800000u || (insn & 0x7f800000u) == 0x52800000u) return unless({}); // MOVN, MOVZ (not MOVK)
+    if ((insn & 0x1f800000u) == 0x11000000u) return unless({rn});                         // ADD/SUB immediate
+    if ((insn & 0x1f800000u) == 0x12000000u) return unless({rn});                         // logical immediate
+    if ((insn & 0x1f800000u) == 0x13000000u && ((insn >> 29) & 3u) != 1u) return unless({rn}); // SBFM, UBFM (not BFM)
+    if ((insn & 0x1f000000u) == 0x0a000000u) return unless({rn, rm});                     // logical shifted register
+    if ((insn & 0x1f200000u) == 0x0b000000u) return unless({rn, rm});                     // ADD/SUB shifted register
+    if ((insn & 0x1fe00000u) == 0x1a800000u) return unless({rn, rm});                     // CSEL, CSINC, CSINV, CSNEG
+    if ((insn & 0x1f000000u) == 0x1b000000u) return unless({rn, rm, ra});                 // MADD, MSUB, SMADDL...
+    // LDR/LDRB/LDRH/LDRSx into a general register: unsigned offset, unscaled and register offset (no writeback).
+    const unsigned size = insn >> 30, opc = (insn >> 22) & 3u;
+    const bool load = opc != 0 && !(size == 3 && opc >= 2) && !(size == 2 && opc == 3); // not a store, PRFM or unallocated
+    if ((insn & 0x3f000000u) == 0x39000000u && load) return unless({rn});
+    if ((insn & 0x3f200c00u) == 0x38000000u && load) return unless({rn});
+    if ((insn & 0x3f200c00u) == 0x38200800u && load) return unless({rn, rm});
+    if ((insn & 0x3fc00000u) == 0x29400000u || (insn & 0x3fc00000u) == 0x29c00000u) { // LDP/LDPSW signed offset / pre-index
+        const unsigned rt2 = (insn >> 10) & 31u;
+        if ((insn & 0x00800000u) != 0) return -1; // pre-index writes back Rn
+        return rt2 != rd ? unless({rn}) : -1;
+    }
+    return -1;
+}
+
+// Position-independent instructions with no control flow that may run from a stub instead of in place: data
+// processing (immediate, except ADR/ADRP; register; SIMD and FP) and loads/stores other than literal loads and
+// exclusives. A copied access to displaced memory faults in the stub and is patched there like a JIT site.
+bool Relocatable(std::uint32_t insn) {
+    if ((insn & 0x1c000000u) == 0x10000000u) return (insn & 0x1f000000u) != 0x10000000u;
+    if ((insn & 0x0e000000u) == 0x0a000000u || (insn & 0x0e000000u) == 0x0e000000u) return true;
+    if (!IsLoadStore(insn)) return false;
+    return (insn & 0x3f000000u) != 0x08000000u; // exclusives and LDAR/STLR family
+}
+
+// A trap-free return from a far stub (D-VA7): no free memory lies within branch range of the dyld shared cache, so the
+// stub cannot `b` back, and every general register may be live. But a register the native code overwrites without
+// reading is dead just before that instruction. Scan forward over up to kFarLookahead instructions the stub can run
+// itself; the stub runs them, loads the address of the overwriting instruction into its dead register and branches
+// there. `copies` receives the instructions to run; the result is that register, or -1 (BRK return).
+constexpr unsigned kFarLookahead = 6;
+int FarReturn(std::uintptr_t pc, std::uint32_t* copies, unsigned& count) {
+    count = 0;
+    const bool immutable = (pc >= g_cacheStart && pc + 4 * (kFarLookahead + 2) <= g_cacheEnd) ||
+                           (InTestFarCode(pc) && pc + 4 * (kFarLookahead + 2) <= g_testFarEnd);
+    if (!immutable) return -1;
+    const auto* code = reinterpret_cast<const std::uint32_t*>(pc + 4);
+    for (unsigned i = 0; i <= kFarLookahead; ++i) {
+        const auto next = code[i];
+        if (const int dead = OverwrittenWithoutRead(next); dead >= 0) return dead;
+        if (i == kFarLookahead || !Relocatable(next)) return -1;
+        copies[count++] = next;
+    }
+    return -1;
+}
+
 Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     const unsigned rn = (insn >> 5) & 31u;
     bool busy[32] = {};
     for (const unsigned shift : {0u, 5u, 10u, 16u}) busy[(insn >> shift) & 31u] = true;
-    unsigned scratch[2] = {32, 32};
-    for (unsigned reg = 9, found = 0; reg <= 15 && found < 2; ++reg) {
-        if (!busy[reg]) scratch[found++] = reg;
-    }
-    const unsigned a = scratch[0], b = scratch[1];
+    unsigned a = 32;
+    for (unsigned reg = 9; reg <= 15 && a == 32; ++reg)
+        if (!busy[reg]) a = reg;
     std::uint32_t* code = nullptr;
     bool far = false;
     const auto stub = AllocateSlot(pc, code, far);
@@ -304,33 +378,28 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
         (void)!write(2, "[displaced] no stub memory\n", 27); // fatal for this access: always said
         return nullptr;
     }
+    std::uint32_t copies[kFarLookahead];
+    unsigned copyCount = 0;
+    const int dead = far ? FarReturn(pc, copies, copyCount) : -1;
     std::uint32_t words[kSlotWords];
     std::uint32_t n = 0;
-    const auto subSp = 0xd10243ffu;
-    const auto addSp = 0x910243ffu;
-    const auto stp = 0xa9000000u | (b << 10) | (31u << 5) | a;
-    const auto ldp = 0xa9400000u | (b << 10) | (31u << 5) | a;
-    const auto back = [&](std::uint32_t at) {
-        if (!far) {
-            words[at] = Branch(stub + at * 4, pc + 4);
-            return at + 1;
-        }
-        const std::uint64_t target = pc + 4;
-        words[at] = kReturnBrk;
-        words[at + 1] = static_cast<std::uint32_t>(target);
-        words[at + 2] = static_cast<std::uint32_t>(target >> 32);
-        return at + 3;
-    };
+    const auto push = 0xf8170fe0u | a; // str xA, [sp, #-144]!   (clear of the 128-byte red zone)
+    const auto pop = 0xf84907e0u | a;  // ldr xA, [sp], #144
     const auto eorFlip = [](unsigned dst, unsigned src) { return 0xd2400000u | (24u << 16) | (src << 5) | dst; };
-    const auto sub = [](unsigned dst, unsigned left, unsigned right) { return 0xcb000000u | (right << 16) | (left << 5) | dst; };
-    words[n++] = subSp;
-    words[n++] = stp;
-    const auto ldrStartAt = n++;
-    words[n++] = sub(a, rn, b);
-    const auto ldrSizeAt = n++;
-    words[n++] = sub(b, a, b);
-    words[n++] = 0x8a200000u | (a << 16) | (b << 5) | b; // bic xB, xB, xA
-    const auto tbzAt = n++;
+    const auto movz = [](unsigned reg, std::uint64_t value, unsigned hw, bool keep) {
+        return (keep ? 0xf2800000u : 0xd2800000u) | (hw << 21) | (static_cast<std::uint32_t>((value >> (16 * hw)) & 0xffffu) << 5) | reg;
+    };
+    // checked: ordinary memory above the window (the arena, first fit from 512 GiB) leaves after three instructions.
+    words[n++] = push;
+    words[n++] = 0xd364fc00u | (rn << 5) | a; // lsr xA, xN, #36       (DisplacedEnd = 7 << 36)
+    words[n++] = 0xd1001c00u | (a << 5) | a;  // sub xA, xA, #7
+    const auto aboveAt = n++;                 // tbz xA, #63, plain   (xN >= DisplacedEnd)
+    const std::uint64_t start = DisplacedStart();
+    words[n++] = movz(a, start, 0, false);
+    words[n++] = movz(a, start, 1, true);
+    words[n++] = movz(a, start, 2, true);
+    words[n++] = 0xcb000000u | (a << 16) | (rn << 5) | a; // sub xA, xN, xA
+    const auto belowAt = n++;                             // tbnz xA, #63, plain (xN < start)
     const auto flipAt = n;
     const auto ordered = OrderedAccess(insn);
     const auto access = [&](std::uint32_t copy) {
@@ -341,27 +410,47 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     words[n++] = eorFlip(a, rn);
     access((insn & ~(31u << 5)) | (a << 5));
     if (HasWriteback(insn)) words[n++] = eorFlip(rn, a);
-    words[n++] = ldp;
-    words[n++] = addSp;
-    n = back(n);
+    words[n++] = pop;
+    std::uint32_t toTailAt = 0;
+    if (far) {
+        toTailAt = n++;
+    } else {
+        words[n] = Branch(stub + n * 4, pc + 4);
+        ++n;
+    }
     const auto plainAt = n;
-    words[n++] = ldp;
-    words[n++] = addSp;
+    words[n++] = pop;
     access(insn);
-    n = back(n);
+    std::uint32_t targetLiteralAt = 0;
+    if (far) {
+        words[toTailAt] = 0x14000000u | ((n - toTailAt) & 0x03ffffffu);
+        if (dead >= 0) {
+            for (unsigned i = 0; i < copyCount; ++i) words[n++] = copies[i];
+            targetLiteralAt = n++;                                // ldr xR, target
+            words[n++] = 0xd61f0000u | (static_cast<unsigned>(dead) << 5); // br xR
+        } else {
+            words[n++] = kReturnBrk;
+            const std::uint64_t target = pc + 4;
+            std::memcpy(&words[n], &target, sizeof(target));
+            n += 2;
+        }
+    } else {
+        words[n] = Branch(stub + n * 4, pc + 4);
+        ++n;
+    }
     const auto forcedAt = n;
-    words[n++] = subSp;
-    words[n++] = stp;
+    words[n++] = push;
     words[n] = 0x14000000u | ((flipAt - n) & 0x03ffffffu);
     ++n;
-    n = (n + 1) & ~1u; // 8-byte literals (slots are 128-byte aligned)
-    const auto literalAt = n;
-    const std::uint64_t window[2] = {DisplacedStart(), DisplacedEnd - DisplacedStart()};
-    std::memcpy(&words[n], window, sizeof(window));
-    n += 4;
-    words[ldrStartAt] = 0x58000000u | ((literalAt - ldrStartAt) << 5) | b;
-    words[ldrSizeAt] = 0x58000000u | ((literalAt + 2 - ldrSizeAt) << 5) | b;
-    words[tbzAt] = 0xb6f80000u | (((plainAt - tbzAt) & 0x3fffu) << 5) | b; // tbz xB, #63
+    if (targetLiteralAt != 0) {
+        n = (n + 1) & ~1u; // 8-byte literal (slots are 16-byte aligned)
+        const std::uint64_t target = pc + 4 * (copyCount + 1);
+        std::memcpy(&words[n], &target, sizeof(target));
+        words[targetLiteralAt] = 0x58000000u | ((n - targetLiteralAt) << 5) | static_cast<unsigned>(dead);
+        n += 2;
+    }
+    words[aboveAt] = 0xb6f80000u | (((plainAt - aboveAt) & 0x3fffu) << 5) | a; // tbz xA, #63
+    words[belowAt] = 0xb7f80000u | (((plainAt - belowAt) & 0x3fffu) << 5) | a; // tbnz xA, #63
     std::memcpy(code, words, n * 4);
     sys_icache_invalidate(reinterpret_cast<void*>(stub), n * 4);
     auto* site = FindSite(pc, true);
@@ -372,8 +461,22 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     site->stub = stub;
     site->forcedOffset = forcedAt * 4;
     site->instruction = insn;
-    site->far = far;
+    site->far = far && dead < 0; // a branch-returning far stub needs no SIGTRAP
+    if (far && dead >= 0) g_farBranchSites.fetch_add(1, std::memory_order_relaxed);
     return site;
+}
+
+// A site inside a stub (an instruction a far stub runs for the native code it returns into) is patched through the
+// chunk's writable view, like a JIT site. Caller holds the lock.
+bool PatchChunk(std::uintptr_t pc, std::uint32_t word) {
+    for (std::size_t i = 0; i < g_chunkCount; ++i) {
+        const auto& chunk = g_chunks[i];
+        if (pc < chunk.rx || pc >= chunk.rx + kChunkBytes) continue;
+        __atomic_store_n(reinterpret_cast<std::uint32_t*>(chunk.rw + (pc - chunk.rx)), word, __ATOMIC_RELEASE);
+        sys_icache_invalidate(reinterpret_cast<void*>(pc), 4);
+        return true;
+    }
+    return false;
 }
 
 void Chain(int signal, siginfo_t* info, void* context) {
@@ -469,8 +572,22 @@ bool Redirect(siginfo_t* info, void* context) {
         if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
     }
     if (g_stackEvery != 0 && fault % g_stackEvery == 0 && fault / g_stackEvery < 32) Backtrace(fault, pc, insn, info, machine);
-    if (auto* writer = g_writer.load(std::memory_order_acquire); !far && writer != nullptr && writer(pc, Branch(pc, checked)))
+    bool patched = false;
+    if (!far) {
+        if (auto* writer = g_writer.load(std::memory_order_acquire); writer != nullptr && writer(pc, Branch(pc, checked))) {
+            patched = true;
+        } else {
+            SpinLock lock;
+            patched = PatchChunk(pc, Branch(pc, checked));
+        }
+    }
+    if (patched) {
         g_patches.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const auto unpatched = g_unpatched.fetch_add(1, std::memory_order_relaxed);
+        ReportMilestone(unpatched + 1, "unpatched (native) faults");
+        if (g_nativeStackEvery != 0 && unpatched % g_nativeStackEvery == 0 && unpatched / g_nativeStackEvery < 32) Backtrace(unpatched, pc, insn, info, machine);
+    }
     arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(forced));
     return true;
 }
@@ -666,6 +783,7 @@ bool Enable() {
     g_trace = std::getenv("APS5_DISPLACED_TRACE") != nullptr;
     g_enabledAt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (const char* every = std::getenv("APS5_DISPLACED_STACKS")) g_stackEvery = std::strtoull(every, nullptr, 0);
+    if (const char* every = std::getenv("APS5_DISPLACED_STACKS_NATIVE")) g_nativeStackEvery = std::strtoull(every, nullptr, 0);
     // Only needed where the ranges really are host guards: probe them. The carveout is the anchor; the commpage guard
     // and the shared region's tail join only when each is contiguous with the next range up.
     if (!AllInaccessible(CarveoutStart, DisplacedEnd)) return false;
@@ -692,6 +810,11 @@ bool Enable() {
     for (std::size_t i = 0; i < count; ++i) g_ranges[i] = found[count - 1 - i];
     g_rangeCount = count;
     g_start = g_ranges[0].guestStart;
+    if (std::uint64_t cache = 0; __shared_region_check_np(&cache) == 0 && cache >= DisplacedLowest && cache < g_start &&
+                                 std::strcmp(g_ranges[0].name, "shared region tail") == 0) {
+        g_cacheStart = static_cast<std::uintptr_t>(cache);
+        g_cacheEnd = g_start;
+    }
     struct sigaction action {};
     action.sa_sigaction = OnFault;
     action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -737,6 +860,21 @@ void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patc
     if (patches != nullptr) *patches = g_patches.load(std::memory_order_relaxed);
 }
 
+void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t start, std::uintptr_t end) {
+    SpinLock lock;
+    // Sites recorded for the old or new range describe code a test may since have replaced: forget their stubs.
+    for (auto& site : g_sites)
+        if (site.pc != 0 && ((site.pc >= g_testFarStart && site.pc < g_testFarEnd) || (site.pc >= start && site.pc < end))) site.stub = 0;
+    g_testFarStart = start;
+    g_testFarEnd = end;
+}
+
+void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint64_t* trapReturns, std::uint64_t* branchSites) {
+    if (unpatched != nullptr) *unpatched = g_unpatched.load(std::memory_order_relaxed);
+    if (branchSites != nullptr) *branchSites = g_farBranchSites.load(std::memory_order_relaxed);
+    if (trapReturns != nullptr) *trapReturns = g_farReturns.load(std::memory_order_relaxed);
+}
+
 void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count) {
     const bool active = g_enabled.load(std::memory_order_acquire);
     if (ranges != nullptr) *ranges = g_ranges;
@@ -753,6 +891,12 @@ void GuestDisplacedSetCodeWriter_nid_no_patch(bool (*)(std::uintptr_t, std::uint
 void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patches) {
     if (faults != nullptr) *faults = 0;
     if (patches != nullptr) *patches = 0;
+}
+void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t, std::uintptr_t) {}
+void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint64_t* trapReturns, std::uint64_t* branchSites) {
+    if (unpatched != nullptr) *unpatched = 0;
+    if (trapReturns != nullptr) *trapReturns = 0;
+    if (branchSites != nullptr) *branchSites = 0;
 }
 void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count) {
     if (ranges != nullptr) *ranges = nullptr;

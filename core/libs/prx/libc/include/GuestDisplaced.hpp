@@ -108,6 +108,12 @@ void GuestDisplacedSetCodeWriter_nid_no_patch(bool (*writer)(std::uintptr_t pc, 
     std::uintptr_t (*allocator)(std::uintptr_t pc, std::size_t bytes, std::uintptr_t* writable));
 // Faults redirected to the alias, and the JIT sites patched so far.
 void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patches);
+// Faults at sites that cannot be patched (native code, signed or out of branch range), and how many of their stubs
+// returned through BRK (a second signal: a far stub whose return could not be made a branch), and the far stubs
+// built with a branch return instead.
+void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint64_t* trapReturns, std::uint64_t* branchSites);
+// Tests: native code in [start, end) gets far stubs and is treated as immutable like the dyld shared cache (0, 0 ends it).
+void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t start, std::uintptr_t end);
 // The active displaced ranges in ascending order (empty when inactive).
 void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count);
 }

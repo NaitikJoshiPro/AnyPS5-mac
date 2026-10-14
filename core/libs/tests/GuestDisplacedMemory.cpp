@@ -154,6 +154,110 @@ void PatchedSiteRace(std::uintptr_t displaced) {
         "a fault at a site another thread already patched was not redirected to its stub");
     munmap(code, 0x4000);
 }
+
+// Generated code in a MAP_JIT page (not hooked to a code writer, so never patched in place).
+struct GeneratedCode {
+    void* code = nullptr;
+    explicit GeneratedCode(std::initializer_list<std::uint32_t> words) {
+        code = mmap(nullptr, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        Require(code != MAP_FAILED, "MAP_JIT for generated code");
+        pthread_jit_write_protect_np(0);
+        std::uint32_t* out = static_cast<std::uint32_t*>(code);
+        for (const auto word : words) *out++ = word;
+        for (int i = 0; i < 16; ++i) *out++ = 0xd4200000u; // brk #0 after the end: the look-ahead stops in mapped code
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(code, 0x4000);
+    }
+    ~GeneratedCode() { munmap(code, 0x4000); }
+    std::uintptr_t Begin() const { return reinterpret_cast<std::uintptr_t>(code); }
+    template <typename F>
+    F As() const { return reinterpret_cast<F>(code); }
+};
+
+struct NativeCounts {
+    std::uint64_t faults = 0, patches = 0, unpatched = 0, traps = 0, branchSites = 0;
+    static NativeCounts Now() {
+        NativeCounts counts;
+        GuestArena::GuestDisplacedStats_nid_no_patch(&counts.faults, &counts.patches);
+        GuestArena::GuestDisplacedNativeStats_nid_no_patch(&counts.unpatched, &counts.traps, &counts.branchSites);
+        return counts;
+    }
+};
+
+// Far stubs (native code out of branch range of free memory, the dyld shared cache) return without SIGTRAP when the
+// code ahead overwrites a register without reading it; otherwise through BRK. The generated code is declared far
+// and immutable through the test hook, like the shared cache.
+void FarStubReturns(std::uintptr_t source, std::uintptr_t destination) {
+    Store<std::uint64_t>(GuestArena::HostAddress(source), 0x1000);
+    {
+        // ldr x9, [x0]; add x10, x9, #1 (x10 dead: the return point); mov x0, x10; ret
+        GeneratedCode code({0xf9400009u, 0x9100052au, 0xaa0a03e0u, 0xd65f03c0u});
+        GuestArena::GuestDisplacedTestFarCode_nid_no_patch(code.Begin(), code.Begin() + 0x4000);
+        const auto before = NativeCounts::Now();
+        for (int i = 0; i < 100; ++i) Require(code.As<std::uint64_t (*)(std::uintptr_t)>()(source) == 0x1001, "far stub, branch return: wrong value");
+        const auto after = NativeCounts::Now();
+        Require(after.branchSites == before.branchSites + 1, "a far stub with a dead register ahead did not get a branch return");
+        Require(after.traps == before.traps, "a branch-returning far stub took SIGTRAP");
+        Require(after.unpatched - before.unpatched == 100, "every execution of an unpatched native site is one fault");
+    }
+    {
+        // ldr x9, [x0]; str x9, [x1] (displaced too: runs in the stub, faults there once and is patched there);
+        // add x9, x9, #3; movz x11, #7 (x11 dead); add x0, x9, x11; ret
+        GeneratedCode code({0xf9400009u, 0xf9000029u, 0x91000d29u, 0xd28000ebu, 0x8b0b0120u, 0xd65f03c0u});
+        GuestArena::GuestDisplacedTestFarCode_nid_no_patch(code.Begin(), code.Begin() + 0x4000);
+        const auto before = NativeCounts::Now();
+        for (int i = 0; i < 100; ++i) {
+            Store<std::uint64_t>(GuestArena::HostAddress(destination), 0);
+            Require(code.As<std::uint64_t (*)(std::uintptr_t, std::uintptr_t)>()(source, destination) == 0x1000 + 3 + 7, "far stub with copied instructions: wrong value");
+            Require(Load<std::uint64_t>(GuestArena::HostAddress(destination)) == 0x1000, "far stub with copied instructions: the copied store was lost");
+        }
+        const auto after = NativeCounts::Now();
+        Require(after.branchSites == before.branchSites + 1 && after.traps == before.traps, "far stub with copied instructions did not return by branch");
+        std::printf("far stub with copies: faults %llu patches %llu unpatched %llu traps %llu branch sites %llu\n",
+            static_cast<unsigned long long>(after.faults - before.faults), static_cast<unsigned long long>(after.patches - before.patches),
+            static_cast<unsigned long long>(after.unpatched - before.unpatched), static_cast<unsigned long long>(after.traps - before.traps),
+            static_cast<unsigned long long>(after.branchSites - before.branchSites));
+        Require(after.patches == before.patches + 1, "the copied displaced store was not patched inside the stub");
+        Require(after.faults - before.faults == 101, "expected one fault per call plus one for the copied store");
+    }
+    {
+        // ldr x0, [x0]; ret: nothing ahead to return through, BRK return.
+        GeneratedCode code({0xf9400000u, 0xd65f03c0u});
+        GuestArena::GuestDisplacedTestFarCode_nid_no_patch(code.Begin(), code.Begin() + 0x4000);
+        const auto before = NativeCounts::Now();
+        for (int i = 0; i < 10; ++i) Require(code.As<std::uint64_t (*)(std::uintptr_t)>()(source) == 0x1000, "far stub, BRK return: wrong value");
+        const auto after = NativeCounts::Now();
+        Require(after.branchSites == before.branchSites && after.traps - before.traps == 10, "a far stub with no return register did not return through BRK");
+    }
+    GuestArena::GuestDisplacedTestFarCode_nid_no_patch(0, 0);
+}
+
+// A patched site's stub on every kind of pointer: above the window (malloc's regions, the arena), below it (the
+// stack, below the shared cache) and displaced; none of them faults once the site is patched.
+void PatchedSitePointers(std::uintptr_t displaced) {
+    // ldr x9, [x0]; add x9, x9, #1; str x9, [x0]; mov x0, x9; ret
+    GeneratedCode code({0xf9400009u, 0x91000529u, 0xf9000009u, 0xaa0903e0u, 0xd65f03c0u});
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(&WriteCode, nullptr);
+    const auto run = code.As<std::uint64_t (*)(std::uintptr_t)>();
+    Store<std::uint64_t>(GuestArena::HostAddress(displaced), 41);
+    Require(run(displaced) == 42, "patched sites: the first (faulting) call");
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(nullptr, nullptr);
+    Require((*static_cast<const std::uint32_t*>(code.code) & 0xfc000000u) == 0x14000000u && (static_cast<const std::uint32_t*>(code.code)[2] & 0xfc000000u) == 0x14000000u,
+        "the load and store sites were not both patched");
+    auto* heap = new std::uint64_t(100);
+    std::uint64_t stack = 200;
+    const auto before = NativeCounts::Now();
+    for (int i = 0; i < 1000; ++i) {
+        run(reinterpret_cast<std::uintptr_t>(heap));
+        run(reinterpret_cast<std::uintptr_t>(&stack));
+        run(displaced);
+    }
+    const auto after = NativeCounts::Now();
+    Require(*heap == 1100 && stack == 1200 && Load<std::uint64_t>(GuestArena::HostAddress(displaced)) == 1042, "patched sites: wrong values");
+    Require(after.faults == before.faults, "a patched site faulted again");
+    Require(reinterpret_cast<std::uintptr_t>(heap) >= GuestArena::DisplacedEnd || reinterpret_cast<std::uintptr_t>(heap) < GuestArena::DisplacedStart(), "the heap is displaced");
+    delete heap;
+}
 #endif
 
 int main() {
@@ -248,6 +352,9 @@ int main() {
         Require(Faults() >= tailFaults + 3, "the tail accesses did not go through the fault handler");
         ManySites(TailBase + 0x104);
         PatchedSiteRace(TailBase + 0x104);
+        FarStubReturns(TailBase + 0x200, Base + 0x300);
+        PatchedSitePointers(TailBase + 0x400);
+        PatchedSitePointers(Base + 0x408);
         {
             // Mutex and condition slots in displaced memory (ASTRO BOT's are at 0x10xxxxxxxx): libkernel resolves them
             // through the slot's host view, so locking takes no fault (VA6's second storm: scePthreadMutexTrylock).
