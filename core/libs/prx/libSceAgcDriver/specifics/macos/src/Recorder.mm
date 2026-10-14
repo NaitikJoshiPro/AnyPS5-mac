@@ -1718,6 +1718,8 @@ void Recorder::flushPendingStore() {
     run.bytes.clear();
 }
 
+std::string DebugImportResidency(void* buffer);
+
 namespace {
 
 // APS5_TRACE_LABEL_LANDING: the label copies a batch recorded, reported when the GPU finishes it.
@@ -1728,6 +1730,8 @@ struct LandingCopy {
     NSUInteger destinationOffset;
     std::size_t bytes;
     std::uint64_t address;
+    id<MTLBuffer> readback;
+    NSUInteger readbackOffset;
 };
 std::mutex landingMutex;
 std::multimap<std::uint64_t, LandingCopy> landingCopies;
@@ -1746,11 +1750,15 @@ void ReportLandingCopies(std::uint64_t serial) {
         landingCopies.erase(first, last);
     }
     for (const auto& copy : copies) {
-        std::uint64_t source = 0, destination = 0, guest = 0;
+        std::uint64_t source = 0, destination = 0, guest = 0, gpuSees = 0;
+        std::memcpy(&gpuSees, static_cast<const std::byte*>(copy.readback.contents) + copy.readbackOffset, copy.bytes);
+        std::uint64_t gpuPage = 0, cpuPage = 0;
+        std::memcpy(&gpuPage, static_cast<const std::byte*>(copy.readback.contents) + copy.readbackOffset + 8, 8);
+        std::memcpy(&cpuPage, reinterpret_cast<const void*>(::GuestArena::HostAddress(copy.address & ~std::uint64_t{0x3fff})), 8);
         std::memcpy(&source, static_cast<const std::byte*>(copy.source.contents) + copy.sourceOffset, copy.bytes);
         std::memcpy(&destination, static_cast<const std::byte*>(copy.destination.contents) + copy.destinationOffset, copy.bytes);
         std::memcpy(&guest, reinterpret_cast<const void*>(::GuestArena::HostAddress(copy.address)), copy.bytes);
-        std::fprintf(stderr, "[landing] batch %llu done: copy of 0x%llx: upload holds 0x%llx, destination buffer %p holds 0x%llx, guest memory holds 0x%llx\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(copy.address), static_cast<unsigned long long>(source), (__bridge void*)copy.destination, static_cast<unsigned long long>(destination), static_cast<unsigned long long>(guest));
+        std::fprintf(stderr, "[landing] batch %llu done: copy of 0x%llx: upload holds 0x%llx, destination buffer %p holds 0x%llx, guest memory holds 0x%llx, the GPU read back 0x%llx through the destination; page start: GPU 0x%llx CPU 0x%llx\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(copy.address), static_cast<unsigned long long>(source), (__bridge void*)copy.destination, static_cast<unsigned long long>(destination), static_cast<unsigned long long>(guest), static_cast<unsigned long long>(gpuSees), static_cast<unsigned long long>(gpuPage), static_cast<unsigned long long>(cpuPage));
     }
 }
 
@@ -1822,7 +1830,15 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                     // can report what the GPU copied from and what the destination holds afterwards.
                     const auto upload = stream.Write(store.bytes, 4);
                     [stream.Compute() copyFromBuffer:upload.buffer sourceOffset:upload.offset toBuffer:Metal::BufferOf(store.buffer) destinationOffset:store.offset size:store.bytes.size()];
-                    NoteLandingCopy(submissions + 1, LandingCopy{upload.buffer, upload.offset, Metal::BufferOf(store.buffer), store.offset, store.bytes.size(), store.address});
+                    // Read the stored bytes back through the same buffer on the GPU, into upload memory.
+                    const auto readback = stream.Allocate(16, 8);
+                    std::memset(readback.host, 0xee, 16);
+                    [stream.Compute() barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+                    [stream.Compute() copyFromBuffer:Metal::BufferOf(store.buffer) sourceOffset:store.offset toBuffer:readback.buffer destinationOffset:readback.offset size:store.bytes.size()];
+                    // Also the first 8 bytes of the store's 16 KiB page, which the CPU wrote (a command buffer header).
+                    [stream.Compute() copyFromBuffer:Metal::BufferOf(store.buffer) sourceOffset:(store.offset & ~VkDeviceSize{0x3fff}) toBuffer:readback.buffer destinationOffset:readback.offset + 8 size:8];
+                    std::fprintf(stderr, "[landing]   residency: %s; recorder queue %p\n", DebugImportResidency((__bridge void*)Metal::BufferOf(store.buffer)).c_str(), (__bridge void*)metal->queue);
+                    NoteLandingCopy(submissions + 1, LandingCopy{upload.buffer, upload.offset, Metal::BufferOf(store.buffer), store.offset, store.bytes.size(), store.address, readback.buffer, readback.offset});
                 } else {
                     stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
                 }

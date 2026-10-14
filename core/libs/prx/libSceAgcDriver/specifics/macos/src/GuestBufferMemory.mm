@@ -362,6 +362,12 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     if (trace) {
         for (auto page = entry.base; page < entry.base + entry.bytes; page += 0x4000u) std::fprintf(stderr, "[metal] host import page 0x%llx: %s\n", static_cast<unsigned long long>(page), AgcDriver::Metal::VmWiredInfo(GuestArena::HostAddress(page)).c_str());
     }
+    // Debug aid: APS5_TRACE_IMPORT_PAGE=<hex guest address> prints that page's VM object whenever an import covering it is made.
+    static const std::uint64_t tracedPage = [] {
+        const char* value = std::getenv("APS5_TRACE_IMPORT_PAGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+    }();
+    if (tracedPage != 0 && tracedPage >= entry.base && tracedPage < entry.base + entry.bytes) std::fprintf(stderr, "[metal] import 0x%llx+0x%llx covers traced page: %s\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), AgcDriver::Metal::VmWiredInfo(GuestArena::HostAddress(tracedPage)).c_str());
     id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), entry.base, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(hostBase).c_str());
     if (buffer == nil) {
@@ -3874,6 +3880,26 @@ namespace AgcDriver::Metal {
 
 void SetImportReleaseProbe(ImportReleaseProbe probe) {
     ::AgcDriver::Graphics::importReleaseProbe.store(probe, std::memory_order_release);
+}
+
+}
+
+namespace AgcDriver::Graphics {
+
+// Debug aid for APS5_TRACE_LABEL_LANDING (Recorder.mm): whether the host-import residency set holds
+// `buffer`, and how many allocations it holds.
+std::string DebugImportResidency(void* buffer) {
+    auto& residency = ::AgcDriver::Graphics::Residency();
+    std::lock_guard lock(residency.mutex);
+    std::string text;
+    for (const auto& [device, entry] : residency.devices) {
+        if (entry.set == nil) continue;
+        id<MTLAllocation> allocation = (__bridge id<MTLBuffer>)buffer;
+        char line[160];
+        std::snprintf(line, sizeof(line), "import set %p on queue %p: %llu allocations, contains it: %d, allocated %llu bytes", (__bridge void*)entry.set, (__bridge void*)entry.queue, static_cast<unsigned long long>(entry.set.allocationCount), [entry.set containsAllocation:allocation] ? 1 : 0, static_cast<unsigned long long>(entry.set.allocatedSize));
+        text += line;
+    }
+    return text;
 }
 
 }
