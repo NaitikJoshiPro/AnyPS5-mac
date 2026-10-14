@@ -74,8 +74,11 @@ std::uintptr_t g_start = CarveoutStart;
 
 constexpr std::uint32_t kSlotWords = 32; // longest stub: 8 check + 9 flip + 7 plain + 3 forced + 1 pad + 4 literal words
 constexpr std::size_t kChunkBytes = 1u << 20;
-constexpr std::size_t kMaxChunks = 64;
-constexpr std::size_t kTableSize = 1u << 15;
+constexpr std::size_t kMaxChunks = 512; // 64K stubs per chunk: chunks are reserved lazily, 1 MiB each
+// Patched sites, open addressing. ASTRO BOT keeps most of its heap in displaced memory and patched 32k JIT sites
+// in its first minute; a full table left new sites unhandled (a SIGBUS/SIGSEGV that looked like an unaligned
+// access). 1M entries of 32 bytes are 32 MiB of zero-fill memory, touched only where sites land.
+constexpr std::size_t kTableSize = 1u << 20;
 constexpr std::int64_t kBranchRange = (1ll << 27) - (1ll << 20);
 
 struct Chunk {
@@ -296,7 +299,7 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     bool far = false;
     const auto stub = AllocateSlot(pc, code, far);
     if (stub == 0) {
-        if (g_trace) (void)!write(2, "[displaced] no stub memory\n", 27);
+        (void)!write(2, "[displaced] no stub memory\n", 27); // fatal for this access: always said
         return nullptr;
     }
     std::uint32_t words[kSlotWords];
@@ -361,7 +364,7 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     sys_icache_invalidate(reinterpret_cast<void*>(stub), n * 4);
     auto* site = FindSite(pc, true);
     if (site == nullptr) {
-        if (g_trace) (void)!write(2, "[displaced] site table full\n", 28);
+        (void)!write(2, "[displaced] site table full\n", 28); // fatal for this access: always said
         return nullptr;
     }
     site->stub = stub;
