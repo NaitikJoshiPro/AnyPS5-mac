@@ -313,3 +313,9 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - VA4: D35, a host-syscall shim at the libSystem import boundary (prototype b12fe6a82, off by default). VA5 is completing it and switching it on.
 - PR #5262: a community member (simonbronk) verified it on Windows at runtime; replied.
 - Machine: Amphetamine session plus caffeinate keep the Mac awake overnight; 77 GB free.
+
+## 2026-10-14 — PROG: progress badges and Pages for the standalone repo (D47)
+- New `tools/mac/mac_progress.py` (+ test `mac_progress_tool`, 9 cases), `docs/mac/milestones.toml` (MISSION §8 criteria with status and the PROGRESS heading that verified each), `docs/mac/gpu-status.json` (snapshot of gpu-suite/upsync-final2), workflow `.github/workflows/mac-progress.yml`, README header with badges and footnotes. Pages enabled with `gh api -X POST repos/NaitikJoshiPro/AnyPS5-mac/pages -f build_type=workflow`.
+- Values: port milestones 73.33 % (M0 4/4, M1 4/4, M2 4/4, M3 2/3, M4 0/9); Metal GPU tests 558/574 = 97.21 % (15 allowlisted skips, 1 held); titles 40 % (DOOM Playable; Showcase, UI Lab, STK Loads on mac-native's COMPATIBILITY.md); libraries 3241/3687 = 87.9 %; shaders 1166/1166 = 100 %.
+- Verification: `python3 -I tools/mac/test_mac_progress.py` 9/9; Actions run 38544379476 green (tests, site, deploy, 3m23s); `curl` of https://naitikjoshipro.github.io/AnyPS5-mac/ , its five badges, progress.html, history.html and mac-progress.json → 200, badge labels match the values above.
+- Refresh: after a full `gpu_suite.py ... all` run, `python3 -I tools/mac/mac_progress.py gpu-snapshot` and commit docs/mac/gpu-status.json; flip a criterion in milestones.toml together with its PROGRESS entry; COMPATIBILITY.md stages are read as they are. Any push to mac-native republishes. `mac_progress.py show` prints the numbers locally.
