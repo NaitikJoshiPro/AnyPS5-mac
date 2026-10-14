@@ -9,6 +9,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 
 namespace {
@@ -108,8 +109,8 @@ int APS5_VABI sceAudio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_leve
     if (!PortIsOpen(port_id)) return AUDIO3D_ERROR_INVALID_PORT;
     if (queue_level == nullptr && queue_available == nullptr) return AUDIO3D_ERROR_INVALID_PARAMETER;
     const std::uint32_t level = QueueLevel(Clock::now());
-    if (queue_level != nullptr) *queue_level = level;
-    if (queue_available != nullptr) *queue_available = g_port.queue_depth - level;
+    if (queue_level != nullptr) *GuestArena::HostPointer(queue_level) = level; // may be displaced guest memory (D31, D33)
+    if (queue_available != nullptr) *GuestArena::HostPointer(queue_available) = g_port.queue_depth - level;
     return 0;
 }
 
@@ -213,6 +214,7 @@ int APS5_VABI sceAudio3dObjectSetAttributes(uint32_t port_id, uint32_t object_id
     if (!PortIsOpen(port_id)) return AUDIO3D_ERROR_INVALID_PORT;
     if (num_attributes == 0 || attribute_array == nullptr) return AUDIO3D_ERROR_INVALID_PARAMETER;
     if (!g_port.objects.contains(object_id)) return AUDIO3D_ERROR_INVALID_OBJECT;
+    attribute_array = GuestArena::HostRange(attribute_array, num_attributes * sizeof(*attribute_array)); // displaced guest memory (D31, D33)
     for (std::uint64_t i = 0; i < num_attributes; ++i) {
         if (attribute_array[i].attribute_id == AUDIO3D_ATTRIBUTE_RESET_STATE) continue;
         if (attribute_array[i].value == nullptr) return AUDIO3D_ERROR_INVALID_PARAMETER;

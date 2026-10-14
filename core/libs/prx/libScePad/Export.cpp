@@ -7,6 +7,7 @@
 
 #include "SceTypes.hpp"
 #include "prx//libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libScePad/include/Pad.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 
@@ -53,6 +54,7 @@ int APS5_VABI scePadVrControllerReadCombinedState() {
 int APS5_VABI scePadDeviceClassGetExtendedInformation(int handle, PadDeviceClassExtendedInformation* info) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (info == nullptr) return PAD_ERROR_INVALID_ARG;
+ info = GuestArena::HostPointer(info); // pad structures may be displaced guest memory (D31, D33)
  std::memset(info, 0, sizeof(*info));
  info->deviceClass = PAD_DEVICE_CLASS_STANDARD;
  return PAD_OK;
@@ -61,6 +63,8 @@ int APS5_VABI scePadDeviceClassGetExtendedInformation(int handle, PadDeviceClass
 int APS5_VABI scePadDeviceClassParseData(int handle, const PadData* data, PadDeviceClassData* class_data) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (data == nullptr || class_data == nullptr) return PAD_ERROR_INVALID_ARG;
+ data = GuestArena::HostPointer(data);
+ class_data = GuestArena::HostPointer(class_data);
  std::memset(class_data, 0, sizeof(*class_data));
  class_data->deviceClass = PAD_DEVICE_CLASS_STANDARD;
  class_data->dataValid = data->connected;
@@ -74,6 +78,7 @@ int APS5_VABI scePadGetControllerInformation(int handle, PadControllerInformatio
  if (info == nullptr) {
   return PAD_ERROR_INVALID_ARG;
  }
+ info = GuestArena::HostPointer(info);
  std::memset(info, 0, sizeof(*info));
  info->touchPadInfo.pixelDensity = 44.86f;
  info->touchPadInfo.resolution.x = 1920;
@@ -94,6 +99,7 @@ int APS5_VABI scePadGetHandle(int user_id, int type, int index) {
 
 int APS5_VABI scePadGetInfo_nid_postfix(PadInfo* info) {
  if (info == nullptr) return PAD_ERROR_INVALID_ARG;
+ info = GuestArena::HostPointer(info);
  std::memset(info, 0, sizeof(*info));
  info->maxConnectCount = 4;
  info->connectedCount[0] = 1;
@@ -110,13 +116,14 @@ int APS5_VABI scePadGetInfo_nid_postfix(PadInfo* info) {
 int APS5_VABI scePadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (info == nullptr) return PAD_ERROR_INVALID_ARG;
- std::memset(info, 0, sizeof(*info));
+ std::memset(GuestArena::HostPointer(info), 0, sizeof(*info));
  return PAD_OK;
 }
 
 int APS5_VABI scePadGetExtControllerInformation(int handle, void* info) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (info == nullptr) return PAD_ERROR_INVALID_ARG;
+ info = GuestArena::HostRange(info, 0x2c);
  std::memset(info, 0, 0x2c);
  PadControllerInformation* base = static_cast<PadControllerInformation*>(info);
  base->touchPadInfo.pixelDensity = 44.86f;
@@ -175,14 +182,14 @@ int APS5_VABI scePadOutputReport() { NotImplemented_nid_no_patch(__func__); retu
 int APS5_VABI scePadRead_nid_postfix(int handle, PadData* data, int num) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (data == nullptr || num <= 0) APS5_INVALID_ARG_EX;
- return Pad::Read(data, num);
+ return Pad::Read(GuestArena::HostRange(data, static_cast<std::size_t>(num) * sizeof(PadData)), num);
 }
 
 int APS5_VABI scePadReadState(int handle, PadData* data) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (data == nullptr) APS5_INVALID_ARG_EX;
 
- *data = Pad::ReadState();
+ *GuestArena::HostPointer(data) = Pad::ReadState();
 
  return 0;
 }
@@ -208,6 +215,7 @@ int APS5_VABI scePadSetAngularVelocityDeadbandState(int handle, bool enable) {
 int APS5_VABI scePadSetLightBar(int handle, const PadLightBarParam* param) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (param == nullptr) return PAD_ERROR_INVALID_ARG;
+ param = GuestArena::HostPointer(param);
  Pad::SetLightBar(true, param->r, param->g, param->b);
  return PAD_OK;
 }
@@ -227,7 +235,7 @@ int APS5_VABI scePadSetTiltCorrectionState(int handle, bool enabled) {
 int APS5_VABI scePadSetTriggerEffect(int handle, const void* param) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (param == nullptr) return PAD_ERROR_INVALID_ARG;
- const std::uint8_t* bytes = static_cast<const std::uint8_t*>(param);
+ const std::uint8_t* bytes = GuestArena::HostRange(static_cast<const std::uint8_t*>(param), 8 + 56 * 2);
  const std::uint8_t mask = bytes[0];
  if ((mask & ~0x3u) != 0) {
   return PAD_ERROR_INVALID_ARG;
@@ -246,6 +254,7 @@ int APS5_VABI scePadSetTriggerEffect(int handle, const void* param) {
 int APS5_VABI scePadSetVibration(int handle, const PadVibrationParam* param) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (param == nullptr) return PAD_ERROR_INVALID_ARG;
+ param = GuestArena::HostPointer(param);
  Pad::SetVibration(param->large_motor, param->small_motor);
  return PAD_OK;
 }
@@ -297,7 +306,7 @@ int APS5_VABI scePadVrControllerSetTriggerEffects() {
 int APS5_VABI scePadIsRemoteController(int handle, bool* remote) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (remote == nullptr) return PAD_ERROR_INVALID_ARG;
- *remote = false;
+ *GuestArena::HostPointer(remote) = false;
  return 0;
 }
 
