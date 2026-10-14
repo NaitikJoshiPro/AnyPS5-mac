@@ -72,8 +72,9 @@ if(MINGW)
 endif()
 
 # D35: hidden definitions of read, write, recv, ... that translate displaced guest buffers before libSystem sees them.
-# Always built (its test runs); linked into every prx only with APS5_HOST_SYSCALL_SHIM.
-option(APS5_HOST_SYSCALL_SHIM "Link the displaced-buffer host system call shim into every prx library (macOS arm64)" OFF)
+# Always built (its test runs); linked into libc and every prx with APS5_HOST_SYSCALL_SHIM (ON by default since D35's
+# verification; OFF only to bisect).
+option(APS5_HOST_SYSCALL_SHIM "Link the displaced-buffer host system call shim into every prx library (macOS arm64)" ON)
 if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     add_library(aps5_host_syscall_shim STATIC ${CMAKE_CURRENT_SOURCE_DIR}/hostsys/HostSyscallShim.cpp)
     target_include_directories(aps5_host_syscall_shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

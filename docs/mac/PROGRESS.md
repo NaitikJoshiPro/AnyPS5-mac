@@ -201,3 +201,9 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Ops: found a GPU-lock deadlock between gpu_suite (lease -> GPU lock) and title_run (GPU lock -> lease); posted in coord/m2.md, DRV-B broke it. tools/mac still has the lock-order bug.
 - Disk 19.49G of 100 GB.
 - Next: RECTLIST (RECT_2D output) in the mesh path (recompiler owner): emit the fourth vertex v0 + v2 - v1 and a second triangle per rect primitive.
+
+## 2026-10-14 — M3 (VA5): host system call shim ON by default (D35 amended)
+- Inventory: 131 prx import 422 libSystem symbols; all classified in `core/libs/hostsys/host_imports.tsv`; 80 shimmed (buffer 47, path 24, stdio 6, retaining 3), 13 address calls stay hand-translated. Test `host_import_inventory` (+ negative twin) guards new imports.
+- Verified with the shim on (build-metal): `ctest -LE gpu` 5098/5098; guest_displaced_*, host_syscall_shim pass; `gpu_suite G1 G4 --validation --build-first` 190/190 + 45/46 (allowlisted skip); title_run 60 s --validation DOOM alive, frames bit-identical to shim off; STK same AGC geometry-assembly stop as with it off. Overhead: syscalls within noise, fprintf +12 ns; DOOM CPU 20.8 % off vs 19.5 % on. Logs `.mac-work/logs/va5/`.
+- Disk: project ~20 GB of 100 GB budget.
+- Next: libc++ filebuf/filesystem and libusb/IOHID buffers are outside the shim (TechnicalDebt).
