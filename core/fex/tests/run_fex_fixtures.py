@@ -94,6 +94,13 @@ def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
     fex_toolchain.make_header_room(directory / "input.elf")
 
 
+def with_exports(directory, sources, libraries):
+    """Like compiled_executable (linked as a shared object, so its default-visibility symbols are in .dynsym),
+    with the PS5 tag that makes the relinker keep them as exports."""
+    compiled_executable(directory, sources, libraries, tpoff=True)
+    fex_toolchain.export_symbols(directory / "input.elf")
+
+
 def with_process_parameters(directory, sources, libraries, extra=()):
     """Like compiled_executable, with PT_SCE_PROCPARAM over the program's processParameters."""
     compiled_executable(directory, sources, libraries, extra)
@@ -203,6 +210,8 @@ COMPILED = {
     "displaced-unaligned": (lambda d: compiled_executable(d, [str(HERE / "displaced_unaligned.cpp")], {"libc.prx": ["exit"],
                             "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "scePthreadCreate",
                             "scePthreadJoin"]}, ["-O2"]), 43),
+    "guest-guards": (lambda d: with_exports(d, [str(HERE / "guest_guards.cpp")], {"libc.prx": ["exit"],
+                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 43),
     "kernel-sys": (lambda d: compiled_executable(d, [str(HERE / "kernel_sys.cpp")], {"libc.prx": ["exit"],
                    "libkernel.prx": ["pathconf"]}), 43),
     "pc-sample": (lambda d: compiled_executable(d, [str(HERE / "pc_sample.cpp")], {"libc.prx": ["exit"]}, ["-O2"]), 43),

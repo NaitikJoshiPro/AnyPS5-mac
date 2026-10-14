@@ -6,6 +6,7 @@
 #include "CodeCache.hpp"
 #include "CodePool.hpp"
 #include "ConsoleSyscalls.hpp"
+#include "GuestGuards.hpp"
 #include "GuestProgram.hpp"
 #include "GuestSampler.hpp"
 #include "Options.hpp"
@@ -578,6 +579,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     state->context->EnableExitOnHLT();
     if (!state->context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
     if (const std::uint64_t gadget = CreateConsoleSyscallGadget(bridge)) state->context->AddThunkTrampolineIRHandler(ConsoleSyscallGadget, gadget);
+    RedirectGuestGuards(bridge, program, *state->context);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
     GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping,
