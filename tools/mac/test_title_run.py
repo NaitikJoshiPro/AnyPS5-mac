@@ -167,7 +167,7 @@ class GpuLockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "locks", "gpu.lock")
             seen = []
-            args = mock.Mock(id="T1", tag="x")
+            args = mock.Mock(id="T1", tag="x", build=tmp)
             with mock.patch.dict(os.environ, {buildlock.GPU_LOCK_ENV: path}), \
                     mock.patch.object(title_run, "run_locked", lambda a: seen.append(buildlock.read_gpu_holder(path)) or 7):
                 os.environ.pop(buildlock.GPU_HELD_ENV, None)
@@ -175,6 +175,52 @@ class GpuLockTests(unittest.TestCase):
                 self.assertIsNone(buildlock.read_gpu_holder(path))
             self.assertEqual(seen[0]["pid"], os.getpid())
             self.assertIn("title_run T1", seen[0]["command"])
+
+    def test_lock_order_has_no_deadlock_between_a_suite_and_a_title_run(self):
+        """A suite-like process holds the lease and takes the GPU lock per test; a title-run-like one waits for the
+        lease, takes the GPU lock and runs buildlock.py as a child. Before the fix each waited on the other forever."""
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        suite = (
+            "import sys, time\nsys.path.insert(0, %r)\nimport buildlock\nbuild = sys.argv[1]\n"
+            "buildlock.take_lease(build, 60, run='t')\ntry:\n print('leased', flush=True)\n"
+            " time.sleep(1.0)\n for i in range(3):\n  with buildlock.gpu_lock(label='suite test', poll=0.05):\n   time.sleep(0.3)\n"
+            "finally:\n buildlock.release_lease(build)\n" % here)
+        title = (
+            "import sys, subprocess\nsys.path.insert(0, %r)\nimport buildlock\nbuild = sys.argv[1]\n"
+            "buildlock.wait_for_lease(build, poll=0.05)\nwith buildlock.gpu_lock(label='title run', poll=0.05):\n"
+            " import time; time.sleep(0.5)\n"
+            " sys.exit(subprocess.call([sys.executable, %r, build, '--', 'true']))\n" % (here, os.path.join(here, "buildlock.py")))
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, **{buildlock.GPU_LOCK_ENV: os.path.join(tmp, "locks", "gpu.lock")})
+            env.pop(buildlock.GPU_HELD_ENV, None)
+            build = os.path.join(tmp, "build")
+            suite_proc = subprocess.Popen([sys.executable, "-c", suite, build], env=env, stdout=subprocess.PIPE, text=True)
+            self.assertEqual(suite_proc.stdout.readline().strip(), "leased")
+            # Title run starts while the lease exists; it waits for it, then races the suite for the GPU lock. Force the
+            # bad interleaving too: the title run holds the GPU lock while the suite (lease holder) is queued.
+            title_proc = subprocess.Popen([sys.executable, "-c", title, build], env=env)
+            try:
+                self.assertEqual(title_proc.wait(timeout=30), 0)
+                self.assertEqual(suite_proc.wait(timeout=30), 0)
+            finally:
+                for proc in (suite_proc, title_proc):
+                    if proc.poll() is None:
+                        proc.kill()
+
+    def test_buildlock_under_the_gpu_lock_does_not_wait_for_the_lease(self):
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as tmp:
+            build = os.path.join(tmp, "build")
+            os.makedirs(build)
+            with open(os.path.join(build, buildlock.LEASE_NAME), "w") as stream:
+                import json, time
+                json.dump({"pid": os.getppid(), "started": time.time(), "max_seconds": 600, "run": "x"}, stream)
+            env = dict(os.environ, **{buildlock.GPU_HELD_ENV: "1"})
+            code = subprocess.run([sys.executable, os.path.join(here, "buildlock.py"), build, "--", "true"],
+                                  env=env, timeout=20).returncode
+            self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

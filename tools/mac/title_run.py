@@ -373,7 +373,11 @@ def cmd_prepare(args):
 
 
 def cmd_run(args):
-    """One title run; the whole run holds the machine-wide GPU lock (taken before the per-build lock)."""
+    """One title run; the whole run holds the machine-wide GPU lock.
+
+    Lock order (see buildlock.py): wait for the build's gpu_suite lease first, WITHOUT the GPU lock, then take the
+    GPU lock; the buildlock child does not wait for the lease again (the suite may be queued on the GPU lock)."""
+    buildlock.wait_for_lease(Path(args.build).resolve(), out=sys.stdout)
     with buildlock.gpu_lock(label=f"title_run {args.id} --tag {args.tag}", out=sys.stdout):
         return run_locked(args)
 

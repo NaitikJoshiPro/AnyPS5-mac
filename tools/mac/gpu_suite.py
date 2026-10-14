@@ -16,7 +16,8 @@ holds the lock for at most --batch-seconds of worst-case test time (sum of the t
 build between batches.
 
 Safety guards (DECISIONS D19, after the 2026-10-12 kernel panic); gpu_suite refuses to run (exit 3) when:
-    - the source tree that configured the build has uncommitted or untracked changes under core/ or specifics/;
+    - the source tree that configured the build has uncommitted or untracked changes under core/ or specifics/
+      (after waiting up to --busy-wait seconds for it to become clean);
     - `ninja -n` reports work for a selected test executable, a canary or libSceAgcDriver.prx (stale binaries);
     - the 1-minute load average is above 6 or a compiler/linker (clang, ld, swift-frontend, metal, ...) runs,
       after waiting up to --busy-wait seconds (checked again before every test);
@@ -219,6 +220,18 @@ def wait_until_idle(max_wait, poll=10.0):
         if time.monotonic() >= deadline:
             raise Refused(f"machine busy after waiting {max_wait:g} s: {reason}")
         print(f"waiting: {reason}", flush=True)
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())) or poll)
+
+
+def wait_until_clean(source, max_wait, poll=10.0):
+    """dirty_paths(source), re-checked for up to max_wait seconds while it is non-empty (someone may be committing).
+    Waiting is safe: nothing is run yet, and the result is the last check, so a still-dirty tree is refused by the caller."""
+    deadline = time.monotonic() + max_wait
+    while True:
+        dirty = dirty_paths(source)
+        if not dirty or time.monotonic() >= deadline:
+            return dirty
+        print(f"waiting for a clean tree ({len(dirty)} uncommitted: {' '.join(dirty[:5])})", flush=True)
         time.sleep(min(poll, max(0.0, deadline - time.monotonic())) or poll)
 
 
@@ -496,7 +509,7 @@ def run_suite():
     parser.add_argument("--timeout", type=int, default=MAX_TIMEOUT, help=f"per-test timeout in seconds for tests without a TIMEOUT property (default and maximum: {MAX_TIMEOUT})")
     parser.add_argument("--batch-seconds", type=float, default=240.0, help="worst-case test seconds per batch in --dry-run listings (default: 240); every test runs in its own ctest process")
     parser.add_argument("--canaries", type=Path, default=CANARIES, help="canary list run first (default: tools/mac/gpu_canaries.txt)")
-    parser.add_argument("--busy-wait", type=float, default=300.0, help="seconds to wait for load/compilers to go away before refusing (default: 300)")
+    parser.add_argument("--busy-wait", type=float, default=300.0, help="seconds to wait for load/compilers to go away and for the source tree to become clean before refusing (default: 300)")
     parser.add_argument("--quarantine", type=Path, default=gpu_groups.QUARANTINE, help="quarantine list (default: tools/mac/gpu_quarantine.txt); missing or malformed: nothing runs")
     parser.add_argument("--rerun-held", metavar="NAME", help="the supervised run of ONE test gpu_groups.HOLD holds back (HOLD is empty now; agc_driver_lds_atomics64 was released on 2026-10-13; use with the coordinator's agreement): NAME must be the only selected test, needs --validation, runs alone after the canaries with a 1-minute load limit of 3; the test stays held for normal runs")
     parser.add_argument("--rerun-quarantined", action="store_true", help="the supervised rerun of ONE quarantined test (D19.4/6): needs exactly one selected test, --validation, and runs it alone after the canaries; the test stays quarantined until the list is edited with this run as evidence")
@@ -619,7 +632,7 @@ def run_suite():
     try:
         source = source_tree(build)
         guards["source"] = str(source)
-        dirty = dirty_paths(source)
+        dirty = wait_until_clean(source, args.busy_wait)
         guards["dirty"] = dirty
         if dirty:
             raise Refused(f"{source} has uncommitted changes under {'/ '.join(GUARDED_PATHS)}/: " + " ".join(dirty[:10])
