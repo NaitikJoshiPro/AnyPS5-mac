@@ -10,9 +10,10 @@
 // location 0 and emulated perspective barycentrics), raw PERSP_CENTER I/J and raw LINEAR_CENTER I/J.
 // The two paths must produce bit-identical R32G32B32A32 images (same positions, same corner order,
 // same one-hot weights through the same rasterizer), for triangle lists (wave64 one- and two-wave
-// subgroups, wave32, indexed), the last-vertex provoking convention and a 128-primitive strip
-// subgroup (two split threadgroups); the per-vertex values of the lists are also checked against
-// the corners.
+// subgroups, wave32, indexed, 64-primitive subgroups split over two threadgroups), the last-vertex
+// provoking convention and strips; the per-vertex values of the lists are also checked against the
+// corners. tests/Mesh.cpp's program outputs three vertices per primitive (maxVertices 3 x the
+// primitives), so a split comes from a mesh declared for more primitives than a subgroup allocates.
 // Strips run with the last vertex provoking: the translator hands an odd strip triangle's NGG
 // program the vertices (i + 1, i, i + 2) (InstructionTranslator.cpp, the mesh entry setup), which
 // with the last-vertex rotation is the vertex path's (i + 2, i + 1, i); under the first-vertex
@@ -100,9 +101,9 @@ struct Vertex {
 };
 
 constexpr std::uint32_t Columns = 8;
-constexpr std::uint32_t Rows = 4;
+constexpr std::uint32_t Rows = 8;
 constexpr std::uint32_t Triangles = Columns * Rows;
-constexpr std::uint32_t StripPrimitives = 128;
+constexpr std::uint32_t StripPrimitives = 30;
 
 alignas(256) std::array<Vertex, 3 * Triangles> List{};
 alignas(256) std::array<Vertex, 3 * Triangles> Scrambled{};
@@ -316,14 +317,18 @@ int main() {
         const auto stripDraw = AgcDriver::Pm4::DrawParameters{0, static_cast<std::uint32_t>(Strip.size()), 0, 1, 0, false};
         // {input primitive, primitives and vertices per group, max vertices, max primitives,
         // threads, LDS dwords, provoking vertex, ESGS item size}, as tests/Mesh.cpp.
-        const std::array<Case, 6> cases{{
+        const std::array<Case, 8> cases{{
             {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 32u, false},
             {"indexed triangle list", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, indexedDraw, BufferDescriptor(Scrambled.data(), static_cast<std::uint32_t>(Scrambled.size())), 64u, false},
             {"triangle list, last vertex provoking", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, true},
+            // 64-primitive subgroups in a mesh declared for 96 (192 output vertices, three waves): the
+            // triangle-vertices mode splits it into two threadgroups of 48 (0-47, then 48-63).
+            {"triangle list, 64-primitive subgroups of a 96-primitive mesh (two splits)", {4u, 64u, 192u, 192u, 96u, 192u, 4096u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
+            {"triangle list, two splits, last vertex provoking", {4u, 64u, 192u, 192u, 96u, 192u, 4096u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, true},
             // Strips with the last vertex provoking (OpenGL's default, radeonsi's): see the header.
-            {"triangle strip, 128-primitive subgroups (two splits), last vertex provoking", {6u, StripPrimitives, StripPrimitives + 2u, StripPrimitives + 2u, StripPrimitives, 192u, 4096u, 0u, 4u}, stripDraw, BufferDescriptor(Strip.data(), static_cast<std::uint32_t>(Strip.size())), 64u, true},
+            {"triangle strip, last vertex provoking", {6u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u}, stripDraw, BufferDescriptor(Strip.data(), static_cast<std::uint32_t>(Strip.size())), 64u, true},
         }};
         std::vector<float> reference(Pixels.size());
         std::uint32_t compared = 0;
