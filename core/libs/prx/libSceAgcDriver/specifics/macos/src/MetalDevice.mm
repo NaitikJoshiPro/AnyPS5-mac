@@ -722,7 +722,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
             state->compiler = state->pipelines->Compiler();
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
-            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT, spv::CapabilityStencilExportEXT, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod}) {
+            // ImageGatherExtended + nonConstantImageOffsets (Target()): MSL's sample/gather take a
+            // run-time int2 offset (MslImage.cpp PackedOffset), as Vulkan's maintenance8 does.
+            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT, spv::CapabilityStencilExportEXT, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod, spv::CapabilityImageGatherExtended}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
             // Multisampled storage images are emulated as 2D arrays of layers * samples slices (DECISIONS D22, MslAbi v6).
@@ -898,6 +900,11 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // "f16->f32 (native)" op matched the exact decode for 20000 halves, a quarter of them denormal
     // (gpu-suite 20261013T140350Z).
     target.float16DenormPreserve = true;
+    // Texel offsets computed at run time (ASTRO BOT: "normalized guest sampler is used with a texel
+    // offset that is not a constant"): MSL sample/gather/sample_compare take a run-time int2 offset,
+    // the equivalent of Vulkan's maintenance8 + shaderImageGatherExtended. Metal is reported to clamp offsets to
+    // [-8, 7] where RDNA2 takes 6-bit fields ([-32, 31]); TechnicalDebt metal-texel-offset-range.
+    target.nonConstantImageOffsets = true;
     return target;
 }
 
