@@ -404,9 +404,8 @@ bool HandleUnaligned(int signal, siginfo_t* info, __darwin_mcontext64* machine) 
     const std::uint64_t pc = arm_thread_state64_get_pc(machine->__ss);
     if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) {
         // Pool memory outside FEX's code buffers holds the displaced-access stubs (GuestDisplaced.cpp). FEX's
-        // backpatch would rewrite the stub's neighbouring words, so the fault is not handled here: name it, since
-        // the chained default action ends the process without saying why.
-        if (pool != nullptr && pool->Contains(reinterpret_cast<const void*>(pc))) ReportUnaligned("in JIT pool memory outside FEX's code buffers", pc, info);
+        // backpatch would rewrite the stub's neighbouring words, so the fault goes down the chain to libc's
+        // displaced handler, which rewrites the stub's own copy the same way (and names what it cannot handle).
         return false;
     }
     // __x[0..28], __fp, __lr, __sp and __pc are contiguous: FEX indexes the GPRs as x0..x31.

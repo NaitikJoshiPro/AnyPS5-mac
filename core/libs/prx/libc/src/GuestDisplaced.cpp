@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestDisplaced.hpp"
 
 #if defined(__APPLE__) && defined(__aarch64__)
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -37,14 +38,16 @@ extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsyst
 //            bic xB, xB, xA
 //            tbz xB, #63, plain
 //   flip:    eor xA, xN, #(1 << 40)
+//            [nop]                     ; barrier slot before an ordered store
 //            <instruction with Rn = xA>
+//            [nop]                     ; barrier slot after an ordered load
 //            [eor xN, xA, #(1 << 40)]  ; only for writeback forms
 //            ldp xA, xB, [sp]
 //            add sp, sp, #144
 //            b next
 //   plain:   ldp xA, xB, [sp]
 //            add sp, sp, #144
-//            <instruction>
+//            [nop] <instruction> [nop]
 //            b next
 //   forced:  sub sp, sp, #144
 //            stp xA, xB, [sp]
@@ -56,12 +59,17 @@ extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsyst
 // site is then patched to `b checked`, so later executions cost ~12 instructions and no signal. Nothing in the stub
 // touches NZCV. xA/xB are chosen outside every register field of the instruction. Stubs live in an RX view of
 // memory written through an RW view (no MAP_JIT toggling), within branch range of the faulting instruction.
+//
+// FEX's TSO emulation emits ordered accesses (LDAPUR/STLUR, LDAR/LDAPR/STLR), which raise SIGBUS (BUS_ADRALN) on
+// the M3 when they cross 16 bytes. FEX's own handler only rewrites code in its code buffers, so a copy in a stub
+// carries a NOP slot next to it, and FixUnaligned rewrites the copy the way FEX rewrites its sites (HalfBarrier):
+// LDUR + DMB ISHLD for a load, DMB ISH + STUR for a store, for good.
 namespace GuestArena {
 namespace {
 
 std::uintptr_t g_start = CarveoutStart;
 
-constexpr std::uint32_t kSlotWords = 32; // longest stub: 8 check + 8 flip + 6 plain + 3 forced + 1 pad + 4 literal words
+constexpr std::uint32_t kSlotWords = 32; // longest stub: 8 check + 9 flip + 7 plain + 3 forced + 1 pad + 4 literal words
 constexpr std::size_t kChunkBytes = 1u << 20;
 constexpr std::size_t kMaxChunks = 64;
 constexpr std::size_t kTableSize = 1u << 15;
@@ -92,6 +100,7 @@ std::atomic<bool> g_enabled{false};
 std::atomic<bool> g_attempted{false};
 std::atomic<std::uint64_t> g_faults{0};
 std::atomic<std::uint64_t> g_patches{0};
+std::atomic<std::uint64_t> g_unaligned{0}; // ordered stub accesses rewritten to FEX's half-barrier form
 std::atomic<bool (*)(std::uintptr_t, std::uint32_t)> g_writer{nullptr};
 std::atomic<std::uintptr_t (*)(std::uintptr_t, std::size_t, std::uintptr_t*)> g_allocator{nullptr};
 std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
@@ -209,6 +218,33 @@ bool IsLoadStore(std::uint32_t insn) {
     return true;
 }
 
+constexpr std::uint32_t kNop = 0xd503201fu;
+constexpr std::uint32_t kDmbIsh = 0xd5033bbfu;   // FEX's DMB (inner shareable, all)
+constexpr std::uint32_t kDmbIshLd = 0xd50339bfu; // FEX's DMB_LD (inner shareable, loads)
+
+enum class Ordered { None, Load, Store };
+
+// The ordered single-register accesses FEX's unaligned handler rewrites (FEX ArchHelpers/Arm64.cpp: LDAR, LDAPR,
+// STLR, LDAPUR, STLUR; all sizes). Writeback forms do not exist among them.
+Ordered OrderedAccess(std::uint32_t insn) {
+    if ((insn & 0x3ffffc00u) == 0x08dffc00u || (insn & 0x3ffffc00u) == 0x38bfc000u) return Ordered::Load; // LDAR, LDAPR
+    if ((insn & 0x3ffffc00u) == 0x089ffc00u) return Ordered::Store;                                      // STLR
+    if ((insn & 0x3fe00c00u) == 0x19400000u) return Ordered::Load;                                       // LDAPUR
+    if ((insn & 0x3fe00c00u) == 0x19000000u) return Ordered::Store;                                      // STLUR
+    return Ordered::None;
+}
+
+// The plain form: LDUR/STUR with the same size, registers and (for LDAPUR/STLUR) offset.
+std::uint32_t Unordered(std::uint32_t insn, Ordered kind) {
+    const bool rcpc2 = (insn & 0x3f000000u) == 0x19000000u;
+    const auto offset = rcpc2 ? insn & (0x1ffu << 12) : 0u;
+    return (insn & 0xc0000000u) | (kind == Ordered::Load ? 0x38400000u : 0x38000000u) | offset | (insn & 0x3ffu);
+}
+
+bool IsUnorderedOf(std::uint32_t insn, Ordered kind) {
+    return (insn & 0x3fe00c00u) == (kind == Ordered::Load ? 0x38400000u : 0x38000000u);
+}
+
 bool HasWriteback(std::uint32_t insn) {
     if ((insn & 0x3b200000u) == 0x38000000u) return (insn & 0x400u) != 0;  // imm9 post (01) / pre (11)
     if ((insn & 0x3a000000u) == 0x28000000u) return (insn & 0x00800000u) != 0; // pair post / pre
@@ -274,8 +310,14 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     words[n++] = 0x8a200000u | (a << 16) | (b << 5) | b; // bic xB, xB, xA
     const auto tbzAt = n++;
     const auto flipAt = n;
+    const auto ordered = OrderedAccess(insn);
+    const auto access = [&](std::uint32_t copy) {
+        if (ordered == Ordered::Store) words[n++] = kNop;
+        words[n++] = copy;
+        if (ordered == Ordered::Load) words[n++] = kNop;
+    };
     words[n++] = eorFlip(a, rn);
-    words[n++] = (insn & ~(31u << 5)) | (a << 5);
+    access((insn & ~(31u << 5)) | (a << 5));
     if (HasWriteback(insn)) words[n++] = eorFlip(rn, a);
     words[n++] = ldp;
     words[n++] = addSp;
@@ -283,7 +325,7 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     const auto plainAt = n;
     words[n++] = ldp;
     words[n++] = addSp;
-    words[n++] = insn;
+    access(insn);
     n = back(n);
     const auto forcedAt = n;
     words[n++] = subSp;
@@ -357,6 +399,74 @@ bool Redirect(siginfo_t* info, void* context) {
     return true;
 }
 
+// True when [address, address + bytes) is mapped with `protection` (a real fault, not a rewritten site, otherwise).
+bool Accessible(std::uintptr_t address, std::size_t bytes, vm_prot_t protection) {
+    for (std::uintptr_t at = address; at < address + bytes;) {
+        mach_vm_address_t start = at;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &start, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS) return false;
+        if (start > at || (info.protection & protection) != protection) return false;
+        at = start + size;
+    }
+    return true;
+}
+
+// SIGBUS (BUS_ADRALN) on an ordered access in a stub that crosses 16 bytes: rewrite it to FEX's half-barrier form
+// (see the comment at the top) and resume at the barrier (store) or the access (load). The stub's registers and
+// stack are untouched, so resuming mid-stub is safe. A thread that faulted on the old instruction while another one
+// rewrote it finds the plain form and runs it again; one whose plain access faults (a real protection fault) is
+// chained. Anything else in a stub that faults for alignment (an LSE atomic crossing 16 bytes) is named and chained.
+bool FixUnaligned(int signal, siginfo_t* info, void* context) {
+    if (signal != SIGBUS || info->si_code != BUS_ADRALN) return false;
+    auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
+    const std::uintptr_t pc = arm_thread_state64_get_pc(machine->__ss);
+    SpinLock lock;
+    const Chunk* chunk = nullptr;
+    for (std::size_t i = 0; i < g_chunkCount && chunk == nullptr; ++i)
+        if (pc >= g_chunks[i].rx && pc < g_chunks[i].rx + kChunkBytes) chunk = &g_chunks[i];
+    if (chunk == nullptr) return false;
+    const auto report = [&](const char* what) {
+        char line[200];
+        const int length = std::snprintf(line, sizeof(line), "[displaced] unaligned access in a displaced-access stub %s: pc 0x%llx insn 0x%08x addr 0x%llx\n", what,
+            static_cast<unsigned long long>(pc), *reinterpret_cast<const std::uint32_t*>(pc), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
+        if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
+        return false;
+    };
+    if ((pc & 3u) != 0 || pc < chunk->rx + 4 || pc + 8 > chunk->rx + kChunkBytes) return report("left unhandled");
+    const auto* code = reinterpret_cast<const std::uint32_t*>(pc);
+    auto* writable = reinterpret_cast<std::uint32_t*>(chunk->rw + (pc - chunk->rx));
+    const auto insn = __atomic_load_n(&code[0], __ATOMIC_ACQUIRE);
+    const unsigned rn = (insn >> 5) & 31u;
+    if (rn == 31) return report("left unhandled");
+    const std::uint64_t base = rn <= 28 ? machine->__ss.__x[rn] : rn == 29 ? machine->__ss.__fp : machine->__ss.__lr;
+    const bool rcpc2 = (insn & 0x3f000000u) == 0x19000000u || (insn & 0x3f000000u) == 0x38000000u;
+    const auto address = base + static_cast<std::uint64_t>(rcpc2 ? (static_cast<std::int32_t>(insn << 11) >> 23) : 0);
+    const std::size_t bytes = std::size_t{1} << (insn >> 30);
+    if ((address & 15u) + bytes <= 16) return report("that does not cross 16 bytes");
+    const auto kind = OrderedAccess(insn);
+    if (kind == Ordered::None) {
+        for (const auto rewritten : {Ordered::Load, Ordered::Store}) {
+            const auto barrier = rewritten == Ordered::Load ? code[1] : code[-1];
+            if (!IsUnorderedOf(insn, rewritten) || barrier != (rewritten == Ordered::Load ? kDmbIshLd : kDmbIsh)) continue;
+            if (!Accessible(address, bytes, rewritten == Ordered::Load ? VM_PROT_READ : VM_PROT_READ | VM_PROT_WRITE)) return false;
+            if (rewritten == Ordered::Store) arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(pc - 4));
+            return true;
+        }
+        return report("left unhandled");
+    }
+    const int slot = kind == Ordered::Load ? 1 : -1;
+    if (code[slot] != kNop) return report("without a barrier slot");
+    __atomic_store_n(&writable[slot], kind == Ordered::Load ? kDmbIshLd : kDmbIsh, __ATOMIC_RELEASE);
+    __atomic_store_n(&writable[0], Unordered(insn, kind), __ATOMIC_RELEASE);
+    sys_icache_invalidate(reinterpret_cast<void*>(pc - 4), 12);
+    if (g_unaligned.fetch_add(1, std::memory_order_relaxed) < 64 && g_trace) report("rewritten to a plain access and a barrier");
+    if (kind == Ordered::Store) arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(pc - 4));
+    return true;
+}
+
 struct sigaction g_previousTrap {};
 
 // A far stub ends in BRK #0xd15 followed by its 64-bit return address.
@@ -388,7 +498,7 @@ void OnTrap(int signal, siginfo_t* info, void* context) {
 
 void OnFault(int signal, siginfo_t* info, void* context) {
     const int saved = errno;
-    const bool handled = Redirect(info, context);
+    const bool handled = Redirect(info, context) || FixUnaligned(signal, info, context);
     static std::atomic<int> unhandled{0};
     if (!handled && g_trace && unhandled.fetch_add(1) < 16) {
         auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
