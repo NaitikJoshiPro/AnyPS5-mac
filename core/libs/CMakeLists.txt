@@ -486,6 +486,24 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePosixForWebKit>")
     endif()
 
+    # libSceAgc's shader functions on displaced guest memory read through host views: zero faults, same results
+    # (D31, D33). The sources are compiled in with stub driver entry points, so no GPU is touched.
+    add_test_executable(guest_displaced_shaders_tests
+            tests/GuestDisplacedShaders.cpp
+            prx/libSceAgc/Shader/src/CreateShader.cpp
+            prx/libSceAgc/Shader/src/ShaderUtils.cpp
+            prx/libSceAgc/Shader/src/InterpolantMapping.cpp
+            prx/libSceAgc/Shader/src/PrimState.cpp
+            prx/libSceAgc/Shader/src/LinkShaders.cpp
+            prx/libSceAgc/Shader/src/GsPrimPayload.cpp
+            prx/libSceAgc/Shader/src/GsOversubscription.cpp
+            prx/libSceAgc/Misc/src/ShaderFusion.cpp
+    )
+    target_include_directories(guest_displaced_shaders_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_displaced_shaders_tests PRIVATE libSceAgcDriver libkernel libc)
+    configure_windows_unwind(guest_displaced_shaders_tests)
+    add_test(NAME guest_displaced_shaders COMMAND guest_displaced_shaders_tests)
+
     if(TARGET aps5_host_syscall_shim)
         add_test_executable(host_syscall_shim_tests tests/HostSyscallShim.cpp)
         target_include_directories(host_syscall_shim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

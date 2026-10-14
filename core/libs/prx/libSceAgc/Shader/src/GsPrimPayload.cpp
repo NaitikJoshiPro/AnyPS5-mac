@@ -5,6 +5,7 @@
 
 #include "SceShaders.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderUtils.hpp"
 
 namespace {
 
@@ -16,10 +17,12 @@ constexpr std::uint32_t TwoComponentPayloadBytes = 8u;
 
 extern "C" {
 
-int APS5_VABI sceAgcGetGsPrimPayload(std::uint32_t* payload, const Shader* gs) {
-    if (payload == nullptr || gs == nullptr) {
+int APS5_VABI sceAgcGetGsPrimPayload(std::uint32_t* payload, const Shader* guestGs) {
+    if (payload == nullptr || guestGs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": payload or gs is null");
     }
+    const Shader view = HostShader(guestGs); // displaced memory (D31, D33)
+    const Shader* gs = &view;
     if (gs->num_cx_registers != 0 && gs->cx_registers == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": gs->cx_registers is null but num_cx_registers != 0");
     }
@@ -32,7 +35,7 @@ int APS5_VABI sceAgcGetGsPrimPayload(std::uint32_t* payload, const Shader* gs) {
             break;
         }
     }
-    *payload = bytes;
+    *GuestArena::HostPointer(payload) = bytes;
     return 0;
 }
 

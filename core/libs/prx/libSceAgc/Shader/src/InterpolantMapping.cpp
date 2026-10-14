@@ -68,15 +68,22 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
     if (ps == nullptr && !fillIdentityTail) {
         throw std::runtime_error(std::string(fn) + ": ps is null");
     }
-    if (ps != nullptr && ps->num_input_semantics > 32) {
+    // Read the headers through their host views (displaced memory, D31, D33); the driver gets the guest headers.
+    Shader psView{};
+    Shader gsView{};
+    if (ps != nullptr) psView = HostShader(ps);
+    if (gs != nullptr) gsView = HostShader(gs);
+    const Shader* psHost = ps != nullptr ? &psView : nullptr;
+    const Shader* gsHost = gs != nullptr ? &gsView : nullptr;
+    if (ps != nullptr && psHost->num_input_semantics > 32) {
         throw std::runtime_error(std::string(fn) + ": input semantic count exceeds 32");
     }
 
     AgcDriver::ShaderPreparationScope transaction;
     std::array<ShaderRegister, 32> values{};
-    auto* output = regs;
+    auto* output = GuestArena::HostPointer(regs); // a guest array (displaced memory, D31, D33)
     regs = values.data();
-    if (ps == nullptr || ps->num_input_semantics == 0) {
+    if (psHost == nullptr || psHost->num_input_semantics == 0) {
         const std::uint32_t count = fillIdentityTail ? InterpolantRegisterCount : 0;
         if (fillIdentityTail) FillIdentityInterpolants(regs, 0);
         if (ps != nullptr) {
@@ -88,11 +95,11 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
         return 0;
     }
 
-    if (ps->num_input_semantics != 0 && ps->input_semantics == nullptr) {
+    if (psHost->num_input_semantics != 0 && psHost->input_semantics == nullptr) {
         throw std::runtime_error(std::string(fn) + ": ps->input_semantics is null but num_input_semantics != 0");
     }
 
-    if (ps->num_input_semantics > InterpolantRegisterCount) {
+    if (psHost->num_input_semantics > InterpolantRegisterCount) {
         throw std::runtime_error(std::string(fn) + ": ps->num_input_semantics exceeds the interpolant register count");
     }
 
@@ -100,18 +107,18 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
         throw std::runtime_error(std::string(fn) + ": gs is null");
     }
 
-    if (gs->num_output_semantics != 0 && gs->output_semantics == nullptr) {
+    if (gsHost->num_output_semantics != 0 && gsHost->output_semantics == nullptr) {
         throw std::runtime_error(std::string(fn) + ": gs->output_semantics is null but num_output_semantics != 0");
     }
 
-    for (std::uint32_t i = 0; i < ps->num_input_semantics; ++i) {
-        const ShaderSemantic& psSemantic = ps->input_semantics[i];
-        const ShaderSemantic* gsSemantic = FindOutputSemantic(gs, psSemantic.semantic);
+    for (std::uint32_t i = 0; i < psHost->num_input_semantics; ++i) {
+        const ShaderSemantic& psSemantic = psHost->input_semantics[i];
+        const ShaderSemantic* gsSemantic = FindOutputSemantic(gsHost, psSemantic.semantic);
         SetInterpolantRegister(regs, i, createValue(ShaderSemanticWord(psSemantic), gsSemantic));
     }
 
-    const std::uint32_t count = fillIdentityTail ? InterpolantRegisterCount : ps->num_input_semantics;
-    if (fillIdentityTail) FillIdentityInterpolants(regs, ps->num_input_semantics);
+    const std::uint32_t count = fillIdentityTail ? InterpolantRegisterCount : psHost->num_input_semantics;
+    if (fillIdentityTail) FillIdentityInterpolants(regs, psHost->num_input_semantics);
     AgcDriverResolveShaderAbi_nid_postfix(ps, {regs, count}, {});
     AgcDriverResolveGraphicsAbi_nid_postfix(gs, ps, 0);
     transaction.Commit();

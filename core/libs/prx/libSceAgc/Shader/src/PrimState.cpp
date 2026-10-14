@@ -25,13 +25,19 @@ void RequireSpecialOffset(const ShaderRegister& reg, std::uint32_t expected, con
 
 extern "C" {
 
-int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs, const Shader* hs, const Shader* gs, std::uint32_t prim_type) {
+int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs, const Shader* guestHs, const Shader* guestGs, std::uint32_t prim_type) {
     if (cx_regs == nullptr && uc_regs == nullptr) {
         return 0;
     }
-    if (gs == nullptr) {
+    if (guestGs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": gs is null");
     }
+    // Read the headers through their host views (displaced memory, D31, D33); the driver gets the guest headers.
+    const Shader gsView = HostShader(guestGs);
+    Shader hsView{};
+    if (guestHs != nullptr) hsView = HostShader(guestHs);
+    const Shader* gs = &gsView;
+    const Shader* hs = guestHs != nullptr ? &hsView : nullptr;
 
     if (gs->type != static_cast<std::uint8_t>(ShaderRegs::ShaderBinaryType::Gs) || gs->specials == nullptr || (hs != nullptr && (hs->type != static_cast<std::uint8_t>(ShaderRegs::ShaderBinaryType::Hs) || hs->specials == nullptr))) {
         throw std::runtime_error(std::string(__func__) + ": invalid shader type or missing special registers");
@@ -53,13 +59,13 @@ int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_
         contextValues[1] = {ShaderRegs::VGT_GS_OUT_PRIM_TYPE, GraphicsPrimTypeToGsOut(prim_type)};
     }
     std::array<ShaderRegister, 3> primitiveValues{gs->specials->ge_cntl, hs != nullptr ? hs->specials->ge_user_vgpr_en : gs->specials->ge_user_vgpr_en, ShaderRegister{ShaderRegs::VGT_PRIMITIVE_TYPE, prim_type}};
-    const std::array<const Shader*, 2> stages{hs, gs};
+    const std::array<const Shader*, 2> stages{guestHs, guestGs};
     const bool patch = prim_type == static_cast<std::uint32_t>(ShaderRegs::PrimitiveType::Patch);
     if (patch == ((contextValues[0].value & ShaderRegs::VGT_SHADER_STAGES_HS_BIT) != 0)) {
         AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span(stages).subspan(hs == nullptr ? 1u : 0u), contextValues, primitiveValues);
     }
-    if (cx_regs != nullptr) std::copy(contextValues.begin(), contextValues.end(), cx_regs);
-    if (uc_regs != nullptr) std::copy(primitiveValues.begin(), primitiveValues.end(), uc_regs);
+    if (cx_regs != nullptr) std::copy(contextValues.begin(), contextValues.end(), GuestArena::HostPointer(cx_regs));
+    if (uc_regs != nullptr) std::copy(primitiveValues.begin(), primitiveValues.end(), GuestArena::HostPointer(uc_regs));
     return 0;
 }
 

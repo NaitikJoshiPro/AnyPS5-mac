@@ -198,17 +198,21 @@ int FuseGeometryHalves(Shader* fused_result, const Shader* front, const Shader* 
     const auto scratch = reinterpret_cast<std::uintptr_t>(scratch_mem);
     const auto base = AlignUp(scratch, FusedCodeAlignment);
     if ((base & SHADER_BASE_ALIGN_MASK) != 0) Fail(fn, "fused shader memory is not a valid program address");
+    // The halves are host views (HostShader); the fused shader is written through the scratch memory's host view and
+    // stores guest addresses (displaced memory, D31, D33).
     auto* memory = static_cast<std::uint8_t*>(scratch_mem) + (base - scratch);
-    std::memcpy(memory, const_cast<const void*>(front->code), layout.frontBytes);
-    for (std::size_t offset = layout.frontBytes; offset < layout.backOffset; offset += sizeof(SNop)) std::memcpy(memory + offset, &SNop, sizeof(SNop));
-    std::memcpy(memory + layout.backOffset, const_cast<const void*>(back->code), back->shader_size);
+    auto* host = GuestArena::HostRange(memory, layout.totalBytes);
+    const auto guest = [&](auto* hostPointer) { return reinterpret_cast<decltype(hostPointer)>(memory + (reinterpret_cast<std::uint8_t*>(hostPointer) - host)); };
+    std::memcpy(host, const_cast<const void*>(front->code), layout.frontBytes);
+    for (std::size_t offset = layout.frontBytes; offset < layout.backOffset; offset += sizeof(SNop)) std::memcpy(host + offset, &SNop, sizeof(SNop));
+    std::memcpy(host + layout.backOffset, const_cast<const void*>(back->code), back->shader_size);
     SetProgramAddress(layout.sh, SPI_SHADER_PGM_LO_GS, base + layout.backOffset);
     if (PatchProgramAddressRegister(layout.sh.data(), static_cast<std::uint32_t>(layout.sh.size()), static_cast<std::uint8_t>(ShaderBinaryType::Gs), base) != 0) Fail(fn, "fused program address patch failed");
-    auto* sh = reinterpret_cast<ShaderRegister*>(memory + layout.shOffset);
-    auto* cx = reinterpret_cast<ShaderRegister*>(memory + layout.cxOffset);
-    auto* specials = reinterpret_cast<ShaderSpecialRegs*>(memory + layout.specialsOffset);
-    auto* inputs = reinterpret_cast<ShaderSemantic*>(memory + layout.inputsOffset);
-    auto* outputs = reinterpret_cast<ShaderSemantic*>(memory + layout.outputsOffset);
+    auto* sh = reinterpret_cast<ShaderRegister*>(host + layout.shOffset);
+    auto* cx = reinterpret_cast<ShaderRegister*>(host + layout.cxOffset);
+    auto* specials = reinterpret_cast<ShaderSpecialRegs*>(host + layout.specialsOffset);
+    auto* inputs = reinterpret_cast<ShaderSemantic*>(host + layout.inputsOffset);
+    auto* outputs = reinterpret_cast<ShaderSemantic*>(host + layout.outputsOffset);
     std::memcpy(sh, layout.sh.data(), layout.sh.size() * sizeof(ShaderRegister));
     std::memcpy(cx, layout.cx.data(), layout.cx.size() * sizeof(ShaderRegister));
     if (back->special_sizes_bytes != 0) std::memcpy(specials, back->specials, back->special_sizes_bytes);
@@ -216,35 +220,35 @@ int FuseGeometryHalves(Shader* fused_result, const Shader* front, const Shader* 
     if (back->num_output_semantics != 0) std::memcpy(outputs, back->output_semantics, back->num_output_semantics * sizeof(ShaderSemantic));
     Shader fused = *back;
     if (back->user_data != nullptr) {
-        auto* userData = reinterpret_cast<ShaderUserData*>(memory + layout.userDataOffset);
+        auto* userData = reinterpret_cast<ShaderUserData*>(host + layout.userDataOffset);
         *userData = *back->user_data;
-        auto* direct = reinterpret_cast<std::uint16_t*>(memory + layout.directOffset);
-        if (userData->direct_resource_count != 0) std::memcpy(direct, back->user_data->direct_resource_offset, userData->direct_resource_count * sizeof(std::uint16_t));
-        userData->direct_resource_offset = userData->direct_resource_count != 0 ? direct : nullptr;
+        auto* direct = reinterpret_cast<std::uint16_t*>(host + layout.directOffset);
+        if (userData->direct_resource_count != 0) std::memcpy(direct, GuestArena::HostPointer(back->user_data->direct_resource_offset), userData->direct_resource_count * sizeof(std::uint16_t));
+        userData->direct_resource_offset = userData->direct_resource_count != 0 ? guest(direct) : nullptr;
         for (std::size_t i = 0; i < layout.sharpOffsets.size(); ++i) {
-            auto* sharps = reinterpret_cast<ShaderSharp*>(memory + layout.sharpOffsets[i]);
-            if (userData->sharp_resource_count[i] != 0) std::memcpy(sharps, back->user_data->sharp_resource_offset[i], userData->sharp_resource_count[i] * sizeof(ShaderSharp));
-            userData->sharp_resource_offset[i] = userData->sharp_resource_count[i] != 0 ? sharps : nullptr;
+            auto* sharps = reinterpret_cast<ShaderSharp*>(host + layout.sharpOffsets[i]);
+            if (userData->sharp_resource_count[i] != 0) std::memcpy(sharps, GuestArena::HostPointer(back->user_data->sharp_resource_offset[i]), userData->sharp_resource_count[i] * sizeof(ShaderSharp));
+            userData->sharp_resource_offset[i] = userData->sharp_resource_count[i] != 0 ? guest(sharps) : nullptr;
         }
-        fused.user_data = userData;
+        fused.user_data = guest(userData);
     }
     fused.header_size = static_cast<std::uint32_t>(layout.totalBytes - layout.headerOffset);
     fused.code = memory;
-    fused.sh_registers = sh;
-    fused.cx_registers = layout.cx.empty() ? nullptr : cx;
-    fused.specials = back->special_sizes_bytes != 0 ? specials : nullptr;
-    fused.input_semantics = front->num_input_semantics != 0 ? inputs : nullptr;
-    fused.output_semantics = back->num_output_semantics != 0 ? outputs : nullptr;
+    fused.sh_registers = guest(sh);
+    fused.cx_registers = layout.cx.empty() ? nullptr : guest(cx);
+    fused.specials = back->special_sizes_bytes != 0 ? guest(specials) : nullptr;
+    fused.input_semantics = front->num_input_semantics != 0 ? guest(inputs) : nullptr;
+    fused.output_semantics = back->num_output_semantics != 0 ? guest(outputs) : nullptr;
     fused.shader_size = static_cast<std::uint32_t>(layout.codeBytes);
     fused.num_input_semantics = front->num_input_semantics;
     fused.scratch_size_dw_per_thread = std::max(front->scratch_size_dw_per_thread, back->scratch_size_dw_per_thread);
     fused.type = static_cast<std::uint8_t>(ShaderBinaryType::Gs);
     fused.num_sh_registers = static_cast<std::uint8_t>(layout.sh.size());
     fused.num_cx_registers = static_cast<std::uint8_t>(layout.cx.size());
-    auto* header = reinterpret_cast<Shader*>(memory + layout.headerOffset);
+    auto* header = reinterpret_cast<Shader*>(host + layout.headerOffset);
     *header = fused;
-    *fused_result = fused;
-    AgcDriverRegisterShader_nid_postfix(header);
+    *GuestArena::HostPointer(fused_result) = fused;
+    AgcDriverRegisterShader_nid_postfix(guest(header));
     return 0;
 }
 
@@ -252,8 +256,13 @@ int FuseGeometryHalves(Shader* fused_result, const Shader* front, const Shader* 
 
 extern "C" {
 
-int APS5_VABI sceAgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front, const Shader* back, void* scratch_mem) {
-    if (fused_result == nullptr || front == nullptr || back == nullptr) APS5_INVALID_ARG_EX;
+int APS5_VABI sceAgcFuseShaderHalves_0200(Shader* fused_result, const Shader* guestFront, const Shader* guestBack, void* scratch_mem) {
+    if (fused_result == nullptr || guestFront == nullptr || guestBack == nullptr) APS5_INVALID_ARG_EX;
+    // Read the halves through their host views (displaced memory, D31, D33).
+    const Shader frontView = HostShader(guestFront);
+    const Shader backView = HostShader(guestBack);
+    const Shader* front = &frontView;
+    const Shader* back = &backView;
     if (!ValidHalves(front, back)) return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
     const bool isGs = GeometryHalves(front);
     const std::uint32_t stageBit = isGs ? (1u << 22u) : (1u << 21u);
@@ -261,15 +270,17 @@ int APS5_VABI sceAgcFuseShaderHalves_0200(Shader* fused_result, const Shader* fr
         return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
     }
     if (isGs) return FuseGeometryHalves(fused_result, front, back, scratch_mem);
-    *fused_result = *back;
-    fused_result->type = static_cast<std::uint8_t>(ShaderBinaryType::Hs);
+    auto* result = GuestArena::HostPointer(fused_result);
+    std::memcpy(result, GuestArena::HostRange(guestBack, sizeof(Shader)), sizeof(Shader)); // the back half's guest pointers
+    result->type = static_cast<std::uint8_t>(ShaderBinaryType::Hs);
     if (scratch_mem != nullptr) {
         auto* regs = static_cast<ShaderRegister*>(scratch_mem);
-        std::memcpy(regs, back->sh_registers, std::size_t{back->num_sh_registers} * sizeof(ShaderRegister));
-        fused_result->sh_registers = regs;
+        const auto bytes = std::size_t{back->num_sh_registers} * sizeof(ShaderRegister);
+        std::memcpy(GuestArena::HostRange(regs, bytes), back->sh_registers, bytes);
+        result->sh_registers = regs;
     }
-    ShaderRegister* fused = fused_result->sh_registers;
-    const std::uint32_t fusedCount = fused_result->num_sh_registers;
+    ShaderRegister* fused = GuestArena::HostPointer(result->sh_registers);
+    const std::uint32_t fusedCount = result->num_sh_registers;
     const std::uint32_t frontCount = front->num_sh_registers;
     for (std::uint32_t occurrence = 0; occurrence < 2; ++occurrence) {
         FindRegister(fused, fusedCount, SPI_SHADER_PGM_CHKSUM_HS, occurrence).value = FindRegister(front->sh_registers, frontCount, SPI_SHADER_PGM_CHKSUM_HS, occurrence).value;
@@ -290,10 +301,10 @@ int APS5_VABI sceAgcFuseShaderHalves_0200(Shader* fused_result, const Shader* fr
     fusedRsrc2.value = (fusedRsrc2.value & 0xf7ffffc1u) | (frontRsrc2.value & 0x0800003eu);
     auto& loRegister = FindRegister(fused, fusedCount, SPI_SHADER_PGM_LO_LS);
     auto& hiRegister = FindRegister(fused, fusedCount, SPI_SHADER_PGM_LO_LS + 1u);
-    const auto address = reinterpret_cast<std::uint64_t>(front->code);
+    const auto address = GuestArena::GuestAddress(reinterpret_cast<std::uintptr_t>(front->code));
     loRegister.value = static_cast<std::uint32_t>(address >> 8u);
     hiRegister.value = (hiRegister.value & 0xffffff00u) | static_cast<std::uint32_t>((address >> 40u) & 0xffu);
-    fused_result->user_data = nullptr;
+    result->user_data = nullptr;
     return 0;
 }
 
@@ -301,8 +312,13 @@ int APS5_VABI sceAgcFuseShaderHalves_nid_postfix(Shader* fused_result, const Sha
     return sceAgcFuseShaderHalves_0200(fused_result, front, back, scratch_mem);
 }
 
-int APS5_VABI sceAgcGetFusedShaderSize_0080(SizeAlign* dst, const Shader* front, const Shader* back) {
-    if (dst == nullptr || front == nullptr || back == nullptr) APS5_INVALID_ARG_EX;
+int APS5_VABI sceAgcGetFusedShaderSize_0080(SizeAlign* dst, const Shader* guestFront, const Shader* guestBack) {
+    if (dst == nullptr || guestFront == nullptr || guestBack == nullptr) APS5_INVALID_ARG_EX;
+    const Shader frontView = HostShader(guestFront);
+    const Shader backView = HostShader(guestBack);
+    const Shader* front = &frontView;
+    const Shader* back = &backView;
+    dst = GuestArena::HostPointer(dst);
     if (!ValidHalves(front, back)) return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
     if (GeometryHalves(front)) {
         const auto layout = ComputeGeometryLayout("sceAgcGetFusedShaderSize_0080", front, back);
