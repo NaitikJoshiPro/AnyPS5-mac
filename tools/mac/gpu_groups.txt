@@ -556,6 +556,7 @@ agc_metal_msl_upstream_parity G7
 agc_metal_msl_wave_lds G7
 agc_metal_pipeline_cache G7
 agc_metal_pipeline_cache_background G7
+agc_metal_pipeline_cache_save_race G7
 agc_metal_recorder G7
 agc_metal_recorder_logic G7
 agc_metal_recorder_logic_late G7

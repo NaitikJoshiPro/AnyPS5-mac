@@ -5,6 +5,9 @@
 //                                       same results (MISSION §8, M2_DESIGN.md §7.6)
 //   agc_metal_pipeline_cache_background background preparation, concurrent requests for one pipeline,
 //                                       failure reporting, key separation
+//   agc_metal_pipeline_cache_save_race  archive saves while other threads compile pipelines (the
+//                                       serializer's flush raced in-flight captures: Metal crashed in
+//                                       -[_MTLBinaryArchive newArchiverIdWithBinaryKey:...], ASTRO BOT)
 // The `--pipeline-cache-only` mode of agc_driver_recorder_tests (agc_pipeline_cache) runs the
 // two-cache check in one process (D5RecorderModes.mm).
 #import <Foundation/Foundation.h>
@@ -14,6 +17,7 @@
 #include "MetalPipelineCacheChecks.h"
 
 #include <spawn.h>
+#include <atomic>
 #include <sys/wait.h>
 #include <cstdio>
 #include <cstdlib>
@@ -172,6 +176,57 @@ int Background() {
     return 0;
 }
 
+// Saves (serializeAsArchiveAndFlushToURL) racing compiles that capture into the same serializer. The
+// cache's own eager saves (one per new pipeline) run on its background thread; one more thread saves
+// in a loop. Without the archive (shader validation) the compiles still run and saves are no-ops.
+int SaveRace() {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil || ![device supportsFamily:MTLGPUFamilyMetal4]) {
+        std::printf("skipped, the machine has no Metal 4 device\n");
+        return 77;
+    }
+    char pattern[] = "/tmp/aps5-pipeline-save-race-XXXXXX";
+    const char* made = mkdtemp(pattern);
+    if (made == nullptr) return Fail("cannot create a temporary directory");
+    const std::filesystem::path directory(made);
+    constexpr std::uint32_t Pipelines = 160;
+    constexpr std::uint32_t Workers = 4;
+    std::atomic<bool> failed{false};
+    std::uint64_t compiled = 0;
+    std::uint64_t saves = 0;
+    {
+        PipelineCache cache(device, directory);
+        std::atomic<bool> done{false};
+        std::thread saver([&] {
+            while (!done.load()) cache.Save();
+        });
+        std::vector<std::thread> workers;
+        for (std::uint32_t worker = 0; worker < Workers; ++worker) {
+            workers.emplace_back([&, worker] {
+                for (std::uint32_t index = worker; index < Pipelines; index += Workers) {
+                    @autoreleasepool {
+                        if (cache.Compute(ComputeFunction(1000u + index)) == nil) failed = true;
+                    }
+                }
+            });
+        }
+        for (auto& thread : workers) thread.join();
+        done = true;
+        saver.join();
+        cache.Drain();
+        const auto statistics = cache.Statistics();
+        compiled = statistics.pipelinesCompiled;
+        saves = statistics.archiveSaves;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    if (failed.load()) return Fail("a pipeline compiled while saving came back nil");
+    if (compiled != Pipelines) return Fail("expected " + std::to_string(Pipelines) + " compiled pipelines, got " + std::to_string(compiled));
+    std::printf("PASS: agc_metal_pipeline_cache_save_race (%llu pipelines, %llu saves%s)\n", static_cast<unsigned long long>(compiled),
+        static_cast<unsigned long long>(saves), ShaderValidation() ? ", archive disabled under shader validation" : "");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -180,8 +235,9 @@ int main(int argc, char** argv) {
             if (argc == 3 && std::strcmp(argv[1], "--child-first") == 0) return Child(false, argv[2]);
             if (argc == 3 && std::strcmp(argv[1], "--child-second") == 0) return Child(true, argv[2]);
             if (argc == 2 && std::strcmp(argv[1], "--background") == 0) return Background();
+            if (argc == 2 && std::strcmp(argv[1], "--save-race") == 0) return SaveRace();
             if (argc == 1) return Parent(argv[0]);
-            return Fail("usage: agc_metal_pipeline_cache_tests [--background]");
+            return Fail("usage: agc_metal_pipeline_cache_tests [--background | --save-race]");
         } catch (const std::exception& error) {
             return Fail(error.what());
         }
