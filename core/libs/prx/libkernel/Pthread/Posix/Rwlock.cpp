@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
@@ -24,7 +25,7 @@ int toPosix(int result) {
 
 void initializeStatic(PthreadRwlock* rwlock, const char* funcName) {
     if (!rwlock) throw std::runtime_error(std::string(funcName) + ": null rwlock");
-    std::atomic_ref<PthreadRwlock> slot(*rwlock);
+    std::atomic_ref<PthreadRwlock> slot(*GuestArena::HostPointer(rwlock));
     PthreadRwlock current = slot.load(std::memory_order_acquire);
     if (current != nullptr) return;
     auto* created = new PthreadRwlockPrivate();

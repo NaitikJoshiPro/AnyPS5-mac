@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
@@ -24,7 +25,7 @@ bool _isStaticInitializer(PthreadMutex mutex) {
 
 void _initializeStatic(PthreadMutex* mutex, const char* funcName) {
     if (!mutex) throw std::runtime_error(std::string(funcName) + ": null mutex");
-    std::atomic_ref<PthreadMutex> slot(*mutex);
+    std::atomic_ref<PthreadMutex> slot(*GuestArena::HostPointer(mutex));
     PthreadMutex current = slot.load(std::memory_order_acquire);
     if (!_isStaticInitializer(current)) return;
     auto* created = new PthreadMutexPrivate();

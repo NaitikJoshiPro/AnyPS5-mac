@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "../include/Pthread.hpp"
 #include "../include/Rwlock.hpp"
 #include "prx/libc/include/General.hpp"
@@ -19,7 +20,7 @@ static PthreadRwlockPrivate* const DestroyedRwlock = reinterpret_cast<PthreadRwl
 
 static PthreadRwlockPrivate* RequireRwlock(PthreadRwlock* rwlock, const char* funcName) {
     if (!rwlock) throw std::runtime_error(std::string(funcName) + ": null rwlock");
-    std::atomic_ref<PthreadRwlock> slot(*rwlock);
+    std::atomic_ref<PthreadRwlock> slot(*GuestArena::HostPointer(rwlock));
     PthreadRwlock current = slot.load(std::memory_order_acquire);
     if (current == nullptr) {
         auto* created = new PthreadRwlockPrivate();
@@ -60,7 +61,7 @@ extern "C" {
 
 int APS5_VABI scePthreadRwlockDestroy(PthreadRwlock* rwlock) {
     if (!rwlock) throw std::runtime_error("scePthreadRwlockDestroy: null rwlock");
-    std::atomic_ref<PthreadRwlock> slot(*rwlock);
+    std::atomic_ref<PthreadRwlock> slot(*GuestArena::HostPointer(rwlock));
     PthreadRwlock lock = slot.load(std::memory_order_acquire);
     do {
         if (lock == nullptr) return SCE_OK;

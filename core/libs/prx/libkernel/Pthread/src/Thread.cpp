@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "../include/Pthread.hpp"
 #include "../include/ThreadLifecycle.hpp"
 #include "../include/WindowsThreadLocal.hpp"
@@ -1006,7 +1007,7 @@ int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
 
 static void APS5_VABI ResetOnce(void* once) {
     constexpr int32_t Never = 0;
-    std::atomic_ref<int32_t> state(*static_cast<int32_t*>(once));
+    std::atomic_ref<int32_t> state(*GuestArena::HostPointer(static_cast<int32_t*>(once)));
     state.store(Never, std::memory_order_release);
     state.notify_all();
 }
@@ -1016,7 +1017,7 @@ int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void)) {
     constexpr int32_t Never = 0;
     constexpr int32_t Done = 1;
     constexpr int32_t Running = 2;
-    std::atomic_ref<int32_t> state(*once);
+    std::atomic_ref<int32_t> state(*GuestArena::HostPointer(once));
     for (int32_t expected = Never; !state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel); expected = Never) {
         if (expected != Running) return SCE_OK;
         state.wait(Running, std::memory_order_acquire);

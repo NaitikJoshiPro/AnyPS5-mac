@@ -11,7 +11,10 @@
 #include <stdexcept>
 #include <string>
 #if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <mach/mach_vm.h>
 #endif
 
@@ -21,6 +24,15 @@ int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64
 int APS5_VABI sceKernelMunmap(void*, std::size_t);
 int APS5_VABI sceKernelMprotect(const void*, std::size_t, int);
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
+// Guest pthread objects are pointer-sized slots in guest memory (void** here: the slot's type does not matter).
+int APS5_VABI scePthreadMutexInit(void** mutex, const void* attr, const char* name);
+int APS5_VABI scePthreadMutexDestroy(void** mutex);
+int APS5_VABI scePthreadMutexLock(void** mutex);
+int APS5_VABI scePthreadMutexUnlock(void** mutex);
+int APS5_VABI scePthreadMutexTrylock(void** mutex);
+int APS5_VABI scePthreadCondInit(void** cond, const void* attr, const char* name);
+int APS5_VABI scePthreadCondSignal(void** cond);
+int APS5_VABI scePthreadCondDestroy(void** cond);
 }
 
 namespace {
@@ -65,6 +77,30 @@ int HostProtection(std::uintptr_t address) {
 #endif
 
 }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+// More distinct faulting sites than the handler's first site table held (32768): ASTRO BOT patched 32k JIT sites on
+// displaced memory in its first minute, and once the table filled every new site was left unhandled (a crash).
+// Generated code with one load per site, run once on a displaced address.
+void ManySites(std::uintptr_t displaced) {
+    constexpr std::size_t Sites = 40000;
+    const std::size_t bytes = ((Sites + 2) * 4 + 0x3fff) & ~std::size_t{0x3fff};
+    void* code = mmap(nullptr, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    Require(code != MAP_FAILED, "MAP_JIT for the many-sites code");
+    pthread_jit_write_protect_np(0);
+    auto* words = static_cast<std::uint32_t*>(code);
+    for (std::size_t i = 0; i < Sites; ++i) words[i] = 0xb9400009u; // ldr w9, [x0]
+    words[Sites] = 0x2a0903e0u;                                      // mov w0, w9
+    words[Sites + 1] = 0xd65f03c0u;                                  // ret
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(code, bytes);
+    const auto before = Faults();
+    const auto value = reinterpret_cast<std::uint32_t (*)(std::uintptr_t)>(code)(displaced);
+    Require(value == Load<std::uint32_t>(GuestArena::HostAddress(displaced)), "the many-sites loads read the wrong value");
+    Require(Faults() - before >= Sites, "the many-sites loads did not each go through the fault handler");
+    munmap(code, bytes);
+}
+#endif
 
 int main() {
 #if !(defined(__APPLE__) && defined(__aarch64__))
@@ -156,6 +192,22 @@ int main() {
         Require(Load<std::uint64_t>(GuestArena::HostAddress(TailBase) + 0x2000) == 0x0102030405060708ull, "a native store in the shared region tail missed the alias");
         Require(Load<std::uint64_t>(Base + 0x2000) == 0x0102030405060708ull, "the tail and carveout views do not share the pages");
         Require(Faults() >= tailFaults + 3, "the tail accesses did not go through the fault handler");
+        ManySites(TailBase + 0x104);
+        {
+            // Mutex and condition slots in displaced memory (ASTRO BOT's are at 0x10xxxxxxxx): libkernel resolves them
+            // through the slot's host view, so locking takes no fault (VA6's second storm: scePthreadMutexTrylock).
+            auto** mutex = reinterpret_cast<void**>(TailBase + 0x3000);
+            auto** cond = reinterpret_cast<void**>(TailBase + 0x3008);
+            const auto before = Faults();
+            Require(scePthreadMutexInit(mutex, nullptr, "displaced") == 0 && scePthreadCondInit(cond, nullptr, "displaced") == 0, "pthread init on displaced slots");
+            for (int i = 0; i < 1000; ++i) {
+                Require(scePthreadMutexLock(mutex) == 0 && scePthreadCondSignal(cond) == 0 && scePthreadMutexUnlock(mutex) == 0, "pthread lock on a displaced slot");
+                Require(scePthreadMutexTrylock(mutex) == 0 && scePthreadMutexUnlock(mutex) == 0, "pthread trylock on a displaced slot");
+            }
+            Require(scePthreadCondDestroy(cond) == 0 && scePthreadMutexDestroy(mutex) == 0, "pthread destroy on displaced slots");
+            const auto taken = Faults() - before;
+            if (taken != 0) throw std::runtime_error(std::to_string(taken) + " displaced faults resolving pthread slots");
+        }
         Require(sceKernelMprotect(tail, 0x4000, CpuRead) == 0 && HostProtection(GuestArena::HostAddress(TailBase)) == VM_PROT_READ, "mprotect in the tail");
         Require(sceKernelMunmap(tail, Bytes) == 0 && HostProtection(GuestArena::HostAddress(TailBase)) == VM_PROT_NONE, "munmap in the tail");
 

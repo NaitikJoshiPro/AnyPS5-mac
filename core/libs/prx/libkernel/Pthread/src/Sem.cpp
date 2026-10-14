@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "../include/Pthread.hpp"
 #include "../include/Cancel.hpp"
 #include "prx/libc/include/General.hpp"
@@ -22,7 +23,7 @@ PthreadSem destroyedSem() {
 PthreadSemPrivate* resolveSem(PthreadSem* sem) {
     if (!sem)
         throw std::invalid_argument("Semaphore pointer is null");
-    std::atomic_ref<PthreadSem> slot(*sem);
+    std::atomic_ref<PthreadSem> slot(*GuestArena::HostPointer(sem));
     const auto current = slot.load(std::memory_order_acquire);
     if (!current || current == destroyedSem())
         throw std::runtime_error("Semaphore is not initialized or has been destroyed");
@@ -42,7 +43,7 @@ int APS5_VABI scePthreadSemInit(PthreadSem* sem, int flag, unsigned int value, c
     (void)name;
     auto replacement = std::make_unique<PthreadSemPrivate>(value);
     std::lock_guard lock(semInitializationMutex);
-    std::atomic_ref<PthreadSem>(*sem).store(replacement.release(), std::memory_order_release);
+    std::atomic_ref<PthreadSem>(*GuestArena::HostPointer(sem)).store(replacement.release(), std::memory_order_release);
     return 0;
 }
 

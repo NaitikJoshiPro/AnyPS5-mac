@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Pthread/include/Mutex.hpp"
 #include "prx/libkernel/Pthread/include/Cond.hpp"
@@ -34,7 +35,7 @@ PthreadMutex adaptiveInitializer() {
 PthreadCond resolveCond(PthreadCond* cond) {
     if (!cond)
         throw std::invalid_argument("Condition variable pointer is null");
-    std::atomic_ref<PthreadCond> slot(*cond);
+    std::atomic_ref<PthreadCond> slot(*GuestArena::HostPointer(cond));
     if (const auto current = slot.load(std::memory_order_acquire); current && current != destroyedCond())
         return current;
     std::lock_guard lock(condInitializationMutex);
@@ -51,7 +52,7 @@ PthreadCond resolveCond(PthreadCond* cond) {
 int mutexOwnership(PthreadMutex* mutex, PthreadMutex* owned) {
     if (!mutex)
         throw std::invalid_argument("Mutex pointer is null");
-    const auto current = std::atomic_ref<PthreadMutex>(*mutex).load(std::memory_order_acquire);
+    const auto current = std::atomic_ref<PthreadMutex>(*GuestArena::HostPointer(mutex)).load(std::memory_order_acquire);
     if (current == destroyedMutex())
         return SCE_KERNEL_ERROR_EINVAL;
     if (!current || current == adaptiveInitializer() || current->_owner.load(std::memory_order_acquire) != std::this_thread::get_id())
@@ -138,18 +139,19 @@ int APS5_VABI scePthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr,
     if (attr)
         replacement->_clockid = (*attr)->_clockid;
     std::lock_guard lock(condInitializationMutex);
-    std::atomic_ref<PthreadCond>(*cond).store(replacement.release(), std::memory_order_release);
+    std::atomic_ref<PthreadCond>(*GuestArena::HostPointer(cond)).store(replacement.release(), std::memory_order_release);
     return 0;
 }
 
 int APS5_VABI scePthreadCondDestroy(PthreadCond* cond) {
     if (!cond)
         throw std::invalid_argument("Condition variable pointer is null");
+    cond = GuestArena::HostPointer(cond); // the slot's host view (displaced memory, D31, D33)
     std::lock_guard lock(condInitializationMutex);
     if (*cond == destroyedCond())
         throw std::runtime_error("Condition variable has already been destroyed");
     delete *cond;
-    std::atomic_ref<PthreadCond>(*cond).store(destroyedCond(), std::memory_order_release);
+    std::atomic_ref<PthreadCond>(*GuestArena::HostPointer(cond)).store(destroyedCond(), std::memory_order_release);
     return 0;
 }
 
