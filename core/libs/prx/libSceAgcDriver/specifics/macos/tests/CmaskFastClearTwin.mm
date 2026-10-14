@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "MslAbi.hpp"
@@ -37,6 +38,7 @@ constexpr std::uint32_t Drawn = 0xffffffffu;
 alignas(4096) std::array<std::byte, 2 * 65536> SurfaceStorage{};
 const std::span<std::byte, 65536> Surface{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(SurfaceStorage.data()) + 65535u) & ~std::uintptr_t{65535u}), 65536};
 alignas(4096) std::array<std::uint8_t, 4096> Cmask{};
+alignas(4096) std::array<std::uint8_t, 4096> Dcc{};
 
 ColorTarget target(ColorTileMode mode) {
     const ColorTargetLayout layout(Width, Height, mode, 4);
@@ -190,6 +192,77 @@ void unknownCode(AgcDriver::VulkanDevice& device) {
     expect(device, color, [](std::uint32_t, std::uint32_t) { return Clear; }, "fast-cleared target eliminated after a CMASK code 3");
 }
 
+// Metal-only: CB metadata passes over DCC color targets (ASTRO BOT's first frame stopped at "CB metadata passes
+// over DCC-compressed targets"). As upstream RunColorMetadataPass: uncompressed keys leave the texels, clear keys
+// store the clear texel, comp-to-single keys (a DCC decompress) each 256-byte block's first texel, and the keys are
+// left uncompressed; a fast-clear eliminate over comp-to-single keys is refused.
+ColorTarget dccTarget(ColorTileMode mode) {
+    auto color = target(mode);
+    color.cmaskAddress = 0;
+    color.cmaskBytes = 0;
+    color.dccAddress = reinterpret_cast<std::uintptr_t>(Dcc.data());
+    return color;
+}
+
+void prepareDcc(const ColorTarget& color, std::uint8_t key, std::uint32_t blockFirst = Stale) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushPending(color.address, Surface.size(), nullptr, "test");
+    std::vector<std::byte> texels(Surface.size());
+    for (std::size_t offset = 0; offset < texels.size(); offset += 4) std::memcpy(texels.data() + offset, offset % 256u == 0 ? &blockFirst : &Stale, 4);
+    AgcDriver::GuestMemory::Write(color.address, texels);
+    std::vector<std::byte> keys(Dcc.size(), std::byte{0xff});
+    std::fill_n(keys.begin(), DccKeyBytes(color.bytes), std::byte{key});
+    AgcDriver::GuestMemory::Write(color.dccAddress, keys);
+}
+
+void passDcc(AgcDriver::VulkanDevice& device, const ColorTarget& color, ColorMetadataPass::Mode mode) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    device.ColorMetadataPass({mode, {color}});
+}
+
+void expectDcc(AgcDriver::VulkanDevice& device, const ColorTarget& color, std::uint32_t texel, const std::string& what) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushPending(color.address, color.bytes, nullptr, "test");
+    device.WaitIdle();
+    const ColorTargetLayout layout(Width, Height, color.tileMode, 4);
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            std::uint32_t stored = 0;
+            std::memcpy(&stored, Surface.data() + layout.Offset(x, y), 4);
+            Require(stored == texel, what + ": texel (" + std::to_string(x) + ", " + std::to_string(y) + ") holds " + std::to_string(stored));
+        }
+    }
+    Require(CurrentDccKeys(color.dccAddress, color.bytes) == DccKeys::Uncompressed, what + ": the DCC keys were not left uncompressed");
+}
+
+void dccPasses(AgcDriver::VulkanDevice& device) {
+    for (const auto mode : {ColorTileMode::Linear, ColorTileMode::RenderTarget}) {
+        const auto color = dccTarget(mode);
+        const std::string name = mode == ColorTileMode::Linear ? "linear" : "SW_64KB_R_X";
+        prepareDcc(color, 0xff);
+        passDcc(device, color, ColorMetadataPass::Mode::EliminateFastClear);
+        expectDcc(device, color, Stale, name + " DCC target with uncompressed keys after a fast-clear eliminate");
+        prepareDcc(color, 0x20);
+        passDcc(device, color, ColorMetadataPass::Mode::EliminateFastClear);
+        expectDcc(device, color, Clear, name + " DCC register clear after a fast-clear eliminate");
+        prepareDcc(color, 0x00);
+        passDcc(device, color, ColorMetadataPass::Mode::DccDecompress);
+        expectDcc(device, color, 0u, name + " DCC 0000 clear after a DCC decompress");
+    }
+    const auto color = dccTarget(ColorTileMode::RenderTarget);
+    prepareDcc(color, 0x10, Clear);
+    passDcc(device, color, ColorMetadataPass::Mode::DccDecompress);
+    expectDcc(device, color, Clear, "SW_64KB_R_X comp-to-single DCC keys after a DCC decompress");
+    prepareDcc(color, 0x10, Clear);
+    bool refused = false;
+    try {
+        passDcc(device, color, ColorMetadataPass::Mode::EliminateFastClear);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    Require(refused, "a fast-clear eliminate over comp-to-single DCC keys was not refused");
+}
+
 }
 
 int main() {
@@ -206,18 +279,21 @@ int main() {
             GuestAllocations::Mutation mutation;
             mutation.Add(SurfaceStorage.data(), SurfaceStorage.size(), true, true, true);
             mutation.Add(Cmask.data(), Cmask.size(), true, true, true);
+            mutation.Add(Dcc.data(), Dcc.size(), true, true, true);
         }
         run(*device, ColorTileMode::Linear, "linear");
         run(*device, ColorTileMode::RenderTarget, "SW_64KB_R_X");
         unknownCode(*device);
+        dccPasses(*device);
         device->WaitIdle();
         device.reset();
         {
             GuestAllocations::Mutation mutation;
             mutation.Remove(SurfaceStorage.data());
             mutation.Remove(Cmask.data());
+            mutation.Remove(Dcc.data());
         }
-        std::cout << "CMASK fast clear draw and eliminate tests passed\n";
+        std::cout << "CMASK fast clear draw and eliminate tests, DCC metadata passes passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

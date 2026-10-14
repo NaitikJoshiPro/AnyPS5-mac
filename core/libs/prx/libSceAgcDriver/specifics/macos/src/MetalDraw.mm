@@ -1715,9 +1715,23 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
         Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, 1u, destination.arraySlice));
         return;
     }
+    // DCC targets (upstream Draw.cpp RunColorMetadataPass): fast-clear keys store the clear texel and comp-to-single
+    // keys each block's first texel in guest memory, and the keys are left uncompressed, exactly as before a draw
+    // (MaterializeDcc). The image cache's resident image of the target, if any, reloads from guest memory.
+    const auto* imageContext = state->images->ImageContext();
     for (const auto& color : pass.targets) {
-        if (color.dccAddress != 0u) Fail("CB metadata passes over DCC-compressed targets");
-        state->MaterializeCmask(color, nullptr);
+        std::shared_ptr<Graphics::StorageTexture> resident;
+        if (color.tileMode != Graphics::ColorTileMode::Linear && imageContext != nullptr) {
+            resident = Graphics::CachedStorageSurface(*imageContext, Graphics::SurfaceForTarget(color));
+            if (resident != nullptr && resident->GuestBytes() != color.bytes) resident = nullptr;
+        }
+        if (color.dccAddress != 0u) {
+            state->SettleRange(color.dccAddress, Graphics::DccKeyBytes(color.bytes));
+            if (pass.mode == Graphics::ColorMetadataPass::Mode::EliminateFastClear && Graphics::CurrentDccKeys(color.dccAddress, color.bytes) == Graphics::DccKeys::ClearSingle)
+                Fail("CB fast-clear eliminate over comp-to-single DCC keys (whether it expands them is not modeled)");
+            state->MaterializeDcc(color, resident.get());
+        }
+        state->MaterializeCmask(color, resident.get());
     }
 }
 
