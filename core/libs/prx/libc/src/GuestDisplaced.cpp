@@ -118,22 +118,27 @@ std::once_flag g_once;
 bool g_trace = false;
 std::uint64_t g_stackEvery = 0; // APS5_DISPLACED_STACKS=N: a frame-pointer backtrace of every Nth fault (32 at most)
 std::uint64_t g_nativeStackEvery = 0; // APS5_DISPLACED_STACKS_NATIVE=N: the same, counting only unpatched faults
-std::atomic<std::uint64_t> g_farBranchSites{0}; // far stubs that return by branch through a dead register
 std::uintptr_t g_cacheStart = 0, g_cacheEnd = 0; // the dyld shared cache's immutable code: [cache, DisplacedStart())
-std::atomic<std::uint64_t> g_unpatched{0}; // faults at sites that stay unpatched (native code): one signal each, every time
 std::uint64_t g_enabledAt = 0;  // CLOCK_MONOTONIC_RAW ns when the handler was installed
 
-// Fault-rate milestones, always on: a line at 1024 faults and every power of two after it, then every 2^22. Native
+// Fault-rate milestones, always on: a line at 1024 faults and every power of two after it, and every 8192. Native
 // code that reads displaced memory without a host view shows up in any title log as a fast-growing count (each fault
 // is two signals, ~2-4 us). clock_gettime_nsec_np and snprintf+write are safe here (no locks, no allocation).
 std::atomic<std::uint64_t> g_farReturns{0}; // far stubs return through BRK #0xd15: one SIGTRAP per execution
 
+std::atomic<std::uint64_t> g_unpatched{0};      // faults at sites that stay unpatched (native code): one signal each, every time
+std::atomic<std::uint64_t> g_farBranchSites{0}; // far stubs that return by branch through a dead register
+
+// One line with every counter, so the last line of a log brackets the totals.
 void ReportMilestone(std::uint64_t count, const char* what = "faults") {
-    if (count < 1024 || ((count & (count - 1)) != 0 && (count & ((1ull << 22) - 1)) != 0)) return;
+    if (count < 1024 || ((count & (count - 1)) != 0 && (count & 8191) != 0)) return;
     const auto seconds = static_cast<double>(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_enabledAt) / 1e9;
-    char line[160];
-    const int length = std::snprintf(line, sizeof(line), "[displaced] %llu %s %.1f s after enable (%llu sites patched)\n", static_cast<unsigned long long>(count), what, seconds,
-        static_cast<unsigned long long>(g_patches.load(std::memory_order_relaxed)));
+    char line[256];
+    const int length = std::snprintf(line, sizeof(line),
+        "[displaced] %llu %s %.1f s after enable (faults %llu, sites patched %llu, unpatched faults %llu, far-stub SIGTRAP returns %llu, branch-return far sites %llu)\n",
+        static_cast<unsigned long long>(count), what, seconds, static_cast<unsigned long long>(g_faults.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_patches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_unpatched.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_farReturns.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_farBranchSites.load(std::memory_order_relaxed)));
     if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
 }
 
