@@ -122,11 +122,13 @@ std::uint64_t g_enabledAt = 0;  // CLOCK_MONOTONIC_RAW ns when the handler was i
 // Fault-rate milestones, always on: a line at 1024 faults and every power of two after it, then every 2^22. Native
 // code that reads displaced memory without a host view shows up in any title log as a fast-growing count (each fault
 // is two signals, ~2-4 us). clock_gettime_nsec_np and snprintf+write are safe here (no locks, no allocation).
-void ReportMilestone(std::uint64_t count) {
+std::atomic<std::uint64_t> g_farReturns{0}; // far stubs return through BRK #0xd15: one SIGTRAP per execution
+
+void ReportMilestone(std::uint64_t count, const char* what = "faults") {
     if (count < 1024 || ((count & (count - 1)) != 0 && (count & ((1ull << 22) - 1)) != 0)) return;
     const auto seconds = static_cast<double>(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_enabledAt) / 1e9;
     char line[160];
-    const int length = std::snprintf(line, sizeof(line), "[displaced] %llu faults %.1f s after enable (%llu sites patched)\n", static_cast<unsigned long long>(count), seconds,
+    const int length = std::snprintf(line, sizeof(line), "[displaced] %llu %s %.1f s after enable (%llu sites patched)\n", static_cast<unsigned long long>(count), what, seconds,
         static_cast<unsigned long long>(g_patches.load(std::memory_order_relaxed)));
     if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
 }
@@ -541,6 +543,7 @@ bool Return(void* context) {
     std::uint64_t target = 0;
     std::memcpy(&target, reinterpret_cast<const void*>(pc + 4), sizeof(target));
     arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(target));
+    ReportMilestone(g_farReturns.fetch_add(1, std::memory_order_relaxed) + 1, "far-stub returns (SIGTRAP)");
     return true;
 }
 
