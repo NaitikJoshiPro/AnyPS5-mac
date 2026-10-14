@@ -37,9 +37,9 @@ std::uint32_t APS5_VABI sceAgcDcbSetIndexSizeGetSize() {
 
 std::uint32_t* APS5_VABI sceAgcDcbSetIndexSize_0600(CommandBuffer* buf, std::uint8_t indexSize, std::uint8_t cachePolicy, std::uint8_t perInstanceObjectId) {
     Agc::Command::CheckBits(perInstanceObjectId, 1, __func__);
-    auto* packet = sceAgcDcbSetIndexSize(buf, indexSize, cachePolicy);
-    packet[2] |= static_cast<std::uint32_t>(perInstanceObjectId) << 14u;
-    return packet;
+    auto* const guestPacket = sceAgcDcbSetIndexSize(buf, indexSize, cachePolicy);
+    Agc::Command::Host(guestPacket + 2)[0] |= static_cast<std::uint32_t>(perInstanceObjectId) << 14u; // displaced storage (D31, D33)
+    return guestPacket;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbSetIndexIndirectArgs(CommandBuffer* buf, std::uint32_t dataOffsetInBytes) {

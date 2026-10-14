@@ -38,6 +38,7 @@ extern "C" std::uint32_t* APS5_VABI sceAgcCbSetShRegisterRangeDirect(CommandBuff
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbContextStateOp_0100(CommandBuffer* buf, std::uint32_t operation);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbPushMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbPopMarker(CommandBuffer* buf);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexSize_0600(CommandBuffer* buf, std::uint8_t indexSize, std::uint8_t cachePolicy, std::uint8_t perInstanceObjectId);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetWorkloadComplete(CommandBuffer* buf, std::uint32_t stream_id, std::uint32_t workload_id);
 extern "C" int APS5_VABI sceAgcDriverRegisterWorkloadStream(std::uint32_t stream_id, const void* stream);
 extern "C" int APS5_VABI sceAgcDriverUnregisterWorkloadStream(std::uint32_t stream_id);
@@ -664,12 +665,13 @@ void testDefaults() {
 // libSceAgc writes packets through host views, so emitting takes no displaced fault (ASTRO: ~37k far-stub SIGTRAP
 // returns in 0.3 s from Agc::Command::Emit/WriteRegisterRange/PatchIndirectCount and sceAgcDcbPushMarker), and the
 // packets are the ones ordinary memory gets.
-void emitSequence(CommandBuffer* buf, const std::uint32_t* values, const ShaderRegister* regs) {
+void emitSequence(CommandBuffer* buf, const std::uint32_t* values, const ShaderRegister* regs, const char* marker = "displaced marker") {
     auto* release = sceAgcCbReleaseMem(buf, 0, 0, 1, 0, reinterpret_cast<const volatile std::uint64_t*>(0x2000), 1, 7, 0, 0, 0, 0);
     check(release != nullptr && sceAgcQueueEndOfPipeActionPatchData(release, 9) == 0 && sceAgcSetPacketPredication(release, 1) == 0 && sceAgcGetPacketSize(release) == 8,
         "release mem and its patches");
     check(sceAgcDcbContextStateOp_0100(buf, 1) != nullptr, "context state op");
-    check(sceAgcDcbPushMarker(buf, "displaced marker", 0) != nullptr && sceAgcDcbPopMarker(buf) != nullptr, "markers");
+    check(sceAgcDcbPushMarker(buf, marker, 0) != nullptr && sceAgcDcbPopMarker(buf) != nullptr, "markers");
+    check(sceAgcDcbSetIndexSize_0600(buf, 1, 0, 1) != nullptr, "index size with a per-instance object id");
     check(sceAgcCbSetShRegisterRangeDirect(buf, 0x10, values, 3) != nullptr, "register range");
     auto* indirect = sceAgcDcbSetCxRegistersIndirect(buf, regs, 2);
     check(indirect != nullptr && sceAgcSetCxRegIndirectPatchAddRegisters(indirect, 1) == 0, "indirect registers");
@@ -692,6 +694,8 @@ void testDisplacedCommandBuffer() {
     const ShaderRegister regData[2] = {{0x100, 0xaaaa}, {0x101, 0xbbbb}};
     std::memcpy(GuestArena::HostRange(values, sizeof(valueData)), valueData, sizeof(valueData));
     std::memcpy(GuestArena::HostRange(regs, sizeof(regData)), regData, sizeof(regData));
+    auto* const marker = reinterpret_cast<char*>(Base + 0x300); // marker text in displaced memory too
+    std::memcpy(GuestArena::HostRange(marker, 17), "displaced marker", 17);
     *GuestArena::HostRange(buffer, sizeof(CommandBuffer)) = CommandBuffer{words, words + Words, words, words + Words, nullptr, nullptr, 0};
 
     std::array<std::uint32_t, Words> ordinaryWords{};
@@ -700,7 +704,7 @@ void testDisplacedCommandBuffer() {
 
     std::uint64_t before = 0, after = 0;
     GuestArena::GuestDisplacedStats_nid_no_patch(&before, nullptr);
-    emitSequence(buffer, values, regs);
+    emitSequence(buffer, values, regs, marker);
     GuestArena::GuestDisplacedStats_nid_no_patch(&after, nullptr);
     if (after != before) throw std::runtime_error("emitting into a displaced command buffer took " + std::to_string(after - before) + " displaced faults");
     const auto* host = GuestArena::HostRange(buffer, sizeof(CommandBuffer));
