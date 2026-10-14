@@ -1,3 +1,17 @@
+# AnyPS5 for Apple Silicon (native arm64 + Metal)
+
+This repository is a port of [AnyPS5](https://github.com/boykopovar/AnyPS5) that runs natively on Apple Silicon Macs: arm64 only, Metal only, no Rosetta, no MoltenVK. Plan and status: [mission](docs/mac/MISSION.md), [progress log](docs/mac/PROGRESS.md), [decisions](docs/mac/DECISIONS.md), [compatibility](docs/mac/COMPATIBILITY.md).
+
+[![port milestones](https://naitikjoshipro.github.io/AnyPS5-mac/badge-milestones.svg)](https://naitikjoshipro.github.io/AnyPS5-mac/) [![Metal GPU tests](https://naitikjoshipro.github.io/AnyPS5-mac/badge-metal-tests.svg)](https://naitikjoshipro.github.io/AnyPS5-mac/#metal-gpu-tests) [![titles](https://naitikjoshipro.github.io/AnyPS5-mac/badge-titles.svg)](https://naitikjoshipro.github.io/AnyPS5-mac/#titles) [![libraries](https://naitikjoshipro.github.io/AnyPS5-mac/badge-libraries.svg)](https://naitikjoshipro.github.io/AnyPS5-mac/progress.html) [![shaders](https://naitikjoshipro.github.io/AnyPS5-mac/badge-shaders.svg)](https://naitikjoshipro.github.io/AnyPS5-mac/progress.html)
+
+<sub>Computed on every push to `mac-native` by [tools/mac/mac_progress.py](tools/mac/mac_progress.py) ([progress page](https://naitikjoshipro.github.io/AnyPS5-mac/)).
+**Port milestones:** share of the [MISSION §8](docs/mac/MISSION.md) exit criteria (M0–M4) verified, from [docs/mac/milestones.toml](docs/mac/milestones.toml); each milestone weighs the same, partly done criteria count as 0.
+**Metal GPU tests:** GPU tests that passed in the last full `tools/mac/gpu_suite.py` run, out of all registered GPU tests; allowlisted skips (Vulkan-only features) and held-back tests count as not passed. Snapshot in [docs/mac/gpu-status.json](docs/mac/gpu-status.json), refreshed on the Mac.
+**Titles:** average stage of the titles in [COMPATIBILITY.md](docs/mac/COMPATIBILITY.md) (Nothing 0, Loads 20, Intro 40, Menu 60, In game 80, Playable 100).
+**Libraries / shaders:** upstream's metrics (functions implemented in core/libs/prx, RDNA instructions decoded) measured on this tree; they describe the shared code, not whether it works on the Mac.</sub>
+
+The upstream README follows.
+
 # About
 
 Tool for automatic executables porting to Linux and Windows.
