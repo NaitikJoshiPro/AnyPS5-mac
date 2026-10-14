@@ -15,6 +15,9 @@
 extern "C" std::uint32_t* APS5_VABI sceAgcCbReleaseMem(CommandBuffer* buf, std::uint8_t action, std::uint16_t gcrControl, std::uint8_t dst, std::uint8_t cachePolicy, const volatile std::uint64_t* address, std::uint8_t dataSelect, std::uint64_t data, std::uint16_t gdsOffset, std::uint16_t gdsSize, std::uint8_t interrupt, std::uint32_t interruptContextId);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetCxRegistersIndirect(CommandBuffer* buf, const volatile ShaderRegister* regs, std::uint32_t numRegs);
 extern "C" int APS5_VABI sceAgcSetCxRegIndirectPatchAddRegisters(std::uint32_t* cmd, std::uint32_t numRegs);
+extern "C" int APS5_VABI sceAgcQueueEndOfPipeActionPatchData(std::uint32_t* cmd, std::uint64_t data);
+extern "C" int APS5_VABI sceAgcSetPacketPredication(std::uint32_t* packet, std::uint32_t predication);
+extern "C" std::uint32_t APS5_VABI sceAgcGetPacketSize(std::uint32_t* packet);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std::uint32_t op, std::uint32_t state);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbClearState(CommandBuffer* buf, std::uint32_t command);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
@@ -662,7 +665,10 @@ void testDefaults() {
 // returns in 0.3 s from Agc::Command::Emit/WriteRegisterRange/PatchIndirectCount and sceAgcDcbPushMarker), and the
 // packets are the ones ordinary memory gets.
 void emitSequence(CommandBuffer* buf, const std::uint32_t* values, const ShaderRegister* regs) {
-    check(sceAgcCbReleaseMem(buf, 0, 0, 1, 0, reinterpret_cast<const volatile std::uint64_t*>(0x2000), 1, 7, 0, 0, 0, 0) != nullptr, "release mem");
+    auto* release = sceAgcCbReleaseMem(buf, 0, 0, 1, 0, reinterpret_cast<const volatile std::uint64_t*>(0x2000), 1, 7, 0, 0, 0, 0);
+    check(release != nullptr && sceAgcQueueEndOfPipeActionPatchData(release, 9) == 0 && sceAgcSetPacketPredication(release, 1) == 0 && sceAgcGetPacketSize(release) == 8,
+        "release mem and its patches");
+    check(sceAgcDcbContextStateOp_0100(buf, 1) != nullptr, "context state op");
     check(sceAgcDcbPushMarker(buf, "displaced marker", 0) != nullptr && sceAgcDcbPopMarker(buf) != nullptr, "markers");
     check(sceAgcCbSetShRegisterRangeDirect(buf, 0x10, values, 3) != nullptr, "register range");
     auto* indirect = sceAgcDcbSetCxRegistersIndirect(buf, regs, 2);

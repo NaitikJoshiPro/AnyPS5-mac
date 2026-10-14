@@ -120,6 +120,7 @@ std::uint32_t* WriteWait(CommandBuffer* buffer, std::uint8_t size, std::uint8_t 
 
 std::uint32_t* ValidateWait(std::uint32_t* packet, const char* function) {
     CheckAddress(reinterpret_cast<std::uintptr_t>(packet), 4, function);
+    packet = Host(packet); // the wrapper returned is a host view too: callers patch through it
     Require(packet[0] == Header(0x79u, 4, 1) && packet[1] == 0x342u, function, "invalid wait wrapper");
     const auto tag = packet[2] & 0xffff0000u;
     Require(tag == 0xc8010000u || tag == 0xc8020000u, function, "invalid wait tag");

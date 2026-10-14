@@ -11,6 +11,7 @@ namespace {
 
 int SetCommandAddress(std::uint32_t* cmd, const volatile std::uint32_t* command, const char* function) {
     Agc::Command::ValidatePacket(cmd, 0x22u, 5, function);
+    cmd = Agc::Command::Host(cmd);
     const auto address = reinterpret_cast<std::uintptr_t>(command);
     Agc::Command::CheckAddress(address, 4, function);
     cmd[1] = (cmd[1] & 3u) | (static_cast<std::uint32_t>(address) & ~3u);
@@ -25,6 +26,7 @@ int SetEnd(std::uint32_t* cmd, const volatile std::uint32_t* buffer, const char*
     Agc::Command::CheckAddress(end, 4, function);
     const auto numDwords = (end - packetEnd) / sizeof(std::uint32_t);
     Agc::Command::Require(numDwords <= 0x3fffu, function, "conditional execution range is too large");
+    cmd = Agc::Command::Host(cmd); // after the guest-address arithmetic above
     cmd[4] = (cmd[4] & ~0x3fffu) | static_cast<std::uint32_t>(numDwords);
     return 0;
 }

@@ -35,8 +35,9 @@ uint32_t* APS5_VABI sceAgcDcbContextStateOp_0100(CommandBuffer* buf, uint32_t op
         auto* packet = Agc::Command::WriteNop(buf, count, function);
         if (first == nullptr) {
             first = packet;
-            packet[0] = Agc::Command::Header(0x10u, count, 0x68u);
-            packet[1] = operation;
+            auto* host = Agc::Command::Host(packet);
+            host[0] = Agc::Command::Header(0x10u, count, 0x68u);
+            host[1] = operation;
         }
     };
     if (operation == 0) {
