@@ -4224,7 +4224,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         return;
     }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
-        Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+        if (unsavedOutsideWatch) {
+        char where[160];
+        std::snprintf(where, sizeof(where), " (image 0x%llx+0x%llx, %u layers; write watch covers it now: %d, first unsaved layer %u)", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0,
+            static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
+        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where);
+    }
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             shadowImport = import;
@@ -4370,7 +4375,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
-    Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+    if (unsavedOutsideWatch) {
+        char where[160];
+        std::snprintf(where, sizeof(where), " (image 0x%llx+0x%llx, %u layers; write watch covers it now: %d, first unsaved layer %u)", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0,
+            static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
+        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where);
+    }
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
     for (const auto& [begin, end] : unitRuns(unsaved)) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
