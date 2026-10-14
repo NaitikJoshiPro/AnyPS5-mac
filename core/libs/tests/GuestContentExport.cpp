@@ -12,6 +12,8 @@ extern "C" int APS5_VABI sceContentExportGetProgress(std::int32_t expId);
 extern "C" int APS5_VABI sceContentExportCancel(std::int32_t expId);
 extern "C" int APS5_VABI sceContentExportFromDataWithThumbnail(std::int32_t expId, const ContentExportParam* param, const ContentExportCallbackParam* contentCallbackParam,
     const char* thumbnailType, const ContentExportCallbackParam* thumbnailCallbackParam, char* path, std::size_t pathBufferLength);
+extern "C" int APS5_VABI sceContentExportFromData(std::int32_t expId, const ContentExportParam* param, std::size_t contentLength, void* func,
+    void* userdata, char* path, std::size_t pathBufferLength);
 
 namespace {
 
@@ -35,6 +37,11 @@ void Export(std::int32_t expId) {
     ContentExportCallbackParam content{};
     ContentExportCallbackParam thumbnail{};
     sceContentExportFromDataWithThumbnail(expId, &param, &content, "image/png", &thumbnail, path, sizeof(path));
+}
+
+void ExportData(std::int32_t expId) {
+    ContentExportParam param{};
+    sceContentExportFromData(expId, &param, 16, &allocator, &allocator, path, sizeof(path));
 }
 
 }
@@ -69,12 +76,14 @@ int main() {
     Require(Throws<std::runtime_error>([&] { sceContentExportGetProgress(first); }));
     Require(Throws<std::runtime_error>([&] { sceContentExportCancel(first); }));
     Require(Throws<std::runtime_error>([&] { Export(first); }));
+    Require(Throws<std::runtime_error>([&] { ExportData(first); }));
     Require(path[0] == 0);
     Require(sceContentExportFinish(first) == 0);
     Require(Throws<std::invalid_argument>([&] { sceContentExportFinish(first); }));
     Require(Throws<std::invalid_argument>([&] { sceContentExportGetProgress(first); }));
     Require(Throws<std::invalid_argument>([&] { sceContentExportCancel(first); }));
     Require(Throws<std::invalid_argument>([&] { Export(first); }));
+    Require(Throws<std::invalid_argument>([&] { ExportData(first); }));
     Require(Throws<std::invalid_argument>([] { sceContentExportFinish(0); }));
     Require(Throws<std::invalid_argument>([] { sceContentExportFinish(-1); }));
     sessions.erase(first);
