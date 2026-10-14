@@ -28,6 +28,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -718,26 +719,59 @@ std::atomic<std::uint64_t> importWindow{0};
 // windows it uses and the live-import budget can serve part of the run in place.
 constexpr std::uint64_t MaxImportBytes = std::uint64_t{1} << 30u;
 
-ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
+// Per-window results of one pass over a lease (refreshImports checks every import against the lease:
+// without it each check walked its window's whole chain, imports x ranges per window, which a heap of
+// thousands of 16 KiB ranges made seconds per refresh; D44). Valid for the one lease it was made for.
+struct WindowMemo {
+    // window base -> [first, last] lease indices of the continuous chain covering the whole window, or
+    // {npos, npos} when no chain covers it.
+    std::unordered_map<std::uint64_t, std::pair<std::size_t, std::size_t>> windows;
+};
+
+ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address, WindowMemo* memo = nullptr) {
     const auto index = leasedIndexContaining(lease, address);
     if (index == lease.size()) return {};
     const auto& containing = *lease[index];
     std::uint64_t low = 0;
     std::uint64_t high = std::numeric_limits<std::uint64_t>::max();
     const auto window = importWindow.load(std::memory_order_relaxed);
+    bool alone = false;
     if (window != 0) {
         low = address / window * window;
         high = low + window;
         if (containing.address < low || containing.address + containing.bytes > high) {
             low = containing.address;
             high = containing.address + containing.bytes;
+            alone = true;
         }
     }
     auto first = index;
-    while (first > 0 && lease[first - 1]->address >= low && continuesRun(*lease[first - 1], *lease[first])) --first;
     auto last = index;
-    while (last + 1 < lease.size() && lease[last + 1]->address + lease[last + 1]->bytes <= high && continuesRun(*lease[last], *lease[last + 1])) ++last;
-    if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
+    if (window != 0 && !alone && memo != nullptr) {
+        // The walk below joins `index` to the whole window exactly when one continuous chain covers
+        // [low, high); that is a property of the window, computed once per lease.
+        constexpr auto npos = std::numeric_limits<std::size_t>::max();
+        auto found = memo->windows.find(low);
+        if (found == memo->windows.end()) {
+            std::pair<std::size_t, std::size_t> chain{npos, npos};
+            auto start = index;
+            while (start > 0 && lease[start - 1]->address >= low && continuesRun(*lease[start - 1], *lease[start])) --start;
+            if (lease[start]->address == low) {
+                auto end = start;
+                while (end + 1 < lease.size() && lease[end + 1]->address + lease[end + 1]->bytes <= high && continuesRun(*lease[end], *lease[end + 1])) ++end;
+                if (lease[end]->address + lease[end]->bytes == high) chain = {start, end};
+            }
+            found = memo->windows.emplace(low, chain).first;
+        }
+        if (found->second.first != npos && found->second.first <= index && index <= found->second.second) {
+            first = found->second.first;
+            last = found->second.second;
+        }
+    } else {
+        while (first > 0 && lease[first - 1]->address >= low && continuesRun(*lease[first - 1], *lease[first])) --first;
+        while (last + 1 < lease.size() && lease[last + 1]->address + lease[last + 1]->bytes <= high && continuesRun(*lease[last], *lease[last + 1])) ++last;
+        if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
+    }
     if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
     ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
     if (run.bytes > MaxImportBytes) {
@@ -778,8 +812,8 @@ bool wouldRetireImport(const HostImports& state, const ImportRun& run) {
     return previous.base + previous.bytes > run.base;
 }
 
-bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
-    return sameRun(entry, importRun(lease, entry.base));
+bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease, WindowMemo* memo = nullptr) {
+    return sameRun(entry, importRun(lease, entry.base, memo));
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
@@ -983,9 +1017,10 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
+    WindowMemo memo;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && sameRange(it->second, lease)) {
+        if (range != nullptr && sameRange(it->second, lease, &memo)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -996,7 +1031,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         retireImport(context.device, state, it, lease);
         it = next;
     }
-    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first)) ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first, &memo)) ? std::next(it) : state.failed.erase(it);
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
