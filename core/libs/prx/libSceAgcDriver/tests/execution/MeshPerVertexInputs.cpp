@@ -1,6 +1,6 @@
 // agc_driver_mesh_per_vertex_inputs: per-vertex fragment inputs and emulated barycentrics of mesh
 // (NGG) draws. The Metal device draws them in the mesh function's triangle-vertices mode (MslAbi
-// Version 13; DECISIONS "per-vertex fragment inputs of mesh draws"): every output triangle has three
+// Version 13; DECISIONS D46): every output triangle has three
 // unshared vertices with one-hot corner weights and its corners' values in the primitive record, the
 // subgroup split over the grid's z when 3 x its primitives exceed Metal's 256 mesh vertices. The
 // same triangles are drawn through a vertex program in the vertex function's triangle-vertices mode
