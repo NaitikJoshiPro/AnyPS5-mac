@@ -235,6 +235,8 @@ void VKAPI_CALL MetalDestroyImportBuffer(VkDevice device, VkBuffer buffer, const
     if (buffer == VK_NULL_HANDLE) return;
     if (const auto probe = importReleaseProbe.load(std::memory_order_acquire)) probe(buffer);
     id<MTLBuffer> released = (__bridge_transfer id<MTLBuffer>)reinterpret_cast<void*>(buffer);
+    static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
+    if (trace) std::fprintf(stderr, "[gpu] host import buffer %p (contents %p, length 0x%llx) leaves the residency set\n", (__bridge void*)released, released.contents, static_cast<unsigned long long>(released.length));
     auto& residency = Residency();
     std::lock_guard lock(residency.mutex);
     if (const auto found = residency.devices.find(device); found != residency.devices.end() && found->second.set != nil) {
@@ -923,7 +925,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok as buffer %p (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reinterpret_cast<void*>(entry.buffer), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
     return &state.imports.emplace(base, entry).first->second;
 }
 
