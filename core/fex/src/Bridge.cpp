@@ -241,7 +241,8 @@ static_assert(MakecontextEntryCode[MakecontextFinishCall] == 0xe8);
 std::vector<std::uint64_t> tlsOffsets;
 
 void* TlsGetAddr(const std::uint64_t* index) {
-    if (currentCall == nullptr || index[0] >= tlsOffsets.size()) {
+    // Module ids start at 1 (GuestProgram numbers image i as i + 1); 0 is no module.
+    if (currentCall == nullptr || index[0] == 0 || index[0] >= tlsOffsets.size()) {
         std::fprintf(stderr, "[aps5-fex] __tls_get_addr for TLS module %llu\n", static_cast<unsigned long long>(index[0]));
         std::abort();
     }
@@ -504,6 +505,9 @@ void Bridge::Connect() {
         reinterpret_cast<void (*)(void (*)(std::uint32_t*, std::uint16_t*))>(setControl)(GuestControl);
     if (void* setCall = HostSymbol("Aps5SetBridgeGuestCall_nid_no_patch"))
         reinterpret_cast<void (*)(std::uint64_t (*)(std::uint64_t, const std::uint64_t*))>(setCall)(CallGuestFunction);
+    // libkernel's __tls_get_addr export (NID vNe1w4diLCs) resolves through the same module numbering.
+    if (void* setTls = HostSymbol("Aps5SetGuestTlsResolver_nid_no_patch"))
+        reinterpret_cast<void (*)(void* (*)(const std::uint64_t*))>(setTls)(TlsGetAddr);
     if (void* setFiber = HostSymbol("Aps5SetFiberBridge_nid_no_patch")) {
         using SetFiberBridge = void (*)(void (*)(std::uintptr_t*), void (*)(const std::uintptr_t*), void (*)(std::uint32_t*, std::uint16_t*),
                                         std::uint64_t);

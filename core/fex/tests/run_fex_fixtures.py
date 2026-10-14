@@ -164,6 +164,8 @@ COMPILED = {
                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 47),
     "tls-exec": (lambda d: compiled_executable(d, [str(HERE / "tls_exec.cpp")], {"libc.prx": ["exit"],
                  "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, tpoff=True), 43),
+    "tls-exec-dynamic": (lambda d: compiled_executable(d, [str(HERE / "tls_exec_dynamic.cpp")], {"libc.prx": ["exit"],
+                         "libkernel.prx": ["scePthreadCreate", "scePthreadJoin", "__tls_get_addr"]}, tpoff=True), 43),
     "image-protect": (lambda d: compiled_executable(d, [str(HERE / "image_protect.cpp")], {"libc.prx": ["exit"],
                       "libkernel.prx": ["sceKernelMprotect", "sceKernelQueryMemoryProtection"]}), 43),
     "unaligned": (lambda d: compiled_executable(d, [str(HERE / "unaligned.cpp")], {"libc.prx": ["exit"],
