@@ -53,7 +53,11 @@ id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRe
         // An object stage launches at most meshGroups mesh threadgroups per object threadgroup.
         descriptor.maxTotalThreadgroupsPerMeshGrid = request.object ? request.meshGroups : MaxMeshThreadgroupsPerGrid;
         NSError* error = nil;
-        id<MTLRenderPipelineState> pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+        id<MTLRenderPipelineState> pipeline = nil;
+        {
+            std::shared_lock gate(serializerGate); // MetalPipelineCache.h: no archive flush during the capture
+            pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+        }
         if (pipeline == nil) throw std::runtime_error("Metal device: mesh render pipeline creation failed: " + std::string(error != nil ? error.localizedDescription.UTF8String : "unknown error"));
         {
             std::lock_guard lock(mutex);

@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -194,6 +195,11 @@ private:
     std::filesystem::path archivePath;
 
     mutable std::mutex mutex;
+    // Compiles capture their binaries into `serializer`; Save's serializeAsArchiveAndFlushToURL flushes
+    // them. A flush during a compile's capture leaves that compile with released capture data (Metal
+    // crashed in -[_MTLBinaryArchive newArchiverIdWithBinaryKey:...] -> dispatch_data_create_map,
+    // ASTRO BOT, once saves became eager). Compiles hold this gate shared, the flush exclusively.
+    std::shared_mutex serializerGate;
     std::unordered_map<std::string, id<MTLLibrary>> libraries;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries;
     std::vector<std::pair<DepthStencilRequest, id<MTLDepthStencilState>>> depthStencilStates;

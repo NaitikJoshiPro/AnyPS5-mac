@@ -239,6 +239,7 @@ id<MTLLibrary> PipelineCache::Library(const ShaderRecompiler::MslShader& shader,
         NSError* error = nil;
         const auto start = std::chrono::steady_clock::now();
         const SlowCompileReport report("an MSL library", shader.source.size());
+        std::shared_lock gate(serializerGate);
         id<MTLLibrary> library = [compiler newLibraryWithDescriptor:descriptor error:&error];
         if (library == nil) {
             std::fprintf(stderr, "[metal] MSL compile failed:\n%s\n", shader.source.c_str());
@@ -316,6 +317,7 @@ id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& 
                         MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
                         options.lookupArchives = @[archive];
                         NSError* ignored = nil;
+                        std::shared_lock gate(serializerGate);
                         (void)[compiler newComputePipelineStateWithDescriptor:again compilerTaskOptions:options error:&ignored];
                     });
                 }
@@ -325,6 +327,7 @@ id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& 
         }
         const auto start = std::chrono::steady_clock::now();
         const SlowCompileReport report("a compute pipeline", 0u);
+        std::shared_lock gate(serializerGate);
         id<MTLComputePipelineState> pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
         if (pipeline == nil) throw std::runtime_error("Metal device: compute pipeline creation failed: " + Describe(error));
         const auto elapsed = Milliseconds(start);
@@ -411,6 +414,7 @@ id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineReques
                             again.rasterizationEnabled = request.rasterization;
                             again.inputPrimitiveTopology = request.topology;
                             NSError* ignored = nil;
+                            std::shared_lock gate(serializerGate);
                             (void)[compiler newRenderPipelineStateWithDescriptor:again compilerTaskOptions:options error:&ignored];
                         }
                     });
@@ -421,6 +425,7 @@ id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineReques
         }
         const auto start = std::chrono::steady_clock::now();
         const SlowCompileReport report("a render pipeline", 0u);
+        std::shared_lock gate(serializerGate);
         id<MTLRenderPipelineState> pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
         if (pipeline == nil) throw std::runtime_error("Metal device: render pipeline creation failed: " + Describe(error));
         const auto elapsed = Milliseconds(start);
@@ -698,7 +703,12 @@ void PipelineCache::Save() {
         auto temporary = archivePath;
         temporary += ".tmp" + std::to_string(::getpid());
         NSError* failure = nil;
-        if (![serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure]) {
+        bool written = false;
+        {
+            std::unique_lock gate(serializerGate);
+            written = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];
+        }
+        if (!written) {
             std::fprintf(stderr, "[metal-pipelines] cannot write %s: %s\n", temporary.c_str(), Describe(failure).c_str());
             std::filesystem::remove(temporary, error);
             return;
