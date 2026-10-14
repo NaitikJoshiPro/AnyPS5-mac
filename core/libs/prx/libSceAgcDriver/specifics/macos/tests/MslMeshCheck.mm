@@ -1,6 +1,6 @@
 // agc_metal_msl_mesh: MSL mesh functions (NGG primitive shaders, B6 stage 5), compile only (no GPU
 // work is submitted). tests/Mesh.cpp's geometry program (wave64 one- and two-wave subgroups, wave32,
-// strips and fans) is recompiled for the Metal device's target; each mesh function must reflect
+// strips, fans and rect lists) is recompiled for the Metal device's target; each mesh function must reflect
 // MslAbi::Stage::Mesh with the host threadgroup size the driver dispatches (wave64 at two lanes per
 // invocation: 32 host threads per guest wave), and links with the Mesh.cpp pixel program into a
 // mesh render pipeline (MTLMeshRenderPipelineDescriptor), which checks that the mesh vertex
@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <iostream>
@@ -134,7 +135,13 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     const auto hostThreads = test.waveSize == 64u ? groupThreads / 2u : groupThreads;
     Require(reflection.threadsPerThreadgroup[0] == hostThreads && reflection.threadsPerThreadgroup[1] == 1u && reflection.threadsPerThreadgroup[2] == 1u,
             name + ": the mesh threadgroup is " + std::to_string(reflection.threadsPerThreadgroup[0]) + " threads, expected " + std::to_string(hostThreads));
-    Require(Has(source, "[[mesh]] void " + std::string(Abi::EntryPoint)) && Has(source, ", " + std::to_string(test.mesh.maxVertices) + ", " + std::to_string(test.mesh.maxPrimitives) + ", metal::topology::triangle>"), name + ": no mesh<> output of the subgroup's limits");
+    // Rect lists (DECISIONS D41): the group's vertices plus one per rect, two triangles per rect.
+    const bool rectList = test.mesh.inputPrimitive == 17u;
+    const auto rects = std::min(test.mesh.maxPrimitives, test.mesh.primitivesPerGroup);
+    const auto outputVertices = rectList ? std::min(test.mesh.maxVertices, test.mesh.verticesPerGroup) + rects : test.mesh.maxVertices;
+    const auto outputPrimitives = rectList ? rects * 2u : test.mesh.maxPrimitives;
+    Require(Has(source, "[[mesh]] void " + std::string(Abi::EntryPoint)) && Has(source, ", " + std::to_string(outputVertices) + ", " + std::to_string(outputPrimitives) + ", metal::topology::triangle>"), name + ": no mesh<> output of the subgroup's limits");
+    Require(rectList == Has(source, "threadgroup Aps5MeshVertex aps5_rv[") && rectList == Has(source, "set_primitive_count(aps5_rects * 2u)"), name + ": rect-list expansion " + (rectList ? "missing" : "in a mesh function that is not a rect list"));
     Require(Has(source, "set_primitive_count(") && Has(source, "[[primitive_culled]]"), name + ": the mesh function does not set its primitive count and cull flags");
     Require(reflection.usesPushData, name + ": the mesh function does not read the draw words from the push data");
 
@@ -168,7 +175,7 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithMeshDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&error];
     Require(pipeline != nil, name + ": the mesh function does not link with the fragment function: " + Describe(error));
     Require(pipeline.maxTotalThreadsPerMeshThreadgroup >= hostThreads, name + ": the mesh pipeline allows " + std::to_string(pipeline.maxTotalThreadsPerMeshThreadgroup) + " threads per threadgroup, the program needs " + std::to_string(hostThreads));
-    std::printf("%s: mesh<%u, %u> with %u host threads, linked with the fragment function\n", test.name, test.mesh.maxVertices, test.mesh.maxPrimitives, hostThreads);
+    std::printf("%s: mesh<%u, %u> with %u host threads, linked with the fragment function\n", test.name, outputVertices, outputPrimitives, hostThreads);
 }
 
 }
@@ -187,13 +194,16 @@ int main() {
             Require(target.mesh.has_value(), "the Metal target advertises no mesh shader limits");
             // tests/Mesh.cpp's subgroups: {input primitive, primitives and vertices per group, max
             // vertices, max primitives, threads, LDS bytes, provoking vertex, ESGS item size}.
-            const std::array<MeshCase, 6> cases{{
+            const std::array<MeshCase, 9> cases{{
                 {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
                 {"triangle list, not indexed", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, false},
                 {"triangle strip", {6u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle fan", {5u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u}, 64u, true},
+                {"rect list, one-wave subgroups, wave64", {17u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, false},
+                {"rect list, two-wave subgroups, wave64", {17u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
+                {"rect list, wave32", {17u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
             }};
             for (const auto& test : cases) Check(metal, target, test);
         }

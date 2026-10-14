@@ -703,6 +703,28 @@ void NggVertexWorkgroupTests() {
     queue.userConfig[0x242] = 6;
     mesh = *AgcDriver::Graphics::DecodeState(queue, true).stages.mesh;
     Require(mesh.primitivesPerGroup == 126 && mesh.verticesPerGroup == 128 && mesh.maxPrimitives == 128, "the NGG vertex subgroup of a triangle strip is not bounded by its vertex budget");
+    // DECISIONS D41: radeonsi's u_blitter rect list through an NGG vertex program (SuperTuxKart,
+    // VGT_SHADER_STAGES_EN 0x412010, GS_OUT_PRIM_TYPE RECTLIST) takes the mesh path as a rect list.
+    queue.userConfig[0x242] = 17;
+    queue.context[0x29b] = 3;
+    queue.context[0x2d5] = 0x412010;
+    state = AgcDriver::Graphics::DecodeState(queue, true);
+    Require(state.stages.mesh && state.stages.mesh->inputPrimitive == 17 && state.rectList && state.cullMode == VK_CULL_MODE_NONE && !state.primitiveRestart, "an NGG rect list did not decode as a mesh rect list");
+    Require(state.stages.mesh->primitivesPerGroup == 42 && state.stages.mesh->verticesPerGroup == 126, "the NGG rect-list subgroup changed");
+    queue.userConfig[0x25b] = (256u << 9u) | 128u;
+    queue.context[0x1ff] = 256;
+    mesh = *AgcDriver::Graphics::DecodeState(queue, true).stages.mesh;
+    Require(mesh.primitivesPerGroup == 64 && mesh.verticesPerGroup == 192, "a rect-list subgroup is not capped at 64 rects (Metal's 256 mesh vertices with one more per rect)");
+    queue.userConfig[0x25b] = 0x10080;
+    queue.context[0x1ff] = 0x80;
+    queue.context[0x29b] = 2;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE 17, VGT_GS_OUT_PRIM_TYPE 2");
+    queue.userConfig[0x242] = 4;
+    queue.context[0x29b] = 3;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE 4, VGT_GS_OUT_PRIM_TYPE 3");
+    queue.userConfig[0x242] = 6;
+    queue.context[0x29b] = 2;
+    queue.context[0x2d5] = 0x12010;
     queue.shader[0x8a] = 0x222c0005;
     queue.shader[0x8b] = 0x400030;
     Require(AgcDriver::Graphics::DecodeState(queue, true).stages.mesh.has_value(), "an NGG vertex program that loads only its vertex ID was rejected");

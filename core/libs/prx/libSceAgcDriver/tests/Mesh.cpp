@@ -11,6 +11,7 @@
 #include <iostream>
 #include <new>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -48,6 +49,13 @@ alignas(256) constexpr auto Wave32GeometryCode = [] {
 
 alignas(256) constexpr std::array<std::uint32_t, 7> PixelCode{
     0xc8020002, 0xc8060102, 0xc80a0202, 0xc80e0302, 0xf800180f, 0x03020100, 0xbf810000,
+};
+
+// v_interp_p1_f32 / v_interp_p2_f32 of attr0.xyzw into v2-v5 with the perspective-center I/J in
+// v0/v1, exported to MRT0: the rect-list draws check interpolated parameters.
+alignas(256) constexpr std::array<std::uint32_t, 11> SmoothPixelCode{
+    0xc8080000, 0xc8090001, 0xc80c0100, 0xc80d0101, 0xc8100200, 0xc8110201, 0xc8140300, 0xc8150301,
+    0xf800180f, 0x05040302, 0xbf810000,
 };
 
 struct Vertex {
@@ -132,6 +140,7 @@ struct MeshDraw {
     bool restart = false;
     std::uint32_t waveSize = 64u;
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
+    bool smooth = false;
 };
 
 bool ReadsNumWorkgroups(const std::vector<std::uint32_t>& words) {
@@ -177,12 +186,15 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
 
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     pixel.interpolatorCount = 1;
-    pixel.interpolatorSettings[0] = 0x400u;
+    pixel.interpolatorSettings[0] = setup.smooth ? 0u : 0x400u;
+    pixel.inputAddr = setup.smooth ? 2u : 0u;
+    pixel.hasPerspectiveCenterVgpr = setup.smooth;
     pixel.targetOutputMode[0] = 9;
     pixel.targetExportMapping.fill(0xe4u);
-    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
+    const std::span<const std::uint32_t> pixelCode = setup.smooth ? std::span<const std::uint32_t>(SmoothPixelCode) : std::span<const std::uint32_t>(PixelCode);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragment{
-        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
         {64, 0, {}, std::nullopt, pixel, std::nullopt, pixelMemory},
         target,
         target.fixedPushSlots ? PixelPushLayout(meshPush, target) : ShaderRecompiler::BindingLayout{0, 0, meshPush, ShaderRecompiler::MeshDrawPushOffsetBytes - meshPush},
@@ -200,7 +212,9 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.renderExtent = {Width, Height};
-    state.topology = setup.mesh.inputPrimitive == 6u ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : setup.mesh.inputPrimitive == 5u ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    // Rect lists decode as State.cpp does on the mesh path (DECISIONS D41).
+    state.rectList = setup.mesh.inputPrimitive == 17u;
+    state.topology = state.rectList ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : setup.mesh.inputPrimitive == 6u ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : setup.mesh.inputPrimitive == 5u ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.primitiveRestart = setup.restart;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
     state.negativeOneToOne = false;
@@ -248,6 +262,90 @@ void CheckQuads(const char* what, std::uint32_t first, std::uint32_t count) {
         Require(PixelIs(gap, Background), std::string(what) + ": a triangle crossed the restart after quad " + std::to_string(quad) + ", pixel " + PixelText(gap));
     }
     Require(PixelIs((static_cast<std::size_t>(Height / 4u) * Width + Width / 2u) * 4u, Background), std::string(what) + ": the upper half changed");
+}
+
+// Rect lists (VGT_PRIMITIVE_TYPE 17, DECISIONS D41): 4 x 2 cells; rects 0-6 give three corners of
+// an axis-aligned rectangle (rect r leaves out corner r % 4 and puts the right-angle corner at
+// position r % 3, so every corner and every position of the right angle is covered; rect 0 is
+// radeonsi's u_blitter order v0 = (x1, y1), v1 = (x1, y2), v2 = (x2, y1)). The color is
+// R = 0.1 + 0.8 u, G = 0.1 + 0.8 t over the rect, so the fourth corner's interpolated values are
+// checked; rect 7 has no right angle and must be culled.
+constexpr std::uint32_t RectColumns = 4;
+constexpr std::uint32_t RectRows = 2;
+constexpr std::uint32_t Rects = RectColumns * RectRows;
+alignas(256) std::array<Vertex, 3 * Rects> RectVertices{};
+alignas(256) std::array<Vertex, 3 * Rects> RectScrambled{};
+alignas(256) std::array<std::uint16_t, 3 * Rects> RectIndices{};
+
+struct RectBounds {
+    float x1, y1, x2, y2;
+};
+
+RectBounds RectOf(std::uint32_t rect) {
+    const float left = -1.0f + 2.0f * static_cast<float>(rect % RectColumns) / RectColumns;
+    const float bottom = -1.0f + 2.0f * static_cast<float>(rect / RectColumns) / RectRows;
+    return {left + 0.1f, bottom + 0.15f, left + 2.0f / RectColumns - 0.1f, bottom + 2.0f / RectRows - 0.15f};
+}
+
+float RectBlue(std::uint32_t rect) {
+    return static_cast<float>(30u + 28u * rect) / 255.0f;
+}
+
+void BuildRects() {
+    for (std::uint32_t rect = 0; rect < Rects; ++rect) {
+        const auto bounds = RectOf(rect);
+        const std::array<std::array<float, 2>, 4> uv{{{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}}};
+        const auto corner = [&](std::uint32_t k) {
+            const float u = uv[k][0], t = uv[k][1];
+            return Vertex{{bounds.x1 + (bounds.x2 - bounds.x1) * u, bounds.y1 + (bounds.y2 - bounds.y1) * t, 0.5f, 1.0f}, {0.1f + 0.8f * u, 0.1f + 0.8f * t, RectBlue(rect), 1.0f}};
+        };
+        const auto omitted = rect % 4u;
+        const auto right = (omitted + 2u) % 4u;
+        std::array<Vertex, 3> vertices{};
+        const auto at = rect % 3u;
+        vertices[at] = corner(right);
+        vertices[(at + 1u) % 3u] = corner((omitted + 1u) % 4u);
+        vertices[(at + 2u) % 3u] = corner((omitted + 3u) % 4u);
+        if (rect == Rects - 1u) vertices[at].position[0] += 0.05f;
+        for (std::uint32_t k = 0; k < 3; ++k) {
+            RectVertices[3 * rect + k] = vertices[k];
+            const auto slot = 3 * (Rects - 1 - rect) + (k + 2) % 3;
+            RectScrambled[slot] = vertices[k];
+            RectIndices[3 * rect + k] = static_cast<std::uint16_t>(slot);
+        }
+    }
+}
+
+void CheckRects(const std::string& what) {
+    for (std::uint32_t rect = 0; rect < Rects; ++rect) {
+        const auto bounds = RectOf(rect);
+        for (const float u : {0.12f, 0.5f, 0.88f}) {
+            for (const float t : {0.12f, 0.5f, 0.88f}) {
+                const auto px = static_cast<std::uint32_t>((bounds.x1 + (bounds.x2 - bounds.x1) * u + 1.0f) * 0.5f * Width);
+                const auto py = static_cast<std::uint32_t>((1.0f - (bounds.y1 + (bounds.y2 - bounds.y1) * t)) * 0.5f * Height);
+                const auto offset = (static_cast<std::size_t>(py) * Width + px) * 4u;
+                if (rect == Rects - 1u) {
+                    // Only the cell's centre: the skewed triangle covers part of the cell.
+                    if (u == 0.5f && t == 0.5f) Require(PixelIs(offset, Background), what + ": the rect without a right angle was drawn, pixel " + PixelText(offset));
+                    continue;
+                }
+                const float pu = ((static_cast<float>(px) + 0.5f) / Width * 2.0f - 1.0f - bounds.x1) / (bounds.x2 - bounds.x1);
+                const float pt = (1.0f - (static_cast<float>(py) + 0.5f) / Height * 2.0f - bounds.y1) / (bounds.y2 - bounds.y1);
+                const std::array<float, 3> expected{(0.1f + 0.8f * pu) * 255.0f, (0.1f + 0.8f * pt) * 255.0f, RectBlue(rect) * 255.0f};
+                for (std::size_t c = 0; c < 3; ++c) {
+                    const auto actual = static_cast<float>(std::to_integer<std::uint8_t>(Pixels[offset + c]));
+                    Require(std::fabs(actual - expected[c]) <= 2.0f, what + ": rect " + std::to_string(rect) + " (u " + std::to_string(u) + ", t " + std::to_string(t) + ") pixel " + PixelText(offset) + ", channel " + std::to_string(c) + " expected " + std::to_string(expected[c]));
+                }
+            }
+        }
+        // Just outside each corner: nothing beyond the rectangle.
+        for (const auto& [x, y] : {std::pair{bounds.x1 - 0.03f, bounds.y1 - 0.03f}, std::pair{bounds.x2 + 0.03f, bounds.y2 + 0.03f}, std::pair{bounds.x1 - 0.03f, bounds.y2 + 0.03f}, std::pair{bounds.x2 + 0.03f, bounds.y1 - 0.03f}}) {
+            const auto px = static_cast<std::uint32_t>((x + 1.0f) * 0.5f * Width);
+            const auto py = static_cast<std::uint32_t>((1.0f - y) * 0.5f * Height);
+            const auto offset = (static_cast<std::size_t>(py) * Width + px) * 4u;
+            Require(PixelIs(offset, Background), what + ": rect " + std::to_string(rect) + " covers a pixel outside its rectangle " + PixelText(offset));
+        }
+    }
 }
 
 void CheckTriangles(const char* what) {
@@ -433,6 +531,34 @@ int main() {
         ClearPixels();
         DrawMesh(device, {fan, fanDraw, VertexBufferDescriptor(FanScrambled.data(), static_cast<std::uint32_t>(FanScrambled.size()))});
         CheckFan("indirect indexed triangle fan");
+
+        if (target.backend != ShaderRecompiler::ShaderBackend::Msl) {
+            std::puts("rect lists skipped: only the MSL mesh function expands them (DECISIONS D41)");
+        } else {
+            BuildRects();
+            const ShaderRecompiler::MeshConfiguration rectSmall{17u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};
+            const ShaderRecompiler::MeshConfiguration rectWide{17u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u};
+            auto rectWave32 = rectSmall;
+            rectWave32.threadsPerGroup = 32u;
+            for (const auto& [name, subgroup, wave] : {std::tuple{"one-wave subgroups", rectSmall, 64u}, std::tuple{"two-wave subgroups", rectWide, 64u}, std::tuple{"wave32", rectWave32, 32u}}) {
+                ClearPixels();
+                DrawMesh(device, {subgroup, {0, static_cast<std::uint32_t>(RectVertices.size()), 0, 1, 0, false}, VertexBufferDescriptor(RectVertices.data(), static_cast<std::uint32_t>(RectVertices.size())), ShaderRecompiler::MeshDrawPushOffsetBytes, false, wave, VK_CULL_MODE_NONE, true});
+                CheckRects(std::string("non-indexed rect list, ") + name);
+                ClearPixels();
+                DrawMesh(device, {subgroup, {reinterpret_cast<std::uintptr_t>(RectIndices.data()), static_cast<std::uint32_t>(RectIndices.size()), 2, 1, 0, true}, VertexBufferDescriptor(RectScrambled.data(), static_cast<std::uint32_t>(RectScrambled.size())), ShaderRecompiler::MeshDrawPushOffsetBytes, false, wave, VK_CULL_MODE_NONE, true});
+                CheckRects(std::string("indexed rect list, ") + name);
+            }
+            ClearPixels();
+            DrawMesh(device, {rectSmall, {0, 9u, 0, 1, 0, false, 6u}, VertexBufferDescriptor(RectVertices.data(), static_cast<std::uint32_t>(RectVertices.size()))});
+            for (std::uint32_t rect = 0; rect < Rects; ++rect) {
+                const auto bounds = RectOf(rect);
+                const auto px = static_cast<std::uint32_t>(((bounds.x1 + bounds.x2) * 0.5f + 1.0f) * 0.5f * Width);
+                const auto py = static_cast<std::uint32_t>((1.0f - (bounds.y1 + bounds.y2) * 0.5f) * 0.5f * Height);
+                const auto offset = (static_cast<std::size_t>(py) * Width + px) * 4u;
+                const bool drawn = rect >= 2u && rect < 5u;
+                Require(drawn != PixelIs(offset, Background), "rect list from vertex 6: rect " + std::to_string(rect) + " pixel " + PixelText(offset));
+            }
+        }
 
         std::puts("Mesh tests passed");
         return 0;
