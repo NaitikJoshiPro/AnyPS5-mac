@@ -153,8 +153,8 @@ std::atomic<std::uint64_t> g_unpatched{0};      // faults at sites that stay unp
 std::atomic<std::uint64_t> g_farBranchSites{0}; // far stubs that return by branch through a dead register
 
 // One line with every counter, so the last line of a log brackets the totals.
-void ReportMilestone(std::uint64_t count, const char* what = "faults") {
-    if (count < 1024 || ((count & (count - 1)) != 0 && (count & 8191) != 0)) return;
+void ReportMilestone(std::uint64_t count, const char* what = "faults", std::uint64_t first = 1024) {
+    if (count < first || ((count & (count - 1)) != 0 && (count & 8191) != 0)) return;
     const auto seconds = static_cast<double>(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_enabledAt) / 1e9;
     char line[384];
     const int length = std::snprintf(line, sizeof(line),
@@ -760,7 +760,7 @@ bool Redirect(siginfo_t* info, void* context) {
         g_patches.fetch_add(1, std::memory_order_relaxed);
     } else {
         const auto unpatched = g_unpatched.fetch_add(1, std::memory_order_relaxed);
-        ReportMilestone(unpatched + 1, "unpatched (native) faults");
+        ReportMilestone(unpatched + 1, "unpatched (native) faults", 1); // rare now: every power of two from the first
         if (g_nativeStackEvery != 0 && unpatched % g_nativeStackEvery == 0 && unpatched / g_nativeStackEvery < 32) Backtrace(unpatched, pc, insn, info, machine);
     }
     arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(forced));

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/RequestMemoryView.hpp"
@@ -163,7 +164,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 word = waited;
             }
         } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
-            std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+            std::memcpy(&word, reinterpret_cast<const void*>(GuestArena::HostRange(static_cast<std::uintptr_t>(address), sizeof(word))), sizeof(word)); // alias if displaced (D31, D33)
             ++CaptureTotals().wordsRaw;
             if (policy == PendingWrite::VerifyRaw) {
                 std::uint32_t waited = 0;
@@ -178,7 +179,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             // On a word-wise page the bytes before the hook's wait are kept for the observer.
             const bool observed = page.wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
             std::uint32_t before = 0;
-            if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
+            if (observed) std::memcpy(&before, reinterpret_cast<const void*>(GuestArena::HostRange(static_cast<std::uintptr_t>(address), sizeof(before))), sizeof(before));
             const auto waitsBefore = observed ? hookWaits() : 0;
             const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
