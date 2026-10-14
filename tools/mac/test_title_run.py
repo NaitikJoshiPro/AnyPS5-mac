@@ -162,6 +162,61 @@ class EnvAndAudioTests(unittest.TestCase):
         self.assertAlmostEqual(title_run.pcm_windows(f32, "f32", 2, 1, 1.0)[0], 0.25)
 
 
+class LibsLinkTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.run_dir = root / "runs" / "m3" / "T"
+        self.run_dir.mkdir(parents=True)
+        self.builds = {}
+        for name in ("build-a", "build-b"):
+            (root / name / "core/libs/libs").mkdir(parents=True)
+            self.builds[name] = root / name
+        self.out = open(os.devnull, "w")
+
+    def tearDown(self):
+        self.out.close()
+        self.tmp.cleanup()
+
+    def target(self):
+        return Path(os.readlink(self.run_dir / "libs"))
+
+    def test_matching_link_is_kept(self):
+        (self.run_dir / "libs").symlink_to(self.builds["build-a"] / "core/libs/libs")
+        self.assertIsNone(title_run.ensure_libs_link(self.run_dir, self.builds["build-a"], out=self.out))
+        self.assertEqual(self.target(), self.builds["build-a"] / "core/libs/libs")
+
+    def test_stale_link_is_repointed_at_the_run_build(self):
+        (self.run_dir / "libs").symlink_to(self.builds["build-a"] / "core/libs/libs")
+        previous = title_run.ensure_libs_link(self.run_dir, self.builds["build-b"], out=self.out)
+        self.assertEqual(previous, self.builds["build-a"] / "core/libs/libs")
+        self.assertEqual(self.target(), self.builds["build-b"].resolve() / "core/libs/libs")
+
+    def test_dangling_or_missing_link_points_at_the_run_build(self):
+        (self.run_dir / "libs").symlink_to(Path(self.tmp.name) / "gone/core/libs/libs")
+        title_run.ensure_libs_link(self.run_dir, self.builds["build-b"], out=self.out)
+        self.assertEqual(self.target(), self.builds["build-b"].resolve() / "core/libs/libs")
+        (self.run_dir / "libs").unlink()
+        title_run.ensure_libs_link(self.run_dir, self.builds["build-a"], out=self.out)
+        self.assertEqual(self.target(), self.builds["build-a"].resolve() / "core/libs/libs")
+
+    def test_refuses_a_build_without_libraries_or_a_real_directory(self):
+        with self.assertRaises(title_run.LibsLinkError):
+            title_run.ensure_libs_link(self.run_dir, Path(self.tmp.name) / "build-none", out=self.out)
+        (self.run_dir / "libs").mkdir()
+        with self.assertRaises(title_run.LibsLinkError):
+            title_run.ensure_libs_link(self.run_dir, self.builds["build-a"], out=self.out)
+
+    def test_run_refuses_before_starting_the_runner(self):
+        (self.run_dir / "app.elf").write_bytes(b"")
+        (self.run_dir / "libs").mkdir()
+        args = mock.Mock(id="T", build=str(self.builds["build-a"]), log_dir=str(Path(self.tmp.name) / "logs"))
+        with mock.patch.object(title_run, "work_dir", return_value=Path(self.tmp.name)), \
+                mock.patch.object(title_run.subprocess, "Popen") as popen, mock.patch("sys.stderr", self.out):
+            self.assertEqual(title_run.run_locked(args), 2)
+            popen.assert_not_called()
+
+
 class GpuLockTests(unittest.TestCase):
     def test_cmd_run_holds_the_gpu_lock_for_the_whole_run(self):
         with tempfile.TemporaryDirectory() as tmp:
