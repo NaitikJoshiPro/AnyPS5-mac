@@ -4,6 +4,7 @@
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -948,9 +949,12 @@ private:
         }
         std::uint8_t* buffer = nullptr;
         if (const auto acquired = acquireBuffer(decoder, epoch, buffer); acquired != Acquire::Buffer) return acquired == Acquire::Stale;
-        auto* chroma = buffer + static_cast<std::size_t>(pitch) * bufferHeight;
+        // The buffer comes from the title's allocator and may be displaced (D31, D33): write through its host view;
+        // the guest keeps the guest address (info.p_data).
+        auto* target = GuestArena::HostRange(buffer, static_cast<std::size_t>(pitch) * bufferHeight * 3 / 2);
+        auto* chroma = target + static_cast<std::size_t>(pitch) * bufferHeight;
         scaler = sws_getCachedContext(scaler, frame.width, frame.height, static_cast<AVPixelFormat>(frame.format), frame.width, frame.height, AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
-        std::uint8_t* planes[4] = {buffer, chroma, nullptr, nullptr};
+        std::uint8_t* planes[4] = {target, chroma, nullptr, nullptr};
         const int strides[4] = {static_cast<int>(pitch), static_cast<int>(pitch), 0, 0};
         if (!scaler || sws_scale(scaler, frame.data, frame.linesize, 0, frame.height, planes, strides) < 0) {
             APS5_LOG_CHARS_ERR("Could not convert a video frame to NV12");
@@ -959,7 +963,7 @@ private:
             return false;
         }
         const auto chromaHeight = (height + 1) / 2;
-        for (std::uint32_t row = height; row < bufferHeight; ++row) std::memcpy(buffer + static_cast<std::size_t>(row) * pitch, buffer + static_cast<std::size_t>(height - 1) * pitch, pitch);
+        for (std::uint32_t row = height; row < bufferHeight; ++row) std::memcpy(target + static_cast<std::size_t>(row) * pitch, target + static_cast<std::size_t>(height - 1) * pitch, pitch);
         for (std::uint32_t row = chromaHeight; row < bufferHeight / 2; ++row) std::memcpy(chroma + static_cast<std::size_t>(row) * pitch, chroma + static_cast<std::size_t>(chromaHeight - 1) * pitch, pitch);
         Frame output{buffer, {}, epoch, seamless};
         auto& info = output.info;
@@ -1023,7 +1027,7 @@ private:
             std::uint8_t* buffer = nullptr;
             if (const auto acquired = acquireBuffer(decoder, epoch, buffer); acquired != Acquire::Buffer) return acquired == Acquire::Stale;
             const auto size = static_cast<std::uint32_t>(samples * channels * static_cast<int>(sizeof(std::int16_t)));
-            std::memcpy(buffer, sampleBuffer.data() + static_cast<std::size_t>(offset) * static_cast<std::size_t>(channels), size);
+            std::memcpy(GuestArena::HostRange(buffer, size), sampleBuffer.data() + static_cast<std::size_t>(offset) * static_cast<std::size_t>(channels), size);
             Frame chunk{buffer, {}, epoch, false};
             chunk.info.p_data = buffer;
             chunk.info.timestamp = timestamp + static_cast<std::uint64_t>(offset) * 1000 / static_cast<std::uint64_t>(frame.sample_rate);

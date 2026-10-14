@@ -444,6 +444,12 @@ if(BUILD_TESTING)
     configure_windows_unwind(savedata_replace_file_failure_tests)
     add_test(NAME savedata_replace_file_failure COMMAND savedata_replace_file_failure_tests)
 
+    add_test_executable(guest_displaced_fiber_media_tests tests/GuestDisplacedFiberMedia.cpp)
+    target_include_directories(guest_displaced_fiber_media_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_displaced_fiber_media_tests PRIVATE libSceFiber libSceSaveData.native libkernel libc)
+    configure_windows_unwind(guest_displaced_fiber_media_tests)
+    add_test(NAME guest_displaced_fiber_media COMMAND guest_displaced_fiber_media_tests)
+
     add_test_executable(guest_crt_tests tests/GuestCrt.cpp)
     target_include_directories(guest_crt_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_crt_tests PRIVATE libSceAmpr libc)

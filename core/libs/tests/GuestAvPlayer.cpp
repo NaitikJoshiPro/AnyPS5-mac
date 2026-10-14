@@ -21,6 +21,9 @@
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "prx/libc/include/GuestDisplaced.hpp"
+#endif
 
 extern "C" {
 AvPlayerInternal* APS5_VABI sceAvPlayerInit(AvPlayerInitData*);
@@ -49,6 +52,10 @@ Bool APS5_VABI sceAvPlayerGetAudioData(AvPlayerInternal*, AvPlayerFrameInfo*);
 Bool APS5_VABI sceAvPlayerIsActive(AvPlayerInternal*);
 std::uint64_t APS5_VABI sceAvPlayerCurrentTime(AvPlayerInternal*);
 int APS5_VABI sceAvPlayerClose(AvPlayerInternal*);
+#if defined(__APPLE__) && defined(__aarch64__)
+int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
+int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
+#endif
 }
 
 namespace {
@@ -469,6 +476,7 @@ void WriteMovie() {
 struct Block {
     bool texture;
     std::align_val_t alignment;
+    bool displaced = false;
 };
 
 struct Allocations {
@@ -476,6 +484,7 @@ struct Allocations {
     std::map<void*, Block> blocks;
     int textures = 0;
     std::optional<int> textureLimit;
+    std::uintptr_t displacedNext = 0, displacedEnd = 0; // bump allocation from displaced guest memory (TestDisplacedBuffers)
 };
 
 Allocations allocations;
@@ -492,23 +501,36 @@ void* Allocate(std::uint32_t alignment, std::uint32_t size, bool texture) {
         std::lock_guard lock(allocations.mutex);
         if (texture && allocations.textureLimit && ActiveTextureCountLocked() >= *allocations.textureLimit) return nullptr;
     }
-    void* memory = ::operator new(size, aligned);
     std::lock_guard lock(allocations.mutex);
-    allocations.blocks[memory] = {texture, aligned};
+    void* memory = nullptr;
+    bool displaced = false;
+    if (allocations.displacedNext != 0) {
+        const auto align = static_cast<std::uintptr_t>(aligned);
+        const auto at = (allocations.displacedNext + align - 1) & ~(align - 1);
+        if (at + size > allocations.displacedEnd) return nullptr;
+        allocations.displacedNext = at + size;
+        memory = reinterpret_cast<void*>(at);
+        displaced = true;
+    } else {
+        memory = ::operator new(size, aligned);
+    }
+    allocations.blocks[memory] = {texture, aligned, displaced};
     if (texture) ++allocations.textures;
     return memory;
 }
 
 void Release(void* memory, bool texture) {
     std::align_val_t aligned{};
+    bool displaced = false;
     {
         std::lock_guard lock(allocations.mutex);
         const auto found = allocations.blocks.find(memory);
         if (found == allocations.blocks.end() || found->second.texture != texture) std::abort();
         aligned = found->second.alignment;
+        displaced = found->second.displaced;
         allocations.blocks.erase(found);
     }
-    ::operator delete(memory, aligned);
+    if (!displaced) ::operator delete(memory, aligned);
 }
 
 void* APS5_VABI AllocateMemory(void*, std::uint32_t alignment, std::uint32_t size) { return Allocate(alignment, size, false); }
@@ -518,6 +540,9 @@ void APS5_VABI DeallocateTexture(void*, void* memory) { Release(memory, true); }
 
 bool IsAllocation(const void* memory, bool texture) {
     std::lock_guard lock(allocations.mutex);
+#if defined(__APPLE__) && defined(__aarch64__)
+    memory = reinterpret_cast<const void*>(GuestArena::GuestAddress(reinterpret_cast<std::uintptr_t>(memory))); // displaced: the test reads through host views
+#endif
     const auto found = allocations.blocks.find(const_cast<void*>(memory));
     return found != allocations.blocks.end() && found->second.texture == texture;
 }
@@ -1156,6 +1181,70 @@ void TestEofStopLatency() {
 
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+std::uint64_t DisplacedFaults() {
+    std::uint64_t faults = 0;
+    GuestArena::GuestDisplacedStats_nid_no_patch(&faults, nullptr);
+    return faults;
+}
+
+// The title's buffers and frame-info structs in displaced guest memory (D31, D33; ASTRO BOT keeps most of its heap
+// there): decoded frames, audio chunks and frame info reach them through host views, so playback takes no fault.
+// The test itself reads them only through their host views as well.
+void TestDisplacedBuffers() {
+    constexpr std::uintptr_t Base = 0x4000000000ull;
+    constexpr std::size_t Bytes = 0x1000000;
+    std::int64_t physical = 0;
+    Check(sceKernelAllocateDirectMemory(0, 0x100000000ll, Bytes, 0x200000, 3, &physical) == 0, "displaced: allocate direct memory");
+    void* fixed = reinterpret_cast<void*>(Base);
+    Check(sceKernelMapDirectMemory(&fixed, Bytes, 0x33, 0x10, physical, 0x200000) == 0 && fixed == reinterpret_cast<void*>(Base), "displaced: map at 0x4000000000");
+    Check(GuestArena::GuestDisplacedActive_nid_no_patch(), "displaced: the window is not active");
+    auto* guestFrame = reinterpret_cast<AvPlayerFrameInfoEx*>(Base);
+    auto* guestSound = reinterpret_cast<AvPlayerFrameInfo*>(Base + 0x400);
+    auto* guestStream = reinterpret_cast<AvPlayerStreamInfo*>(Base + 0x800);
+    {
+        std::lock_guard lock(allocations.mutex);
+        allocations.displacedNext = Base + 0x10000;
+        allocations.displacedEnd = Base + Bytes;
+    }
+    const auto before = DisplacedFaults();
+    Events events;
+    AvPlayerInitData init = InitData(&events);
+    auto* player = sceAvPlayerInit(&init);
+    Check(player != nullptr, "displaced: init failed");
+    Check(sceAvPlayerAddSource(player, "/app0/avplayer.mp4") == 0, "displaced: add source failed");
+    Check(WaitFor([&] { return events.Seen(EventReady); }), "displaced: ready event missing");
+    Check(sceAvPlayerGetStreamInfo(player, VideoStream, guestStream) == 0 && GuestArena::HostPointer(guestStream)->type == 1, "displaced: stream info");
+    Check(sceAvPlayerEnableStream(player, VideoStream) == 0 && sceAvPlayerEnableStream(player, EnglishAudioStream) == 0, "displaced: enable streams");
+    Check(sceAvPlayerStart(player) == 0, "displaced: start failed");
+    int frames = 0, sounds = 0;
+    Check(WaitFor([&] {
+        if (sceAvPlayerGetAudioData(player, guestSound)) {
+            AvPlayerFrameInfo sound = *GuestArena::HostPointer(guestSound);
+            Check(reinterpret_cast<std::uintptr_t>(sound.p_data) >= Base && reinterpret_cast<std::uintptr_t>(sound.p_data) < Base + Bytes, "displaced: audio chunk outside the displaced allocator");
+            sound.p_data = GuestArena::HostPointer(sound.p_data);
+            CheckEnglishAudio(sound);
+            ++sounds;
+        }
+        if (sceAvPlayerGetVideoDataEx(player, guestFrame)) {
+            AvPlayerFrameInfoEx frame = *GuestArena::HostPointer(guestFrame);
+            Check(reinterpret_cast<std::uintptr_t>(frame.p_data) >= Base && reinterpret_cast<std::uintptr_t>(frame.p_data) < Base + Bytes, "displaced: video frame outside the displaced allocator");
+            frame.p_data = GuestArena::HostPointer(frame.p_data);
+            CheckVideoPicture(frame);
+            ++frames;
+        }
+        return frames >= 4 && sounds >= 4;
+    }), "displaced: playback stalled");
+    Check(sceAvPlayerStop(player) == 0, "displaced: stop failed");
+    Check(sceAvPlayerClose(player) == 0, "displaced: close failed");
+    const auto faults = DisplacedFaults() - before;
+    std::printf("displaced buffers: %d frames, %d audio chunks, %llu faults\n", frames, sounds, static_cast<unsigned long long>(faults));
+    Check(faults == 0, "displaced: playback faulted on displaced guest memory");
+    std::lock_guard lock(allocations.mutex);
+    allocations.displacedNext = allocations.displacedEnd = 0;
+}
+#endif
+
 int main() {
     try {
         WriteMovie();
@@ -1170,6 +1259,9 @@ int main() {
         TestAutoStartKeepsStartedPlayback();
         TestUnsyncedVideoKeepsUpWithAudio();
         TestEofStopLatency();
+#if defined(__APPLE__) && defined(__aarch64__)
+        TestDisplacedBuffers();
+#endif
         std::puts("AvPlayer tests passed");
         return 0;
     } catch (const std::exception& error) {
