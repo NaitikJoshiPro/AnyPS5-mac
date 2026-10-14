@@ -87,6 +87,7 @@ clearerr	stdio	none	no guest buffer: character or FILE argument only, I/O throug
 clock	userspace	none	
 clock_getres	buffer	shim	timespec out
 clock_gettime	buffer	shim	timespec out
+clock_gettime_nsec_np	scalar	none	clock id in, nanoseconds returned: no pointer
 close	scalar	none	kernel call without a pointer argument
 closedir	userspace	none	
 connect	buffer	shim	socket address in-struct

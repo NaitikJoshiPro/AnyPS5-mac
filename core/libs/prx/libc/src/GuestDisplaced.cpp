@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
+#include <time.h>
 #include <unistd.h>
 
 extern "C" int __shared_region_check_np(std::uint64_t* startAddress); // libsystem_kernel; the shared cache's address
@@ -113,6 +114,19 @@ struct sigaction g_previousBus {}, g_previousSegv {};
 std::once_flag g_once;
 bool g_trace = false;
 std::uint64_t g_stackEvery = 0; // APS5_DISPLACED_STACKS=N: a frame-pointer backtrace of every Nth fault (32 at most)
+std::uint64_t g_enabledAt = 0;  // CLOCK_MONOTONIC_RAW ns when the handler was installed
+
+// Fault-rate milestones, always on: a line at 1024 faults and every power of two after it, then every 2^22. Native
+// code that reads displaced memory without a host view shows up in any title log as a fast-growing count (each fault
+// is two signals, ~2-4 us). clock_gettime_nsec_np and snprintf+write are safe here (no locks, no allocation).
+void ReportMilestone(std::uint64_t count) {
+    if (count < 1024 || ((count & (count - 1)) != 0 && (count & ((1ull << 22) - 1)) != 0)) return;
+    const auto seconds = static_cast<double>(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_enabledAt) / 1e9;
+    char line[160];
+    const int length = std::snprintf(line, sizeof(line), "[displaced] %llu faults %.1f s after enable (%llu sites patched)\n", static_cast<unsigned long long>(count), seconds,
+        static_cast<unsigned long long>(g_patches.load(std::memory_order_relaxed)));
+    if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
+}
 
 struct SpinLock {
     SpinLock() {
@@ -429,6 +443,7 @@ bool Redirect(siginfo_t* info, void* context) {
         far = site->far;
     }
     const auto fault = g_faults.fetch_add(1, std::memory_order_relaxed);
+    ReportMilestone(fault + 1);
     if (g_trace && fault < 64) {
         char line[160];
         const int length = std::snprintf(line, sizeof(line), "[displaced] fault %llu pc 0x%llx insn 0x%08x addr 0x%llx\n", static_cast<unsigned long long>(fault),
@@ -625,6 +640,7 @@ mach_vm_address_t SharedRegionTail(mach_vm_address_t limit) {
 
 bool Enable() {
     g_trace = std::getenv("APS5_DISPLACED_TRACE") != nullptr;
+    g_enabledAt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (const char* every = std::getenv("APS5_DISPLACED_STACKS")) g_stackEvery = std::strtoull(every, nullptr, 0);
     // Only needed where the ranges really are host guards: probe them. The carveout is the anchor; the commpage guard
     // and the shared region's tail join only when each is contiguous with the next range up.
