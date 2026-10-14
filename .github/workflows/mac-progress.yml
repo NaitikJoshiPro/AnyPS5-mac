@@ -1,0 +1,38 @@
+name: Mac progress
+
+# Progress badges and page of the native Apple Silicon port, published to GitHub Pages of the standalone
+# repository. Libraries, shaders, milestones and titles are computed here; the Metal GPU test number comes
+# from docs/mac/gpu-status.json, refreshed on the Mac (tools/mac/mac_progress.py gpu-snapshot).
+
+on:
+  push:
+    branches: [mac-native]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  pages:
+    if: github.repository == 'NaitikJoshiPro/AnyPS5-mac'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: python3 tools/mac/test_mac_progress.py
+      - run: python3 tools/mac/mac_progress.py site "$RUNNER_TEMP/site"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/site
+      - id: deployment
+        uses: actions/deploy-pages@v5
