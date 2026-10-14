@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "prx/libSceNgs2.native/include/Ngs2Types.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 static constexpr std::uint32_t NGS2_MAX_CHANNELS = 8;
 static constexpr std::uint32_t MIN_GRAIN_SAMPLES = 64;
@@ -177,6 +178,18 @@ template <typename TParam>
 const TParam& ParamAs(const Ngs2VoiceParamHeader& param) {
     if (param.size < sizeof(TParam)) throw std::invalid_argument("NGS2: voice param " + Ngs2Hex(param.id) + " is too small");
     return reinterpret_cast<const TParam&>(param);
+}
+
+// System and rack objects live in the guest's context buffer, reached through its host view (D31, D33: a buffer in
+// displaced memory would fault on every member access); the guest knows them by their guest address.
+inline Ngs2Handle Ngs2GuestHandle(const void* object) {
+    return GuestArena::GuestAddress(reinterpret_cast<std::uintptr_t>(object));
+}
+
+// Guest memory NGS2 reads or writes natively (waveforms, render buffers, parameter structs): its host view.
+template <typename T>
+T* Ngs2Host(T* guest, std::size_t bytes) {
+    return guest == nullptr ? nullptr : GuestArena::HostRange(guest, bytes);
 }
 
 Ngs2Rack* Ngs2FindRack(Ngs2Handle handle);
