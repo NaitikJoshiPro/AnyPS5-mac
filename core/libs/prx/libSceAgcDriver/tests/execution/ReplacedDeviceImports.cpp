@@ -1,5 +1,6 @@
 // A device that replaces another (Driver::AttachWindow keeps the windowless device alive and makes a
-// windowed one) writes through host imports the first device made. On Metal both devices share the
+// windowed one) writes through host imports the first device made, and through new imports that
+// join the residency set the first device's queue carries. On Metal both devices share the
 // MTLDevice, so the imports and their residency set outlive the first device's work; with a command
 // queue per device the second device's command buffers ran without that set, and every GPU store
 // through such an import was lost (PPSA99005's completion markers never reached the CPU). Upstream's
@@ -110,6 +111,12 @@ int main() {
         Expect(guest, 0, 0x22222222u, "the second device's fill over the first device's import");
         Require(Fill(*second, guest, BlockBytes * 2, 0x33333333u), "replaced device imports: the second device's fill of the other blocks");
         Expect(guest, BlockBytes * 2, 0x33333333u, "the second device's fill of blocks the first device never wrote");
+        // Memory the guest maps after the replacement: its import joins the residency set made for the
+        // first device, whose queue commits nothing more (a set's new allocations only take effect for
+        // a queue that commits after they were added).
+        GuestAllocation later;
+        Require(Fill(*second, later, 0, 0x66666666u), "replaced device imports: the second device did not fill memory mapped after it opened");
+        Expect(later, 0, 0x66666666u, "the second device's fill of memory mapped after the replacement");
         // The first device's stores still land too.
         Require(Fill(*first, guest, BlockBytes, 0x44444444u), "replaced device imports: the first device's later fill");
         Expect(guest, BlockBytes, 0x44444444u, "the first device's fill after the second device's");
