@@ -1,6 +1,7 @@
 #include "Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 
@@ -434,6 +435,10 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
     if (num < 1 || out == nullptr) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
+    // The event array and the out/timeout words may be displaced guest memory (D31, D33): written through host views.
+    ev = GuestArena::HostRange(ev, static_cast<std::size_t>(num) * sizeof(KernelEvent));
+    out = GuestArena::HostPointer(out);
+    if (timo != nullptr) timo = GuestArena::HostPointer(timo);
     const auto waitStart = std::chrono::steady_clock::now();
     if (timo == nullptr) {
         *out = owner->WaitForEvents(ev, num, 0);

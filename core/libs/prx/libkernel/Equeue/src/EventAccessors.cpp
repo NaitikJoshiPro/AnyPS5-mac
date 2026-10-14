@@ -4,13 +4,14 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 
 static const KernelEvent& requireEvent(const KernelEvent* ev, const char* caller) {
     if (ev == nullptr) {
         throw std::runtime_error(std::string(caller) + ": null event");
     }
-    return *ev;
+    return *GuestArena::HostPointer(ev); // events may sit in displaced guest memory (D31, D33)
 }
 
 extern "C" {
