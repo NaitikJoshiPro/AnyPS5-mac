@@ -94,6 +94,9 @@ if(BUILD_TESTING)
         add_test(NAME fex_code_churn COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --only code-churn)
         set_tests_properties(fex_code_churn PROPERTIES TIMEOUT 300 ENVIRONMENT APS5_FEX_CLEAR_CODE=1)
+        add_test(NAME fex_displaced_churn COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_fixtures.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs --only displaced-churn)
+        set_tests_properties(fex_displaced_churn PROPERTIES TIMEOUT 300 ENVIRONMENT APS5_FEX_CLEAR_CODE=1)
         add_test(NAME fex_disk_cache COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fex_cache.py
             $<TARGET_FILE:relinker> $<TARGET_FILE:aps5-fex> ${CMAKE_BINARY_DIR}/core/libs/libs)
         set_tests_properties(fex_disk_cache PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)

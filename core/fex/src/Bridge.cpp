@@ -518,6 +518,9 @@ void Bridge::Connect() {
     if (void* setWriter = HostSymbol("GuestDisplacedSetCodeWriter_nid_no_patch"))
         reinterpret_cast<void (*)(bool (*)(std::uintptr_t, std::uint32_t), std::uintptr_t (*)(std::uintptr_t, std::size_t, std::uintptr_t*))>(setWriter)(
             &CodePool::WriteInstruction, &CodePool::AllocateBeside);
+    // ... and forgotten, with their stubs, when FEX frees the code buffer that holds them.
+    if (void* codeFreed = HostSymbol("GuestDisplacedCodeFreed_nid_no_patch"))
+        CodePool::SetFreeListener(reinterpret_cast<CodePool::FreeListener>(codeFreed));
     if (void* setMachine = HostSymbol("Aps5SetBridgeMachineState_nid_no_patch")) {
         std::uint64_t entry = 0;
         if (void* finish = HostSymbol("Aps5MakecontextFinish_nid_no_patch")) {

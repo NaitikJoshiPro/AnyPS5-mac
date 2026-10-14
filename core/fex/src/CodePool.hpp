@@ -39,6 +39,10 @@ public:
     // Allocates the free range nearest pc (pc in this pool) if it ends within reach bytes of pc; nullptr otherwise.
     void* AllocateNear(std::uintptr_t pc, std::size_t length, std::size_t reach);
     static constexpr std::size_t NearReach = std::size_t{120} << 20; // inside an A64 branch's +-128 MiB
+    // Called with [start, end) of every range Free returns, before the range can be handed out again (libc's
+    // GuestDisplacedCodeFreed: the displaced-access sites patched in that code and their stubs are released).
+    using FreeListener = std::size_t (*)(std::uintptr_t start, std::uintptr_t end);
+    static void SetFreeListener(FreeListener listener);
     std::uint8_t* Code() const { return code; }
     std::int64_t WriteOffset() const { return writeOffset; }
     std::size_t Size() const { return size; }

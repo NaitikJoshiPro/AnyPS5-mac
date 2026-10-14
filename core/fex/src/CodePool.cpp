@@ -21,7 +21,12 @@ std::size_t RoundUp(std::size_t value) {
 // Live pools, read from fault handlers (no locks).
 constexpr std::size_t MaxPools = 8;
 std::atomic<CodePool*> pools[MaxPools];
+std::atomic<CodePool::FreeListener> freeListener{nullptr};
 
+}
+
+void CodePool::SetFreeListener(FreeListener listener) {
+    freeListener.store(listener, std::memory_order_release);
 }
 
 CodePool::CodePool(std::size_t size) : size(RoundUp(size)) {
@@ -115,6 +120,10 @@ bool CodePool::Free(void* address, std::size_t length) {
     const std::size_t aligned = RoundUp(length);
     if (offset % Granule != 0 || aligned == 0 || offset + aligned > size)
         throw std::runtime_error("JIT pool: bad free of " + std::to_string(length) + " bytes at offset " + std::to_string(offset));
+    // Before the pool lock: the listener takes libc's displaced-site lock, which a fault handler holds while it
+    // allocates stub memory from this pool (AllocateBeside), so the order is always site lock -> pool lock.
+    if (const auto listener = freeListener.load(std::memory_order_acquire))
+        listener(reinterpret_cast<std::uintptr_t>(byte), reinterpret_cast<std::uintptr_t>(byte) + aligned);
     std::lock_guard lock(mutex);
     auto next = free.lower_bound(offset);
     if (next != free.end() && next->first < offset + aligned) throw std::runtime_error("JIT pool: range freed twice");

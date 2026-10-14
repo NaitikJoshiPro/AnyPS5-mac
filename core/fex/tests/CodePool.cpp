@@ -172,6 +172,33 @@ void Nearest() {
     Require(pool.FreeRanges() == 1 && pool.Used() == 0);
 }
 
+// Displaced-access sites (libc GuestDisplaced) are released with the code that holds them: Free reports every range
+// to the listener, with the rounded length, before the range can be allocated again.
+std::uintptr_t listenedStart = 0, listenedEnd = 0;
+std::size_t listened = 0;
+std::size_t Listener(std::uintptr_t start, std::uintptr_t end) {
+    listenedStart = start;
+    listenedEnd = end;
+    ++listened;
+    return 0;
+}
+
+void FreeListener() {
+    CodePool pool(16 * CodePool::Granule);
+    CodePool::SetFreeListener(&Listener);
+    void* buffer = pool.Allocate(3 * CodePool::Granule - 100);
+    Require(listened == 0);
+    Require(pool.Free(buffer, 3 * CodePool::Granule - 100));
+    Require(listened == 1 && listenedStart == reinterpret_cast<std::uintptr_t>(buffer) &&
+            listenedEnd == reinterpret_cast<std::uintptr_t>(buffer) + 3 * CodePool::Granule);
+    int outside = 0;
+    Require(!pool.Free(&outside, 4)); // not pool memory: not reported
+    Require(listened == 1);
+    CodePool::SetFreeListener(nullptr);
+    void* again = pool.Allocate(CodePool::Granule);
+    Require(pool.Free(again, CodePool::Granule) && listened == 1);
+}
+
 int main() {
     Granularity();
     DualMapping();
@@ -182,6 +209,7 @@ int main() {
     Threads();
     DontNeedZeroes();
     Nearest();
+    FreeListener();
     std::puts("code pool: all checks passed");
     return 0;
 }

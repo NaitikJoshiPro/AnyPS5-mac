@@ -5,6 +5,7 @@ in fex_toolchain.py are there, and run them with aps5-fex.
 
 Each program reports its result through its exit status and standard output."""
 import os
+import re
 import pathlib
 import subprocess
 import sys
@@ -67,8 +68,18 @@ def sampled_spin(directory):
     return None
 
 
-CHECKS = {"opening": created_with_mode, "pc-sample": sampled_spin}
-ENVIRONMENT = {"pc-sample": {"APS5_FEX_SAMPLE": "1", "APS5_FEX_SAMPLE_REPORT": "60"}}
+def sites_forgotten(directory):
+    """With APS5_FEX_CLEAR_CODE=1 the freed code buffers must release their displaced-access sites."""
+    text = (directory / "stderr.txt").read_text(errors="replace")
+    forgotten = [int(m) for m in re.findall(r"\[displaced\] code freed .*?: (\d+) sites forgotten", text)]
+    if os.environ.get("APS5_FEX_CLEAR_CODE") == "1" and not any(forgotten):
+        return "no freed code buffer released displaced-access sites (expected '[displaced] code freed ...: N sites forgotten')"
+    return None
+
+
+CHECKS = {"opening": created_with_mode, "pc-sample": sampled_spin, "displaced-churn": sites_forgotten}
+ENVIRONMENT = {"pc-sample": {"APS5_FEX_SAMPLE": "1", "APS5_FEX_SAMPLE_REPORT": "60"},
+               "displaced-churn": {"APS5_DISPLACED_TRACE": "1"}}
 
 
 def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
@@ -207,6 +218,9 @@ COMPILED = {
     "console-syscall": (lambda d: compiled_executable(d, [str(HERE / "console_syscall.cpp")], {"libc.prx": ["exit"]}), 43),
     "displaced": (lambda d: compiled_executable(d, [str(HERE / "displaced.cpp")], {"libc.prx": ["exit", "memset", "memcpy"],
                   "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "sceKernelMunmap"]}, ["-O2"]), 43),
+    "displaced-churn": (lambda d: compiled_executable(d, [str(HERE / "displaced_churn.cpp")], {"libc.prx": ["exit"],
+                        "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "scePthreadCreate",
+                        "scePthreadJoin"]}, ["-O2"]), 43),
     "displaced-unaligned": (lambda d: compiled_executable(d, [str(HERE / "displaced_unaligned.cpp")], {"libc.prx": ["exit"],
                             "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "scePthreadCreate",
                             "scePthreadJoin"]}, ["-O2"]), 43),
