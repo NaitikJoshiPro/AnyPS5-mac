@@ -60,6 +60,23 @@ std::string vteMessage(std::uint32_t viewportControl) {
     return message.str();
 }
 
+// PA_SU_VTX_CNTL: PIX_CENTER (bit 0, 1 = pixel centers at +0.5), ROUND_MODE (bits 1-2, 2 = round to
+// even), QUANT_MODE (bits 3-5: 5 = 16.8 fixed point 1/256, 6 = 14.10 1/1024, 7 = 12.12 1/4096). radeonsi
+// picks the quantization by viewport size (si_state_viewport.c: 1/4096 or 1/1024 for small viewports,
+// 1/256 otherwise). The host rasterizer snaps with its own fixed sub-pixel precision whatever the guest
+// asks, so the finer modes are accepted as 1/256 is (D45); D3D pixel centers, other rounding and the
+// coarser modes are refused.
+bool StandardVertexControl(std::uint32_t control) {
+    const auto quantization = (control >> 3u) & 7u;
+    return (control & ~0x3fu) == 0 && (control & 7u) == 5u && quantization >= 5u;
+}
+
+std::string vertexControlMessage(std::uint32_t control) {
+    std::ostringstream message;
+    message << "AGC graphics: nonstandard pixel center or vertex quantization is unsupported (PA_SU_VTX_CNTL=0x" << std::hex << control << "; supported: OpenGL pixel centers, round to even, 1/256 or finer sub-pixel quantization: 0x2d, 0x35, 0x3d)";
+    return message.str();
+}
+
 std::string conservativeMessage(std::uint32_t control) {
     std::ostringstream message;
     message << "AGC graphics: PA_SC_CONSERVATIVE_RASTERIZATION_CNTL=0x" << std::hex << control << ": only off (over- and underestimation disabled, with at most the inner-to-normal overrides, NULL_SQUAD_AA_MASK_ENABLE and the uncertainty-region mode and edge rules set) and 0x6001 (overestimation) are supported";
@@ -779,7 +796,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
     zero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits");
     Require(read(cx, 0x83) == 0xffffu, "clip rectangles are unsupported");
     Require((read(cx, 0x8c) & 0xfu) == 0xau, "nonstandard triangle edge rules are unsupported");
-    Require(read(cx, 0x2f9) == 0x2du, "nonstandard pixel center or vertex quantization is unsupported");
+    if (const auto vertexControl = read(cx, 0x2f9); !StandardVertexControl(vertexControl)) throw std::runtime_error(vertexControlMessage(vertexControl));
     Require(read(cx, 0x30e) == 0xffffffffu && read(cx, 0x30f) == 0xffffffffu, "sample masks are unsupported");
     const auto viewportControl = read(cx, 0x206);
     if (viewportControl != HomogeneousViewportControl && viewportControl != WindowSpaceViewportControl) throw std::runtime_error(vteMessage(viewportControl));
@@ -1330,7 +1347,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (auto reason = nonzero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits"); !reason.empty()) return reason;
     if (value(cx, 0x83, word) && word != 0xffffu) return require(false, "clip rectangles are unsupported");
     if (value(cx, 0x8c, word) && (word & 0xfu) != 0xau) return require(false, "nonstandard triangle edge rules are unsupported");
-    if (value(cx, 0x2f9, word) && word != 0x2du) return require(false, "nonstandard pixel center or vertex quantization is unsupported");
+    if (value(cx, 0x2f9, word) && !StandardVertexControl(word)) return vertexControlMessage(word);
     if (value(cx, 0x313, word) && (word & ~0x001f6000u) != 0 && word != 0x6001u) return conservativeMessage(word);
     std::uint32_t other = 0;
     if (value(cx, 0x30e, word) && value(cx, 0x30f, other) && (word != 0xffffffffu || other != 0xffffffffu)) return require(false, "sample masks are unsupported");

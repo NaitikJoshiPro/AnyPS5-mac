@@ -2537,6 +2537,19 @@ void InitialContextTests() {
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
     }
     queue.context[0x206] = 0x43f;
+    // PA_SU_VTX_CNTL (D45): radeonsi's finer sub-pixel quantization for small viewports (1/1024, 1/4096)
+    // is accepted beside 1/256; D3D pixel centers, other rounding modes and coarser quantization are not.
+    for (const std::uint32_t control : {0x35u, 0x3du}) {
+        queue.context[0x2f9] = control;
+        static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_SU_VTX_CNTL") == std::string::npos, "the draw pre-check refused a finer vertex quantization");
+    }
+    for (const std::uint32_t control : {0x2cu, 0x29u, 0x2bu, 0x25u, 0x05u, 0x6du}) {
+        queue.context[0x2f9] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_SU_VTX_CNTL=0x");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_SU_VTX_CNTL=0x") != std::string::npos, "the draw pre-check accepted an unsupported PA_SU_VTX_CNTL");
+    }
+    queue.context[0x2f9] = 0x2d;
     queue.context[0x2dc] |= 1;
     Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "undithered alpha-to-coverage was not decoded");
     queue.context.erase(0x2dc);
