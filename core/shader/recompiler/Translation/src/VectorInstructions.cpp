@@ -105,6 +105,65 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     return denormals == 0u ? flush : 0u;
 }
 
+TranslationContext::NativeF32Flush TranslationContext::nativeF32FlushFor(const RdnaInstruction& inst) {
+    if (!nativeF32Flush) return NativeF32Flush::None;
+    const std::uint32_t mode = floatMode.has_value() ? floatMode->floatMode : 0u;
+    // f32 flush (FP_DENORM_32 == 0) and round to nearest even (FP_ROUND_32 == 0) only: the directed
+    // rounding modes keep their emulation.
+    if (((mode >> 4u) & 3u) != 0u || (mode & 3u) != 0u) return NativeF32Flush::None;
+    switch (inst.op) {
+    case RdnaOpcode::VAddF32:
+    case RdnaOpcode::VSubF32:
+    case RdnaOpcode::VSubrevF32:
+    case RdnaOpcode::VFractF32:
+    case RdnaOpcode::VFloorF32:
+    case RdnaOpcode::VCeilF32:
+        return NativeF32Flush::Arithmetic;
+    case RdnaOpcode::VMulF32:
+        return NativeF32Flush::Product;
+    case RdnaOpcode::VMacF32:
+    case RdnaOpcode::VMadmkF32:
+    case RdnaOpcode::VMadakF32:
+    case RdnaOpcode::VFmaF32: {
+        // Fused forms with f32 sources only (the product rounded separately, VOP3P and f16 halves
+        // keep the emulation).
+        if (roundsProductSeparately(inst) || inst.family == RdnaInstructionFamily::VOP3P) return NativeF32Flush::None;
+        const std::uint32_t sources = inst.op == RdnaOpcode::VMacF32 ? 2u : 3u;
+        for (std::uint32_t index = 0; index < sources; ++index) {
+            if (sourceAt(inst, index).opSelHi) return NativeF32Flush::None;
+        }
+        return NativeF32Flush::Product;
+    }
+    case RdnaOpcode::VCmpEqF32:
+    case RdnaOpcode::VCmpGeF32:
+    case RdnaOpcode::VCmpGtF32:
+    case RdnaOpcode::VCmpLeF32:
+    case RdnaOpcode::VCmpLgF32:
+    case RdnaOpcode::VCmpLtF32:
+    case RdnaOpcode::VCmpNeqF32:
+    case RdnaOpcode::VCmpNgeF32:
+    case RdnaOpcode::VCmpNgtF32:
+    case RdnaOpcode::VCmpNleF32:
+    case RdnaOpcode::VCmpNlgF32:
+    case RdnaOpcode::VCmpNltF32:
+    case RdnaOpcode::VCmpxEqF32:
+    case RdnaOpcode::VCmpxGeF32:
+    case RdnaOpcode::VCmpxGtF32:
+    case RdnaOpcode::VCmpxLeF32:
+    case RdnaOpcode::VCmpxLgF32:
+    case RdnaOpcode::VCmpxLtF32:
+    case RdnaOpcode::VCmpxNeqF32:
+    case RdnaOpcode::VCmpxNgeF32:
+    case RdnaOpcode::VCmpxNgtF32:
+    case RdnaOpcode::VCmpxNleF32:
+    case RdnaOpcode::VCmpxNlgF32:
+    case RdnaOpcode::VCmpxNltF32:
+        return NativeF32Flush::Compare;
+    default:
+        return NativeF32Flush::None;
+    }
+}
+
 bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     switch (inst.op) {
     case RdnaOpcode::VNop:

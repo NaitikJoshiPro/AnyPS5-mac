@@ -905,6 +905,15 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // the equivalent of Vulkan's maintenance8 + shaderImageGatherExtended. Metal is reported to clamp offsets to
     // [-8, 7] where RDNA2 takes 6-bit fields ([-32, 31]); TechnicalDebt metal-texel-offset-range.
     target.nonConstantImageOffsets = true;
+    // DECISIONS D54: Apple GPUs flush f32 denormal operands and results of add, subtract, multiply
+    // and compares to signed zeros, as RDNA's FLOAT_MODE f32 flush does (agc_metal_native_f32_flush
+    // compares both translations bit for bit), so the front end drops its explicit flushes there.
+    // APS5_MSL_NATIVE_F32_FLUSH=0 keeps them (debug aid).
+    static const bool nativeF32Flush = [] {
+        const char* value = std::getenv("APS5_MSL_NATIVE_F32_FLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    target.float32DenormFlushNative = nativeF32Flush;
     return target;
 }
 

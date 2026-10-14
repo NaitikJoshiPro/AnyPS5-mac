@@ -14,6 +14,14 @@
 namespace ShaderRecompiler {
 
 class IrBlock;
+// FPMul32 / FPFma32 flag (Flags<std::uint32_t>): the product of a v_mul_f32, or the fused
+// multiply-add of a v_fma/v_fmac/v_fmamk/v_fmaak_f32, in FLOAT_MODE f32 flush on a target with
+// SpirvTarget::float32DenormFlushNative. The front end emitted no operand or result flush and no
+// tiny-product check, so the backend computes RDNA's result itself: the device flushes denormal
+// operands and results, and a result whose exact value rounds to +-2^-126 (RDNA detects tininess
+// after rounding) is kept.
+inline constexpr std::uint32_t FPMulNativeFlushFlag = 1u;
+
 class IrValue;
 
 struct IrUse {
@@ -46,6 +54,8 @@ public:
     void SetImmediateU32(std::uint32_t value);
     void SetParent(IrBlock* parent);
 
+    // Opcode-specific flags (Flags<T>): MemoryFlags, ExportFlags, InterpolationLocationFlags, and on
+    // FPMul32 FPMulNativeFlushFlag.
     template<typename TValue> requires(sizeof(TValue) <= sizeof(std::uint64_t) && std::is_trivially_copyable_v<TValue>)
     [[nodiscard]] TValue Flags() const {
         TValue result{};

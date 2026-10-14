@@ -218,6 +218,38 @@ static inline float aps5_fma(float a, float b, float c) {
     return r == 0.0f ? aps5_f32_fma_exact(a, b, c) : r;
 }
 
+// v_mul_f32 in FLOAT_MODE f32 flush, round to nearest even (FPMulNativeFlushFlag, DECISIONS D54):
+// the GPU flushes denormal operands and results itself and detects tininess before rounding, RDNA
+// after rounding, so of the products the GPU flushes (|exact| < 2^-126) RDNA keeps those whose
+// exact value rounds to +-2^-126 at an unbounded exponent. Here |a| < 1 (both operands are normal:
+// |a * b| < 2^-126 with |b| >= 2^-126), so a * 2^64 is exact and the scaled product rounds as RDNA.
+static inline float aps5_fmul_ftz(float a, float b) {
+    const float r = a * b;
+    if (r != 0.0f) return r;
+    const uint scaled = as_type<uint>((a * as_type<float>(0x5f800000u)) * b);
+    return (scaled & 0x7fffffffu) == 0x20800000u ? as_type<float>((scaled & 0x80000000u) | 0x00800000u) : r;
+}
+
+// The fused multiply-add of aps5_fmul_ftz (FPMulNativeFlushFlag on FPFma32): the GPU flushes
+// operands and results itself; a zero result is recomputed as the front end's emulation does
+// (TranslationContext::flushTinyProduct and the result flush around aps5_fma): with a zero addend a
+// product tiny after rounding at an unbounded exponent is a signed zero, otherwise the exact result
+// rounded at the denormal precision is kept when it is normal (+-2^-126) and flushed when it is not.
+static inline float aps5_fma_ftz(float a, float b, float c) {
+    const float r = fma(a, b, c);
+    if (r != 0.0f) return r;
+    const uint ua = as_type<uint>(a);
+    const uint ub = as_type<uint>(b);
+    const uint uc = as_type<uint>(c);
+    const float fa = (ua & 0x7f800000u) == 0u ? as_type<float>(ua & 0x80000000u) : a;
+    const float fb = (ub & 0x7f800000u) == 0u ? as_type<float>(ub & 0x80000000u) : b;
+    const float fc = (uc & 0x7f800000u) == 0u ? as_type<float>(uc & 0x80000000u) : c;
+    const uint scaled = as_type<uint>(aps5_fmul(aps5_fmul(fa, as_type<float>(0x5f800000u)), fb)) & 0x7fffffffu;
+    if ((as_type<uint>(fc) & 0x7fffffffu) == 0u && scaled - 1u < 0x207fffffu) return as_type<float>((as_type<uint>(fa) ^ as_type<uint>(fb)) & 0x80000000u);
+    const uint exact = as_type<uint>(aps5_f32_fma_exact(fa, fb, fc));
+    return as_type<float>((exact & 0x7f800000u) == 0u ? exact & 0x80000000u : exact);
+}
+
 // FLOAT_MODE keeps f32 denormals: exact unless every operand and the result are normal.
 static inline float aps5_fmul_keep(float a, float b) {
     const float r = a * b;
@@ -875,10 +907,12 @@ bool EmitMslAluInstruction(MslEmitterState& state, const IrValue& instruction) {
         else FloatBinary(state, instruction, "-");
         return true;
     case IrOpcode::FPMul32:
-        FloatCall(state, instruction, state.target.keepF32Denormals ? "aps5_fmul_keep" : "aps5_fmul");
+        if ((instruction.Flags<std::uint32_t>() & FPMulNativeFlushFlag) != 0u && !state.target.keepF32Denormals) FloatCall(state, instruction, "aps5_fmul_ftz");
+        else FloatCall(state, instruction, state.target.keepF32Denormals ? "aps5_fmul_keep" : "aps5_fmul");
         return true;
     case IrOpcode::FPFma32:
-        FloatCall(state, instruction, state.target.keepF32Denormals ? "aps5_fma_keep" : "aps5_fma");
+        if ((instruction.Flags<std::uint32_t>() & FPMulNativeFlushFlag) != 0u && !state.target.keepF32Denormals) FloatCall(state, instruction, "aps5_fma_ftz");
+        else FloatCall(state, instruction, state.target.keepF32Denormals ? "aps5_fma_keep" : "aps5_fma");
         return true;
     case IrOpcode::FPMad32: {
         const auto product = std::string(state.target.keepF32Denormals ? "aps5_fmul_keep(" : "aps5_fmul(") + state.Arg(instruction, 0u) + ", " + state.Arg(instruction, 1u) + ")";

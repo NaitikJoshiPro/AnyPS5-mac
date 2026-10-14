@@ -18,6 +18,7 @@ public:
     void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled, bool fallback = false) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; barycentricFallback = fallback; }
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) { floatMode = mode; ieeeMode = mode.has_value() && mode->ieeeMode; }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
+    void SetNativeF32Flush(bool enabled) { nativeF32Flush = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
 
@@ -345,6 +346,10 @@ private:
     bool emitScalar(const RdnaInstruction& inst);
     bool emitVector(const RdnaInstruction& inst);
     std::uint32_t f32DenormalFlushFor(const RdnaInstruction& inst) const;
+    // SpirvTarget::float32DenormFlushNative: how the current instruction relies on the device's own
+    // f32 flush (FLOAT_MODE f32 flush with round to nearest even only).
+    enum class NativeF32Flush : std::uint8_t { None, Arithmetic, Product, Compare };
+    NativeF32Flush nativeF32FlushFor(const RdnaInstruction& inst);
     bool emitInterpolation(const RdnaInstruction& inst);
     bool emitMemory(const RdnaInstruction& inst);
 
@@ -355,6 +360,8 @@ private:
     std::optional<ShaderFloatMode> floatMode;
     bool ieeeMode = false;
     bool nativeFloat16 = false;
+    bool nativeF32Flush = false;
+    NativeF32Flush nativeF32FlushOp = NativeF32Flush::None;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

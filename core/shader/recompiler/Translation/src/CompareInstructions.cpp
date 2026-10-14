@@ -140,8 +140,10 @@ void TranslationContext::emitFloatCompare(const RdnaInstruction& inst, IrOpcode 
             emitCompareResult(inst, floatCompareKeepingDenormals(opcode, IrU32(*lhsBits), IrU32(*rhsBits)), false, cmpx);
             return;
         }
-        lhs = &ir.BitCastF32(flushF32Denormal(IrU32(*lhsBits)).Value());
-        rhs = &ir.BitCastF32(flushF32Denormal(IrU32(*rhsBits)).Value());
+        // SpirvTarget::float32DenormFlushNative: the device's compare flushes denormal operands.
+        const bool native = nativeF32FlushOp == NativeF32Flush::Compare;
+        lhs = &ir.BitCastF32(native ? IrU32(*lhsBits).Value() : flushF32Denormal(IrU32(*lhsBits)).Value());
+        rhs = &ir.BitCastF32(native ? IrU32(*rhsBits).Value() : flushF32Denormal(IrU32(*rhsBits)).Value());
         emitCompareResult(inst, IrU1(ir.Emit(opcode, IrType::U1, {lhs, rhs})), false, cmpx);
         return;
     }
