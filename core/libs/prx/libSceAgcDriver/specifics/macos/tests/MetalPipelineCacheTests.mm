@@ -1,8 +1,12 @@
 // Work package D5: the Metal pipeline cache (src/MetalPipelineCache.h).
-//   agc_metal_pipeline_cache            two child processes share a fresh archive directory: the first
+//   agc_metal_pipeline_cache            child processes share a fresh archive directory: the first
 //                                       compiles every pipeline and saves the archive, the second
 //                                       must compile 0 pipelines (all archive hits) and compute the
-//                                       same results (MISSION §8, M2_DESIGN.md §7.6)
+//                                       same results (MISSION §8, M2_DESIGN.md §7.6); a third adds two
+//                                       pipelines with a save between them, and a fourth must find
+//                                       the old and the new ones in the archive (each save flushes the
+//                                       serializer, D46: the archive used to keep only the pipelines
+//                                       since the previous save)
 //   agc_metal_pipeline_cache_background background preparation, concurrent requests for one pipeline,
 //                                       failure reporting, key separation
 //   agc_metal_pipeline_cache_save_race  archive saves while other threads compile pipelines (the
@@ -70,14 +74,19 @@ int Parent(const char* self) {
     }
     std::string first;
     std::string second;
+    std::string extend;
+    std::string last;
     const int firstStatus = RunChild(self, "--child-first", directory, &first);
     const int secondStatus = firstStatus == 0 ? RunChild(self, "--child-second", directory, &second) : -1;
+    const int extendStatus = secondStatus == 0 ? RunChild(self, "--child-extend", directory, &extend) : -1;
+    const int finalStatus = extendStatus == 0 ? RunChild(self, "--child-final", directory, &last) : -1;
     std::error_code error;
     std::filesystem::remove_all(directory, error);
-    std::fputs(first.c_str(), stdout);
-    std::fputs(second.c_str(), stdout);
+    for (const auto* text : {&first, &second, &extend, &last}) std::fputs(text->c_str(), stdout);
     if (firstStatus != 0) return Fail("the first run failed (" + std::to_string(firstStatus) + ")");
     if (secondStatus != 0) return Fail("the second run failed (" + std::to_string(secondStatus) + ")");
+    if (extendStatus != 0) return Fail("the extending run failed (" + std::to_string(extendStatus) + ")");
+    if (finalStatus != 0) return Fail("the final run failed (" + std::to_string(finalStatus) + ")");
     // Both children print their results; they must agree.
     const auto results = [](const std::string& text) {
         const auto at = text.find("results ");
@@ -110,6 +119,31 @@ int Child(bool second, const std::filesystem::path& directory) {
     if (!statistics.archiveLoaded) return Fail("the second run did not load the archive");
     if (statistics.pipelinesCompiled != 0u) return Fail("the second run compiled " + std::to_string(statistics.pipelinesCompiled) + " pipelines, expected 0");
     if (statistics.archiveHits != WorkloadPipelines) return Fail("the second run had " + std::to_string(statistics.archiveHits) + " archive hits, expected " + std::to_string(WorkloadPipelines));
+    return 0;
+}
+
+// --child-extend: the workload from the archive plus two new pipelines, saved in between (the second
+// save must replay the workload's hits and the first new pipeline). --child-final: all from the archive.
+int Extend(bool final, const std::filesystem::path& directory) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    PipelineCacheStatistics statistics;
+    std::vector<std::uint32_t> results;
+    {
+        PipelineCache cache(device, directory);
+        if (const auto failure = BuildWorkload(device, cache, &results); !failure.empty()) return Fail(failure);
+        if (cache.Compute(ComputeFunction(7u)) == nil) return Fail("no pipeline for multiplier 7");
+        if (!final) cache.Save();
+        if (cache.Compute(ComputeFunction(9u)) == nil) return Fail("no pipeline for multiplier 9");
+        statistics = cache.Statistics();
+    }
+    std::printf("%s run: %llu pipelines compiled, %llu archive hits, %llu saves, %llu replays (%.1f ms)\n", final ? "final" : "extend", static_cast<unsigned long long>(statistics.pipelinesCompiled),
+        static_cast<unsigned long long>(statistics.archiveHits), static_cast<unsigned long long>(statistics.archiveSaves), static_cast<unsigned long long>(statistics.archiveReplays), statistics.replayMilliseconds);
+    if (!statistics.archiveLoaded) return Fail("the archive was not loaded");
+    if (!final) {
+        if (statistics.pipelinesCompiled != 2u || statistics.archiveHits != WorkloadPipelines) return Fail("the extending run compiled " + std::to_string(statistics.pipelinesCompiled) + " pipelines with " + std::to_string(statistics.archiveHits) + " hits, expected 2 and " + std::to_string(WorkloadPipelines));
+        return 0;
+    }
+    if (statistics.pipelinesCompiled != 0u || statistics.archiveHits != WorkloadPipelines + 2u) return Fail("the final run compiled " + std::to_string(statistics.pipelinesCompiled) + " pipelines with " + std::to_string(statistics.archiveHits) + " hits, expected 0 and " + std::to_string(WorkloadPipelines + 2u));
     return 0;
 }
 
@@ -234,6 +268,8 @@ int main(int argc, char** argv) {
         try {
             if (argc == 3 && std::strcmp(argv[1], "--child-first") == 0) return Child(false, argv[2]);
             if (argc == 3 && std::strcmp(argv[1], "--child-second") == 0) return Child(true, argv[2]);
+            if (argc == 3 && std::strcmp(argv[1], "--child-extend") == 0) return Extend(false, argv[2]);
+            if (argc == 3 && std::strcmp(argv[1], "--child-final") == 0) return Extend(true, argv[2]);
             if (argc == 2 && std::strcmp(argv[1], "--background") == 0) return Background();
             if (argc == 2 && std::strcmp(argv[1], "--save-race") == 0) return SaveRace();
             if (argc == 1) return Parent(argv[0]);

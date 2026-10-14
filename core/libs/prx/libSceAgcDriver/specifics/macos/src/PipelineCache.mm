@@ -182,6 +182,7 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
     // threads keep the performance cores), at utility QoS so they prefer the efficiency cores.
     const auto count = std::clamp<std::size_t>(device.maximumConcurrentCompilationTaskCount, 1u, 3u);
     for (std::size_t index = 0; index < count; ++index) workers.emplace_back([this] { worker(); });
+    if (serializer != nil && !archivePath.empty()) saverThread = std::thread([this] { saver(); });
 }
 
 PipelineCache::~PipelineCache() {
@@ -191,6 +192,12 @@ PipelineCache::~PipelineCache() {
     }
     queueWake.notify_all();
     for (auto& thread : workers) thread.join();
+    {
+        std::lock_guard lock(saverMutex);
+        saverStopping = true;
+    }
+    saverWake.notify_all();
+    if (saverThread.joinable()) saverThread.join();
     Save();
     if (Profile()) {
         const auto stats = Statistics();
@@ -300,146 +307,149 @@ std::shared_ptr<PipelineCache::Entry> PipelineCache::entryFor(const std::string&
     return entry;
 }
 
-id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& function) {
+id<MTLComputePipelineState> PipelineCache::obtainCompute(const std::function<MTL4ComputePipelineDescriptor*()>& describe, const char* what) {
     @autoreleasepool {
-        MTL4ComputePipelineDescriptor* descriptor = [MTL4ComputePipelineDescriptor new];
-        descriptor.computeFunctionDescriptor = functionDescriptor(function);
+        MTL4ComputePipelineDescriptor* descriptor = describe();
         NSError* error = nil;
         if (archive != nil) {
             id<MTLComputePipelineState> found = [archive newComputePipelineStateWithDescriptor:descriptor error:&error];
             if (found != nil) {
-                std::lock_guard lock(mutex);
-                ++statistics.archiveHits;
-                if (serializer != nil) {
-                    archiveRecaptures.push_back([this, function] {
-                        MTL4ComputePipelineDescriptor* again = [MTL4ComputePipelineDescriptor new];
-                        again.computeFunctionDescriptor = functionDescriptor(function);
-                        MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
-                        options.lookupArchives = @[archive];
-                        NSError* ignored = nil;
-                        std::shared_lock gate(serializerGate);
-                        (void)[compiler newComputePipelineStateWithDescriptor:again compilerTaskOptions:options error:&ignored];
-                    });
+                {
+                    std::lock_guard lock(mutex);
+                    ++statistics.archiveHits;
                 }
+                noteArchived([this, describe](NSArray<id<MTL4Archive>>* lookups) {
+                    MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
+                    options.lookupArchives = lookups;
+                    NSError* ignored = nil;
+                    (void)[compiler newComputePipelineStateWithDescriptor:describe() compilerTaskOptions:options error:&ignored];
+                }, false);
                 return found;
             }
             error = nil;
         }
         const auto start = std::chrono::steady_clock::now();
-        const SlowCompileReport report("a compute pipeline", 0u);
+        const SlowCompileReport report(what, 0u);
         std::shared_lock gate(serializerGate);
         id<MTLComputePipelineState> pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
         if (pipeline == nil) throw std::runtime_error("Metal device: compute pipeline creation failed: " + Describe(error));
         const auto elapsed = Milliseconds(start);
-        bool save = false;
         {
             std::lock_guard lock(mutex);
             ++statistics.pipelinesCompiled;
             statistics.compileMilliseconds += elapsed;
-            save = ++unsaved >= SaveInterval || statistics.pipelinesCompiled <= EagerSaves;
+            ++unsaved;
         }
-        if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled a compute pipeline in %.1f ms\n", elapsed);
-        if (save) submit([this] { Save(); });
+        // Still under the gate: the capture and this note are one step for Save's flush.
+        noteArchived([this, describe](NSArray<id<MTL4Archive>>* lookups) {
+            MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
+            options.lookupArchives = lookups;
+            NSError* ignored = nil;
+            (void)[compiler newComputePipelineStateWithDescriptor:describe() compilerTaskOptions:options error:&ignored];
+        }, true);
+        if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled %s in %.1f ms\n", what, elapsed);
+        requestSave();
         return pipeline;
     }
 }
 
-id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineRequest& request) {
-    if (request.mesh) return buildMeshRender(request);
+id<MTLRenderPipelineState> PipelineCache::obtainRender(const std::function<MTL4PipelineDescriptor*()>& describe, const char* what) {
     @autoreleasepool {
-        MTL4RenderPipelineDescriptor* descriptor = [MTL4RenderPipelineDescriptor new];
-        descriptor.vertexFunctionDescriptor = functionDescriptor(request.vertex);
-        if (request.fragment) descriptor.fragmentFunctionDescriptor = functionDescriptor(*request.fragment);
-        for (std::size_t index = 0; index < request.colors.size(); ++index) {
-            const auto& color = request.colors[index];
-            if (color.format == MTLPixelFormatInvalid) continue;
-            MTL4RenderPipelineColorAttachmentDescriptor* attachment = descriptor.colorAttachments[index];
-            attachment.pixelFormat = color.format;
-            attachment.writeMask = color.writeMask;
-            attachment.blendingState = color.blending ? MTL4BlendStateEnabled : MTL4BlendStateDisabled;
-            if (color.blending) {
-                attachment.sourceRGBBlendFactor = color.sourceRgb;
-                attachment.destinationRGBBlendFactor = color.destinationRgb;
-                attachment.rgbBlendOperation = color.rgbOperation;
-                attachment.sourceAlphaBlendFactor = color.sourceAlpha;
-                attachment.destinationAlphaBlendFactor = color.destinationAlpha;
-                attachment.alphaBlendOperation = color.alphaOperation;
-            }
-        }
-        if (request.depthFormat != MTLPixelFormatInvalid || request.stencilFormat != MTLPixelFormatInvalid) {
-            // Metal 4 render pipelines take the depth/stencil formats from the render pass at encode
-            // time; nothing to set beyond validating the pair here.
-            if (request.stencilFormat != MTLPixelFormatInvalid && request.depthFormat != MTLPixelFormatInvalid && request.stencilFormat != request.depthFormat) {
-                throw std::runtime_error("Metal pipeline cache (work package D5): separate depth and stencil formats are not supported");
-            }
-        }
-        descriptor.rasterSampleCount = request.rasterSampleCount;
-        descriptor.alphaToCoverageState = request.alphaToCoverage ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
-        descriptor.alphaToOneState = request.alphaToOne ? MTL4AlphaToOneStateEnabled : MTL4AlphaToOneStateDisabled;
-        descriptor.rasterizationEnabled = request.rasterization;
-        descriptor.inputPrimitiveTopology = request.topology;
+        MTL4PipelineDescriptor* descriptor = describe();
         NSError* error = nil;
         if (archive != nil) {
             id<MTLRenderPipelineState> found = [archive newRenderPipelineStateWithDescriptor:descriptor error:&error];
             if (found != nil) {
-                std::lock_guard lock(mutex);
-                ++statistics.archiveHits;
-                if (serializer != nil) {
-                    archiveRecaptures.push_back([this, request] {
-                        @autoreleasepool {
-                            MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
-                            options.lookupArchives = @[archive];
-                            MTL4RenderPipelineDescriptor* again = [MTL4RenderPipelineDescriptor new];
-                            again.vertexFunctionDescriptor = functionDescriptor(request.vertex);
-                            if (request.fragment) again.fragmentFunctionDescriptor = functionDescriptor(*request.fragment);
-                            for (std::size_t index = 0; index < request.colors.size(); ++index) {
-                                const auto& color = request.colors[index];
-                                if (color.format == MTLPixelFormatInvalid) continue;
-                                MTL4RenderPipelineColorAttachmentDescriptor* attachment = again.colorAttachments[index];
-                                attachment.pixelFormat = color.format;
-                                attachment.writeMask = color.writeMask;
-                                attachment.blendingState = color.blending ? MTL4BlendStateEnabled : MTL4BlendStateDisabled;
-                                if (color.blending) {
-                                    attachment.sourceRGBBlendFactor = color.sourceRgb;
-                                    attachment.destinationRGBBlendFactor = color.destinationRgb;
-                                    attachment.rgbBlendOperation = color.rgbOperation;
-                                    attachment.sourceAlphaBlendFactor = color.sourceAlpha;
-                                    attachment.destinationAlphaBlendFactor = color.destinationAlpha;
-                                    attachment.alphaBlendOperation = color.alphaOperation;
-                                }
-                            }
-                            again.rasterSampleCount = request.rasterSampleCount;
-                            again.alphaToCoverageState = request.alphaToCoverage ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
-                            again.alphaToOneState = request.alphaToOne ? MTL4AlphaToOneStateEnabled : MTL4AlphaToOneStateDisabled;
-                            again.rasterizationEnabled = request.rasterization;
-                            again.inputPrimitiveTopology = request.topology;
-                            NSError* ignored = nil;
-                            std::shared_lock gate(serializerGate);
-                            (void)[compiler newRenderPipelineStateWithDescriptor:again compilerTaskOptions:options error:&ignored];
-                        }
-                    });
+                {
+                    std::lock_guard lock(mutex);
+                    ++statistics.archiveHits;
                 }
+                noteArchived([this, describe](NSArray<id<MTL4Archive>>* lookups) {
+                    MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
+                    options.lookupArchives = lookups;
+                    NSError* ignored = nil;
+                    (void)[compiler newRenderPipelineStateWithDescriptor:describe() compilerTaskOptions:options error:&ignored];
+                }, false);
                 return found;
             }
             error = nil;
         }
         const auto start = std::chrono::steady_clock::now();
-        const SlowCompileReport report("a render pipeline", 0u);
+        const SlowCompileReport report(what, 0u);
         std::shared_lock gate(serializerGate);
         id<MTLRenderPipelineState> pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
-        if (pipeline == nil) throw std::runtime_error("Metal device: render pipeline creation failed: " + Describe(error));
+        if (pipeline == nil) throw std::runtime_error(std::string("Metal device: ") + what + " creation failed: " + Describe(error));
         const auto elapsed = Milliseconds(start);
-        bool save = false;
         {
             std::lock_guard lock(mutex);
             ++statistics.pipelinesCompiled;
             statistics.compileMilliseconds += elapsed;
-            save = ++unsaved >= SaveInterval || statistics.pipelinesCompiled <= EagerSaves;
+            ++unsaved;
         }
-        if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled a render pipeline in %.1f ms\n", elapsed);
-        if (save) submit([this] { Save(); });
+        noteArchived([this, describe](NSArray<id<MTL4Archive>>* lookups) {
+            MTL4CompilerTaskOptions* options = [MTL4CompilerTaskOptions new];
+            options.lookupArchives = lookups;
+            NSError* ignored = nil;
+            (void)[compiler newRenderPipelineStateWithDescriptor:describe() compilerTaskOptions:options error:&ignored];
+        }, true);
+        if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled %s in %.1f ms\n", what, elapsed);
+        requestSave();
         return pipeline;
     }
+}
+
+void PipelineCache::noteArchived(std::function<void(NSArray<id<MTL4Archive>>*)> replay, bool captured) {
+    if (serializer == nil) return;
+    std::lock_guard lock(mutex);
+    archived.push_back({std::move(replay), captured});
+}
+
+id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& function) {
+    return obtainCompute([this, function] {
+        MTL4ComputePipelineDescriptor* descriptor = [MTL4ComputePipelineDescriptor new];
+        descriptor.computeFunctionDescriptor = functionDescriptor(function);
+        return descriptor;
+    }, "a compute pipeline");
+}
+
+MTL4PipelineDescriptor* PipelineCache::renderDescriptor(const RenderPipelineRequest& request) {
+    MTL4RenderPipelineDescriptor* descriptor = [MTL4RenderPipelineDescriptor new];
+    descriptor.vertexFunctionDescriptor = functionDescriptor(request.vertex);
+    if (request.fragment) descriptor.fragmentFunctionDescriptor = functionDescriptor(*request.fragment);
+    for (std::size_t index = 0; index < request.colors.size(); ++index) {
+        const auto& color = request.colors[index];
+        if (color.format == MTLPixelFormatInvalid) continue;
+        MTL4RenderPipelineColorAttachmentDescriptor* attachment = descriptor.colorAttachments[index];
+        attachment.pixelFormat = color.format;
+        attachment.writeMask = color.writeMask;
+        attachment.blendingState = color.blending ? MTL4BlendStateEnabled : MTL4BlendStateDisabled;
+        if (color.blending) {
+            attachment.sourceRGBBlendFactor = color.sourceRgb;
+            attachment.destinationRGBBlendFactor = color.destinationRgb;
+            attachment.rgbBlendOperation = color.rgbOperation;
+            attachment.sourceAlphaBlendFactor = color.sourceAlpha;
+            attachment.destinationAlphaBlendFactor = color.destinationAlpha;
+            attachment.alphaBlendOperation = color.alphaOperation;
+        }
+    }
+    if (request.depthFormat != MTLPixelFormatInvalid || request.stencilFormat != MTLPixelFormatInvalid) {
+        // Metal 4 render pipelines take the depth/stencil formats from the render pass at encode
+        // time; nothing to set beyond validating the pair here.
+        if (request.stencilFormat != MTLPixelFormatInvalid && request.depthFormat != MTLPixelFormatInvalid && request.stencilFormat != request.depthFormat) {
+            throw std::runtime_error("Metal pipeline cache (work package D5): separate depth and stencil formats are not supported");
+        }
+    }
+    descriptor.rasterSampleCount = request.rasterSampleCount;
+    descriptor.alphaToCoverageState = request.alphaToCoverage ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
+    descriptor.alphaToOneState = request.alphaToOne ? MTL4AlphaToOneStateEnabled : MTL4AlphaToOneStateDisabled;
+    descriptor.rasterizationEnabled = request.rasterization;
+    descriptor.inputPrimitiveTopology = request.topology;
+    return descriptor;
+}
+
+id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineRequest& request) {
+    if (request.mesh) return buildMeshRender(request);
+    return obtainRender([this, request] { return renderDescriptor(request); }, "a render pipeline");
 }
 
 id<MTLComputePipelineState> PipelineCache::Compute(const ShaderRecompiler::RecompileResult& shader) {
@@ -666,61 +676,107 @@ void PipelineCache::Drain() {
     queueIdle.wait(lock, [&] { return queue.empty() && running == 0; });
 }
 
-void PipelineCache::recaptureHits() {
-    std::vector<std::function<void()>> recaptures;
+void PipelineCache::requestSave() {
+    if (serializer == nil || archivePath.empty()) return;
     {
-        std::lock_guard lock(mutex);
-        recaptures.swap(archiveRecaptures);
+        std::lock_guard lock(saverMutex);
+        saveRequested = true;
     }
-    for (auto& recapture : recaptures) {
-        @autoreleasepool {
-            try {
-                recapture();
-            } catch (const std::exception&) {
-            }
-        }
+    saverWake.notify_one();
+}
+
+void PipelineCache::saver() {
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    std::unique_lock lock(saverMutex);
+    for (;;) {
+        saverWake.wait(lock, [&] { return saverStopping || saveRequested; });
+        if (saverStopping) return;
+        // Coalesce: requests made while waiting for the spacing (or while saving) are this save.
+        if (saverWake.wait_until(lock, nextSave, [&] { return saverStopping; })) return;
+        saveRequested = false;
+        lock.unlock();
+        const auto start = std::chrono::steady_clock::now();
+        Save();
+        const auto finished = std::chrono::steady_clock::now();
+        lock.lock();
+        nextSave = finished + std::max<std::chrono::steady_clock::duration>(SaveSpacing, (finished - start) * SaveCostFactor);
     }
 }
 
 void PipelineCache::Save() {
-    // Never destroyed: the first save now runs early (EagerSaves), so a function-local mutex would be
-    // destroyed at exit() before the exit handler tears a live device (and its cache) down.
+    // Never destroyed: the first save runs early, so a function-local mutex would be destroyed at
+    // exit() before the exit handler tears a live device (and its cache) down.
     static std::mutex* const saveMutex = new std::mutex;
     std::lock_guard saving(*saveMutex);
+    std::uint64_t saved = 0;
+    std::vector<std::function<void(NSArray<id<MTL4Archive>>*)>> replays;
+    std::size_t known = 0;
     {
         std::lock_guard lock(mutex);
         if (serializer == nil || archivePath.empty() || unsaved == 0) return;
-    }
-    recaptureHits();
-    std::uint64_t saved = 0;
-    {
-        std::lock_guard lock(mutex);
         saved = unsaved;
+        known = archived.size();
+        for (std::size_t index = 0; index < known; ++index) {
+            if (!archived[index].captured) replays.push_back(archived[index].replay);
+        }
     }
     @autoreleasepool {
+        // Replays (D46): serializeAsArchiveAndFlushToURL empties the serializer, so the pipelines an
+        // earlier save flushed and the archive's hits are captured again, looked up (not compiled) in
+        // the archive they came from.
+        NSMutableArray<id<MTL4Archive>>* lookups = [NSMutableArray array];
+        if (written != nil) [lookups addObject:written];
+        if (archive != nil) [lookups addObject:archive];
+        const auto replayStart = std::chrono::steady_clock::now();
+        for (auto& replay : replays) {
+            @autoreleasepool {
+                try {
+                    std::shared_lock gate(serializerGate);
+                    replay(lookups);
+                } catch (const std::exception&) {
+                }
+            }
+        }
+        const auto replayElapsed = Milliseconds(replayStart);
         std::error_code error;
         std::filesystem::create_directories(archivePath.parent_path(), error);
         auto temporary = archivePath;
         temporary += ".tmp" + std::to_string(::getpid());
         NSError* failure = nil;
-        bool written = false;
+        bool stored = false;
         {
             std::unique_lock gate(serializerGate);
-            written = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];
+            stored = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];
+            // Whatever succeeded or not, the serializer is empty now: everything noted so far must
+            // be replayed before the next save (the first `known` entries were replayed above, the
+            // rest were captured or are hits, all flushed by this call).
+            std::lock_guard lock(mutex);
+            for (auto& entry : archived) entry.captured = false;
+            statistics.archiveReplays += replays.size();
+            statistics.replayMilliseconds += replayElapsed;
         }
-        if (!written) {
+        if (!stored) {
             std::fprintf(stderr, "[metal-pipelines] cannot write %s: %s\n", temporary.c_str(), Describe(failure).c_str());
             std::filesystem::remove(temporary, error);
             return;
         }
+        // The pipelines just flushed are replayed from this file at the next save; it is opened
+        // before the rename (a later save replaces the path, the open archive keeps its file).
+        NSError* openFailure = nil;
+        id<MTL4Archive> reopened = [device newArchiveWithURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&openFailure];
         std::filesystem::rename(temporary, archivePath, error);
         if (error) {
             std::fprintf(stderr, "[metal-pipelines] cannot rename %s: %s\n", temporary.c_str(), error.message().c_str());
             std::filesystem::remove(temporary, error);
             return;
         }
+        if (reopened == nil) {
+            std::fprintf(stderr, "[metal-pipelines] cannot reopen the archive just written (%s): the next save compiles its pipelines again\n", Describe(openFailure).c_str());
+        } else {
+            written = reopened;
+        }
+        if (Profile()) std::fprintf(stderr, "[metal-pipelines] archive %s saved (%llu new pipelines, %zu replayed in %.1f ms)\n", archivePath.c_str(), static_cast<unsigned long long>(saved), replays.size(), replayElapsed);
     }
-    if (Profile()) std::fprintf(stderr, "[metal-pipelines] archive %s saved (%llu new pipelines)\n", archivePath.c_str(), static_cast<unsigned long long>(saved));
     std::lock_guard lock(mutex);
     unsaved -= std::min(unsaved, saved);
     ++statistics.archiveSaves;

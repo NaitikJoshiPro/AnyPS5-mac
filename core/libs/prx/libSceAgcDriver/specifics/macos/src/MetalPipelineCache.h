@@ -22,6 +22,7 @@
 
 #include "Recompiler.hpp"
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -56,6 +57,9 @@ struct PipelineCacheStatistics {
     // Archive persistence.
     bool archiveLoaded = false;
     std::uint64_t archiveSaves = 0;
+    // Pipelines replayed into the serializer before saves (D46) and the time the replays took.
+    std::uint64_t archiveReplays = 0;
+    double replayMilliseconds = 0.0;
     std::string archivePath;
     // Why there is no archive although a directory was given (empty: there is one, or none asked).
     std::string archiveDisabled;
@@ -160,19 +164,24 @@ public:
     void PrepareRender(const RenderPipelineRequest& request);
 
     // Writes the archive when pipelines were compiled since the last save (atomically renamed).
-    // Called after each of the first EagerSaves new pipelines of a process, then every SaveInterval
-    // new pipelines, and at destruction. Never throws.
+    // The serializer's serializeAsArchiveAndFlushToURL empties it, so every save first replays the
+    // pipelines an earlier save flushed (and the archive's hits) through the compiler with the
+    // archives as lookup archives (no compile), keeping each written archive a superset of the
+    // last. Requested after every new pipeline and run by the saver thread, coalesced and spaced
+    // (SaveSpacing); also at destruction. Never throws.
     void Save();
     // Waits until no background task runs.
     void Drain();
 
     PipelineCacheStatistics Statistics() const;
 
-    static constexpr std::uint64_t SaveInterval = 64;
     // A title that fail-stops (_Exit) runs no destructor, so the pipelines of its first frames,
     // the slow ones (PPSA99005's first draw compiles for 3 s against the guest's 2 s retirement
-    // bound), only persist if they are saved as they are compiled.
-    static constexpr std::uint64_t EagerSaves = 256;
+    // bound), only persist if they are saved as they are compiled: the first new pipeline is saved
+    // at once, later ones at most SaveSpacing (or SaveCostFactor x the last save's duration, when
+    // longer) after the previous save.
+    static constexpr std::chrono::milliseconds SaveSpacing{1000};
+    static constexpr std::uint32_t SaveCostFactor = 4;
     // The cache key of a request (exposed for tests).
     static std::string ComputeKey(const PipelineFunction& function);
     static std::string RenderKey(const RenderPipelineRequest& request);
@@ -186,7 +195,15 @@ private:
     MTL4FunctionDescriptor* functionDescriptor(const PipelineFunction& function);
     void submit(std::function<void()> task);
     void worker();
-    void recaptureHits();
+    void saver();
+    void requestSave();
+    // A pipeline the serializer holds (compiled now) or must get again before the next save (an
+    // archive hit, or a pipeline an earlier save flushed); `replay` rebuilds it with lookup archives.
+    void noteArchived(std::function<void(NSArray<id<MTL4Archive>>*)> replay, bool captured);
+    id<MTLComputePipelineState> obtainCompute(const std::function<MTL4ComputePipelineDescriptor*()>& describe, const char* what);
+    id<MTLRenderPipelineState> obtainRender(const std::function<MTL4PipelineDescriptor*()>& describe, const char* what);
+    MTL4PipelineDescriptor* renderDescriptor(const RenderPipelineRequest& request);
+    MTL4PipelineDescriptor* meshDescriptor(const RenderPipelineRequest& request);
 
     id<MTLDevice> device = nil;
     id<MTL4Compiler> compiler = nil;
@@ -203,10 +220,18 @@ private:
     std::unordered_map<std::string, id<MTLLibrary>> libraries;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries;
     std::vector<std::pair<DepthStencilRequest, id<MTLDepthStencilState>>> depthStencilStates;
-    // Pipelines served by the archive this run: the serializer only captures pipelines its compiler
-    // builds, so before a save they are rebuilt through the compiler (archive-accelerated) to keep
-    // the new archive a superset of the old one.
-    std::vector<std::function<void()>> archiveRecaptures;
+    // Every pipeline this cache built or took from the archive (D46). The serializer only captures
+    // what its compiler builds, and each save's flush empties it: entries not `captured` (archive
+    // hits, and everything once flushed) are replayed through the compiler, with the loaded and the
+    // last written archive as lookup archives, before the next save. Guarded by `mutex`; entries are
+    // appended under the shared serializerGate so a flush never falls between capture and append.
+    struct Archived {
+        std::function<void(NSArray<id<MTL4Archive>>*)> replay;
+        bool captured = false;
+    };
+    std::vector<Archived> archived;
+    // The archive this process wrote last (opened from the file after the save), or nil.
+    id<MTL4Archive> written = nil;
     std::uint64_t unsaved = 0;
     PipelineCacheStatistics statistics;
 
@@ -217,6 +242,13 @@ private:
     std::size_t running = 0;
     bool stopping = false;
     std::vector<std::thread> workers;
+    // The saver thread (requestSave/saver): one pending request at a time.
+    std::mutex saverMutex;
+    std::condition_variable saverWake;
+    bool saveRequested = false;
+    bool saverStopping = false;
+    std::chrono::steady_clock::time_point nextSave{};
+    std::thread saverThread;
 };
 
 }
