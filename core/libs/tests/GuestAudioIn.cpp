@@ -19,6 +19,7 @@ int APS5_VABI sceAudioInAsyncOpen(int, std::uint32_t, std::uint32_t, std::uint32
 int APS5_VABI sceAudioInInput(int, void*);
 int APS5_VABI sceAudioInGetSilentState(int);
 int APS5_VABI sceAudioInClose(int);
+int APS5_VABI sceAudioInIsPadEmbeddedMic(int);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -122,6 +123,9 @@ void TestNoDevice() {
     for (std::size_t i = 0; i < 256 * 8; ++i) Require(buffer[i] == 0);
     Require(buffer[256 * 8] == 0xCC);
     Require(sceAudioInInput(handle, nullptr) == 0);
+    Require(sceAudioInIsPadEmbeddedMic(handle) == 0);
+    Require(sceAudioInIsPadEmbeddedMic(handle + 1) == invalidHandle);
+    Require(sceAudioInIsPadEmbeddedMic(0) == invalidHandle);
     const int hq = sceAudioInHqOpen(user, 0, 0, 128, 48000, 2);
     const int async = sceAudioInAsyncOpen(user, 1, 0, 256, 16000, 0x11);
     Require(hq > 0 && async > 0 && hq != handle && async != handle && hq != async);
@@ -149,8 +153,24 @@ void TestNoDevice() {
     Require(sceAudioInClose(handle) == 0);
     Require(sceAudioInClose(handle) == invalidHandle);
     Require(sceAudioInInput(handle, buffer.data()) == invalidHandle);
+    Require(sceAudioInIsPadEmbeddedMic(handle) == invalidHandle);
     Require(sceAudioInOpen(user, 1, 0, 128, 48000, 0x11) == handle);
 }
+
+#if defined(__APPLE__)
+// The host's own capture device (Core Audio, SDL's default driver) is never opened: the port opens
+// without a device and stays silent, so no microphone prompt appears and nothing is recorded.
+void TestHostMicrophoneUnused() {
+    SetEnvironment("SDL_AUDIODRIVER", "coreaudio");
+    const int handle = sceAudioInOpen(user, 0, 0, 256, 48000, 2);
+    Require(handle > 0 && sceAudioInGetSilentState(handle) == 1);
+    Require(sceAudioInIsPadEmbeddedMic(handle) == 0);
+    std::vector<std::int16_t> block(256 * 2, 0x5555);
+    Require(sceAudioInInput(handle, block.data()) == 256);
+    for (const auto sample : block) Require(sample == 0);
+    Require(sceAudioInClose(handle) == 0);
+}
+#endif
 
 }
 
@@ -158,5 +178,8 @@ int main(int argc, char** argv) {
     Require(argc == 2);
     Require(sceAudioInInit() == 0);
     if (std::strcmp(argv[1], "capture") == 0) TestCapture();
+#if defined(__APPLE__)
+    else if (std::strcmp(argv[1], "host") == 0) TestHostMicrophoneUnused();
+#endif
     else TestNoDevice();
 }
