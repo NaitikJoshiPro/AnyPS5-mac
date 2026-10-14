@@ -12,6 +12,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mutex>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
@@ -110,6 +111,7 @@ Site g_sites[kTableSize];
 struct sigaction g_previousBus {}, g_previousSegv {};
 std::once_flag g_once;
 bool g_trace = false;
+std::uint64_t g_stackEvery = 0; // APS5_DISPLACED_STACKS=N: a frame-pointer backtrace of every Nth fault (32 at most)
 
 struct SpinLock {
     SpinLock() {
@@ -367,6 +369,31 @@ void Chain(int signal, siginfo_t* info, void* context) {
     std::signal(signal, SIG_DFL);
 }
 
+// Who drives a fault storm: pc, lr and the frame-pointer chain of the faulting thread, walked only inside its own
+// stack (JIT code may use x29 for anything). Symbolize offline with atos against the binary images of a sample.
+void Backtrace(std::uint64_t fault, std::uintptr_t pc, std::uint32_t insn, const siginfo_t* info, const __darwin_mcontext64* machine) {
+    char line[640];
+    int length = std::snprintf(line, sizeof(line), "[displaced] stack of fault %llu: insn 0x%08x addr 0x%llx pc 0x%llx lr 0x%llx", static_cast<unsigned long long>(fault), insn,
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)), static_cast<unsigned long long>(pc),
+        static_cast<unsigned long long>(arm_thread_state64_get_lr(machine->__ss)));
+    const auto self = pthread_self();
+    const auto top = reinterpret_cast<std::uintptr_t>(pthread_get_stackaddr_np(self));
+    const auto bottom = top - pthread_get_stacksize_np(self);
+    auto fp = static_cast<std::uintptr_t>(arm_thread_state64_get_fp(machine->__ss));
+    for (int depth = 0; depth < 16 && length > 0 && length < static_cast<int>(sizeof(line)) - 24; ++depth) {
+        if (fp < bottom || fp + 16 > top || (fp & 15u) != 0) break;
+        const auto* frame = reinterpret_cast<const std::uintptr_t*>(fp);
+        length += std::snprintf(line + length, sizeof(line) - static_cast<std::size_t>(length), " 0x%llx", static_cast<unsigned long long>(frame[1]));
+        if (frame[0] <= fp) break;
+        fp = frame[0];
+    }
+    if (length > 0) {
+        length = std::min(length, static_cast<int>(sizeof(line)) - 2);
+        line[length++] = '\n';
+        (void)!write(2, line, static_cast<std::size_t>(length));
+    }
+}
+
 bool Redirect(siginfo_t* info, void* context) {
     if (!IsDisplaced(reinterpret_cast<std::uintptr_t>(info->si_addr))) return false;
     auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
@@ -393,6 +420,7 @@ bool Redirect(siginfo_t* info, void* context) {
             static_cast<unsigned long long>(pc), insn, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
         if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
     }
+    if (g_stackEvery != 0 && fault % g_stackEvery == 0 && fault / g_stackEvery < 32) Backtrace(fault, pc, insn, info, machine);
     if (auto* writer = g_writer.load(std::memory_order_acquire); !far && writer != nullptr && writer(pc, Branch(pc, checked)))
         g_patches.fetch_add(1, std::memory_order_relaxed);
     arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(forced));
@@ -582,6 +610,7 @@ mach_vm_address_t SharedRegionTail(mach_vm_address_t limit) {
 
 bool Enable() {
     g_trace = std::getenv("APS5_DISPLACED_TRACE") != nullptr;
+    if (const char* every = std::getenv("APS5_DISPLACED_STACKS")) g_stackEvery = std::strtoull(every, nullptr, 0);
     // Only needed where the ranges really are host guards: probe them. The carveout is the anchor; the commpage guard
     // and the shared region's tail join only when each is contiguous with the next range up.
     if (!AllInaccessible(CarveoutStart, DisplacedEnd)) return false;
