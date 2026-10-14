@@ -123,16 +123,20 @@ int Child(bool second, const std::filesystem::path& directory) {
 }
 
 // --child-extend: the workload from the archive plus two new pipelines, saved in between (the second
-// save must replay the workload's hits and the first new pipeline). --child-final: all from the archive.
+// save must replay the workload's hits, some made after the first save, and the first new
+// pipeline). --child-final: all five from the archive.
 int Extend(bool final, const std::filesystem::path& directory) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     PipelineCacheStatistics statistics;
     std::vector<std::uint32_t> results;
     {
         PipelineCache cache(device, directory);
-        if (const auto failure = BuildWorkload(device, cache, &results); !failure.empty()) return Fail(failure);
+        // One hit, a new pipeline, a save, then the other hits (looked up in the loaded archive
+        // after this process wrote its own) and another new pipeline.
+        if (cache.Compute(ComputeFunction(3u)) == nil) return Fail("no pipeline for multiplier 3");
         if (cache.Compute(ComputeFunction(7u)) == nil) return Fail("no pipeline for multiplier 7");
         if (!final) cache.Save();
+        if (const auto failure = BuildWorkload(device, cache, &results); !failure.empty()) return Fail(failure);
         if (cache.Compute(ComputeFunction(9u)) == nil) return Fail("no pipeline for multiplier 9");
         statistics = cache.Statistics();
     }

@@ -3,6 +3,8 @@
 #include "ShaderCacheDirectory.hpp"
 
 #include <sys/sysctl.h>
+#include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <chrono>
@@ -154,18 +156,40 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
     }
     if (Profile()) std::fprintf(stderr, "[metal-pipelines] archive directory: %s\n", directory.empty() ? "(none)" : directory.c_str());
     if (!directory.empty()) {
-        archivePath = directory / FileSafe(std::string(device.name.UTF8String) + "-" + OsBuild() + ".mtl4archive");
-        statistics.archivePath = archivePath.string();
+        // Archive generations (D46): <stem>.<ns>-<pid>.mtl4archive. The newest readable one is
+        // loaded and never written by this process (Metal resolves a lookup archive through its
+        // file, so the file a hit came from must stay as it was); this process writes its own
+        // generation, a superset of its hits and its compiles, which the next process loads. Older
+        // generations (and the single file of earlier builds) are deleted once a newer one loads.
+        const std::string stem = FileSafe(std::string(device.name.UTF8String) + "-" + OsBuild());
         std::error_code error;
-        if (std::filesystem::exists(archivePath, error)) {
-            NSError* failure = nil;
-            archive = [device newArchiveWithURL:[NSURL fileURLWithPath:@(archivePath.c_str())] error:&failure];
-            if (archive == nil) {
-                std::fprintf(stderr, "[metal-pipelines] ignoring the unreadable archive %s: %s\n", archivePath.c_str(), Describe(failure).c_str());
-            } else {
-                statistics.archiveLoaded = true;
-            }
+        std::vector<std::filesystem::path> generations;
+        for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+            const auto name = it->path().filename().string();
+            if (name.rfind(stem + ".", 0) == 0 && name.size() > 12 && name.compare(name.size() - 12, 12, ".mtl4archive") == 0) generations.push_back(it->path());
         }
+        // Names sort by creation time (fixed-width nanoseconds; the legacy "<stem>.mtl4archive" first).
+        const auto legacy = directory / (stem + ".mtl4archive");
+        std::sort(generations.begin(), generations.end(), [&](const std::filesystem::path& a, const std::filesystem::path& b) {
+            if ((a == legacy) != (b == legacy)) return a == legacy;
+            return a < b;
+        });
+        std::size_t loaded = generations.size();
+        for (std::size_t index = generations.size(); index-- > 0;) {
+            NSError* failure = nil;
+            archive = [device newArchiveWithURL:[NSURL fileURLWithPath:@(generations[index].c_str())] error:&failure];
+            if (archive != nil) {
+                loaded = index;
+                statistics.archiveLoaded = true;
+                break;
+            }
+            std::fprintf(stderr, "[metal-pipelines] ignoring the unreadable archive %s: %s\n", generations[index].c_str(), Describe(failure).c_str());
+        }
+        for (std::size_t index = 0; index < loaded && index < generations.size(); ++index) std::filesystem::remove(generations[index], error);
+        char unique[64];
+        std::snprintf(unique, sizeof(unique), ".%020llu-%d.mtl4archive", static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()), static_cast<int>(::getpid()));
+        archivePath = directory / (stem + unique);
+        statistics.archivePath = archivePath.string();
         MTL4PipelineDataSetSerializerDescriptor* serializerDescriptor = [MTL4PipelineDataSetSerializerDescriptor new];
         // Binaries only: binaries + descriptors fails to serialize on macOS 27.0.1 (D16).
         serializerDescriptor.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
@@ -760,16 +784,18 @@ void PipelineCache::Save() {
             std::filesystem::remove(temporary, error);
             return;
         }
-        // The pipelines just flushed are replayed from this file at the next save; it is opened
-        // before the rename (a later save replaces the path, the open archive keeps its file).
-        NSError* openFailure = nil;
-        id<MTL4Archive> reopened = [device newArchiveWithURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&openFailure];
         std::filesystem::rename(temporary, archivePath, error);
         if (error) {
             std::fprintf(stderr, "[metal-pipelines] cannot rename %s: %s\n", temporary.c_str(), error.message().c_str());
             std::filesystem::remove(temporary, error);
             return;
         }
+        // The pipelines just flushed are replayed from this file at the next save. Opened at its
+        // final path: Metal resolves a lookup archive through its file (one opened at the temporary
+        // path made the compiler throw on a nil archive once renamed). Later saves replace the file
+        // with a superset, so the lookups still find everything this one held.
+        NSError* openFailure = nil;
+        id<MTL4Archive> reopened = [device newArchiveWithURL:[NSURL fileURLWithPath:@(archivePath.c_str())] error:&openFailure];
         if (reopened == nil) {
             std::fprintf(stderr, "[metal-pipelines] cannot reopen the archive just written (%s): the next save compiles its pipelines again\n", Describe(openFailure).c_str());
         } else {
