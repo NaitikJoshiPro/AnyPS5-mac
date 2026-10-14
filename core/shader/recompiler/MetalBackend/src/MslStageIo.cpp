@@ -798,9 +798,10 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     if (stage == IrShaderStage::Mesh) {
         // Mesh functions (NGG primitive shaders, as DefineMeshOutputs): the vertex record carries the
         // position and the parameters, the primitive record the cull flag and the layer.
-        const auto& mesh = VertexInfo(state).mesh;
-        if (mesh.maxVertices == 0u || mesh.maxVertices > 256u) state.Fail("mesh functions output 1 to 256 vertices (Metal mesh<> limit), the subgroup has " + std::to_string(mesh.maxVertices));
-        if (mesh.maxPrimitives == 0u || mesh.maxPrimitives > 512u) state.Fail("mesh functions output 1 to 512 primitives (Metal mesh<> limit), the subgroup has " + std::to_string(mesh.maxPrimitives));
+        const auto meshOutput = MslMeshOutputOf(VertexInfo(state).mesh);
+        const auto subgroup = meshOutput.rectList ? std::string(" (rect list: guest vertices plus one per rect)") : std::string();
+        if (meshOutput.vertices == 0u || meshOutput.vertices > 256u) state.Fail("mesh functions output 1 to 256 vertices (Metal mesh<> limit), the subgroup has " + std::to_string(meshOutput.vertices) + subgroup);
+        if (meshOutput.primitives == 0u || meshOutput.primitives > 512u) state.Fail("mesh functions output 1 to 512 primitives (Metal mesh<> limit), the subgroup has " + std::to_string(meshOutput.primitives) + subgroup);
         text += "struct Aps5MeshVertex {\n    float4 aps5_position [[position]];\n";
         std::uint32_t scalars = 4u;
         bool layer = false;
@@ -821,7 +822,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
         if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
         text += "};\n\n";
-        text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(mesh.maxVertices) + ", " + std::to_string(mesh.maxPrimitives) + ", metal::topology::triangle>;\n\n";
+        text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n\n";
         result.outputType = "Aps5MeshVertex";
         return result;
     }

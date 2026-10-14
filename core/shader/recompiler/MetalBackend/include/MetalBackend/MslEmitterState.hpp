@@ -267,6 +267,16 @@ bool EmitMslTessellationInstruction(MslEmitterState& state, const IrValue& instr
 [[nodiscard]] std::string MslTessellationInvocation(MslEmitterState& state);
 void PrepareMslTessellationStage(MslEmitterState& state);
 [[nodiscard]] std::string EmitMslTessellationStage(MslEmitterState& state, std::vector<std::string> parameters, bool hasTable);
+// Mesh output of an NGG rect list (VGT_PRIMITIVE_TYPE 17, DECISIONS D41): the guest's vertices
+// (at most its group's), then one synthesized fourth vertex per rect, and two triangles per rect.
+struct MslMeshOutput {
+    bool rectList = false;
+    std::uint32_t guestVertices = 0u;
+    std::uint32_t guestPrimitives = 0u;
+    std::uint32_t vertices = 0u;
+    std::uint32_t primitives = 0u;
+};
+[[nodiscard]] MslMeshOutput MslMeshOutputOf(const ShaderMeshInputInfo& mesh);
 // The stage function's signature and module-scope declarations (MslEntryPoint.cpp).
 [[nodiscard]] std::string EmitMslEntryPoint(MslEmitterState& state);
 // Graphics stages (MslStageIo.cpp, B6): the stage-function output/input struct declarations and the

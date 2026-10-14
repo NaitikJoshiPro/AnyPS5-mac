@@ -656,7 +656,11 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, c
         const auto primitives = group & 0x1ffu;
         const auto maxVertices = read(queue.context, 0x1ff);
         const auto verticesPerPrimitive = vertexWorkgroup ? 3u : read(queue.context, 0x2ce);
-        if (!((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3)) {
+        // DECISIONS D41: a rect list (17) through an NGG vertex program outputs RECTLIST (GS_OUT_PRIM_TYPE
+        // 3); the MSL mesh function adds each rect's fourth vertex. A geometry program's rect output
+        // and the other output types stay refused.
+        const bool rectList = primitive == 17 && vertexWorkgroup && read(queue.context, 0x29b) == 3;
+        if (!rectList && !((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3)) {
             const std::string assembly = "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE " + std::to_string(primitive) + ", VGT_GS_OUT_PRIM_TYPE " + std::to_string(read(queue.context, 0x29b)) + ", " + std::to_string(verticesPerPrimitive) + " vertices per output primitive)";
             validate(false, assembly.c_str());
         }
@@ -664,7 +668,9 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, c
         validate(vertices >= inputSize && maxVertices != 0 && (!vertexWorkgroup || maxVertices >= inputSize) && maxVertices <= 256 && verticesPerPrimitive <= 256, "invalid geometry subgroup output");
         const auto inputStep = primitive == 5 || primitive == 6 ? 1u : inputSize;
         const auto outputLimit = vertexWorkgroup ? (maxVertices - inputSize) / inputStep + 1u : maxVertices / verticesPerPrimitive;
-        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit});
+        // The host mesh holds a rect group's 3 vertices per rect plus the synthesized one: at most 64
+        // rects keep it within Metal's 256 vertices per mesh.
+        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit, rectList ? 64u : primitives});
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
         validate(vertexWorkgroup || (((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3), "unsupported geometry VGPR allocation");
@@ -714,7 +720,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
         case 3: result.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
         case 7:
         case 17:
-            Require(result.stages.path == ShaderPath::Vertex, "rect-list requires vertex routing");
+            // DECISIONS D41: the mesh path takes rect lists that DecodeShaderStages accepted.
+            Require(result.stages.path == ShaderPath::Vertex || (primitive == 17 && result.stages.mesh.has_value() && result.stages.mesh->inputPrimitive == 17), "rect-list requires vertex routing");
             result.rectList = true;
             result.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
             break;

@@ -649,7 +649,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
 
     if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
-    if (graphics.rectList && draw.indexed) Fail("indexed rect lists");
+    // The mesh path fetches rect-list indices like any list (DECISIONS D41); the vertex function's
+    // expansion counts vertex ids.
+    if (graphics.rectList && draw.indexed && !mesh) Fail("indexed rect lists");
     if (draw.indexed && draw.indexSize != 2u && draw.indexSize != 4u) Fail("index size " + std::to_string(draw.indexSize));
 
     // Guest ranges of both stages, the vertex fetches, the indices and the color targets.
@@ -882,7 +884,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         request.objectThreads = linked->objectThreads;
         request.meshGroups = linked->maxMeshThreadgroups;
     }
-    if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
+    // Mesh draws expand rect lists from the mesh configuration (DECISIONS D41), not the macro.
+    if (graphics.rectList && !mesh) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
     if (cullPoints) request.vertex.macros.push_back({Abi::CullPointsMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
