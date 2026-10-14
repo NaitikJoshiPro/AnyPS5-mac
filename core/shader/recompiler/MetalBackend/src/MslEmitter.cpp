@@ -313,8 +313,9 @@ std::string MslEmitterState::GuestGlobalInvocationId(std::uint32_t component) {
 }
 
 std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
-    // Mesh draws are never split: the grid is (mesh groups, instances, 1), as gl_WorkGroupID.
-    if (program.Resources().stage == IrShaderStage::Mesh) return Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component);
+    // Mesh draws: the grid is (mesh groups, instances, splits), gl_WorkGroupID is (x, y, 0). The z
+    // dimension splits a group's primitives in the triangle-vertices mode (MslAbi Version 13).
+    if (program.Resources().stage == IrShaderStage::Mesh) return component == 2u ? std::string("0u") : Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component);
     usesDriverData = true;
     return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "])";
 }

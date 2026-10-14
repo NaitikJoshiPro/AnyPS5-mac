@@ -94,7 +94,27 @@ namespace ShaderRecompiler::MslAbi {
 // Version 12: vertex and mesh functions take the window-space macros (APS5_WINDOW_SPACE,
 //   APS5_WINDOW_SPACE_WIDTH/HEIGHT): positions in pixels and depth (PA_CL_VTE_CNTL 0x300) are mapped
 //   to clip space over a viewport covering the render area.
-inline constexpr std::uint32_t Version = 12u;
+// Version 13: mesh functions take the triangle-vertices macros (TriangleVerticesMacro with
+//   PerVertexLocationsMacro / BarycentricsMacro; DECISIONS "per-vertex fragment inputs of mesh
+//   draws"): each output triangle gets three unshared vertices with one-hot corner weights and its
+//   corners' per-vertex values in the primitive record (user(aps5_pv<L>_<j>)). A mesh holds at most
+//   MeshTriangleVerticesPrimitives(maxPrimitives) triangles, so the driver draws the grid (mesh
+//   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.
+inline constexpr std::uint32_t Version = 13u;
+
+// Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
+// vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
+// a subgroup's primitives are split over the grid's z dimension in equal parts.
+inline constexpr std::uint32_t MeshMaxVertices = 256u;
+inline constexpr std::uint32_t MeshTriangleVerticesSplits(std::uint32_t maxPrimitives) {
+    constexpr std::uint32_t limit = MeshMaxVertices / 3u;
+    return maxPrimitives == 0u ? 1u : (maxPrimitives + limit - 1u) / limit;
+}
+inline constexpr std::uint32_t MeshTriangleVerticesPrimitives(std::uint32_t maxPrimitives) {
+    const auto splits = MeshTriangleVerticesSplits(maxPrimitives);
+    return std::max((maxPrimitives + splits - 1u) / splits, 1u);
+}
+static_assert(MeshTriangleVerticesPrimitives(85u) == 85u && MeshTriangleVerticesSplits(86u) == 2u && MeshTriangleVerticesPrimitives(128u) == 64u && MeshTriangleVerticesPrimitives(256u) == 64u && MeshTriangleVerticesSplits(256u) == 4u && MeshTriangleVerticesPrimitives(512u) * 3u <= MeshMaxVertices);
 
 // Metal Shading Language version the backend emits (MTLLanguageVersion4_1, macOS 27 and later: the
 // acquire/release orders of the mem_flags fences).
@@ -281,17 +301,24 @@ inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
 // - vertex: 1 when the draw is non-indexed with 3 host vertices per guest triangle and binds
 //   BufferIndex::TriangleVertices; host vertex v runs the guest program for the 3 guest vertices
 //   guestVertex[3 * (v / 3) + 0..2] and emits corner v % 3;
+//   Version 13, mesh: 1 when the draw runs the mesh function's triangle-vertices mode (three
+//   unshared vertices per output triangle, MeshTriangleVerticesSplits threadgroups per subgroup);
+//   no buffer: the corners come from the guest's own primitive export;
 inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
-// - vertex (with TriangleVerticesMacro): the fragment function's Reflection::perVertexLocations,
-//   decimal, bits 0-31 and 32-63: each location is also emitted as three flat values (one per
-//   corner, user(aps5_pv<L>_<j>));
+// - vertex and mesh (with TriangleVerticesMacro): the fragment function's
+//   Reflection::perVertexLocations, decimal, bits 0-31 and 32-63: each location is also emitted as
+//   three flat values (one per corner, user(aps5_pv<L>_<j>); per primitive in mesh functions);
 inline constexpr const char* PerVertexLocationsMacro = "APS5_PER_VERTEX_LOCATIONS";
 inline constexpr const char* PerVertexLocationsHighMacro = "APS5_PER_VERTEX_LOCATIONS_HI";
-// - vertex (with TriangleVerticesMacro): the fragment function's Reflection::emulatedBarycentrics
+// - vertex and mesh (with TriangleVerticesMacro): the fragment function's Reflection::emulatedBarycentrics
 //   (bit 0 perspective, bit 1 linear): one-hot corner weights interpolated as the barycentrics.
 inline constexpr const char* BarycentricsMacro = "APS5_BARYCENTRICS";
+// Version 13: mesh (with TriangleVerticesMacro): 1 when the draw's provoking vertex is the last
+// (PA_SU_SC_MODE_CNTL PROVOKING_VTX_LAST): corner 0 is the guest primitive's third vertex, then the
+// first and second (the vertex function's TriangleVerticesHeader order).
+inline constexpr const char* ProvokingLastMacro = "APS5_PROVOKING_LAST";
 // Version 10: vertex functions with Reflection::cullDistances drawn as points (not triangle-vertices
 // or rect-list draws): 1, each point is culled when one of its cull distances is negative.
 inline constexpr const char* CullPointsMacro = "APS5_CULL_POINTS";

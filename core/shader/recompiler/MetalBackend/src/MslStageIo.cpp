@@ -815,14 +815,41 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                 scalars += 4u;
                 break;
             case StageOutputKind::Layer: layer = true; break;
-            default: state.Fail("unsupported mesh output kind");
+            default: state.Fail("mesh functions output the position, parameters and layer only: clip and cull distances, point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
             }
         }
         if (scalars > 124u) state.Fail("the mesh function exceeds 124 scalar varyings");
+        // MslAbi Version 13, the triangle-vertices mode (APS5_TRIANGLE_VERTICES, as the vertex
+        // function's D20 emulation): every output triangle has its own three vertices, which carry
+        // one-hot corner weights as the barycentrics; the corners' values of the per-vertex locations
+        // go in the primitive record (flat by definition, read by the fragment function's flat
+        // user(aps5_pv<L>_<j>) inputs), so each is stored once per triangle, not per vertex.
+        text += TriangleVertexMacroDefaults();
+        text += "#if " + TriangleVerticesCondition() + "\n";
+        text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
+        text += "#if (APS5_BARYCENTRICS & 2)\n    float3 aps5_bwl [[user(aps5_bwl)]];\n#endif\n";
+        text += "#endif\n";
         text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
         if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
+        text += "#if " + TriangleVerticesCondition() + "\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            text += "#endif\n";
+        }
+        text += "#endif\n";
         text += "};\n\n";
-        text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n\n";
+        if (meshOutput.rectList) {
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n\n";
+        } else {
+            const auto split = MslAbi::MeshTriangleVerticesPrimitives(meshOutput.primitives);
+            text += "#if " + TriangleVerticesCondition() + "\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(3u * split) + ", " + std::to_string(split) + ", metal::topology::triangle>;\n";
+            text += "#else\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n";
+            text += "#endif\n\n";
+        }
         result.outputType = "Aps5MeshVertex";
         return result;
     }
