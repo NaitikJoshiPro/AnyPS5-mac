@@ -17,9 +17,13 @@
 #include "MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "MetalResidency.h"
+#include "MetalVulkanImages.h"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #include <algorithm>
@@ -57,6 +61,10 @@ vertex ScalerOut aps5_scaler_vertex(uint id [[vertex_id]], constant float4& rect
 }
 fragment float4 aps5_scaler_fragment(ScalerOut in [[stage_in]], texture2d<float> source [[texture(0)]], sampler filter [[sampler(0)]]) {
     return float4(source.sample(filter, in.uv).rgb, 1.0f);
+}
+// A resident image whose bytes the display reads with red and blue in the other order.
+fragment float4 aps5_scaler_fragment_swap(ScalerOut in [[stage_in]], texture2d<float> source [[texture(0)]], sampler filter [[sampler(0)]]) {
+    return float4(source.sample(filter, in.uv).bgr, 1.0f);
 }
 )";
 
@@ -219,6 +227,37 @@ VulkanDevice::PresentStatistics& Counters() {
     return counters;
 }
 
+// Debug aid (upstream's): APS5_NO_RESIDENT_PRESENT=1 always presents through guest memory.
+bool NoResidentPresent() {
+    static const bool no = std::getenv("APS5_NO_RESIDENT_PRESENT") != nullptr;
+    return no;
+}
+
+// How flips were presented (the [flip] line of APS5_PROFILE_DRAW, as upstream's).
+struct ResidentCounts {
+    std::uint64_t resident = 0;
+    std::uint64_t refreshed = 0;
+    std::uint64_t notPending = 0;
+    std::uint64_t unsuitable = 0;
+    std::uint64_t guestMemory = 0;
+    // The last unsuitable image: why it was not presented from.
+    std::string lastUnsuitable;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+ResidentCounts& Residents() {
+    static ResidentCounts counts;
+    return counts;
+}
+
+void ReportResidents() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& counts = Residents();
+    if (!profile || std::chrono::steady_clock::now() - counts.lastReport < std::chrono::seconds(10)) return;
+    counts.lastReport = std::chrono::steady_clock::now();
+    ProfilePrint_nid_no_patch("[flip] %llu presents from the resident image (%llu refreshed first), %llu through guest memory: %llu not pending, %llu unsuitable%s%s\n", static_cast<unsigned long long>(counts.resident), static_cast<unsigned long long>(counts.refreshed), static_cast<unsigned long long>(counts.guestMemory), static_cast<unsigned long long>(counts.notPending), static_cast<unsigned long long>(counts.unsuitable), counts.lastUnsuitable.empty() ? "" : " (last: ", counts.lastUnsuitable.empty() ? "" : (counts.lastUnsuitable + ")").c_str());
+}
+
 }
 
 namespace Metal {
@@ -248,6 +287,7 @@ struct Presenter {
     bool queuePending = false;
     // The scaler.
     id<MTLRenderPipelineState> scaler = nil;
+    id<MTLRenderPipelineState> scalerSwap = nil;
     id<MTLSamplerState> filter = nil;
     id<MTL4ArgumentTable> arguments = nil;
     id<MTLTexture> source = nil;
@@ -257,6 +297,9 @@ struct Presenter {
         id<MTLBuffer> readback;
         std::uint32_t width;
         std::uint32_t height;
+        // The resident image the present samples (D54) and the view it sampled, kept until the slot retires.
+        std::shared_ptr<Graphics::StorageTexture> resident;
+        id<MTLTexture> residentView;
     };
     std::deque<Slot> slots;
     // Frame dumps (APS5_DUMP_FRAMES), written off the presenting thread.
@@ -345,6 +388,9 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     presenter->scaler = [device newRenderPipelineStateWithDescriptor:pipeline error:&error];
     if (presenter->scaler == nil) Fail("the scaler has no pipeline: " + Metal::Describe(error));
+    pipeline.fragmentFunction = [library newFunctionWithName:@"aps5_scaler_fragment_swap"];
+    presenter->scalerSwap = [device newRenderPipelineStateWithDescriptor:pipeline error:&error];
+    if (presenter->scalerSwap == nil) Fail("the red/blue scaler has no pipeline: " + Metal::Describe(error));
     MTLSamplerDescriptor* sampler = [MTLSamplerDescriptor new];
     sampler.minFilter = MTLSamplerMinMagFilterLinear;
     sampler.magFilter = MTLSamplerMinMagFilterLinear;
@@ -447,7 +493,7 @@ bool VulkanDevice::AcquireImage() {
     return presenter->target != nil;
 }
 
-bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels) {
+bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const std::shared_ptr<Graphics::StorageTexture>& resident, bool swapRedBlue, std::uint32_t residentLayer) {
     auto* presenter = state->presenter.get();
     if (presenter == nullptr || state->recorder == nullptr || !Presentable()) return false;
     // A slot in flight beyond the allowed count is retired first (its drawable and readback).
@@ -455,8 +501,18 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     if (!AcquireImage()) return false;
     auto& recorder = *state->recorder;
     @autoreleasepool {
-        const bool hasSource = !pixels.empty();
-        if (hasSource) {
+        if (resident != nullptr && !pixels.empty()) Fail("a present has both pixels and a resident image");
+        id<MTLTexture> residentTexture = resident != nullptr ? Graphics::Metal::TextureOfImage(resident->Image()) : nil;
+        if (resident != nullptr && residentTexture == nil) Fail("the resident image of a present has no texture");
+        if (residentTexture != nil && (residentTexture.textureType != MTLTextureType2D || residentLayer != 0u)) {
+            // A 2D view of the layer (same format: no pixel-format-view usage needed).
+            if (residentLayer >= residentTexture.arrayLength) Fail("the resident layer of a present is outside its image");
+            residentTexture = [residentTexture newTextureViewWithPixelFormat:residentTexture.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(residentLayer, 1)];
+            if (residentTexture == nil) Fail("cannot view the resident layer of a present");
+        }
+        const bool uploads = !pixels.empty();
+        const bool hasSource = uploads || residentTexture != nil;
+        if (uploads) {
             if (width == 0u || height == 0u || width > 16384u || height > 16384u || pixels.size() != static_cast<std::size_t>(width) * height * 4u) Fail("invalid source image for the present");
             if (presenter->source == nil || presenter->source.width != width || presenter->source.height != height) {
                 if (presenter->source != nil) {
@@ -473,7 +529,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             }
         }
         auto& stream = recorder.Stream();
-        if (hasSource) {
+        if (uploads) {
             auto upload = stream.Write(pixels, 256u);
             id<MTL4ComputeCommandEncoder> copy = stream.Compute();
             [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:static_cast<NSUInteger>(width) * 4u sourceBytesPerImage:pixels.size() sourceSize:MTLSizeMake(width, height, 1) toTexture:presenter->source destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -496,9 +552,11 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                 1.0f - 2.0f * static_cast<float>(rect.y + static_cast<std::int32_t>(rect.height)) / static_cast<float>(targetHeight)};
             const auto rectUpload = stream.Write(std::as_bytes(std::span(ndc)), 16u);
             [presenter->arguments setAddress:rectUpload.address atIndex:0];
-            [presenter->arguments setTexture:presenter->source.gpuResourceID atIndex:0];
+            // The render pass begins after a queue barrier over every earlier stage (BeginRender), so
+            // the resident image's recorded writes, in this batch or an earlier one, precede the read.
+            [presenter->arguments setTexture:(residentTexture != nil ? residentTexture : presenter->source).gpuResourceID atIndex:0];
             [presenter->arguments setSamplerState:presenter->filter.gpuResourceID atIndex:0];
-            [encoder setRenderPipelineState:presenter->scaler];
+            [encoder setRenderPipelineState:swapRedBlue && residentTexture != nil ? presenter->scalerSwap : presenter->scaler];
             [encoder setArgumentTable:presenter->arguments atStages:MTLRenderStageVertex | MTLRenderStageFragment];
             [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<double>(targetWidth), static_cast<double>(targetHeight), 0.0, 1.0}];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -527,7 +585,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         const auto serial = recorder.SubmitAndEpoch();
         if (presenter->drawable != nil) [state->queue signalDrawable:presenter->drawable];
         if (PresentTrace()) std::fprintf(stderr, "[metal] present %llu: source %ux%u%s into %lux%lu, %s, batch %llu\n", static_cast<unsigned long long>(Counters().presents + 1u), width, height, hasSource ? "" : " (clear)", static_cast<unsigned long>(presenter->target.width), static_cast<unsigned long>(presenter->target.height), presenter->drawable != nil ? "drawable" : "offscreen", static_cast<unsigned long long>(serial));
-        presenter->slots.push_back({serial, presenter->drawable, readback, static_cast<std::uint32_t>(presenter->target.width), static_cast<std::uint32_t>(presenter->target.height)});
+        presenter->slots.push_back({serial, presenter->drawable, readback, static_cast<std::uint32_t>(presenter->target.width), static_cast<std::uint32_t>(presenter->target.height), resident, residentTexture});
         presenter->queuePending = presenter->drawable != nil;
         presenter->target = nil;
         ++Counters().presents;
@@ -560,10 +618,60 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    auto& dumps = Dumps();
+    // D54: the display buffer is usually a render target whose results are still on the GPU (pending
+    // in its image). The present samples that image, as upstream's resident present blits it,
+    // instead of waiting for the GPU, storing the image to guest memory, decoding the buffer on the
+    // CPU and uploading it (with the GPU mutex held throughout). Dumped frames (the dump writes the
+    // decoded pixels), linear and DCC-compressed buffers, and images sampling cannot show exactly
+    // (ResidentSamplePath) take the guest-memory path. The image's write-back stays pending, as for
+    // any storage image.
+    const bool dumpFrame = dumps.dumped < dumps.limit && (dumps.presents + 1u) % static_cast<std::uint64_t>(dumps.every) == 0u;
+    auto& residents = Residents();
+    std::shared_ptr<Graphics::StorageTexture> resident;
+    bool swapRedBlue = false;
+    std::uint32_t layer = 0;
+    if (!dumpFrame && !NoResidentPresent() && buffer.tilingMode != 1u && buffer.dccAddress == 0u) {
+        const auto bytes = DisplayBufferSize(buffer);
+        resident = Graphics::StorageTexture::FindPending(buffer.address, bytes);
+        if (resident == nullptr) {
+            ++residents.notPending;
+        } else {
+            const auto& descriptor = resident->Descriptor();
+            // The buffer is the image or one layer of it (a swap chain is often one array image
+            // whose layers are the display buffers).
+            const auto found = ResidentLayer(descriptor.baseAddress, resident->GuestBytes(), resident->ImageLayers(), buffer.address, bytes);
+            const bool shape = found >= 0 && descriptor.width == buffer.width && descriptor.height == buffer.height && descriptor.mipCount == 1u && resident->ImageDepth() == 1u;
+            layer = shape ? static_cast<std::uint32_t>(found) : 0u;
+            const auto path = shape && Graphics::StorageFormatAvailable(state->context, descriptor.format) ? ResidentSamplePath(Graphics::StorageFormatForGuest(state->context, descriptor.format), buffer.pixelFormat) : ResidentSample::None;
+            if (path == ResidentSample::None) {
+                char reason[192];
+                std::snprintf(reason, sizeof(reason), "image %ux%u mips %u layers %u depth %u bytes 0x%llx guest format %u (storage %d), display %ux%u bytes 0x%zx pixel format 0x%llx", descriptor.width, descriptor.height, descriptor.mipCount, resident->ImageLayers(), resident->ImageDepth(), static_cast<unsigned long long>(resident->GuestBytes()), descriptor.format, Graphics::StorageFormatAvailable(state->context, descriptor.format) ? static_cast<int>(Graphics::StorageFormatForGuest(state->context, descriptor.format)) : -1, buffer.width, buffer.height, bytes, static_cast<unsigned long long>(buffer.pixelFormat));
+                residents.lastUnsuitable = reason;
+                resident.reset();
+                ++residents.unsuitable;
+            } else {
+                swapRedBlue = path == ResidentSample::SwapRedBlue;
+                // 64 KiB blocks the CPU wrote since the image last matched guest memory would be shown
+                // stale: Refresh merges them into the image first (upstream's resident present).
+                GuestMemory::CollectWritesUncached(buffer.address, bytes);
+                if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->Generation())) {
+                    resident->Refresh();
+                    ++residents.refreshed;
+                }
+                ++residents.resident;
+            }
+        }
+    }
+    if (resident == nullptr) ++residents.guestMemory;
+    ReportResidents();
+    if (resident != nullptr) {
+        ++dumps.presents;
+        return present(buffer.width, buffer.height, true, {}, resident, swapRedBlue, layer);
+    }
     // The bring-up source: the display buffer decoded on the CPU (linear or tiled, the formats
     // DisplayBuffer.cpp decodes); the read waits for recorded GPU writes over it.
     const auto pixels = ReadDisplayBuffer(buffer);
-    auto& dumps = Dumps();
     int dumpIndex = -1;
     if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0u) dumpIndex = dumps.dumped++;
     if (!present(buffer.width, buffer.height, true, pixels)) {

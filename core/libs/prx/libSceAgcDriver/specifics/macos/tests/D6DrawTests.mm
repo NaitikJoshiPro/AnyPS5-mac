@@ -13,6 +13,7 @@
 #include "../src/MetalDeviceState.h"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -47,8 +48,8 @@ void Require(bool condition, const std::string& message) {
 // Guest memory registered with GuestAllocations, as the guest's own allocations are.
 class GuestBlock {
 public:
-    explicit GuestBlock(std::size_t bytes) : size(bytes) {
-        block = static_cast<std::byte*>(std::aligned_alloc(16384, (bytes + 16383u) & ~std::size_t{16383u}));
+    explicit GuestBlock(std::size_t bytes, std::size_t alignment = 16384u) : size(bytes) {
+        block = static_cast<std::byte*>(std::aligned_alloc(alignment, (bytes + alignment - 1u) & ~(alignment - 1u)));
         Require(block != nullptr, "cannot allocate a guest block");
         std::memset(block, 0, bytes);
         GuestAllocations::Mutation().Add(block, bytes, true, true, true);
@@ -391,6 +392,56 @@ void CheckOffscreen(AgcDriver::VulkanDevice& device) {
     std::puts("offscreen: aspect-fit scaling, letterbox, clear, slot retirement passed");
 }
 
+// D54: a display buffer whose results are pending in its render target is presented from that image.
+// An RGBA8 target shown as a BGRA8 display buffer (red and blue exchanged): the presented pixels are
+// the guest's bytes as the display reads them, the results stay pending (nothing was stored to guest
+// memory or decoded on the CPU), and the guest-memory path (after a store) presents the same pixels.
+void CheckResidentPresent(AgcDriver::VulkanDevice& device) {
+    GuestBlock vertices(16384);
+    WriteVertices(vertices, FullScreen);
+    const AgcDriver::Graphics::ColorTargetLayout layout(Extent, Extent, ColorTileMode::RenderTarget, 4u);
+    GuestBlock target(layout.Bytes(), 65536u);
+    const AgcDriver::DisplayBuffer display {target.Address(), 0x8000000000000000ull, Extent, Extent};
+    Require(AgcDriver::DisplayBufferSize(display) == layout.Bytes(), "the test's display buffer is not the render target's size");
+    auto state = BaseState();
+    SetTarget(state, target.Address(), VK_FORMAT_R8G8B8A8_UNORM, ColorTileMode::RenderTarget, 4u);
+    Draw(device, state, MakeShaders(vertices.Address(), 3u, 0xff0000ffu), {0u, 3u, 0u, 1u, 0u, false});
+    auto half = state;
+    half.scissor = {{0, 0}, {Extent / 2u, Extent}};
+    Draw(device, half, MakeShaders(vertices.Address(), 3u, 0xff00ff00u), {0u, 3u, 0u, 1u, 0u, false});
+    device.WaitIdle();
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(target.Address(), layout.Bytes()) != nullptr, "the draws left no pending render target");
+    const auto present = [&] {
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(device.PresentDisplayBuffer(display), "the display buffer was not presented");
+        }
+        device.FinishPresent();
+        device.QueuePresent();
+        return AgcDriver::Metal::LastPresentedFrame();
+    };
+    // The 64x64 source is fitted into the 64x48 target: 48x48 from x 8, green left of x 32.
+    const auto check = [&](const AgcDriver::Metal::PresentedFrame& frame, const char* path) {
+        const auto at = [&](std::uint32_t x, std::uint32_t y) {
+            std::uint32_t value;
+            std::memcpy(&value, frame.pixels.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4u, 4u);
+            return value;
+        };
+        Require(frame.width == 64u && frame.height == 48u, std::string(path) + ": the present read back " + std::to_string(frame.width) + "x" + std::to_string(frame.height));
+        Require(at(2u, 24u) == 0xff000000u && at(61u, 24u) == 0xff000000u, std::string(path) + ": the pillarbox columns are not opaque black");
+        Require(at(16u, 10u) == 0xff00ff00u && at(16u, 40u) == 0xff00ff00u && at(46u, 10u) == 0xff0000ffu && at(46u, 40u) == 0xff0000ffu, std::string(path) + ": the presented halves are wrong (" + std::to_string(at(16u, 10u)) + " " + std::to_string(at(46u, 10u)) + ")");
+    };
+    const auto resident = present();
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(target.Address(), layout.Bytes()) != nullptr, "the present stored the render target: it took the guest-memory path");
+    check(resident, "resident");
+    StoreResults(device, target.Address(), layout.Bytes());
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(target.Address(), layout.Bytes()) == nullptr, "the store left the render target pending");
+    const auto guest = present();
+    check(guest, "guest memory");
+    Require(guest.frames == resident.frames + 1u && guest.pixels == resident.pixels, "the resident and guest-memory presents differ");
+    std::puts("resident: present from the pending render target (red and blue exchanged), results kept pending, same pixels as through guest memory passed");
+}
+
 void NoDrawableSize(void*, std::uint32_t* width, std::uint32_t* height) {
     *width = 64u;
     *height = 48u;
@@ -404,7 +455,7 @@ int main(int argc, char** argv) {
     static int windowToken = 0;
     AgcDriver::PresentationWindow window {&windowToken, {}, nullptr, &NoDrawableSize, 64u, 48u, nullptr};
     try {
-        device = mode == "offscreen" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
+        device = mode == "offscreen" || mode == "resident" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
     } catch (const std::exception& error) {
         std::printf("skipped, no usable Metal device: %s\n", error.what());
         return Skipped;
@@ -416,6 +467,8 @@ int main(int argc, char** argv) {
             CheckPrimitives(*device);
         } else if (mode == "offscreen") {
             CheckOffscreen(*device);
+        } else if (mode == "resident") {
+            CheckResidentPresent(*device);
         } else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;

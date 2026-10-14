@@ -51,4 +51,19 @@ ResidentPresent ResidentPresentPath(VkFormat storage, std::uint64_t pixelFormat,
     }
 }
 
+ResidentSample ResidentSamplePath(VkFormat storage, std::uint64_t pixelFormat) {
+    if (DisplayHalfFloat(pixelFormat) || DisplayTenBit(pixelFormat)) return ResidentSample::None;
+    const auto display = DisplayTexelFormat(pixelFormat);
+    if (storage == display) return ResidentSample::Direct;
+    const bool exchanged = (storage == VK_FORMAT_R8G8B8A8_UNORM && display == VK_FORMAT_B8G8R8A8_UNORM) || (storage == VK_FORMAT_B8G8R8A8_UNORM && display == VK_FORMAT_R8G8B8A8_UNORM);
+    return exchanged ? ResidentSample::SwapRedBlue : ResidentSample::None;
+}
+
+std::int64_t ResidentLayer(std::uint64_t imageBase, std::uint64_t imageBytes, std::uint32_t layers, std::uint64_t address, std::uint64_t bytes) {
+    if (bytes == 0 || layers == 0 || address < imageBase || imageBytes != static_cast<std::uint64_t>(layers) * bytes) return -1;
+    const auto offset = address - imageBase;
+    if (offset % bytes != 0 || offset / bytes >= layers) return -1;
+    return static_cast<std::int64_t>(offset / bytes);
+}
+
 }

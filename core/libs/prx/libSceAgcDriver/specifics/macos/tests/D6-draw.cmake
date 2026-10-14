@@ -14,3 +14,6 @@ endforeach()
 # Headless presentation (no window opens: the PresentationWindow has no Metal layer).
 add_test(NAME agc_metal_offscreen_frames COMMAND agc_metal_draw_tests offscreen)
 set_tests_properties(agc_metal_offscreen_frames PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)
+# Present from the pending render target (D54), headless.
+add_test(NAME agc_metal_resident_present COMMAND agc_metal_draw_tests resident)
+set_tests_properties(agc_metal_resident_present PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)

@@ -71,6 +71,22 @@ static void HalfFloatDisplay() {
     Require(AgcDriver::ResidentPresentPath(VK_FORMAT_R16G16B16A16_SFLOAT, rgba16Float, true) == AgcDriver::ResidentPresent::Convert);
     Require(AgcDriver::ResidentPresentPath(VK_FORMAT_R8G8B8A8_UNORM, rgba16Float, true) == AgcDriver::ResidentPresent::None);
     Require(AgcDriver::ResidentPresentPath(VK_FORMAT_R16G16B16A16_SFLOAT, 0x8000000022000000ull, true) == AgcDriver::ResidentPresent::None);
+    {
+        using AgcDriver::ResidentSample;
+        using AgcDriver::ResidentSamplePath;
+        constexpr std::uint64_t bgra8 = 0x8000000000000000ull;
+        constexpr std::uint64_t rgba8 = 0x8000000022000000ull;
+        constexpr std::uint64_t tenBit = 0x0100000000000000ull;
+        Require(ResidentSamplePath(VK_FORMAT_B8G8R8A8_UNORM, bgra8) == ResidentSample::Direct && ResidentSamplePath(VK_FORMAT_R8G8B8A8_UNORM, rgba8) == ResidentSample::Direct);
+        Require(ResidentSamplePath(VK_FORMAT_R8G8B8A8_UNORM, bgra8) == ResidentSample::SwapRedBlue && ResidentSamplePath(VK_FORMAT_B8G8R8A8_UNORM, rgba8) == ResidentSample::SwapRedBlue);
+        Require(ResidentSamplePath(VK_FORMAT_R8G8B8A8_SRGB, rgba8) == ResidentSample::None && ResidentSamplePath(VK_FORMAT_B8G8R8A8_SRGB, bgra8) == ResidentSample::None);
+        Require(ResidentSamplePath(VK_FORMAT_A2B10G10R10_UNORM_PACK32, rgba8 | tenBit) == ResidentSample::None && ResidentSamplePath(VK_FORMAT_B8G8R8A8_UNORM, bgra8 | tenBit) == ResidentSample::None);
+        Require(ResidentSamplePath(VK_FORMAT_R16G16B16A16_SFLOAT, rgba16Float) == ResidentSample::None && ResidentSamplePath(VK_FORMAT_R16G16_SFLOAT, bgra8) == ResidentSample::None);
+        using AgcDriver::ResidentLayer;
+        Require(ResidentLayer(0x10000, 0x20000, 1, 0x10000, 0x20000) == 0 && ResidentLayer(0x10000, 0x40000, 2, 0x30000, 0x20000) == 1 && ResidentLayer(0x10000, 0x40000, 2, 0x10000, 0x20000) == 0);
+        Require(ResidentLayer(0x10000, 0x40000, 2, 0x20000, 0x20000) == -1 && ResidentLayer(0x10000, 0x40000, 2, 0x50000, 0x20000) == -1 && ResidentLayer(0x10000, 0x40000, 2, 0x0, 0x20000) == -1);
+        Require(ResidentLayer(0x10000, 0x50000, 2, 0x10000, 0x20000) == -1 && ResidentLayer(0x10000, 0x20000, 1, 0x10000, 0x10000) == -1 && ResidentLayer(0x10000, 0, 0, 0x10000, 0) == -1);
+    }
     buffer = {65536, rgba16Float, 3840, 2160};
     Require(AgcDriver::DisplayBufferSize(buffer) == 30u * 34u * 65536u);
     buffer.dccAddress = 0x20000;
