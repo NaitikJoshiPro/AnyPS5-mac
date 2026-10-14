@@ -10,7 +10,13 @@
 // The two paths must produce bit-identical R32G32B32A32 images (same positions, same corner order,
 // same one-hot weights through the same rasterizer), for triangle lists (wave64 one- and two-wave
 // subgroups, wave32, indexed), the last-vertex provoking convention and a 128-primitive strip
-// subgroup (two split threadgroups); the per-vertex values are also checked against the corners.
+// subgroup (two split threadgroups); the per-vertex values of the lists are also checked against
+// the corners.
+// Strips run with the last vertex provoking: the translator hands an odd strip triangle's NGG
+// program the vertices (i + 1, i, i + 2) (InstructionTranslator.cpp, the mesh entry setup), which
+// with the last-vertex rotation is the vertex path's (i + 2, i + 1, i); under the first-vertex
+// convention the vertex path uses Vulkan's (i, i + 2, i + 1) and the mesh path the guest's export
+// order (i + 1, i, i + 2) (TechnicalDebt metal-mesh-per-vertex).
 // Metal only: the Vulkan device's mesh path has its own barycentric emulation (upstream).
 
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -308,7 +314,8 @@ int main() {
             {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 32u, false},
             {"indexed triangle list", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, indexedDraw, BufferDescriptor(Scrambled.data(), static_cast<std::uint32_t>(Scrambled.size())), 64u, false},
             {"triangle list, last vertex provoking", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, true},
-            {"triangle strip, 128-primitive subgroups (two splits)", {6u, StripPrimitives, StripPrimitives + 2u, StripPrimitives + 2u, StripPrimitives, 192u, 4096u, 0u, 4u}, stripDraw, BufferDescriptor(Strip.data(), static_cast<std::uint32_t>(Strip.size())), 64u, false},
+            // Strips with the last vertex provoking (OpenGL's default, radeonsi's): see the header.
+            {"triangle strip, 128-primitive subgroups (two splits), last vertex provoking", {6u, StripPrimitives, StripPrimitives + 2u, StripPrimitives + 2u, StripPrimitives, 192u, 4096u, 0u, 4u}, stripDraw, BufferDescriptor(Strip.data(), static_cast<std::uint32_t>(Strip.size())), 64u, true},
         }};
         std::vector<float> reference(Pixels.size());
         std::uint32_t compared = 0;
