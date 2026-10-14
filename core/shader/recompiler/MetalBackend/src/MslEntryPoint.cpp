@@ -312,7 +312,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
     }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
-    text += ")\n{\n" + state.locals + prologue + state.body + "}\n\n";
+    text += ")\n{\n" + MslFunctionStatements(state, prologue) + "}\n\n";
     text += "[[mesh]] void " + std::string(MslAbi::EntryPoint) + "(\n    Aps5Mesh aps5_mesh";
     for (const auto& parameter : parameters) text += ",\n    " + parameter;
     text += ")\n{\n" + hoisted;
@@ -415,7 +415,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         for (std::size_t index = 0; index < parameters.size(); ++index) {
             text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];
         }
-        text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n";
+        text += ")\n{\n" + MslFunctionStatements(state, state.prologue) + "}\n";
         return text;
     }
     if (state.reflection.stage == MslAbi::Stage::Mesh) return text + EmitMeshFunction(state, std::move(parameters));
@@ -476,7 +476,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
-    text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n\n";
+    text += ")\n{\n" + MslFunctionStatements(state, state.prologue) + "}\n\n";
     const auto returnType = graphics.outputType.empty() ? std::string("void") : graphics.outputType;
     text += graphics.attributes + (fragment ? "fragment " : "vertex ") + returnType + " " + std::string(MslAbi::EntryPoint) + "(";
     for (std::size_t index = 0; index < parameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];

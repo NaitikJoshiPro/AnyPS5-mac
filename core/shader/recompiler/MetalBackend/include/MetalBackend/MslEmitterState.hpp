@@ -306,6 +306,15 @@ struct MslGraphicsInterface {
 [[nodiscard]] std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInputInfo& workgroup, std::uint32_t laneCount);
 // The stage function's body (MslFlowEmitter.cpp): structured control flow over the IR blocks.
 void EmitMslFunctionBody(MslEmitterState& state);
+// The statements of a function: the locals, `prologue` and the body (MslEmitter.cpp). An SSA local
+// whose first occurrence is its definition statement, with every other occurrence inside that
+// statement's block, is declared at the definition instead of zero-initialized at function scope
+// (MslSinkDeclarations; APS5_MSL_HOIST_ALL=1 keeps every one hoisted).
+[[nodiscard]] std::string MslFunctionStatements(const MslEmitterState& state, const std::string& prologue);
+// The declaration sinking on its own: `locals` lines `    T vN = T(0);` (and `vN_h`) whose value
+// qualifies lose their declaration, and their definition line `vN = e;` in `body` becomes
+// `T vN = e;`. Nothing changes when the text has a preprocessor line. Returns the number sunk.
+std::size_t MslSinkDeclarations(std::string& locals, const std::string& prologue, std::string& body);
 // The wave-LDS barrier scope of a program (MslFlowEmitter.cpp, the SPIR-V path's WaveLdsScope).
 [[nodiscard]] MslBarrierScope MslWaveLdsScope(const MslEmitterState& state);
 
