@@ -102,9 +102,15 @@ int APS5_VABI sceSslClose() {
  return 0;
 }
 
-int APS5_VABI sceSslGetSerialNumber() {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+// Signature from Orbital (cited in the debt file). A certificate reaches a title only from this library
+// (a CA list, a connection's peer, a verify callback), and no certificate exists here: the CA store is empty
+// and no connection ever handshakes. So a certificate passed in was not issued by this library and throws,
+// as sceSslFreeCaList does for a list it did not return.
+int APS5_VABI sceSslGetSerialNumber(int sslCtxId, void* sslCert, std::uint8_t* sboData, std::size_t* sboLen) {
+    if (!sslCert || !sboLen) return ERROR_INVALID_ARG;
+    (void)sboData;
+    RequireContext(__func__, sslCtxId);
+    throw std::invalid_argument(std::string(__func__) + ": certificate not issued by this library (it holds no certificates)");
 }
 
 int APS5_VABI sceSslLoadCert() {

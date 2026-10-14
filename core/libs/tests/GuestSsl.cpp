@@ -13,6 +13,7 @@ int APS5_VABI sceSslGetCaList(int, void*);
 int APS5_VABI sceSslFreeCaList(int, void*);
 int APS5_VABI sceSslUnloadCert(int);
 int APS5_VABI sceSslSetVerifyCallback(void);
+int APS5_VABI sceSslGetSerialNumber(int, void*, std::uint8_t*, std::size_t*);
 }
 
 struct SslMemoryPoolStats {
@@ -90,7 +91,15 @@ int main() {
     Require(sceSslGetCaList(context, &list) == notFound);
     Require(list.certs == nullptr && list.num == 0);
 
+    std::uint8_t serial[32] = {};
+    std::size_t serialLength = sizeof(serial);
+    Require(sceSslGetSerialNumber(context, nullptr, serial, &serialLength) == invalidArg);
+    Require(sceSslGetSerialNumber(context, &handle, serial, nullptr) == invalidArg);
+    Require(Throws([&] { sceSslGetSerialNumber(context, &handle, serial, &serialLength); }));
+    Require(serialLength == sizeof(serial) && serial[0] == 0);
+
     Require(sceSslTerm_nid_postfix(context) == 0);
+    Require(Throws([&] { sceSslGetSerialNumber(context, &handle, serial, &serialLength); }));
     Require(sceSslGetCaList(context, nullptr) == invalidArg);
     Require(sceSslFreeCaList(context, nullptr) == invalidArg);
     list = {&handle, 3};
