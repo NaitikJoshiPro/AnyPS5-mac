@@ -374,6 +374,7 @@ agc_driver_interpolation_f16 G3
 agc_driver_layered_volume_draw G3
 agc_driver_layered_volume_vertex G3
 agc_driver_layered_volume_vertex_no_gpl G3
+agc_driver_mesh_per_vertex_inputs G3
 agc_driver_ngg_vertex_wave_info G3
 agc_driver_ngg_vertex_wave_reduction G3
 agc_driver_packed_mip_tail_target G3

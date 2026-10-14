@@ -4,7 +4,9 @@
 // MslAbi::Stage::Mesh with the host threadgroup size the driver dispatches (wave64 at two lanes per
 // invocation: 32 host threads per guest wave), and links with the Mesh.cpp pixel program into a
 // mesh render pipeline (MTLMeshRenderPipelineDescriptor), which checks that the mesh vertex
-// user() outputs match the fragment inputs. The rendering itself is checked by agc_driver_mesh.
+// user() outputs match the fragment inputs. Each non-rect mesh function is also compiled in its
+// triangle-vertices mode (MslAbi Version 13) and linked with a per-vertex/barycentric fragment
+// function. The rendering itself is checked by agc_driver_mesh and agc_driver_mesh_per_vertex_inputs.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -69,6 +71,14 @@ alignas(256) constexpr auto Wave32GeometryCode = [] {
 
 alignas(256) constexpr std::array<std::uint32_t, 7> PixelCode{
     0xc8020002, 0xc8060102, 0xc80a0202, 0xc80e0302, 0xf800180f, 0x03020100, 0xbf810000,
+};
+
+// Per-vertex inputs (MslAbi Version 13, the mesh triangle-vertices mode; DECISIONS "per-vertex
+// fragment inputs of mesh draws"): v_interp_mov P10, P20 and P0 of attr0.x and the raw
+// PERSP_CENTER I exported to MRT0, so the fragment function reads per-vertex location 0 and the
+// emulated perspective barycentrics, as SuperTuxKart's radeonsi programs do.
+alignas(256) constexpr std::array<std::uint32_t, 6> PerVertexPixelCode{
+    0xc80a0000, 0xc80e0001, 0xc8120002, 0xf800180f, 0x00040302, 0xbf810000,
 };
 
 alignas(256) std::array<std::uint16_t, 64> Indices{};
@@ -176,6 +186,58 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     Require(pipeline != nil, name + ": the mesh function does not link with the fragment function: " + Describe(error));
     Require(pipeline.maxTotalThreadsPerMeshThreadgroup >= hostThreads, name + ": the mesh pipeline allows " + std::to_string(pipeline.maxTotalThreadsPerMeshThreadgroup) + " threads per threadgroup, the program needs " + std::to_string(hostThreads));
     std::printf("%s: mesh<%u, %u> with %u host threads, linked with the fragment function\n", test.name, outputVertices, outputPrimitives, hostThreads);
+    if (rectList) {
+        Require(!Has(source, "aps5_tv_v["), name + ": a rect-list mesh function has the triangle-vertices mode");
+        return;
+    }
+
+    // The triangle-vertices mode: unshared vertices, MeshTriangleVerticesPrimitives triangles per
+    // split threadgroup, compiled with the driver's macros and linked with a fragment function that
+    // reads per-vertex values and emulated barycentrics (flat user(aps5_pv0_<j>) from the primitive
+    // record, user(aps5_bw) from the vertices).
+    const auto split = Abi::MeshTriangleVerticesPrimitives(test.mesh.maxPrimitives);
+    Require(split * 3u <= Abi::MeshMaxVertices && split * Abi::MeshTriangleVerticesSplits(test.mesh.maxPrimitives) >= test.mesh.maxPrimitives, name + ": the triangle-vertices split does not cover the subgroup");
+    Require(Has(source, ", " + std::to_string(3u * split) + ", " + std::to_string(split) + ", metal::topology::triangle>"), name + ": no triangle-vertices mesh<> of " + std::to_string(3u * split) + " vertices and " + std::to_string(split) + " primitives");
+    Require(Has(source, "aps5_tv_v[") && Has(source, "float4 pv0_0 [[user(aps5_pv0_0)]]") && Has(source, "float3 aps5_bw [[user(aps5_bw)]]"), name + ": the triangle-vertices epilogue or its outputs are missing");
+    ShaderRecompiler::ShaderPixelStageInfo perVertexPixel{};
+    perVertexPixel.interpolatorCount = 1;
+    perVertexPixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PerspectiveCenter);
+    perVertexPixel.hasPerspectiveCenterVgpr = true;
+    perVertexPixel.targetOutputMode[0] = 9;
+    perVertexPixel.targetExportMapping.fill(0xe4u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> perVertexMemory{{{reinterpret_cast<std::uintptr_t>(PerVertexPixelCode.data()), std::as_bytes(std::span(PerVertexPixelCode))}}};
+    ShaderRecompiler::RecompileRequest perVertexRequest{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PerVertexPixelCode.data()), PerVertexPixelCode, 0, {}},
+        {64, 0, {}, std::nullopt, perVertexPixel, std::nullopt, perVertexMemory},
+        target,
+        PixelPushLayout(meshPush, target),
+        std::nullopt
+    };
+    perVertexRequest.useCache = false;
+    const auto perVertexFragment = ShaderRecompiler::Recompile(perVertexRequest);
+    const auto& fragmentReflection = perVertexFragment.msl.Reflection();
+    Require(fragmentReflection.perVertexLocations == 1u && (fragmentReflection.emulatedBarycentrics & 1u) != 0u, name + ": the per-vertex pixel program reads per-vertex locations 0x" + std::to_string(fragmentReflection.perVertexLocations) + " and emulated barycentrics " + std::to_string(fragmentReflection.emulatedBarycentrics) + ", expected location 0 and perspective weights");
+    for (const bool last : {false, true}) {
+        NSMutableDictionary<NSString*, NSObject*>* macros = [@{
+            @(Abi::TriangleVerticesMacro): @"1",
+            @(Abi::PerVertexLocationsMacro): [Decimal(fragmentReflection.perVertexLocations & 0xffffffffu) stringByAppendingString:@"u"],
+            @(Abi::PerVertexLocationsHighMacro): [Decimal(fragmentReflection.perVertexLocations >> 32u) stringByAppendingString:@"u"],
+            @(Abi::BarycentricsMacro): [Decimal(fragmentReflection.emulatedBarycentrics) stringByAppendingString:@"u"],
+        } mutableCopy];
+        if (last) macros[@(Abi::ProvokingLastMacro)] = @"1";
+        id<MTLFunction> splitMesh = Compile(device, name + " triangle-vertices mesh", mesh, macros);
+        id<MTLFunction> perVertexFunction = Compile(device, name + " per-vertex fragment", perVertexFragment, @{
+            @(Abi::VertexOutputsMacro): Decimal(reflection.outputLocations & 0xffffffffu),
+            @(Abi::VertexOutputsHighMacro): Decimal(reflection.outputLocations >> 32u),
+        });
+        MTLMeshRenderPipelineDescriptor* splitDescriptor = [MTLMeshRenderPipelineDescriptor new];
+        splitDescriptor.meshFunction = splitMesh;
+        splitDescriptor.fragmentFunction = perVertexFunction;
+        splitDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+        id<MTLRenderPipelineState> splitPipeline = [device newRenderPipelineStateWithMeshDescriptor:splitDescriptor options:MTLPipelineOptionNone reflection:nil error:&error];
+        Require(splitPipeline != nil, name + ": the triangle-vertices mesh function does not link with the per-vertex fragment function: " + Describe(error));
+    }
+    std::printf("%s: triangle-vertices mesh<%u, %u> x %u splits linked with per-vertex values and barycentrics (first and last provoking)\n", test.name, 3u * split, split, Abi::MeshTriangleVerticesSplits(test.mesh.maxPrimitives));
 }
 
 }
@@ -194,13 +256,15 @@ int main() {
             Require(target.mesh.has_value(), "the Metal target advertises no mesh shader limits");
             // tests/Mesh.cpp's subgroups: {input primitive, primitives and vertices per group, max
             // vertices, max primitives, threads, LDS bytes, provoking vertex, ESGS item size}.
-            const std::array<MeshCase, 9> cases{{
+            const std::array<MeshCase, 10> cases{{
                 {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
                 {"triangle list, not indexed", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, false},
                 {"triangle strip", {6u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle fan", {5u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u}, 64u, true},
+                // 128 primitives: the triangle-vertices mode splits the subgroup in two.
+                {"triangle strip, 128 primitives", {6u, 128u, 130u, 130u, 128u, 192u, 4096u, 0u, 4u}, 64u, false},
                 {"rect list, one-wave subgroups, wave64", {17u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, false},
                 {"rect list, two-wave subgroups, wave64", {17u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"rect list, wave32", {17u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
