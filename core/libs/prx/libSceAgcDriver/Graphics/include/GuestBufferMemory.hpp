@@ -57,6 +57,11 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+#ifdef __APPLE__
+// macOS (DECISIONS D42): a run of guest memory longer than this is imported in pieces, the aligned
+// windows of this size; an import never crosses a multiple of it.
+inline constexpr std::uint64_t HostImportPieceBytes = std::uint64_t{1} << 30u;
+#endif
 void SetHostImportWindow(std::uint64_t bytes);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports

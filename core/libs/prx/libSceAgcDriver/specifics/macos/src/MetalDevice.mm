@@ -104,6 +104,16 @@ std::uint32_t LoopGuardLimit() {
     return limit;
 }
 
+// The guest memory the BDA page table may add through new page wrappers (D46): wrappers are no-copy
+// buffers Metal wires in full when a command buffer uses them, outside the live-import budget.
+std::uint64_t BdaWrapperBudget() {
+    static const std::uint64_t bytes = [] {
+        if (const char* value = std::getenv("APS5_BDA_WRAP_MIB"); value != nullptr && *value != '\0') return std::strtoull(value, nullptr, 10) << 20u;
+        return std::uint64_t{1024} << 20u;
+    }();
+    return bytes;
+}
+
 // Debug aid (APS5_NO_OPPORTUNISTIC_REAP=1), as upstream: no reap of finished batches before a
 // label, fill, copy or dispatch decision.
 bool OpportunisticReap() {
@@ -363,23 +373,71 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         static const bool traceTable = std::getenv("APS5_TRACE_GPU") != nullptr;
         std::uint64_t importedBytes = 0;
         std::uint64_t wrappedBytes = 0;
+        std::uint64_t refusedBytes = 0;
+        // Every page wrapper the device holds counts (the V# wrappers of earlier dispatches too):
+        // they live until the recorder is idle (DropWrappersIfIdle).
+        std::uint64_t heldWrapperBytes = 0;
+        for (const auto& wrapper : wrappers) heldWrapperBytes += wrapper.end - wrapper.begin;
+        const auto add = [&](const GuestAllocations::Range& range, std::uint64_t begin, std::uint64_t end, std::uint64_t gpu) {
+            const auto permissions = Bda::Read | (range.writable ? Bda::Write : 0u);
+            if ((permissions & Bda::Write) != 0u) {
+                if (end > Bda::WrittenAddressLimit) throw std::runtime_error("Metal device: a writable BDA range ends past the addresses the written-page record can hold");
+                writable.push_back({begin, end});
+            }
+            ranges.push_back({begin, end, gpu, permissions, 0u});
+        };
         for (const auto& range : *acquired) {
-            if (traceTable) {
-                std::uint64_t ignored = 0;
-                if (context.hostImportAlignment != 0u && ImportOf(range->address, range->bytes, &ignored) != nil) importedBytes += range->bytes;
-                else wrappedBytes += range->bytes;
+            const auto end = range->address + range->bytes;
+            if (context.hostImportAlignment != 0u && range->bytes > Graphics::HostImportPieceBytes) {
+                // A long allocation is served piece by piece through host imports (D42 windows,
+                // within the live-import budget), never by one page wrapper: Metal wires a no-copy
+                // buffer in full when a command buffer uses it, and a table holding ASTRO BOT's
+                // 3.1 + 4.6 GiB direct memory as wrappers beside the imports made the GPU fail the
+                // first BDA dispatch with kIOGPUCommandBufferCallbackErrorOutOfMemory (reported as
+                // MTL4CommandQueueErrorTimeout, D46). A piece the budget refuses is left out of the
+                // table: an access there records an Unmapped fault instead.
+                for (auto begin = range->address; begin < end;) {
+                    const auto pieceEnd = std::min(end, (begin / Graphics::HostImportPieceBytes + 1u) * Graphics::HostImportPieceBytes);
+                    std::uint64_t offset = 0;
+                    if (id<MTLBuffer> import = ImportOf(begin, pieceEnd - begin, &offset)) {
+                        add(*range, begin, pieceEnd, import.gpuAddress + offset);
+                        importedBytes += pieceEnd - begin;
+                    } else {
+                        refusedBytes += pieceEnd - begin;
+                    }
+                    begin = pieceEnd;
+                }
+                continue;
+            }
+            std::uint64_t offset = 0;
+            if (context.hostImportAlignment != 0u) {
+                if (id<MTLBuffer> import = ImportOf(range->address, range->bytes, &offset)) {
+                    add(*range, range->address, end, import.gpuAddress + offset);
+                    importedBytes += range->bytes;
+                    continue;
+                }
+            }
+            // Not imported (the budget, or memory imports cannot hold): a page wrapper, which the
+            // import budget does not see, so the wrappers the table adds are bounded on their own
+            // (BdaWrapperBudget, over all the device's wrappers); one that already holds the range
+            // costs nothing more.
+            if (WrapperOf(range->address, range->bytes, &offset) == nil) {
+                if (heldWrapperBytes + range->bytes > BdaWrapperBudget()) {
+                    refusedBytes += range->bytes;
+                    continue;
+                }
+                wrappedBytes += range->bytes;
+                heldWrapperBytes += range->bytes;
             }
             const auto gpu = TryWrap(range->address, range->bytes);
             if (gpu == 0) {
                 ++skipped;
                 continue;
             }
-            const auto permissions = Bda::Read | (range->writable ? Bda::Write : 0u);
-            if ((permissions & Bda::Write) != 0u) {
-                if (range->address + range->bytes > Bda::WrittenAddressLimit) throw std::runtime_error("Metal device: a writable BDA range ends past the addresses the written-page record can hold");
-                writable.push_back({range->address, range->address + range->bytes});
-            }
-            ranges.push_back({range->address, range->address + range->bytes, gpu, permissions, 0u});
+            add(*range, range->address, end, gpu);
+        }
+        if (refusedBytes != 0u && addressTable.refusedBytes != refusedBytes) {
+            std::fprintf(stderr, "[metal] BDA page table: %.0f MiB of guest allocations left out (live-import budget APS5_HOST_IMPORT_MIB, page-wrapper budget APS5_BDA_WRAP_MIB; an access there records an Unmapped fault)\n", refusedBytes / 1048576.0);
         }
         if (skipped != 0u && addressTable.skipped != skipped) {
             std::fprintf(stderr, "[metal] BDA page table: %zu of %zu guest allocations cannot be wrapped in place and are left out (mirrors: work package D3)\n", skipped, acquired->size());
@@ -391,7 +449,7 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
                 wrapperBytes += wrapper.end - wrapper.begin;
                 largest = std::max(largest, wrapper.end - wrapper.begin);
             }
-            std::fprintf(stderr, "[gpu] BDA page table: %zu ranges, %.1f MiB of them in host imports, %.1f MiB outside; %zu page wrappers hold %.1f MiB (largest %.1f MiB)\n", ranges.size(), importedBytes / 1048576.0, wrappedBytes / 1048576.0, wrappers.size(), wrapperBytes / 1048576.0, largest / 1048576.0);
+            std::fprintf(stderr, "[gpu] BDA page table: %zu ranges, %.1f MiB of them in host imports, %.1f MiB in new page wrappers, %.1f MiB left out; %zu page wrappers hold %.1f MiB (largest %.1f MiB)\n", ranges.size(), importedBytes / 1048576.0, wrappedBytes / 1048576.0, refusedBytes / 1048576.0, wrappers.size(), wrapperBytes / 1048576.0, largest / 1048576.0);
         }
         // TryWrap may have created wrappers but never drops any, so the epoch is still current.
         const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
@@ -406,6 +464,7 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         addressTable.ranges = std::move(ranges);
         addressTable.writable = std::move(writable);
         addressTable.skipped = skipped;
+        addressTable.refusedBytes = refusedBytes;
     }
     *lease = addressTable.lease.lock();
     // Nothing in flight held it: the registry is unchanged (same generation), so a new lease pins

@@ -717,7 +717,7 @@ std::atomic<std::uint64_t> importWindow{0};
 // import of a long run (ASTRO BOT's 7.8 GiB of direct memory) wires all of it, or is refused whole. A run longer
 // than this is imported in pieces, the aligned 1 GiB window around the requested address, so the GPU wires the
 // windows it uses and the live-import budget can serve part of the run in place.
-constexpr std::uint64_t MaxImportBytes = std::uint64_t{1} << 30u;
+constexpr std::uint64_t MaxImportBytes = HostImportPieceBytes;
 
 // Per-window results of one pass over a lease (refreshImports checks every import against the lease:
 // without it each check walked its window's whole chain, imports x ranges per window, which a heap of

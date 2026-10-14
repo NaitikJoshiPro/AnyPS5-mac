@@ -183,6 +183,8 @@ struct VulkanDevice::State {
         // The writable ranges (a dispatch binding the table may store anywhere in them).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
+        // Bytes of long allocations the host-import budget left out (D46).
+        std::uint64_t refusedBytes = 0;
     } addressTable;
 
     // D5's shader library and pipeline cache (MTL4Compiler + MTL4Archive, background builds); it
