@@ -27,6 +27,9 @@ namespace AgcDriver::Metal {
 // a time; nullptr clears it. GuestBufferMemory.mm defines it.
 using ImportReleaseProbe = void (*)(const void* buffer);
 void SetImportReleaseProbe(ImportReleaseProbe probe);
+// Test seam (tests/ReplacedDeviceQueue.mm): the command queue the host-import residency set of `device`
+// (an MTLDevice) is attached to, null when it has none. GuestBufferMemory.mm defines it.
+const void* HostImportResidencyQueue(const void* device);
 
 // guestBegin is a guest address: the write watch keys pages by guest address, while the region scan, the temporary
 // mprotect and the wrap itself use the host address, the alias for a displaced range (GuestDisplaced.hpp, D31/D33;

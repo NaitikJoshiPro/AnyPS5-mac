@@ -3882,6 +3882,13 @@ void SetImportReleaseProbe(ImportReleaseProbe probe) {
     ::AgcDriver::Graphics::importReleaseProbe.store(probe, std::memory_order_release);
 }
 
+const void* HostImportResidencyQueue(const void* device) {
+    auto& residency = ::AgcDriver::Graphics::Residency();
+    std::lock_guard lock(residency.mutex);
+    const auto found = residency.devices.find(reinterpret_cast<VkDevice>(const_cast<void*>(device)));
+    return found == residency.devices.end() || found->second.set == nil ? nullptr : (__bridge const void*)found->second.queue;
+}
+
 }
 
 namespace AgcDriver::Graphics {
