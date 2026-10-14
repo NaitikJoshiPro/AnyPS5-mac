@@ -678,8 +678,10 @@ void PipelineCache::recaptureHits() {
 }
 
 void PipelineCache::Save() {
-    static std::mutex saveMutex;
-    std::lock_guard saving(saveMutex);
+    // Never destroyed: the first save now runs early (EagerSaves), so a function-local mutex would be
+    // destroyed at exit() before the exit handler tears a live device (and its cache) down.
+    static std::mutex* const saveMutex = new std::mutex;
+    std::lock_guard saving(*saveMutex);
     {
         std::lock_guard lock(mutex);
         if (serializer == nil || archivePath.empty() || unsaved == 0) return;
