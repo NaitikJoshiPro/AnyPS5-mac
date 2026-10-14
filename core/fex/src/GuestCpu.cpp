@@ -7,6 +7,7 @@
 #include "CodePool.hpp"
 #include "ConsoleSyscalls.hpp"
 #include "GuestProgram.hpp"
+#include "GuestSampler.hpp"
 #include "Options.hpp"
 
 #include <FEXCore/Config/Config.h>
@@ -223,6 +224,7 @@ public:
             std::lock_guard lock(threadsMutex);
             thread = guestCode.context->CreateThread();
         }
+        GuestSampler::Register(thread);
         thread->CurrentFrame->State.rip = rip;
         thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = rsp;
         callRet = mmap(nullptr, ThreadState::CALLRET_STACK_SIZE + 2 * Page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -250,6 +252,7 @@ public:
     GuestThread& operator=(const GuestThread&) = delete;
 
     ~GuestThread() {
+        GuestSampler::Unregister(thread);
         {
             std::lock_guard lock(threadsMutex);
             guestCode.context->DestroyThread(thread);
@@ -577,6 +580,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     if (const std::uint64_t gadget = CreateConsoleSyscallGadget(bridge)) state->context->AddThunkTrampolineIRHandler(ConsoleSyscallGadget, gadget);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
+    GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping);
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
     exitFlush = ExitFlush {state->context.get(), state->modules.get(), state->coverage};
 }

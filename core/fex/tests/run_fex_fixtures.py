@@ -13,6 +13,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fex_fixtures
 import fex_toolchain
+from nid import nid
 
 MACOS = pathlib.Path(__file__).resolve().parents[2] / "relinker" / "relinker" / "tests" / "macos"
 HERE = pathlib.Path(__file__).resolve().parent
@@ -43,7 +44,31 @@ def current_umask():
     return mask
 
 
-CHECKS = {"opening": created_with_mode}
+def sampled_spin(directory):
+    """The sampler's report names the guest loop and the polled address (pc_sample.cpp)."""
+    # Global symbols carry their NIDs (fex_toolchain.nidify).
+    poll, poll_size = fex_toolchain.symbol(directory / "input.elf", nid("sample_poll"))
+    flag, _ = fex_toolchain.symbol(directory / "input.elf", nid("sampleFlag"))
+    lines = (directory / "stderr.txt").read_text().splitlines()
+    rows = [line.split() for line in lines if line.startswith("[fex-sample]") and "% rip 0x" in line]
+    if not rows:
+        return "no [fex-sample] rows in stderr: " + " | ".join(lines[-5:])
+    # "[fex-sample] 97.0% rip 0x... eboot.elf+0x... jit", then the register line that follows it.
+    best = max(range(len(rows)), key=lambda i: float(rows[i][1].rstrip("%")))
+    rip = int(rows[best][3], 16)
+    offset = int(rows[best][4].rsplit("+", 1)[1], 16)
+    base = rip - offset
+    if not poll <= offset < poll + poll_size or rows[best][-1] != "jit":
+        return f"hottest row {' '.join(rows[best])} is not in sample_poll [{poll:#x}, {poll + poll_size:#x})"
+    index = [i for i, line in enumerate(lines) if line.startswith("[fex-sample]") and "% rip 0x" in line][best]
+    values = dict(item.split("=") for item in lines[index + 1].split()[1:] + lines[index + 2].split()[1:])
+    if int(values["rdi"], 16) != base + flag:
+        return f"rdi={values['rdi']} at the hot RIP, expected sampleFlag at {base + flag:#x}"
+    return None
+
+
+CHECKS = {"opening": created_with_mode, "pc-sample": sampled_spin}
+ENVIRONMENT = {"pc-sample": {"APS5_FEX_SAMPLE": "1", "APS5_FEX_SAMPLE_REPORT": "60"}}
 
 
 def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
@@ -180,6 +205,7 @@ COMPILED = {
                             "scePthreadJoin"]}, ["-O2"]), 43),
     "kernel-sys": (lambda d: compiled_executable(d, [str(HERE / "kernel_sys.cpp")], {"libc.prx": ["exit"],
                    "libkernel.prx": ["pathconf"]}), 43),
+    "pc-sample": (lambda d: compiled_executable(d, [str(HERE / "pc_sample.cpp")], {"libc.prx": ["exit"]}, ["-O2"]), 43),
     "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
                    "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }
@@ -215,7 +241,9 @@ def main():
                 continue
             if not (directory / "libs").exists():
                 (directory / "libs").symlink_to(libraries, target_is_directory=True)
-            executed = subprocess.run([str(runner), "eboot.elf"], cwd=directory, capture_output=True, text=True, timeout=60)
+            executed = subprocess.run([str(runner), "eboot.elf"], cwd=directory, capture_output=True, text=True, timeout=60,
+                                      env={**os.environ, **ENVIRONMENT.get(name, {})})
+            (directory / "stderr.txt").write_text(executed.stderr)
             if executed.returncode != status or (output is not None and executed.stdout != output):
                 failures.append(f"{name}: exit {executed.returncode}, expected {status}; output {executed.stdout!r}, "
                                 f"expected {output!r}; {executed.stderr.strip()[-400:]}")
