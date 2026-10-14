@@ -95,8 +95,7 @@ namespace ShaderRecompiler::MslAbi {
 //   APS5_WINDOW_SPACE_WIDTH/HEIGHT): positions in pixels and depth (PA_CL_VTE_CNTL 0x300) are mapped
 //   to clip space over a viewport covering the render area.
 // Version 13: mesh functions take the triangle-vertices macros (TriangleVerticesMacro with
-//   PerVertexLocationsMacro / BarycentricsMacro; DECISIONS "per-vertex fragment inputs of mesh
-//   draws"): each output triangle gets three unshared vertices with one-hot corner weights and its
+//   PerVertexLocationsMacro / BarycentricsMacro; DECISIONS D46): each output triangle gets three unshared vertices with one-hot corner weights and its
 //   corners' per-vertex values in the primitive record (user(aps5_pv<L>_<j>)). A mesh holds at most
 //   MeshTriangleVerticesPrimitives(maxPrimitives) triangles, so the driver draws the grid (mesh
 //   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.

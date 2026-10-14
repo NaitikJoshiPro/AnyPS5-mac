@@ -73,8 +73,8 @@ alignas(256) constexpr std::array<std::uint32_t, 7> PixelCode{
     0xc8020002, 0xc8060102, 0xc80a0202, 0xc80e0302, 0xf800180f, 0x03020100, 0xbf810000,
 };
 
-// Per-vertex inputs (MslAbi Version 13, the mesh triangle-vertices mode; DECISIONS "per-vertex
-// fragment inputs of mesh draws"): v_interp_mov P10, P20 and P0 of attr0.x and the raw
+// Per-vertex inputs (MslAbi Version 13, the mesh triangle-vertices mode; DECISIONS
+// D46): v_interp_mov P10, P20 and P0 of attr0.x and the raw
 // PERSP_CENTER I exported to MRT0, so the fragment function reads per-vertex location 0 and the
 // emulated perspective barycentrics, as SuperTuxKart's radeonsi programs do.
 alignas(256) constexpr std::array<std::uint32_t, 6> PerVertexPixelCode{
