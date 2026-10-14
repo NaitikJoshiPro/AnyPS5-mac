@@ -195,15 +195,19 @@ id<MTLDevice> SelectDevice() {
 // command buffers ran without those sets: its label stores and every other access through such an
 // import went to non-resident memory (reads 0, writes lost; PPSA99005's completion markers never
 // reached the CPU). Upstream's VkDevice differs per VulkanDevice, which resets that state instead.
+// Never destroyed: the exit handler tears down devices still alive at exit() after static destructors ran.
 id<MTL4CommandQueue> SharedQueue(id<MTLDevice> device) {
-    static std::mutex mutex;
-    static std::vector<std::pair<id<MTLDevice>, id<MTL4CommandQueue>>> queues;
-    std::lock_guard lock(mutex);
-    for (const auto& [owner, queue] : queues) {
+    struct Queues {
+        std::mutex mutex;
+        std::vector<std::pair<id<MTLDevice>, id<MTL4CommandQueue>>> queues;
+    };
+    static Queues* const shared = new Queues;
+    std::lock_guard lock(shared->mutex);
+    for (const auto& [owner, queue] : shared->queues) {
         if (owner == device) return queue;
     }
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
-    if (queue != nil) queues.emplace_back(device, queue);
+    if (queue != nil) shared->queues.emplace_back(device, queue);
     return queue;
 }
 
