@@ -1,0 +1,169 @@
+# Exit criteria of the port milestones (docs/mac/MISSION.md §8), one entry per criterion.
+# tools/mac/mac_progress.py turns this file into the "port milestones" percentage.
+#
+# status:   "verified" = met and verified by a command whose result is in PROGRESS.md
+#           "partial"  = some of it is done; counts as 0 (only verified criteria count)
+#           "open"     = not done
+# progress: the start of a "## " heading in docs/mac/PROGRESS.md that records the verification.
+#           Required for "verified"; the tool fails if no heading starts with it.
+# evidence: short summary of the result, with log paths under .mac-work/logs/ where they exist.
+#
+# Weighting: each milestone is worth the same (20 %), and inside a milestone each criterion is worth the
+# same. A MISSION bullet that names two separate subjects is split into two criteria (M3: the homebrew
+# title and the user's title; M4: one criterion per optimisation in the "implement and measure" list).
+# Change a status only together with the PROGRESS.md entry that verifies it.
+
+[[milestone]]
+id = "M0"
+title = "Native arm64 build"
+
+[[milestone.criterion]]
+text = "Relinker-only build passes natively (all tests)"
+status = "verified"
+progress = "2026-10-12: M0 complete"
+evidence = "build-relinker (-DANYPS5_RELINKER_ONLY=ON, arm64): ctest 122/122 passed, 0 skipped (logs/relinker-m0-ctest.xml)"
+
+[[milestone.criterion]]
+text = "All prx libraries build as arm64 Mach-O, NID-patched and signed"
+status = "verified"
+progress = "2026-10-12: M0 complete"
+evidence = "123 libraries + 4 fixtures are Mach-O arm64 (file), codesign --verify --strict 0 failures, 28,959 NID exports"
+
+[[milestone.criterion]]
+text = "Full non-GPU ctest on arm64: 0 failures, every skip has a recorded reason, flaky tests run 20x"
+status = "verified"
+progress = "2026-10-12: M0 complete"
+evidence = "ctest -LE gpu: 453 tests, 449 passed, 4 skipped (reasons recorded), 0 failed; guest_tcp and host_thread_local 20/20"
+
+[[milestone.criterion]]
+text = "No x86 inline asm or intrinsics on the arm64 build path"
+status = "verified"
+progress = "2026-10-12: M0 complete"
+evidence = "tools/mac/check_no_x86.py build-arm64: 1,632 TUs, 0 findings"
+
+[[milestone]]
+id = "M1"
+title = "CPU translator"
+
+[[milestone.criterion]]
+text = "Per-instruction semantic tests for every x86-64 instruction class used, against the oracle"
+status = "verified"
+progress = "2026-10-12: M1 complete"
+evidence = "FEX ASM tests recorded on hardware: 2,237 pass, 5 xfail, 28 skip, 0 fail (logs/m1-exit-nongpu.xml)"
+
+[[milestone.criterion]]
+text = "Guest fixtures (imports, TLS, threads, exceptions, cleanup, printf, callbacks, long double) run translated"
+status = "verified"
+progress = "2026-10-12: M1 complete"
+evidence = "34 fixture programs pass translated"
+
+[[milestone.criterion]]
+text = "Discovery report per binary (AOT vs JIT bytes); JIT results persisted and reused"
+status = "verified"
+progress = "2026-10-12: M1 complete"
+evidence = "82-100 % AOT on fixtures, DOOM eboot 82.3 %; the second run compiles 0 blocks"
+
+[[milestone.criterion]]
+text = "Microbenchmarks vs native C recorded (target >= 0.7x on integer/SIMD)"
+status = "verified"
+progress = "2026-10-12: M1 complete"
+evidence = "Ratios recorded: integer 0.68, memory 0.53, SIMD 0.51, atomics 0.80. The 0.7x target is NOT met; it is carried to M4 (translator hot-path criterion below)"
+
+[[milestone]]
+id = "M2"
+title = "Metal backend"
+
+[[milestone.criterion]]
+text = "MetalBackend produces valid MSL for every shader in the recompiler test corpus"
+status = "verified"
+progress = "2026-10-13 evening — M2 exit verification"
+evidence = "corpus 2,827/2,827 valid (exit-dump1); 3,329/3,329 after the upstream sync"
+
+[[milestone.criterion]]
+text = "Metal driver passes the libSceAgcDriver GPU suite: 0 failures, skips only for documented hardware limits"
+status = "verified"
+progress = "2026-10-13 evening — M2 exit verification"
+evidence = "gpu-suite/exit-final1: 502 run, 488 pass, 0 fail, 14 allowlisted skips; f16_denormal_flush closed in '2026-10-13 late'"
+
+[[milestone.criterion]]
+text = "Presentation via CAMetalLayer works (flip/display tests pass)"
+status = "verified"
+progress = "2026-10-13 evening — M2 exit verification"
+evidence = "G5 14/14 headless; windowed present/decode/overlay rc=0; DOOM windowed run (M3)"
+
+[[milestone.criterion]]
+text = "Pipeline cache persisted; second run compiles 0 pipelines"
+status = "verified"
+progress = "2026-10-13 evening — M2 exit verification"
+evidence = "second run: 0 compiled, 3 archive hits"
+
+[[milestone]]
+id = "M3"
+title = "First titles"
+
+[[milestone.criterion]]
+text = "A freely distributed homebrew title boots, renders correct frames, takes input, plays audio, runs >= 10 min, fully native"
+status = "verified"
+progress = "2026-10-13 ~20:00 — M3: DOOM (PPSA99666) meets every M3 exit criterion"
+evidence = "DOOM PPSA99666: 11.5-min soak, 58 frames checked, 886 pad commands, audio non-silent, P_TRANSLATED clear (logs/m3-qa/PPSA99666-soak1*)"
+
+[[milestone.criterion]]
+text = "The title the user provides meets the same criteria"
+status = "open"
+progress = "2026-10-14 night — ASTRO BOT"
+evidence = "ASTRO BOT PPSA21564: relinks, every import resolves, boot stops at the first fixed 1.9 GiB direct-memory map"
+
+[[milestone.criterion]]
+text = "A compatibility table in docs/mac/COMPATIBILITY.md"
+status = "verified"
+progress = "2026-10-13 ~18:40 — M3 kickoff"
+evidence = "docs/mac/COMPATIBILITY.md: status, blockers, logs and licences per title"
+
+[[milestone]]
+id = "M4"
+title = "Performance"
+
+[[milestone.criterion]]
+text = "Profiling harness: frame time median/1% low, CPU/GPU watts, GPU pass timings, sustained 10-minute runs"
+status = "partial"
+evidence = "title_run.py samples CPU % and RSS over a soak; no frame-time, power or GPU pass timings yet"
+
+[[milestone.criterion]]
+text = "TBDR render-pass reconstruction and memoryless targets, measured"
+status = "open"
+evidence = ""
+
+[[milestone.criterion]]
+text = "Persistent pipeline/binary archives, measured"
+status = "partial"
+evidence = "the pipeline cache with binary archives exists since M2 (0 compiles on a warm run); no before/after numbers in PERFORMANCE.md"
+
+[[milestone.criterion]]
+text = "Translator hot-path optimisation (barriers, flags, register allocation), measured"
+status = "open"
+evidence = "M1 ratios 0.68 integer / 0.51 SIMD are the baseline"
+
+[[milestone.criterion]]
+text = "Efficiency-core placement of background work, measured"
+status = "open"
+evidence = ""
+
+[[milestone.criterion]]
+text = "Internal resolution override + MetalFX upscaling, measured"
+status = "open"
+evidence = ""
+
+[[milestone.criterion]]
+text = "2D titles: locked 60 fps at panel resolution, sustained, with lower power than at the M3 start"
+status = "open"
+evidence = ""
+
+[[milestone.criterion]]
+text = "A 3D title against the §7 targets, with a profile of the remaining bottlenecks"
+status = "open"
+evidence = ""
+
+[[milestone.criterion]]
+text = "docs/mac/PERFORMANCE.md with before/after numbers for every optimisation"
+status = "open"
+evidence = ""

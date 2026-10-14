@@ -99,6 +99,7 @@ downloads/
 
 *.json
 !demo/web/i18n/*.json
+!/docs/mac/gpu-status.json
 
 !/assets/*.jpg
 !/assets/*.png

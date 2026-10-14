@@ -1,0 +1,99 @@
+{
+ "run": "upsync-final2",
+ "started": "2026-10-14T00:37:01",
+ "finished": "2026-10-14T01:08:24",
+ "commit": "e29d6604b",
+ "branch": "mac-native-upsync",
+ "modified_files": 0,
+ "validation": true,
+ "registered": 574,
+ "run_count": 573,
+ "passed": 558,
+ "failed": 0,
+ "timeout": 0,
+ "skipped": 15,
+ "not_built": 0,
+ "skipped_allowlisted": 15,
+ "held": [
+  "agc_driver_f16_denormal_flush"
+ ],
+ "percent": 97.21,
+ "skips": [
+  {
+   "test": "agc_driver_draw_cache_reuse",
+   "reason": "skipped, SKIP_RETURN_CODE=77",
+   "allowlisted": true
+  },
+  {
+   "test": "guest_video_out_high_frame_rate",
+   "reason": "skipped, current display does not provide 120 Hz",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_descriptor_pool_recycling",
+   "reason": "skipped, the device has no Vulkan descriptor pools: Metal descriptor tables are written into the per-batch upload ring",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_descriptor_pool_reset_failure",
+   "reason": "skipped, the device has no Vulkan descriptor pools: Metal descriptor pools are tokens whose reset cannot fail, so the termination on a failed reset is unreachable",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_color32",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_color32_fast",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_color64",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_color64_fast",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_d16",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_d16_fast",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_d32",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_driver_pipeline_optimized_readback_d32_fast",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_pipeline_library",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_pipeline_library_fast_only",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none",
+   "allowlisted": true
+  },
+  {
+   "test": "agc_pipeline_library_off",
+   "reason": "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none",
+   "allowlisted": true
+  }
+ ],
+ "failures": []
+}
