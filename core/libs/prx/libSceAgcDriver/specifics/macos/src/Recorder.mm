@@ -3282,6 +3282,7 @@ void Recorder::Submit() {
         if (traceLandingCopies) ReportLandingCopies(serial);
         if (traceGpu) std::fprintf(stderr, "[gpu] recorder batch %llu completed on the GPU (%.2f ms; feedback %.1f ms after the commit)%s%s\n", static_cast<unsigned long long>(serial), (commitFeedback.GPUEndTime - commitFeedback.GPUStartTime) * 1e3,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committedAt).count(), commitFeedback.error != nil ? ": " : "", commitFeedback.error != nil ? Metal::Describe(commitFeedback.error).c_str() : "");
+        if (traceGpu && commitFeedback.error != nil) std::fprintf(stderr, "[gpu] recorder batch %llu error domain %s code %ld user info %s\n", static_cast<unsigned long long>(serial), commitFeedback.error.domain.UTF8String, static_cast<long>(commitFeedback.error.code), commitFeedback.error.userInfo.description.UTF8String);
         feedback->gpuStartSeconds = commitFeedback.GPUStartTime;
         feedback->gpuEndSeconds = commitFeedback.GPUEndTime;
         if (commitFeedback.error != nil) {
