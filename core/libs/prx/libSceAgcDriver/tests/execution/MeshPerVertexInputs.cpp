@@ -337,13 +337,18 @@ int main() {
                 const auto meshPixel = DrawMesh(*device, test, program);
                 Require(meshPixel.barycentricEmulation.active == emulated, what + ": the mesh draw's pixel program " + (emulated ? "does not run" : "runs") + " the barycentric emulation");
                 std::uint32_t drawn = 0;
+                std::uint32_t differing = 0;
+                std::size_t first = 0;
+                std::uint32_t low = Width, high = 0;
                 for (std::size_t index = 0; index < Pixels.size(); ++index) {
                     if (std::memcmp(&Pixels[index], &reference[index], sizeof(float)) != 0) {
-                        const auto pixel = index / 4u;
-                        Require(false, what + ": pixel " + At(pixel) + " channel " + std::to_string(index % 4u) + " is " + std::to_string(Pixels[index]) + " on the mesh path, " + std::to_string(reference[index]) + " on the vertex path");
+                        if (differing++ == 0u) first = index;
+                        low = std::min<std::uint32_t>(low, static_cast<std::uint32_t>(index / 4u % Width));
+                        high = std::max<std::uint32_t>(high, static_cast<std::uint32_t>(index / 4u % Width));
                     }
                     drawn += index % 4u == 0u && Pixels[index] != Unwritten ? 1u : 0u;
                 }
+                Require(differing == 0u, what + ": " + std::to_string(differing) + " channels differ (x " + std::to_string(low) + " to " + std::to_string(high) + "), first pixel " + At(first / 4u) + " channel " + std::to_string(first % 4u) + " is " + std::to_string(Pixels[first]) + " on the mesh path, " + std::to_string(reference[first]) + " on the vertex path");
                 Require(drawn > 400u, what + ": only " + std::to_string(drawn) + " pixels were drawn");
                 if (program.code.data() == PerVertexPixelCode.data() && test.mesh.inputPrimitive == 4u) CheckListValues(what, test.last);
                 std::printf("%s: %u pixels identical on the mesh and vertex paths\n", what.c_str(), drawn);
