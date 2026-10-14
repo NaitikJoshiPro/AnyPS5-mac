@@ -85,7 +85,10 @@ bool exact(const IrValue& inst, const IrProgram& program, const ShaderPixelInput
     if (partial->Opcode() != IrOpcode::InterpolateHostP1 || !sameParameter(inst, *partial)) return false;
     const auto& metadata = program.Metadata();
     const auto kind = pixel.InputIsLinear(inst.Argument(0)->Resolve()->ImmediateU32(), metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs) ? StageInputKind::BaryCoordNoPerspective : StageInputKind::BaryCoordSmooth;
-    return isBarycentric(*lookThrough(partial->Argument(2)), kind, 0u) && isBarycentric(*lookThrough(inst.Argument(2)), kind, 1u);
+    // I and J of one pair: the same interpolation location (DECISIONS D38).
+    const auto* i = lookThrough(partial->Argument(2));
+    const auto* j = lookThrough(inst.Argument(2));
+    return isBarycentric(*i, kind, 0u) && isBarycentric(*j, kind, 1u) && i->Flags<std::uint32_t>() == j->Flags<std::uint32_t>();
 }
 
 bool sharesSlots(const IrProgram& program, const ShaderPixelInputInfo& pixel) {

@@ -72,6 +72,7 @@ void TranslationContext::vInterpP2F32(const RdnaInstruction& inst) {
         writeOperand(inst.destination, &result);
         return;
     }
+    std::uint32_t locationFlags = 0u;
     if (pixelInput != nullptr && inst.source0.kind == RdnaOperandKind::VectorRegister && inst.source1.value < 32u) {
         const auto readsPair = [&](PixelInput input) {
             const auto base = pixelInput->psInputVgpr[static_cast<std::size_t>(input)];
@@ -87,9 +88,15 @@ void TranslationContext::vInterpP2F32(const RdnaInstruction& inst) {
         if (readsPair(PixelInput::LinearCenter) || readsPair(PixelInput::PerspectiveCenter)) metadata.pixelCenterInputs |= bit;
         if (readsPair(PixelInput::LinearCentroid) || readsPair(PixelInput::PerspectiveCentroid)) metadata.pixelCentroidInputs |= bit;
         if (readsPair(PixelInput::LinearSample) || readsPair(PixelInput::PerspectiveSample)) metadata.pixelSampleInputs |= bit;
+        // This read's own location (DECISIONS D38): an input read at several locations is
+        // interpolated per read.
+        if (readsPair(PixelInput::LinearCenter) || readsPair(PixelInput::PerspectiveCenter)) locationFlags = InterpolationLocationFlags(InterpolationLocation::Center);
+        else if (readsPair(PixelInput::LinearCentroid) || readsPair(PixelInput::PerspectiveCentroid)) locationFlags = InterpolationLocationFlags(InterpolationLocation::Centroid);
+        else if (readsPair(PixelInput::LinearSample) || readsPair(PixelInput::PerspectiveSample)) locationFlags = InterpolationLocationFlags(InterpolationLocation::Sample);
     }
     (void)ir.Emit(IrOpcode::InterpolateHostP2, IrType::Void, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value), readOperand(inst.source0, IrType::F32), readOperand(inst.destination, IrType::F32), &ir.GetExec()});
     IrValue& value = ir.Emit(IrOpcode::GetAttribute, IrType::U32, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value)});
+    value.SetFlags<std::uint32_t>(locationFlags);
     writeOperand(inst.destination, &value);
 }
 

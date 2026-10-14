@@ -146,9 +146,17 @@ public:
     std::string Builtin(MslBuiltin builtin);
     std::bitset<static_cast<std::size_t>(MslBuiltin::Count)> builtins;
     bool usesTable = false;
-    // Graphics stages (MslStageIo.cpp, B6): fragment inputs read (Vulkan location -> interpolation
-    // qualifier, e.g. ", flat"), and whether the pixel valid mask (kill) is used.
-    std::map<std::uint32_t, std::string> fragmentInputs;
+    // Graphics stages (MslStageIo.cpp, B6): fragment inputs read (Vulkan location -> how: flat,
+    // perspective or linear, and the interpolation locations read, one bit per
+    // InterpolationLocation: one location takes its qualifier, several make the input an
+    // interpolant<> read with interpolate_at_*, DECISIONS D38), the emulated barycentrics' locations
+    // (perspective, linear), and whether the pixel valid mask (kill) is used.
+    struct FragmentInput {
+        enum class Mode : std::uint32_t { Flat, Perspective, Linear } mode = Mode::Flat;
+        std::uint32_t locations = 0;
+    };
+    std::map<std::uint32_t, FragmentInput> fragmentInputs;
+    std::array<std::uint32_t, 2> barycentricLocations {};
     bool usesValidMask = false;
     // Images (MslImage.cpp): the direct runtime-mode switch case being emitted, {selector function
     // constant id, mode index}, for Reflection::samplerModeUses; {0, ~0u} outside one.

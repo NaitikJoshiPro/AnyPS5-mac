@@ -17,6 +17,8 @@
 //                                   integer resolve, depth, pass sharing; 4x == 2 x 2x emulation)
 //   agc_metal_msaa_tests sampled8  (8x type 14 and 4x/8x type 15 T# reads, image_get_resinfo)
 //   agc_metal_msaa_tests interp    (recompiled PERSP_SAMPLE vs PERSP_CENTER pixel programs, per sample)
+//   agc_metal_msaa_tests interp_locations (DECISIONS D38: one input read at sample, center and
+//                                   centroid through interpolant<>, against CPU positions)
 //   agc_metal_msaa_tests a2c       (recompiled alpha-to-coverage: the measured proportional rule)
 //   agc_metal_msaa_tests storage   (guest image_store / image_atomic_add on rendered 4x/8x targets)
 //   agc_metal_msaa_tests ranges    (a build binding an MSAA T# before single-sample T#s: each surface
@@ -792,6 +794,127 @@ void CheckInterpolation(AgcDriver::VulkanDevice& device) {
     std::puts("interp: PERSP_SAMPLE inputs interpolate at each 4x/8x sample, PERSP_CENTER at the center passed");
 }
 
+// One input read at several locations (DECISIONS D38): the interpolant<> path. Guest programs
+// (llvm-mc -arch=amdgcn -mcpu=gfx1030), I/J pairs in SPI_PS_INPUT_ADDR order from v0:
+//   sample, center, centroid (PERSP_SAMPLE v[0:1], PERSP_CENTER v[2:3], PERSP_CENTROID v[4:5]):
+//     v_interp_p1_f32 v6, v0, attr0.x; v_interp_p2_f32 v6, v1, attr0.x
+//     v_interp_p1_f32 v7, v2, attr0.x; v_interp_p2_f32 v7, v3, attr0.x
+//     v_interp_p1_f32 v8, v4, attr0.x; v_interp_p2_f32 v8, v5, attr0.x
+//     exp mrt0 v6, v7, v8, v7 done vm; s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 9> ThreeLocationsPixelCode {0xc8180000u, 0xc8190001u, 0xc81c0002u, 0xc81d0003u, 0xc8200004u, 0xc8210005u, 0xf800180fu, 0x07080706u, 0xbf810000u};
+//   center, centroid (PERSP_CENTER v[0:1], PERSP_CENTROID v[2:3]), no per-sample execution:
+//     the first four interp instructions above; exp mrt0 v6, v7, v6, v7 done vm; s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 7> CenterCentroidPixelCode {0xc8180000u, 0xc8190001u, 0xc81c0002u, 0xc81d0003u, 0xf800180fu, 0x07060706u, 0xbf810000u};
+
+ShaderRecompiler::RecompileResult RecompileLocations(const AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t inputs) {
+    using ShaderRecompiler::PixelInput;
+    using ShaderRecompiler::PixelInputBit;
+    ShaderRecompiler::ShaderPixelStageInfo pixel {};
+    pixel.wave32 = false;
+    pixel.interpolatorCount = 1;
+    pixel.executeOnNoop = true;
+    pixel.inputAddr = inputs;
+    pixel.hasPerspectiveCenterVgpr = (inputs & PixelInputBit(PixelInput::PerspectiveCenter)) != 0u;
+    pixel.perspectiveCentroid = (inputs & PixelInputBit(PixelInput::PerspectiveCentroid)) != 0u;
+    pixel.targetOutputMode[0] = 9u;
+    pixel.targetExportMapping.fill(0xe4u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory {{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const auto target = device.Target();
+    ShaderRecompiler::RecompileRequest request {
+        {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {64u, 0, {}, std::nullopt, pixel, std::nullopt, memory},
+        target,
+        PixelPushLayout(0u, target)};
+    request.useCache = false;
+    return ShaderRecompiler::Recompile(request);
+}
+
+// A triangle covering x < Edge (framebuffer pixels) over the whole height: pixel 2 of row 5 is
+// partially covered, its center (2.5) is not.
+constexpr double LocationsEdge = 2.4375 + 1.0 / 32.0;
+constexpr std::array<std::array<float, 4>, 3> LocationsTriangle {{
+    {static_cast<float>(LocationsEdge / Extent * 2.0 - 1.0), -3.0f, 0.5f, 0.0f},
+    {static_cast<float>(LocationsEdge / Extent * 2.0 - 1.0), 3.0f, 0.5f, 0.0f},
+    {-5.0f, 0.0f, 0.5f, 0.0f},
+}};
+
+// Input 0 is framebuffer x / 32 (linear in x, so perspective and linear agree); channels: sample,
+// center, centroid (first program), center, centroid (second). Each is checked against the CPU's location. Sample reads are the sample's position; center reads x + 0.5,
+// covered or not; centroid reads lie within the covered samples' x range (Vulkan and Metal leave
+// the point inside the covered area to the implementation), and equal the center for a fully
+// covered pixel when the function runs per pixel.
+void CheckInterpolationLocations(AgcDriver::VulkanDevice& device) {
+    using ShaderRecompiler::PixelInput;
+    using ShaderRecompiler::PixelInputBit;
+    GuestBlock vertices(16384);
+    WriteVertices(vertices, LocationsTriangle);
+    const auto vertex = MakeShaders(vertices.Address(), 3u, 0u, "", ~0u, true);
+    struct Program {
+        const char* name;
+        std::span<const std::uint32_t> code;
+        std::uint32_t inputs;
+        bool perSample;
+    };
+    const std::array<Program, 2> programs {{
+        {"sample+center+centroid", ThreeLocationsPixelCode, PixelInputBit(PixelInput::PerspectiveSample) | PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::PerspectiveCentroid), true},
+        {"center+centroid", CenterCentroidPixelCode, PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::PerspectiveCentroid), false},
+    }};
+    std::uint32_t partial = 0;
+    for (const auto& program : programs) {
+        const auto pixel = RecompileLocations(device, program.code, program.inputs);
+        const std::string source(pixel.msl.Source());
+        const std::string what(program.name);
+        Require(source.find("interpolant<float4, interpolation::perspective> p0 [[user(locn0)]]") != std::string::npos, what + ": input 0 is not an interpolant");
+        Require(source.find(".interpolate_at_centroid()") != std::string::npos && source.find(".interpolate_at_center()") != std::string::npos, what + ": no center and centroid reads");
+        Require((source.find(".interpolate_at_sample(aps5_sample_id)") != std::string::npos) == program.perSample, what + ": the sample read does not match");
+        Require(pixel.msl.Reflection().perSample == program.perSample, what + ": Reflection::perSample does not match");
+        for (const std::uint32_t samples : {4u, 8u}) {
+            auto& block = *sources.emplace_back(std::make_unique<GuestBlock>(Extent * Extent * 4u * samples));
+            const auto target = Target(block.Address(), VK_FORMAT_R8G8B8A8_UNORM, samples);
+            const auto state = BaseState(target);
+            DrawRecompiled(device, state, vertex, pixel);
+            RunGuest(device, samples == 8u ? std::span<const std::uint32_t>(Load8Code) : std::span<const std::uint32_t>(MsaaLoadCode), block.Address(), samples, 14u);
+            const auto positions = Positions(state);
+            constexpr double tolerance = 0.6 / 255.0;
+            for (std::uint32_t thread = 0; thread < 32u; ++thread) {
+                const auto sample = samples == 8u ? thread & 7u : thread & 3u;
+                const auto x = samples == 8u ? thread >> 3u : thread >> 2u;
+                if (x + positions[sample][0] >= LocationsEdge) continue;
+                double low = 1.0;
+                double high = 0.0;
+                std::uint32_t covered = 0;
+                for (const auto& position : positions) {
+                    if (x + position[0] >= LocationsEdge) continue;
+                    low = std::min(low, position[0]);
+                    high = std::max(high, position[0]);
+                    ++covered;
+                }
+                const auto label = what + " " + std::to_string(samples) + "x sample " + std::to_string(sample) + " of pixel " + std::to_string(x);
+                const double center = (x + 0.5) / Extent;
+                if (program.perSample) {
+                    const double expected = (x + positions[sample][0]) / Extent;
+                    Require(std::fabs(ResultFloat(thread, 0) - expected) <= tolerance, label + ": the sample read is " + std::to_string(ResultFloat(thread, 0) * 255.0f) + "/255, expected " + std::to_string(expected * 255.0) + "/255");
+                } else {
+                    Require(std::fabs(ResultFloat(thread, 0) - center) <= tolerance, label + ": the center read (red) is " + std::to_string(ResultFloat(thread, 0) * 255.0f) + "/255, expected " + std::to_string(center * 255.0) + "/255");
+                }
+                if (program.perSample) Require(std::fabs(ResultFloat(thread, 1) - center) <= tolerance, label + ": the center read (green) is " + std::to_string(ResultFloat(thread, 1) * 255.0f) + "/255, expected " + std::to_string(center * 255.0) + "/255");
+                const auto centroid = ResultFloat(thread, program.perSample ? 2u : 1u);
+                const double lowest = (x + low) / Extent - tolerance;
+                const double highest = (x + high) / Extent + tolerance;
+                Require(centroid >= lowest && centroid <= highest, label + ": the centroid read is " + std::to_string(centroid * 255.0f) + "/255, outside the covered samples' " + std::to_string((x + low) / Extent * 255.0) + ".." + std::to_string((x + high) / Extent * 255.0) + "/255");
+                if (covered == samples && !program.perSample) Require(std::fabs(centroid - center) <= tolerance, label + ": the centroid read of a fully covered pixel is " + std::to_string(centroid * 255.0f) + "/255, not the center");
+                if (covered != samples) {
+                    ++partial;
+                    if (sample == 0u) std::printf("%s: %u of %u samples covered, centroid %.3f/255 (center %.3f/255)\n", label.c_str(), covered, samples, centroid * 255.0, center * 255.0);
+                }
+            }
+        }
+    }
+    Require(partial != 0u, "no partially covered pixel was checked");
+    sources.clear();
+    std::puts("interp_locations: one input at sample, center and centroid (interpolant<>), 4x/8x, passed");
+}
+
 // Alpha to coverage of the recompiled program (alpha = x / 32 at the pixel center): the measured
 // 0xaa01 rule (DECISIONS D28): floor(alpha * n + 0.5) samples, 8x in a fixed mask per 1/16.
 constexpr std::array<std::uint32_t, 16> AlphaMasks8 {0x00u, 0x10u, 0x04u, 0x14u, 0x12u, 0x32u, 0x16u, 0x36u, 0x35u, 0x75u, 0x3du, 0x7du, 0x77u, 0xf7u, 0x7fu, 0xffu};
@@ -1013,6 +1136,7 @@ int main(int argc, char** argv) {
         else if (mode == "emulated") CheckEmulated(*device);
         else if (mode == "sampled8") CheckSampledEmulated(*device);
         else if (mode == "interp") CheckInterpolation(*device);
+        else if (mode == "interp_locations") CheckInterpolationLocations(*device);
         else if (mode == "a2c") CheckAlphaToCoverage(*device);
         else if (mode == "storage") CheckStorage(*device);
         else if (mode == "ranges") CheckRanges(*device);

@@ -410,6 +410,7 @@ agc_metal_msaa_edges G3
 agc_metal_msaa_emulated G3
 agc_metal_msaa_integer G3
 agc_metal_msaa_interp G3
+agc_metal_msaa_interp_locations G3
 agc_metal_msaa_masks G3
 agc_metal_msaa_sampled G3
 agc_metal_msaa_sampled8 G3
