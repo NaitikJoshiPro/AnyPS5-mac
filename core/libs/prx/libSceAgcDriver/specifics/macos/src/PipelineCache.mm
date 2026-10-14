@@ -152,6 +152,7 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
         directory.clear();
         statistics.archiveDisabled = "MTL_SHADER_VALIDATION";
     }
+    if (Profile()) std::fprintf(stderr, "[metal-pipelines] archive directory: %s\n", directory.empty() ? "(none)" : directory.c_str());
     if (!directory.empty()) {
         archivePath = directory / FileSafe(std::string(device.name.UTF8String) + "-" + OsBuild() + ".mtl4archive");
         statistics.archivePath = archivePath.string();
@@ -332,7 +333,7 @@ id<MTLComputePipelineState> PipelineCache::buildCompute(const PipelineFunction& 
             std::lock_guard lock(mutex);
             ++statistics.pipelinesCompiled;
             statistics.compileMilliseconds += elapsed;
-            save = ++unsaved >= SaveInterval;
+            save = ++unsaved >= SaveInterval || statistics.pipelinesCompiled <= EagerSaves;
         }
         if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled a compute pipeline in %.1f ms\n", elapsed);
         if (save) submit([this] { Save(); });
@@ -428,7 +429,7 @@ id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineReques
             std::lock_guard lock(mutex);
             ++statistics.pipelinesCompiled;
             statistics.compileMilliseconds += elapsed;
-            save = ++unsaved >= SaveInterval;
+            save = ++unsaved >= SaveInterval || statistics.pipelinesCompiled <= EagerSaves;
         }
         if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled a render pipeline in %.1f ms\n", elapsed);
         if (save) submit([this] { Save(); });
@@ -707,6 +708,7 @@ void PipelineCache::Save() {
             return;
         }
     }
+    if (Profile()) std::fprintf(stderr, "[metal-pipelines] archive %s saved (%llu new pipelines)\n", archivePath.c_str(), static_cast<unsigned long long>(saved));
     std::lock_guard lock(mutex);
     unsaved -= std::min(unsaved, saved);
     ++statistics.archiveSaves;

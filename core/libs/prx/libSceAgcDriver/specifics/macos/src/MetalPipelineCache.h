@@ -159,7 +159,8 @@ public:
     void PrepareRender(const RenderPipelineRequest& request);
 
     // Writes the archive when pipelines were compiled since the last save (atomically renamed).
-    // Called every SaveInterval new pipelines and at destruction. Never throws.
+    // Called after each of the first EagerSaves new pipelines of a process, then every SaveInterval
+    // new pipelines, and at destruction. Never throws.
     void Save();
     // Waits until no background task runs.
     void Drain();
@@ -167,6 +168,10 @@ public:
     PipelineCacheStatistics Statistics() const;
 
     static constexpr std::uint64_t SaveInterval = 64;
+    // A title that fail-stops (_Exit) runs no destructor, so the pipelines of its first frames,
+    // the slow ones (PPSA99005's first draw compiles for 3 s against the guest's 2 s retirement
+    // bound), only persist if they are saved as they are compiled.
+    static constexpr std::uint64_t EagerSaves = 256;
     // The cache key of a request (exposed for tests).
     static std::string ComputeKey(const PipelineFunction& function);
     static std::string RenderKey(const RenderPipelineRequest& request);
