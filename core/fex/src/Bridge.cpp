@@ -553,6 +553,13 @@ std::uint64_t Bridge::TlsGetAddrStub() {
     return tlsGetAddrStub;
 }
 
+std::string Bridge::StubName(std::uint64_t address) {
+    if (!OwnsStub(address) || address < StubBase() + FirstStubOffset) return {};
+    std::lock_guard lock(stubMutex);
+    const std::size_t index = (address - StubBase() - FirstStubOffset) / StubBytes;
+    return index < functions.size() ? functions[index].name : std::string {};
+}
+
 std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic variadic, std::uint8_t fixed, bool x87Result,
                               const BridgeSignature* signature) {
     std::lock_guard lock(stubMutex);

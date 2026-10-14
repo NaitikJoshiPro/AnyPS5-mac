@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,12 @@ public:
     static bool Enabled();
 
     // Starts the sampler thread (once). modules may be null.
+    // importName names a RIP outside the modules (the bridge's import stubs); it may return "".
     static void Start(FEXCore::Context::Context* context, const GuestModules* modules,
-                      const FEXCore::SignalDelegatorConfig::SRAIndexMapping& gprMapping);
+                      const FEXCore::SignalDelegatorConfig::SRAIndexMapping& gprMapping,
+                      std::function<std::string(std::uint64_t)> importName);
+    // Detaches the context and modules (GuestCpu's destructor): sampling pauses until the next Start.
+    static void Stop(FEXCore::Context::Context* context);
 
     // Called on the host thread that will run guest code through `thread`, and before that thread is destroyed.
     static void Register(FEXCore::Core::InternalThreadState* thread);

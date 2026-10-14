@@ -60,6 +60,8 @@ struct Sampler {
     std::map<unsigned, std::string> names; // threads seen in this window, by index
     FEXCore::Context::Context* context = nullptr;
     const GuestModules* modules = nullptr;
+    std::function<std::string(std::uint64_t)> importName;
+    bool started = false;
     FEXCore::SignalDelegatorConfig::SRAIndexMapping gprMapping {};
     unsigned periodMs = 0;
     unsigned reportSeconds = 10;
@@ -171,6 +173,7 @@ bool Take(const Registered& entry, FEXCore::Context::Context* context, Snapshot&
 
 void SampleOnce(Sampler& sampler) {
     std::lock_guard lock(sampler.mutex);
+    if (sampler.context == nullptr) return;
     for (const auto& entry : sampler.threads) {
         Snapshot snapshot;
         if (!Take(entry, sampler.context, snapshot)) continue;
@@ -230,15 +233,18 @@ GuestSampler::Location GuestSampler::Locate(const GuestModules* modules, std::ui
 }
 
 void GuestSampler::Start(FEXCore::Context::Context* context, const GuestModules* modules,
-                         const FEXCore::SignalDelegatorConfig::SRAIndexMapping& gprMapping) {
+                         const FEXCore::SignalDelegatorConfig::SRAIndexMapping& gprMapping,
+                         std::function<std::string(std::uint64_t)> importName) {
     if (!Enabled()) return;
     auto& sampler = Instance();
     {
         std::lock_guard lock(sampler.mutex);
-        if (sampler.context != nullptr) return;
         sampler.context = context;
         sampler.modules = modules;
+        sampler.importName = std::move(importName);
         sampler.gprMapping = gprMapping;
+        if (sampler.started) return;
+        sampler.started = true;
         sampler.periodMs = PeriodFromEnvironment();
         sampler.reportSeconds = std::max(1u, EnvNumber("APS5_FEX_SAMPLE_REPORT", 10));
         sampler.top = std::max(1u, EnvNumber("APS5_FEX_SAMPLE_TOP", 8));
@@ -246,6 +252,16 @@ void GuestSampler::Start(FEXCore::Context::Context* context, const GuestModules*
     std::fprintf(stderr, "[fex-sample] sampling guest threads every %u ms, report every %u s\n", sampler.periodMs, sampler.reportSeconds);
     std::atexit(ReportAtExit);
     std::thread(Run).detach();
+}
+
+void GuestSampler::Stop(FEXCore::Context::Context* context) {
+    if (!Enabled()) return;
+    auto& sampler = Instance();
+    std::lock_guard lock(sampler.mutex);
+    if (sampler.context != context) return;
+    sampler.context = nullptr;
+    sampler.modules = nullptr;
+    sampler.importName = nullptr;
 }
 
 void GuestSampler::Register(ThreadState* thread) {
@@ -279,7 +295,9 @@ void GuestSampler::Report(std::FILE* out) {
         for (std::size_t i = 0; i < rows.size() && i < sampler.top; ++i) {
             const auto& [key, hits] = rows[i];
             const std::uint64_t rip = std::get<1>(key);
-            const auto location = Locate(sampler.modules, rip);
+            auto location = Locate(sampler.modules, rip);
+            if (location.module == "?" && sampler.importName)
+                if (auto name = sampler.importName(rip); !name.empty()) location = {"import:" + name, 0};
             std::fprintf(out, "[fex-sample]   %5.1f%% rip 0x%" PRIx64 " %s+0x%" PRIx64, 100.0 * double(hits.count) / double(total), rip,
                          location.module.c_str(), location.offset);
             if (hits.inJit) {

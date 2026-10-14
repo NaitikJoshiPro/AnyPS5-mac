@@ -580,12 +580,14 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     if (const std::uint64_t gadget = CreateConsoleSyscallGadget(bridge)) state->context->AddThunkTrampolineIRHandler(ConsoleSyscallGadget, gadget);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
-    GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping);
+    GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping,
+                        [&bridge](std::uint64_t rip) { return bridge.StubName(rip); });
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
     exitFlush = ExitFlush {state->context.get(), state->modules.get(), state->coverage};
 }
 
 GuestCpu::~GuestCpu() {
+    GuestSampler::Stop(state->context.get());
     if (exitFlush && exitFlush->context == state->context.get()) exitFlush.reset();
     state->context->FlushDiskCache();
     guestCode = {};
