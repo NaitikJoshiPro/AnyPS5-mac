@@ -142,6 +142,8 @@ void ImageCache::Attach(const Context& deviceContext) {
     limits.maxImageArrayLayers = std::max(limits.maxImageArrayLayers, 2048u);
     context.samplerAnisotropy = true;
     context.samplerFilterMinmax = true;
+    // Indexed lists with primitive restart expand on the CPU (MetalDraw.mm), as PrimitiveListRestart says.
+    context.primitiveListRestart = true;
     placeholderImages = std::make_unique<PlaceholderImages>(context);
     context.placeholderImages = placeholderImages.get();
     upstreamSamplers = std::make_unique<SamplerCache>();

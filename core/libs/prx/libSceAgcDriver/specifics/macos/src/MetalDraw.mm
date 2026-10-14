@@ -427,8 +427,8 @@ static void CheckInputsClearOfTarget(Settle settle, const Graphics::State& graph
                     maxIndex = draw.firstVertex + draw.indexCount - 1u;
                 } else {
                     settle(indexBegin, indexBytes);
-                    const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, static_cast<std::size_t>(indexBytes))), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart && !listTopology);
+                    // Lists restart too (PrimitiveListRestart: the index expansion below).
+                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, static_cast<std::size_t>(indexBytes))), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart);
                     if (highest) maxIndex = *highest + draw.firstVertex;
                 }
             }
@@ -1065,7 +1065,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const auto& parameters = fragment->program->fragmentParameters;
         if (std::any_of(parameters.begin(), parameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flatP10; })) Fail("v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
     }
-    const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
+    // Indexed lists with primitive restart (PrimitiveListRestart) expand too: Metal restarts strips
+    // only, and a restart index ends a list's current primitive (its incomplete vertices dropped,
+    // as VK_EXT_primitive_topology_list_restart and the guest's VGT reset index do).
+    const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const bool listRestart = draw.indexed && graphics.primitiveRestart && listTopology && !graphics.rectList;
+    const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
     if (expand) {
@@ -1125,6 +1130,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
                 for (std::size_t k = 0; k + 1 < n; k += 2) line(v[k], v[k + 1]);
                 break;
+            case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+                fanIndices.insert(fanIndices.end(), v.begin(), v.end());
+                break;
             case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
                 for (std::size_t i = 0; i + 1 < n; ++i) line(v[i], v[i + 1]);
                 break;
@@ -1141,7 +1149,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     continue;
                 }
                 const auto value = indexAt(call.first + position);
-                if (strips && graphics.primitiveRestart && value == restart) {
+                if ((strips || listTopology) && graphics.primitiveRestart && value == restart) {
                     flush();
                     continue;
                 }
@@ -1407,7 +1415,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         std::uint64_t indexLength = 0;
         MTLIndexType indexType = draw.indexSize == 2u ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         const bool expanded = expand;
-        const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
+        const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : primitive.topologyClass == MTLPrimitiveTopologyClassPoint ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle) : primitive.type;
         const auto& drawCalls = expanded ? fanCalls : calls;
         const bool indexedDraw = (draw.indexed || expanded) && !triangleVertices;
         if (triangleVertices && !mesh) {
@@ -1615,7 +1623,8 @@ bool VulkanDevice::DualSrcBlend() const {
 }
 
 bool VulkanDevice::PrimitiveListRestart() const {
-    return false;
+    // Indexed list draws with restart go through the CPU index expansion (MetalDraw.mm `listRestart`).
+    return true;
 }
 
 bool VulkanDevice::SamplerFilterMinmax() const {

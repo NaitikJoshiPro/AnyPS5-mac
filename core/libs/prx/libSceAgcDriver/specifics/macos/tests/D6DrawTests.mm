@@ -5,7 +5,8 @@
 //                                   continued pass, tiled RenderTarget-mode targets loaded and
 //                                   written back, cull mode and front-face winding as Vulkan)
 //   agc_metal_draw_tests primitives (agc_metal_draw_primitives: depth surfaces and the depth test,
-//                                   indexed triangle fans, CPU-read indirect draws, instancing)
+//                                   indexed triangle fans, a triangle list with primitive restart,
+//                                   CPU-read indirect draws, instancing)
 //   agc_metal_draw_tests offscreen  (agc_metal_offscreen_frames: headless presentation, a window
 //                                   without a Metal layer: pixels scaled aspect-fit over black,
 //                                   clears, slots retired; read back via APS5_METAL_PRESENT_READBACK)
@@ -303,6 +304,31 @@ void CheckPrimitives(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     Require(PixelRgba8(target, Extent - 2u, 2u) == 0xff0000ffu && PixelRgba8(target, Extent - 2u, Extent - 2u) == 0xff0000ffu && PixelRgba8(target, 2u, 2u) == 0u, "the indexed triangle fan did not cover exactly the right half");
 
+    // Indexed triangle list with primitive restart (VK_EXT_primitive_topology_list_restart
+    // semantics, the guest's VGT reset index): the restart index ends the current triangle and drops
+    // its incomplete vertices. {0 1 2, 4 5, R, 0 2 3} draws the right-half quad only; ignoring the
+    // restart would add triangle (4 5 0) on the left, and Metal's own assembly (restart for strips
+    // only) would take R as a vertex.
+    std::memset(target.Data(), 0, target.Size());
+    constexpr std::array<std::array<float, 4>, 6> listQuad {{{0.0f, -1.0f, 0.5f, 0.0f}, {1.0f, -1.0f, 0.5f, 0.0f}, {1.0f, 1.0f, 0.5f, 0.0f}, {0.0f, 1.0f, 0.5f, 0.0f}, {-1.0f, -1.0f, 0.5f, 0.0f}, {-1.0f, 1.0f, 0.5f, 0.0f}}};
+    WriteVertices(vertices, listQuad);
+    const std::array<std::uint16_t, 9> listIndices {0u, 1u, 2u, 4u, 5u, 0xffffu, 0u, 2u, 3u};
+    std::memcpy(indices.Data(), listIndices.data(), sizeof(listIndices));
+    auto list = BaseState();
+    SetTarget(list, target.Address(), VK_FORMAT_R8G8B8A8_UNORM, ColorTileMode::Linear, 4u);
+    list.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    list.primitiveRestart = true;
+    Draw(device, list, MakeShaders(vertices.Address(), 6u, 0xff0000ffu), {indices.Address(), static_cast<std::uint32_t>(listIndices.size()), 2u, 1u, 0u, true});
+    device.WaitIdle();
+    for (const auto y : {2u, Extent / 4u, Extent / 2u, Extent - 3u}) {
+        for (const auto x : {Extent / 2u + 1u, Extent * 3u / 4u, Extent - 2u}) {
+            Require(PixelRgba8(target, x, y) == 0xff0000ffu, "the restarted triangle list left right-half pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") uncovered");
+        }
+        for (const auto x : {1u, Extent / 8u, Extent / 4u}) {
+            Require(PixelRgba8(target, x, y) == 0u, "the restarted triangle list drew left-half pixel (" + std::to_string(x) + ", " + std::to_string(y) + "): the restart did not drop the incomplete triangle");
+        }
+    }
+
     // CPU-read indirect draw (two records, the first empty) plus instancing: the instance at w
     // = 1 shifts the half-width quad's triangles by one unit.
     std::memset(target.Data(), 0, target.Size());
@@ -327,7 +353,7 @@ void CheckPrimitives(AgcDriver::VulkanDevice& device) {
     Draw(device, plain, shifted, indirect);
     device.WaitIdle();
     Require(PixelRgba8(target, 2u, 2u) == 0xff00ff00u && PixelRgba8(target, Extent - 2u, 2u) == 0xff00ff00u, "the indirect draw's second instance did not reach the right half");
-    std::puts("primitives: depth test, indexed fan, CPU indirect, instancing passed");
+    std::puts("primitives: depth test, indexed fan, restarted triangle list, CPU indirect, instancing passed");
 }
 
 // Headless presentation: a 32x16 source with four colored quadrants presented into a 64x48
