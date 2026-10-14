@@ -86,6 +86,7 @@ struct Chunk {
     std::uintptr_t rw = 0;
     std::size_t used = 0;
     bool far = false; // out of branch range: stubs return through BRK and the SIGTRAP handler
+    std::size_t bytes = kChunkBytes;
 };
 
 constexpr std::uint32_t kReturnBrk = 0xd4200000u | (0xd15u << 5);
@@ -229,7 +230,7 @@ std::uintptr_t AllocateSlot(std::uintptr_t pc, std::uint32_t*& writable, bool& f
     const bool forceFar = InTestFarCode(pc);
     for (std::size_t i = 0; i < g_chunkCount && !forceFar; ++i) {
         auto& candidate = g_chunks[i];
-        if (!candidate.far && candidate.used + kSlotWords * 4 <= kChunkBytes && InBranchRange(pc, candidate.rx) && InBranchRange(pc, candidate.rx + kChunkBytes)) {
+        if (!candidate.far && candidate.used + kSlotWords * 4 <= candidate.bytes && InBranchRange(pc, candidate.rx) && InBranchRange(pc, candidate.rx + candidate.bytes)) {
             chunk = &candidate;
             break;
         }
@@ -237,7 +238,7 @@ std::uintptr_t AllocateSlot(std::uintptr_t pc, std::uint32_t*& writable, bool& f
     if (chunk == nullptr && !forceFar) chunk = NewChunkNear(pc);
     if (chunk == nullptr) {
         for (std::size_t i = 0; i < g_chunkCount && chunk == nullptr; ++i) {
-            if (g_chunks[i].far && g_chunks[i].used + kSlotWords * 4 <= kChunkBytes) chunk = &g_chunks[i];
+            if (g_chunks[i].far && g_chunks[i].used + kSlotWords * 4 <= g_chunks[i].bytes) chunk = &g_chunks[i];
         }
         if (chunk == nullptr) chunk = NewFarChunk();
     }
@@ -468,6 +469,13 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
     site->instruction = insn;
     site->far = far && dead < 0; // a branch-returning far stub needs no SIGTRAP
     if (far && dead >= 0) g_farBranchSites.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> farReported{0}; // APS5_DISPLACED_TRACE: the first far sites (no free memory in branch range)
+    if (far && g_trace && farReported.fetch_add(1) < 16) {
+        char line[160];
+        const int length = std::snprintf(line, sizeof(line), "[displaced] far stub for pc 0x%llx insn 0x%08x (%s)\n", static_cast<unsigned long long>(pc), insn,
+            dead >= 0 ? "branch return" : "BRK return");
+        if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
+    }
     return site;
 }
 
@@ -476,7 +484,7 @@ Site* BuildSite(std::uintptr_t pc, std::uint32_t insn) {
 bool PatchChunk(std::uintptr_t pc, std::uint32_t word) {
     for (std::size_t i = 0; i < g_chunkCount; ++i) {
         const auto& chunk = g_chunks[i];
-        if (pc < chunk.rx || pc >= chunk.rx + kChunkBytes) continue;
+        if (pc < chunk.rx || pc >= chunk.rx + chunk.bytes) continue;
         __atomic_store_n(reinterpret_cast<std::uint32_t*>(chunk.rw + (pc - chunk.rx)), word, __ATOMIC_RELEASE);
         sys_icache_invalidate(reinterpret_cast<void*>(pc), 4);
         return true;
@@ -624,7 +632,7 @@ bool FixUnaligned(int signal, siginfo_t* info, void* context) {
     SpinLock lock;
     const Chunk* chunk = nullptr;
     for (std::size_t i = 0; i < g_chunkCount && chunk == nullptr; ++i)
-        if (pc >= g_chunks[i].rx && pc < g_chunks[i].rx + kChunkBytes) chunk = &g_chunks[i];
+        if (pc >= g_chunks[i].rx && pc < g_chunks[i].rx + g_chunks[i].bytes) chunk = &g_chunks[i];
     if (chunk == nullptr) return false;
     const auto report = [&](const char* what) {
         char line[200];
@@ -633,7 +641,7 @@ bool FixUnaligned(int signal, siginfo_t* info, void* context) {
         if (length > 0) (void)!write(2, line, std::min(static_cast<std::size_t>(length), sizeof(line) - 1));
         return false;
     };
-    if ((pc & 3u) != 0 || pc < chunk->rx + 4 || pc + 8 > chunk->rx + kChunkBytes) return report("left unhandled");
+    if ((pc & 3u) != 0 || pc < chunk->rx + 4 || pc + 8 > chunk->rx + chunk->bytes) return report("left unhandled");
     const auto* code = reinterpret_cast<const std::uint32_t*>(pc);
     auto* writable = reinterpret_cast<std::uint32_t*>(chunk->rw + (pc - chunk->rx));
     const auto insn = __atomic_load_n(&code[0], __ATOMIC_ACQUIRE);
@@ -673,7 +681,7 @@ bool Return(void* context) {
     const std::uintptr_t pc = arm_thread_state64_get_pc(machine->__ss);
     bool inside = false;
     for (std::size_t i = 0; i < g_chunkCount && !inside; ++i)
-        inside = g_chunks[i].far && pc >= g_chunks[i].rx && pc < g_chunks[i].rx + kChunkBytes;
+        inside = g_chunks[i].far && pc >= g_chunks[i].rx && pc < g_chunks[i].rx + g_chunks[i].bytes;
     if (!inside || *reinterpret_cast<const std::uint32_t*>(pc) != kReturnBrk) return false;
     std::uint64_t target = 0;
     std::memcpy(&target, reinterpret_cast<const void*>(pc + 4), sizeof(target));
