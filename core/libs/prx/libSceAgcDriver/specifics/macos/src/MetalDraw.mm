@@ -607,7 +607,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool cullTriangles = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassTriangle;
     const bool cullPoints = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassPoint;
     const bool triangleVertices = conservativeMode != 0u || perVertex || cullTriangles;
-    if ((mesh || tess) && triangleVertices) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws"));
+    if ((mesh || tess) && triangleVertices) {
+        // The triangle-vertices mode (D20/D21) exists for vertex functions only; name what the draw needed.
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), " (per-vertex locations 0x%llx, emulated barycentrics 0x%x, conservative mode %u, cull distances %u)", static_cast<unsigned long long>(fragmentReflection != nullptr ? fragmentReflection->perVertexLocations : 0u), fragmentReflection != nullptr ? fragmentReflection->emulatedBarycentrics : 0u, conservativeMode, vertexReflection.cullDistances);
+        Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws") + detail);
+    }
     if (tess && (draw.indirect || graphics.rectList)) Fail(draw.indirect ? "indirect tessellated draws (refused as upstream)" : "tessellated rect lists");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
