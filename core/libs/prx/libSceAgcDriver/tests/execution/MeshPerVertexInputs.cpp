@@ -4,7 +4,8 @@
 // unshared vertices with one-hot corner weights and its corners' values in the primitive record, the
 // subgroup split over the grid's z when 3 x its primitives exceed Metal's 256 mesh vertices. The
 // same triangles are drawn through a vertex program in the vertex function's triangle-vertices mode
-// (DECISIONS D20) and through tests/Mesh.cpp's NGG geometry program, with three pixel programs:
+// (DECISIONS D20) and through tests/Mesh.cpp's NGG geometry program, first with a host-interpolated
+// pixel program (same coverage on both paths), then with three pixel programs:
 // v_interp_mov P10/P20/P0 plus the raw PERSP_CENTER I (SuperTuxKart's radeonsi shape: per-vertex
 // location 0 and emulated perspective barycentrics), raw PERSP_CENTER I/J and raw LINEAR_CENTER I/J.
 // The two paths must produce bit-identical R32G32B32A32 images (same positions, same corner order,
@@ -85,6 +86,12 @@ alignas(256) constexpr std::array<std::uint32_t, 6> PerVertexPixelCode{
 // The raw I/J exported as (I, J, I, J).
 alignas(256) constexpr std::array<std::uint32_t, 3> BarycentricPixelCode{
     0xf800180f, 0x01000100, 0xbf810000,
+};
+
+// v_interp_p1/p2 of attr0.x with the PERSP_CENTER I/J, exported to all four channels: host
+// interpolation (no emulation), which checks that both paths cover the same pixels.
+alignas(256) constexpr std::array<std::uint32_t, 5> InterpolatedPixelCode{
+    0xc8080000, 0xc8090001, 0xf800180f, 0x02020202, 0xbf810000,
 };
 
 struct Vertex {
@@ -298,7 +305,8 @@ int main() {
         Build();
         const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
         const auto linear = PixelInputBit(PixelInput::LinearCenter);
-        const std::array<PixelProgram, 3> programs{{
+        const std::array<PixelProgram, 4> programs{{
+            {"host interpolation", InterpolatedPixelCode, perspective},
             {"P10/P20/P0 and PERSP_CENTER I", PerVertexPixelCode, perspective},
             {"PERSP_CENTER I/J", BarycentricPixelCode, perspective},
             {"LINEAR_CENTER I/J", BarycentricPixelCode, linear},
@@ -323,10 +331,11 @@ int main() {
             for (const auto& program : programs) {
                 const auto what = test.name + ", " + program.name;
                 const auto vertexPixel = DrawVertex(*device, test, program);
-                Require(vertexPixel.barycentricEmulation.active, what + ": the pixel program does not run the barycentric emulation");
+                const bool emulated = program.code.data() != InterpolatedPixelCode.data();
+                Require(vertexPixel.barycentricEmulation.active == emulated, what + ": the pixel program " + (emulated ? "does not run" : "runs") + " the barycentric emulation");
                 std::copy(Pixels.begin(), Pixels.end(), reference.begin());
                 const auto meshPixel = DrawMesh(*device, test, program);
-                Require(meshPixel.barycentricEmulation.active, what + ": the mesh draw's pixel program does not run the barycentric emulation");
+                Require(meshPixel.barycentricEmulation.active == emulated, what + ": the mesh draw's pixel program " + (emulated ? "does not run" : "runs") + " the barycentric emulation");
                 std::uint32_t drawn = 0;
                 for (std::size_t index = 0; index < Pixels.size(); ++index) {
                     if (std::memcmp(&Pixels[index], &reference[index], sizeof(float)) != 0) {
