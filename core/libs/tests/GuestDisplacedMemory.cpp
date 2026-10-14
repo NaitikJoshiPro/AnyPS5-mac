@@ -14,6 +14,8 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <csignal>
+#include <sys/ucontext.h>
 #include <sys/mman.h>
 #include <mach/mach_vm.h>
 #endif
@@ -99,6 +101,58 @@ void ManySites(std::uintptr_t displaced) {
     Require(value == Load<std::uint32_t>(GuestArena::HostAddress(displaced)), "the many-sites loads read the wrong value");
     Require(Faults() - before >= Sites, "the many-sites loads did not each go through the fault handler");
     munmap(code, bytes);
+}
+
+// A second thread that faulted on a site before the first thread's handler patched it to a branch to its stub
+// reaches the handler with the branch at its pc. The handler must run the recorded access, not chain the fault
+// (ASTRO BOT died of SIGSEGV on such a branch). The second thread is simulated by calling the installed handler
+// with a context whose pc is the patched site.
+bool WriteCode(std::uintptr_t at, std::uint32_t word) {
+    pthread_jit_write_protect_np(0);
+    __atomic_store_n(reinterpret_cast<std::uint32_t*>(at), word, __ATOMIC_RELEASE);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(reinterpret_cast<void*>(at), 4);
+    return true;
+}
+
+void PatchedSiteRace(std::uintptr_t displaced) {
+    void* code = mmap(nullptr, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    Require(code != MAP_FAILED, "MAP_JIT for the patched-site code");
+    pthread_jit_write_protect_np(0);
+    auto* words = static_cast<std::uint32_t*>(code);
+    words[0] = 0xb9400009u; // ldr w9, [x0]
+    words[1] = 0x2a0903e0u; // mov w0, w9
+    words[2] = 0xd65f03c0u; // ret
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(code, 12);
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(&WriteCode, nullptr);
+    const auto value = reinterpret_cast<std::uint32_t (*)(std::uintptr_t)>(code)(displaced);
+    GuestArena::GuestDisplacedSetCodeWriter_nid_no_patch(nullptr, nullptr);
+    Require(value == Load<std::uint32_t>(GuestArena::HostAddress(displaced)), "the patched-site load read the wrong value");
+    const std::uint32_t patched = __atomic_load_n(&words[0], __ATOMIC_ACQUIRE);
+    Require((patched & 0xfc000000u) == 0x14000000u, "the faulting site was not patched to a branch");
+
+    struct sigaction installed {};
+    Require(sigaction(SIGSEGV, nullptr, &installed) == 0 && (installed.sa_flags & SA_SIGINFO) != 0 && installed.sa_sigaction != nullptr,
+        "no SIGSEGV handler is installed");
+    __darwin_mcontext64 machine{};
+    for (unsigned i = 0; i < 29; ++i) machine.__ss.__x[i] = 0;
+    machine.__ss.__x[0] = displaced;
+    arm_thread_state64_set_pc_fptr(machine.__ss, code);
+    ucontext_t context{};
+    context.uc_mcontext = &machine;
+    siginfo_t info{};
+    info.si_signo = SIGSEGV;
+    info.si_addr = reinterpret_cast<void*>(displaced);
+    installed.sa_sigaction(SIGSEGV, &info, &context);
+    struct sigaction after {};
+    sigaction(SIGSEGV, nullptr, &after);
+    const bool chained = after.sa_sigaction != installed.sa_sigaction;
+    if (chained) sigaction(SIGSEGV, &installed, nullptr); // the chain ended at SIG_DFL
+    const auto resumed = static_cast<std::uintptr_t>(arm_thread_state64_get_pc(machine.__ss));
+    Require(!chained && resumed != reinterpret_cast<std::uintptr_t>(code),
+        "a fault at a site another thread already patched was not redirected to its stub");
+    munmap(code, 0x4000);
 }
 #endif
 
@@ -193,6 +247,7 @@ int main() {
         Require(Load<std::uint64_t>(Base + 0x2000) == 0x0102030405060708ull, "the tail and carveout views do not share the pages");
         Require(Faults() >= tailFaults + 3, "the tail accesses did not go through the fault handler");
         ManySites(TailBase + 0x104);
+        PatchedSiteRace(TailBase + 0x104);
         {
             // Mutex and condition slots in displaced memory (ASTRO BOT's are at 0x10xxxxxxxx): libkernel resolves them
             // through the slot's host view, so locking takes no fault (VA6's second storm: scePthreadMutexTrylock).

@@ -433,7 +433,16 @@ bool Redirect(siginfo_t* info, void* context) {
     auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
     const std::uintptr_t pc = arm_thread_state64_get_pc(machine->__ss);
     if (pc == 0 || (pc & 3u) != 0) return false;
-    const auto insn = *reinterpret_cast<const std::uint32_t*>(pc);
+    auto insn = *reinterpret_cast<const std::uint32_t*>(pc);
+    if (!IsLoadStore(insn)) {
+        // Two threads faulted on the same access; the first one's handler patched the site to a branch to its stub
+        // before the second one's handler read the instruction. Run the recorded access (ASTRO BOT died of this
+        // with SIGSEGV on a patched B, run astro3-s7).
+        SpinLock lock;
+        const auto* site = FindSite(pc, false);
+        if (site == nullptr || site->stub == 0 || site->far || insn != Branch(pc, site->stub)) return false;
+        insn = site->instruction;
+    }
     if (!IsLoadStore(insn) || ((insn >> 5) & 31u) == 31u) return false;
     std::uintptr_t forced = 0;
     std::uintptr_t checked = 0;
@@ -567,8 +576,12 @@ void OnFault(int signal, siginfo_t* info, void* context) {
     if (!handled && g_trace && unhandled.fetch_add(1) < 16) {
         auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
         char line[160];
-        const int length = std::snprintf(line, sizeof(line), "[displaced] not ours: signal %d pc 0x%llx addr 0x%llx\n", signal,
-            static_cast<unsigned long long>(arm_thread_state64_get_pc(machine->__ss)), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
+        const std::uintptr_t pc = arm_thread_state64_get_pc(machine->__ss);
+        std::uint32_t insn = 0;
+        if (pc != 0 && (pc & 3u) == 0 && Accessible(pc, 4, VM_PROT_READ)) insn = *reinterpret_cast<const std::uint32_t*>(pc);
+        const int length = std::snprintf(line, sizeof(line), "[displaced] not ours: signal %d pc 0x%llx insn 0x%08x esr 0x%llx addr 0x%llx\n", signal,
+            static_cast<unsigned long long>(pc), insn, static_cast<unsigned long long>(machine->__es.__esr),
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
         if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
     }
     errno = saved;
