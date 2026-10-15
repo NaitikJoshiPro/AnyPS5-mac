@@ -192,6 +192,9 @@ def build_report(log_dir, title, tag):
     gputime = pp.parse_gputime(log_text)
     if gputime:
         result["gputime"] = gputime
+    fex_stats = pp.parse_fex_stats(log_text)
+    if fex_stats:
+        result["fex_stats"] = fex_stats
     windows = pp.parse_fex_sample(log_text)
     if windows:
         result["fex_sample"] = pp.summarize_fex_sample(windows)
@@ -199,6 +202,45 @@ def build_report(log_dir, title, tag):
     Path(f"{base}-profile.json").write_text(json.dumps(result, indent=1, default=str))
     Path(f"{base}-profile.md").write_text(markdown(result))
     return result
+
+
+def compare_row(result):
+    """The numbers one A/B line needs, from a build_report result."""
+    summary = result.get("trace_summary") or {}
+    frame = summary.get("frame_ms", {})
+    power = result.get("power") or {}
+    row = {"tag": result["tag"], "presents": summary.get("presents"), "p50": frame.get("p50"), "p99": frame.get("p99"),
+           "p_mhz": power.get("p_active_mhz"), "e_mhz": power.get("e_active_mhz"), "gpu_mhz": power.get("gpu_mhz"),
+           "gpu_active": power.get("gpu_active_pct"), "pressure": "/".join(sorted(power.get("pressure", {}))) or "-"}
+    threads = (result.get("threads_cpu") or {}).get("rows", [])
+    seconds = (result.get("threads_cpu") or {}).get("seconds") or 1.0
+    total = sum(entry["cpu_ms"] for entry in threads)
+    row["cores"] = total / 1000.0 / seconds if threads else None
+    row["p_share"] = sum(entry["p_ms"] for entry in threads) / total if total else None
+    if threads:
+        top = threads[0]
+        row["top_thread"] = f"{top['name'] or top['tid']} {top['cpu_pct']:.0f}% P{100 * top['p_share']:.0f}%"
+    stats = result.get("fex_stats") or []
+    if stats:
+        last = stats[-2] if len(stats) > 1 else stats[-1]
+        row["jit"] = f"{last['jit_blocks']} blk {last['jit_ms']:.0f} ms, {last['cache_misses']} misses"
+    return row
+
+
+def compare(log_dir, title, tags):
+    rows = [compare_row(build_report(Path(log_dir), title, tag)) for tag in tags]
+    columns = ["tag", "presents", "p50", "p99", "cores", "p_share", "top_thread", "p_mhz", "e_mhz", "gpu_mhz", "gpu_active",
+               "pressure", "jit"]
+    lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    for row in rows:
+        cells = []
+        for column in columns:
+            value = row.get(column)
+            if isinstance(value, float):
+                value = f"{100 * value:.0f}%" if column == "p_share" else f"{value:.1f}" if column in ("p50", "p99", "cores", "gpu_active") else f"{value:.0f}"
+            cells.append("-" if value is None else str(value))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
 
 
 def _fmt(value, digits=1):
@@ -308,6 +350,10 @@ def main(argv=None):
     run.add_argument("--max-load", type=float, default=8.0)
     run.add_argument("--validation", action="store_true")
     run.add_argument("--no-powermetrics", action="store_true")
+    comparison = sub.add_parser("compare", help="one table of several runs' frame times, clocks, CPU and JIT numbers")
+    comparison.add_argument("log_dir")
+    comparison.add_argument("title")
+    comparison.add_argument("tags", nargs="+")
     report = sub.add_parser("report")
     report.add_argument("log_dir")
     report.add_argument("title")
@@ -315,6 +361,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "run":
         return cmd_run(args)
+    if args.command == "compare":
+        print(compare(args.log_dir, args.title, args.tags))
+        return 0
     result = build_report(Path(args.log_dir), args.title, args.tag)
     print(Path(f"{stem(args.log_dir, args.title, args.tag)}-profile.md").read_text())
     return 0 if result else 1
