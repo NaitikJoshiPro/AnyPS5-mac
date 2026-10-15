@@ -60,8 +60,8 @@ def stem(log_dir, title, tag):
     return Path(log_dir) / f"{title}-{tag}"
 
 
-def find_title_pid(root_pid, stop):
-    while not stop.is_set():
+def find_title_pid(root_pid, stop, runner=None):
+    while not stop.is_set() and (runner is None or runner.poll() is None):
         table = title_run.parse_ps_table(subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="],
                                                         capture_output=True, text=True).stdout)
         pid = title_run.find_descendant(table, root_pid, "aps5-fex")
@@ -131,9 +131,13 @@ def cmd_run(args):
     print("profile:", " ".join(command), flush=True)
     runner = subprocess.Popen(command, env=env)
     stop = threading.Event()
-    pid = find_title_pid(runner.pid, stop)
+    pid = find_title_pid(runner.pid, stop, runner)
     started = time.monotonic()
     print(f"profile: title pid {pid}", flush=True)
+    if pid is None:
+        rc = runner.wait()
+        print(f"profile: the title never started (runner rc {rc})")
+        return 1
     collector = threading.Thread(target=collect, args=(pid, base, window, args.sample_seconds,
                                                        not args.no_powermetrics, started))
     collector.start()
@@ -241,11 +245,17 @@ def markdown(result):
         busy = sum(count for category, count in sample["totals"].items() if not category.startswith(("wait", "idle")))
         out += ["", "## Where the CPU goes (`sample`, all threads)", "",
                 f"{sample['samples_per_thread']} samples per thread; {busy} busy samples of {total}.", "",
-                "| category | samples | % of busy | top items |", "|---|---|---|---|"]
+                "Cores is samples / samples per thread (CPU cores kept busy, or threads parked, on average); ms per "
+                "frame is that times the mean frame time.", "",
+                "| category | samples | cores | ms/frame | % of busy | top items |", "|---|---|---|---|---|---|"]
+        frame_ms = (result.get("critical_path") or {}).get("frame_ms")
+        per_thread = sample["samples_per_thread"] or 1
         for category, count in sample["totals"].items():
             share = f"{100.0 * count / busy:.1f}" if busy and not category.startswith(("wait", "idle")) else "-"
+            cores = count / per_thread
+            per_frame = f"{cores * frame_ms:.1f}" if frame_ms else "-"
             top = "; ".join(f"{detail} {n}" for detail, n in sample["details"].get(category, [])[:4])
-            out.append(f"| {category} | {count} | {share} | {top} |")
+            out.append(f"| {category} | {count} | {cores:.2f} | {per_frame} | {share} | {top} |")
         out += ["", "### Busiest threads", ""]
         for thread in sample["threads"][:10]:
             if thread["busy"] == 0:
