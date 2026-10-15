@@ -99,7 +99,27 @@ namespace ShaderRecompiler::MslAbi {
 //   corners' per-vertex values in the primitive record (user(aps5_pv<L>_<j>)). A mesh holds at most
 //   MeshTriangleVerticesPrimitives(maxPrimitives) triangles, so the driver draws the grid (mesh
 //   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.
-inline constexpr std::uint32_t Version = 13u;
+// Version 15 (upstream sync to 721db55dc):
+// - fragment: APS5_SAMPLE_MASK (SampleMaskMacro), the uniform PA_SC_AA_MASK in guest sample bits
+//   (upstream 1ffc5f672 HostSampleMask, the Vulkan pipeline's pSampleMask): the function ANDs its
+//   [[sample_mask]] with it before the APS5_SAMPLE_BASE shift, and a function with other outputs
+//   but no mask export gains a [[sample_mask]] member that writes it; unset when the mask is full.
+//   Every fragment function reads [[sample_mask]] (aps5_sample_mask_in) and, under the macro,
+//   discards a pixel whose covered samples the mask removes before the guest body
+//   (SampleMaskDiscardText: Vulkan runs no invocation for it, so its memory writes do not happen),
+//   and drops [[early_fragment_tests]] (Metal applies the function's mask after early tests).
+// - image and sampler tables (upstream d9e47d1e9/34525fdf7/c794273ab/55eefe9c5, ImageTableAbi) replace
+//   the bindless image search. ImageTableMap is an Aps5Buffer entry holding the driver's finalized
+//   table map words. SamplerTable is one Aps5TableArray<sampler> entry (16 bytes: the GPU address of
+//   an array of 8-byte sampler MTLResourceIDs, its size in bytes, flags 0) indexed by the map's
+//   sampler element (+2 depth compare, +1 point twin). ImageTable is ImageTableSlots such entries
+//   (struct Aps5ImageTable, member k<b> typed as heap binding b = FirstImageBinding + slot; the
+//   multisampled slots are Aps5Buffer placeholders): the driver writes the same array of texture
+//   MTLResourceIDs (one per table element of the stage) to every slot, and an access reads element
+//   HeaderElementBase + element (the Metal driver's per-shader builds keep the base 0). A missed key,
+//   poisoned word, out-of-range element or driver rejection records BdaAbi fault reason ImageTable
+//   (bytes = poison index) as the SPIR-V path does, and the access yields zero.
+inline constexpr std::uint32_t Version = 15u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
@@ -175,10 +195,19 @@ enum class EntryKind : std::uint32_t {
     Sampler
 };
 
+// Version 15: the ImageTable range holds one Aps5TableArray entry per sampled heap binding
+// (FirstImageBinding .. FirstStorageImageBinding - 1), all pointing at the same texture array.
+inline constexpr std::uint32_t ImageTableSlots = RuntimeAbi::FirstStorageImageBinding - RuntimeAbi::FirstImageBinding;
+
 // The entry kind of a RuntimeAbi binding (its number within a stage group).
+// RuntimeAbi 12 (upstream d9e47d1e9) adds the runtime-indexed tables: SamplerTable, ImageTableMap and
+// ImageTable (the one binding numbered past Count, shared by every stage on the SPIR-V path). On Metal
+// all three are buffer entries (Version 15): the map's words, and arrays of MTLResourceIDs.
 inline EntryKind KindOf(RuntimeAbi::Binding binding) {
     const auto value = static_cast<std::uint32_t>(binding);
+    if (binding == RuntimeAbi::Binding::ImageTable) return EntryKind::Buffer;
     if (value >= static_cast<std::uint32_t>(RuntimeAbi::Binding::Count)) throw std::runtime_error("MslAbi: invalid RuntimeAbi binding " + std::to_string(value));
+    if (binding == RuntimeAbi::Binding::SamplerTable || binding == RuntimeAbi::Binding::ImageTableMap) return EntryKind::Buffer;
     if (binding == RuntimeAbi::Binding::Samplers) return EntryKind::Sampler;
     if (value >= RuntimeAbi::FirstImageBinding && value < static_cast<std::uint32_t>(RuntimeAbi::Binding::Samplers)) return EntryKind::Texture;
     return EntryKind::Buffer;
@@ -295,6 +324,14 @@ inline constexpr const char* SampleBaseMacro = "APS5_SAMPLE_BASE";
 // (an emulated count, DECISIONS D28; default: the pass's get_num_samples()), for the alpha-to-
 // coverage mask.
 inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
+// Version 15: fragment: the guest samples a uniform PA_SC_AA_MASK keeps (decimal with a u suffix,
+// guest sample bits; unset when every sample is kept): the function ANDs its [[sample_mask]] with
+// it (MTLRenderPipelineDescriptor has no sample mask). The driver refuses it for a function without
+// outputs when the draw writes depth or stencil.
+inline constexpr const char* SampleMaskMacro = "APS5_SAMPLE_MASK";
+// Version 15: the stage function's discard of pixels without samples left by APS5_SAMPLE_MASK
+// (before the guest body; the host coverage bits are guest samples APS5_SAMPLE_BASE and up).
+inline constexpr const char* SampleMaskDiscardText = "#if defined(APS5_SAMPLE_MASK)\n    if (((aps5_sample_mask_in << APS5_SAMPLE_BASE) & (APS5_SAMPLE_MASK)) == 0u) discard_fragment();\n#endif\n";
 // Version 5: the triangle-vertices expansion, shared by conservative rasterization and the per-vertex
 // fragment value emulation (no Metal geometry stage; per-vertex fragment inputs are Apple10-only):
 // - vertex: 1 when the draw is non-indexed with 3 host vertices per guest triangle and binds

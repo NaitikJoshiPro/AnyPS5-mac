@@ -1,4 +1,6 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include "MslBufferShared.hpp"
+#include "BdaAbi.hpp"
 #include "ControlFlow/include/ControlFlow/ControlFlowGraph.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -525,6 +527,15 @@ bool EmitMslControlInstruction(MslEmitterState& state, const IrValue& instructio
     case IrOpcode::GetScratchResource:
     case IrOpcode::GetSrtResource:
         return true;
+    case IrOpcode::UnlinkedCall: {
+        // Upstream 9c8fb780e (SpirvFlowEmitter EmitUnlinkedCall): a call whose target the relinker
+        // did not link records an UnlinkedCall fault with the target address and the pc, then ends
+        // the invocation where the program may stop one (as a faulting BDA access).
+        const auto address = "((ulong(" + state.Arg(instruction, 1u) + ") << 32u) | ulong(" + state.Arg(instruction, 0u) + "))";
+        state.Line(MslRecordFault(state, static_cast<std::uint32_t>(BdaAbi::FaultReason::UnlinkedCall), address, "0u", state.Arg(instruction, 2u)));
+        MslB5StopIf(state, "true");
+        return true;
+    }
     case IrOpcode::UndefU1:
     case IrOpcode::UndefU8:
     case IrOpcode::UndefU16:

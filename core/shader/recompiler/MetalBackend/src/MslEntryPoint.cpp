@@ -36,6 +36,9 @@ constexpr const char* DepthShapes[HeapDimensions] = {"depth2d", "depth2d_array",
 }
 
 std::string MslTableMemberType(DescriptorBindingKind kind) {
+    // MslAbi Version 15: the runtime-indexed tables point at arrays of MTLResourceIDs.
+    if (kind == DescriptorBindingKind::SamplerTable) return "Aps5TableArray<sampler>";
+    if (kind == DescriptorBindingKind::ImageTable) return "Aps5ImageTable";
     switch (MslAbi::KindOf(kind)) {
     case MslAbi::EntryKind::Buffer:
         return "Aps5Buffer";
@@ -67,10 +70,33 @@ std::string MslTableMemberType(DescriptorBindingKind kind) {
 }
 
 std::string MslTableDeclaration(const MslAbi::TableLayout& layout) {
-    std::string text = "struct Aps5Table {\n";
+    std::string text;
+    // MslAbi Version 15: an image or sampler table entry is the GPU address of an array of 8-byte
+    // MTLResourceIDs (Tier 2 argument buffer descriptors, read as Aps5TableEntry<T>), its size and flags.
+    const bool imageTable = layout.Find(DescriptorBindingKind::ImageTable) != nullptr;
+    if (imageTable || layout.Find(DescriptorBindingKind::SamplerTable) != nullptr) {
+        text += "template <typename T> struct Aps5TableEntry {\n    T value;\n};\n";
+        text += "template <typename T> struct Aps5TableArray {\n    const device Aps5TableEntry<T>* address;\n    uint bytes;\n    uint flags;\n};\n";
+    }
+    if (imageTable) {
+        text += "struct Aps5ImageTable {\n";
+        for (std::uint32_t slot = 0; slot < MslAbi::ImageTableSlots; ++slot) {
+            const auto binding = RuntimeAbi::FirstImageBinding + slot;
+            const auto dimension = (binding < RuntimeAbi::FirstComparisonImageBinding ? binding - RuntimeAbi::FirstImageBinding : binding - RuntimeAbi::FirstComparisonImageBinding) % HeapDimensions;
+            // Multisampled modes never come from a table (TableModeEmitted): placeholders keep the layout.
+            const bool multisampled = dimension == 4u || dimension == 5u;
+            const auto type = multisampled ? std::string("Aps5Buffer") : "Aps5TableArray<" + MslTableMemberType(static_cast<DescriptorBindingKind>(binding)) + ">";
+            text += "    " + type + " k" + std::to_string(binding) + ";\n";
+        }
+        text += "};\nstatic_assert(sizeof(Aps5ImageTable) == " + std::to_string(MslAbi::ImageTableSlots * sizeof(MslAbi::BufferEntry)) + ", \"MslAbi image table size\");\n";
+    }
+    text += "struct Aps5Table {\n";
     for (const auto& range : layout.ranges) {
         const auto type = MslTableMemberType(range.binding);
-        if (range.kind == MslAbi::EntryKind::Buffer) text += "    " + type + " " + MslTableField(range.binding) + "[" + std::to_string(range.count) + "];\n";
+        if (range.binding == DescriptorBindingKind::ImageTable) {
+            if (range.count != MslAbi::ImageTableSlots) throw std::runtime_error("MSL emission failed: the image table range must hold MslAbi::ImageTableSlots entries");
+            text += "    " + type + " " + MslTableField(range.binding) + ";\n";
+        } else if (range.kind == MslAbi::EntryKind::Buffer) text += "    " + type + " " + MslTableField(range.binding) + "[" + std::to_string(range.count) + "];\n";
         else text += "    array<" + type + ", " + std::to_string(range.count) + "> " + MslTableField(range.binding) + ";\n";
     }
     text += "};\n";
@@ -171,6 +197,10 @@ std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& ou
             if (stageOutput.kind != StageOutputKind::Parameter) continue;
             const auto field = "p" + std::to_string(stageOutput.location);
             text += "            aps5_v3." + field + " = aps5_r[0]." + field + " * aps5_weight[0] + aps5_r[1]." + field + " * aps5_weight[1] + aps5_r[2]." + field + " * aps5_weight[2];\n";
+        }
+        // Clip distances (upstream f7a2903ed) are linear over the rect like the parameters.
+        if (const auto clips = MslCullClipSlot(state) - 1u; clips != 0u) {
+            text += "            for (uint c = 0u; c < " + std::to_string(clips) + "u; ++c) aps5_v3.aps5_clip[c] = aps5_r[0].aps5_clip[c] * aps5_weight[0] + aps5_r[1].aps5_clip[c] * aps5_weight[1] + aps5_r[2].aps5_clip[c] * aps5_weight[2];\n";
         }
         text += "            const float aps5_w = aps5_r[0].aps5_position.w;\n";
         text += "            const bool aps5_valid_rect = aps5_edges == 1u && aps5_w > 0.0f && aps5_r[1].aps5_position.w == aps5_w && aps5_r[2].aps5_position.w == aps5_w && all(isfinite(aps5_v3.aps5_position));\n";
@@ -368,7 +398,9 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     std::vector<MslAbi::TableBinding> tableBindings;
     for (const auto& descriptor : state.program.Metadata().bindings.descriptors) {
         if (!state.usedKinds.contains(descriptor.kind)) continue;
-        tableBindings.push_back({descriptor.kind, std::max<std::uint32_t>(static_cast<std::uint32_t>(descriptor.resources.size()), 1u)});
+        // MslAbi Version 15: the image table holds one array entry per sampled heap binding.
+        const auto count = descriptor.kind == DescriptorBindingKind::ImageTable ? MslAbi::ImageTableSlots : std::max<std::uint32_t>(static_cast<std::uint32_t>(descriptor.resources.size()), 1u);
+        tableBindings.push_back({descriptor.kind, count});
     }
     state.reflection.table = MslAbi::LayoutTable(tableBindings);
     if (state.workgroup != nullptr) state.reflection.threadsPerThreadgroup = MslThreadsPerThreadgroup(*state.workgroup, state.laneCount);
@@ -437,6 +469,19 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
             parameters.push_back(driver);
         }
     }
+    // Upstream 72518f64f/90b20afac/1ffc5f672: PA_SC_AA_MASK leaves some pixels of each 2x2 quad (or
+    // some samples of them) uncovered. Those pixels are discarded before the guest body; Metal's
+    // discard_fragment demotes to a helper thread (derivatives of the covered pixels stay defined),
+    // which is the SPIR-V path's OpDemoteToHelperInvocation, so its kill fallback and the
+    // neighbour-read refusal have no Metal counterpart.
+    const bool quadMasked = fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadMasked();
+    const bool quadSamples = quadMasked && state.inputInfo.pixel->QuadSampleMaskPartial();
+    // MslAbi Version 15: every fragment function reads its coverage for the uniform-mask discard
+    // (SampleMaskDiscardText, APS5_SAMPLE_MASK).
+    if (fragment) {
+        const std::string maskIn = "uint aps5_sample_mask_in [[sample_mask]]";
+        if (std::find(parameters.begin(), parameters.end(), maskIn) == parameters.end()) parameters.push_back(maskIn);
+    }
     const auto graphics = MslGraphicsInterfaceOf(state);
     text += graphics.declarations;
     std::vector<std::string> helperParameters;
@@ -488,6 +533,18 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     // float MRT0 export lowers it, so uint exports keep every sample.
     if (fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) text += "    aps5_out.aps5_sample_mask = 0xffffffffu;\n";
     if (fragment) text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentText() + "#endif\n";
+    if (quadMasked) {
+        if (quadSamples) {
+            text += "    const uint aps5_quad_coverage = " + MslQuadCoverage(state) + ";\n";
+            text += "    aps5_out.aps5_sample_mask = 0xffffffffu;\n";
+        }
+        text += "    if (" + MslQuadUncovered(state) + ") discard_fragment();\n";
+        state.reflection.usesDiscard = true;
+    }
+    // MslAbi Version 15: a uniform PA_SC_AA_MASK leaves Vulkan no invocation for a pixel whose
+    // covered samples it removes (a mask of 0 runs none); the driver's mask, not the program's:
+    // Reflection::usesDiscard does not count it.
+    if (fragment) text += MslAbi::SampleMaskDiscardText;
     const auto call = [&](const std::string& vertexId, const std::string& output, std::uint32_t vertex = 0u) {
         std::string line = "aps5_body(";
         for (std::size_t index = 0; index < arguments.size(); ++index) {
@@ -585,6 +642,9 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     } else {
         text += "    " + call("aps5_vertex_id", "aps5_out") + "\n";
     }
+    // Every coverage the function writes (alpha to coverage, the guest's mask export) keeps only
+    // the pixel's covered samples, as the SPIR-V path's StoreCoverage.
+    if (quadSamples) text += "    aps5_out.aps5_sample_mask &= aps5_quad_coverage;\n";
     text += graphics.epilogue;
     if (!graphics.outputType.empty()) text += "    return aps5_out;\n";
     text += "}\n";

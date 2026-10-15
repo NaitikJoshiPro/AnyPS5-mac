@@ -65,6 +65,32 @@ std::uint32_t MslCullClipSlot(const MslEmitterState& state) {
     return count + 1u;
 }
 
+namespace {
+
+std::string QuadPixel() {
+    return "((uint(aps5_in.aps5_position.x) & 1u) | ((uint(aps5_in.aps5_position.y) & 1u) << 1u))";
+}
+
+}
+
+std::string MslQuadCoverage(const MslEmitterState& state) {
+    const auto& pixel = *state.inputInfo.pixel;
+    if (!pixel.QuadSampleMaskPartial()) return "0xffffffffu";
+    // 16 guest samples per quad pixel, the top row's two pixels in one word, the bottom row's in
+    // the other (x selects the half word).
+    const auto& masks = pixel.quadSampleMask;
+    const auto top = static_cast<std::uint32_t>(masks[0]) | (static_cast<std::uint32_t>(masks[1]) << 16u);
+    const auto bottom = static_cast<std::uint32_t>(masks[2]) | (static_cast<std::uint32_t>(masks[3]) << 16u);
+    return "((((" + QuadPixel() + " & 2u) != 0u ? " + std::to_string(bottom) + "u : " + std::to_string(top) + "u) >> ((" + QuadPixel() + " & 1u) << 4u)) & 0xffffu)";
+}
+
+std::string MslQuadUncovered(const MslEmitterState& state) {
+    const auto& pixel = *state.inputInfo.pixel;
+    // The host mask's bits are guest samples APS5_SAMPLE_BASE and up (DECISIONS D28).
+    if (pixel.QuadSampleMaskPartial()) return "(((aps5_sample_mask_in << APS5_SAMPLE_BASE) & " + MslQuadCoverage(state) + ") == 0u)";
+    return "(((" + std::to_string(static_cast<std::uint32_t>(pixel.quadPixelMask)) + "u >> " + QuadPixel() + ") & 1u) == 0u)";
+}
+
 std::uint32_t MslCullDistanceCount(const MslEmitterState& state) {
     std::uint32_t count = 0u;
     for (const auto& output : state.program.Info().outputs) {
@@ -212,6 +238,28 @@ static uint aps5_alpha_to_mask(float alpha, uint samples) {
 }
 )";
 
+// Dithered alpha to coverage (upstream c8b3a3753, StoreDitheredAlphaCoverage): DB_ALPHA_TO_MASK
+// 0x18701 at eight samples (the driver accepts it only there), 64 alpha bins whose packed word
+// holds one 8-sample mask per pixel of the 2x2 quad, selected by ((x & 1) << 1) | (y & 1) of the
+// window position; NaN and negative alphas take bin 0, alphas above 63/64 bin 63.
+constexpr std::string_view DitheredAlphaToMaskText = R"(static uint aps5_dithered_alpha_to_mask(float alpha, float4 position) {
+    const uint masks[64] = {
+        0x00000000u, 0x00000010u, 0x00000004u, 0x10000004u, 0x10000002u, 0x10100002u, 0x04100002u, 0x04101002u,
+        0x04101001u, 0x04101011u, 0x04041011u, 0x14041011u, 0x12041011u, 0x12141011u, 0x12140411u, 0x12141411u,
+        0x12141411u, 0x12141431u, 0x12141415u, 0x32141415u, 0x32121415u, 0x32321415u, 0x16321415u, 0x16323415u,
+        0x15323415u, 0x15323435u, 0x15163435u, 0x35163435u, 0x35163235u, 0x35363235u, 0x35361635u, 0x35363635u,
+        0x35363635u, 0x35363675u, 0x3536363du, 0x7536363du, 0x75363637u, 0x75763637u, 0x3d763637u, 0x3d767637u,
+        0x3d757637u, 0x3d757677u, 0x3d3d7677u, 0x7d3d7677u, 0x773d7677u, 0x777d7677u, 0x777d3e77u, 0x777d7e77u,
+        0x777d7e77u, 0x777d7ef7u, 0x777d7e7fu, 0xf77d7e7fu, 0xf7777e7fu, 0xf7f77e7fu, 0x7ff77e7fu, 0x7ff7fe7fu,
+        0x7ff7fd7fu, 0x7ff7fdffu, 0x7f7ffdffu, 0xff7ffdffu, 0xff7ff7ffu, 0xfffff7ffu, 0xffff7fffu, 0xffffffffu,
+    };
+    const float positive = alpha > 0.0f ? alpha : 0.0f;
+    const float bounded = positive > 0.984375f ? 0.984375f : positive;
+    const uint pixel = ((uint(position.x) & 1u) << 1u) | (uint(position.y) & 1u);
+    return (masks[uint(bounded * 64.0f)] >> (pixel << 3u)) & 0xffu;
+}
+)";
+
 // EmitBuiltinU32 for vertex and pixel programs: the value's bits as a uint.
 std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
     const auto stage = StageOf(state);
@@ -246,6 +294,9 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             state.AddParameter("uint aps5_layer_in [[render_target_array_index]]");
             return "aps5_layer_in";
         case StageInputKind::HelperInvocation:
+            // Upstream 90b20afac: a pixel the quad mask demoted reads as a helper (Metal's
+            // discard_fragment demotes too; the test is explicit, as the SPIR-V path's).
+            if (PixelInfo(state).QuadMasked()) return "((simd_is_helper_thread() || " + MslQuadUncovered(state) + ") ? 1u : 0u)";
             return "(simd_is_helper_thread() ? 1u : 0u)";
         case StageInputKind::LayerExported:
             // Upstream #5097 (EmitBuiltinU32): 1 when the draw's last geometry stage exports a render
@@ -438,7 +489,8 @@ std::string ExportVector(MslEmitterState& state, const std::string& data, const 
         return name;
     }
     state.Line("uint4 " + name + " = uint4(0u, 0u, 0u, " + std::string(uintOutput ? "1u" : "0x3f800000u") + ");");
-    const auto exported = exp.en & (mode == 1u ? 0x1u : mode == 2u ? 0x3u : mode == 3u ? 0x9u : 0xfu);
+    // Upstream 26a746a43: 32_AR (mode 3) exports channels 0 and 1, and channel 1 is the alpha (GFX10).
+    const auto exported = exp.en & (mode == 1u ? 0x1u : mode == 2u || mode == 3u ? 0x3u : 0xfu);
     if (exp.compr) {
         for (std::uint32_t pair = 0; pair < 2u; ++pair) {
             if ((exp.en & (3u << (pair * 2u))) == 0u) continue;
@@ -450,7 +502,7 @@ std::string ExportVector(MslEmitterState& state, const std::string& data, const 
         }
     } else {
         for (std::uint32_t component = 0; component < 4u; ++component) {
-            if (((exported >> component) & 1u) != 0u) state.Line(name + "[" + std::to_string(component) + "] = " + data + "[" + std::to_string(component) + "];");
+            if (((exported >> component) & 1u) != 0u) state.Line(name + "[" + std::to_string(mode == 3u && component == 1u ? 3u : component) + "] = " + data + "[" + std::to_string(component) + "];");
         }
     }
     return name;
@@ -470,8 +522,9 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
         if ((exp.en & (1u << component)) == 0u) continue;
         const auto output = DecodePositionExportComponent(vertex.paClVsOutCntl, exp.index, component);
         const auto raw = data + "[" + std::to_string(component) + "]";
-        // DefineMeshOutputs: mesh functions output the position, parameters and the layer only.
-        if (mesh && (output.viewport || output.pointSize || output.clipDistance != std::numeric_limits<std::uint32_t>::max() || output.cullDistance != std::numeric_limits<std::uint32_t>::max())) state.Fail("unsupported mesh output kind (viewport index, point size, clip or cull distance)");
+        // DefineMeshOutputs: mesh functions output the position, parameters, the layer and (upstream
+        // f7a2903ed) clip distances; cull distances are refused in MslGraphicsInterfaceOf.
+        if (mesh && (output.viewport || output.pointSize || output.cullDistance != std::numeric_limits<std::uint32_t>::max())) state.Fail("unsupported mesh output kind (viewport index, point size or cull distance)");
         if (output.layer && mesh) {
             // Per vertex in threadgroup memory; each primitive takes its provoking vertex's layer.
             const auto index = state.GuestInvocationIndex();
@@ -485,7 +538,7 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
             state.Line("aps5_out.aps5_point_size = as_type<float>(" + raw + ");");
             continue;
         }
-        if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_out.aps5_clip[" + std::to_string(output.clipDistance) + "] = as_type<float>(" + raw + ");");
+        if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) state.Line(OutputRecord(state) + ".aps5_clip[" + std::to_string(output.clipDistance) + "] = as_type<float>(" + raw + ");");
         // Upstream #423: Metal has no cull distance output. The guest program's distances go to the
         // vertex function's per-vertex record (aps5_cull, EmitMslEntryPoint), which turns them into
         // one clip distance per primitive (MslAbi Version 10).
@@ -616,8 +669,13 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
                 state.Line("const uint4 " + name + " = " + mapped + ");");
                 value = name;
                 if (exp.index == 0u && !uintOutput && PixelInfo(state).psAlphaToCoverage) {
-                    if (state.declarations.find("aps5_alpha_to_mask") == std::string::npos) state.AddDeclaration(AlphaToMaskText);
-                    state.Line("aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(" + value + ".w), APS5_SAMPLE_COUNT);");
+                    if (PixelInfo(state).psDitheredAlphaToCoverage) {
+                        if (state.declarations.find("aps5_dithered_alpha_to_mask") == std::string::npos) state.AddDeclaration(DitheredAlphaToMaskText);
+                        state.Line("aps5_out.aps5_sample_mask = aps5_dithered_alpha_to_mask(as_type<float>(" + value + ".w), aps5_in.aps5_position);");
+                    } else {
+                        if (state.declarations.find("aps5_alpha_to_mask") == std::string::npos) state.AddDeclaration(AlphaToMaskText);
+                        state.Line("aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(" + value + ".w), APS5_SAMPLE_COUNT);");
+                    }
                 }
                 if (!uintOutput && mode != 5u && mode != 6u) value = ExportPacking(state, exp.index, value);
                 state.Line("aps5_out.c" + std::to_string(output->location) + " = as_type<APS5_COLOR" + std::to_string(output->location) + "_TYPE>(" + value + ");");
@@ -815,8 +873,21 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                 scalars += 4u;
                 break;
             case StageOutputKind::Layer: layer = true; break;
-            default: state.Fail("mesh functions output the position, parameters and layer only: clip and cull distances, point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
+            case StageOutputKind::ClipDistance: break;
+            case StageOutputKind::CullDistance:
+                // Upstream f7a2903ed writes gl_CullDistance per mesh vertex; Metal has no cull
+                // distance output, and the mesh function's primitive verdict over its vertices'
+                // distances (as D30 does for vertex functions) is not implemented.
+                state.Fail("mesh functions with guest cull distances are not implemented (Metal has no cull distance output; TechnicalDebt metal-mesh-functions)");
+            default: state.Fail("mesh functions output the position, parameters, layer and clip distances only: point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
             }
+        }
+        // Upstream f7a2903ed: guest clip distances per mesh vertex (no all-zero-position distance on
+        // mesh outputs, as the SPIR-V path).
+        if (const auto clips = MslCullClipSlot(state) - 1u; clips != 0u) {
+            if (clips > MaxClipDistances) state.Fail("more than 8 guest clip distances");
+            text += "    float aps5_clip [[clip_distance]] [" + std::to_string(clips) + "];\n";
+            scalars += clips;
         }
         if (scalars > 124u) state.Fail("the mesh function exceeds 124 scalar varyings");
         // MslAbi Version 13, the triangle-vertices mode (APS5_TRIANGLE_VERTICES, as the vertex
@@ -954,20 +1025,31 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             break;
         }
     }
-    if (pixel.psAlphaToCoverage && !state.reflection.exportsSampleMask) {
+    // Upstream 1ffc5f672: a partial per-pixel PA_SC_AA_MASK writes its coverage (EmitMslEntryPoint).
+    if ((pixel.psAlphaToCoverage || pixel.QuadSampleMaskPartial()) && !state.reflection.exportsSampleMask) {
         members += "    uint aps5_sample_mask [[sample_mask]];\n";
         state.reflection.exportsSampleMask = true;
     }
+    // Upstream 1ffc5f672: a PA_SC_AA_MASK that is the same for the four quad pixels but leaves
+    // samples out is the Vulkan pipeline's sample mask; MTLRenderPipelineDescriptor has none, so the
+    // driver compiles the function with APS5_SAMPLE_MASK (the guest samples kept) and the function
+    // ANDs its coverage with it (MTLCompileOptions.preprocessorMacros, as APS5_SAMPLE_BASE). A function without other outputs cannot
+    // apply it (the driver refuses such draws).
+    const bool hostMaskMember = !state.reflection.exportsSampleMask && !members.empty();
+    if (hostMaskMember) members += "#if defined(APS5_SAMPLE_MASK)\n    uint aps5_sample_mask [[sample_mask]];\n#endif\n";
     if (!members.empty()) {
         text += "struct Aps5FragmentOut {\n" + members + "};\n\n";
         result.outputType = "Aps5FragmentOut";
     }
     // PS_ITER_SAMPLE: the stage function takes [[sample_id]] (EmitMslEntryPoint).
     if (pixel.psSampleShading) state.reflection.perSample = true;
+    // MslAbi Version 9: the guest mask's bits of this pass's host samples (APS5_SAMPLE_BASE,
+    // DECISIONS D28).
+    const std::string toHost = "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";
     if (state.reflection.exportsSampleMask) {
-        // MslAbi Version 9: the guest mask's bits of this pass's host samples (APS5_SAMPLE_BASE,
-        // DECISIONS D28).
-        result.epilogue += "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";
+        result.epilogue += "#if defined(APS5_SAMPLE_MASK)\n    aps5_out.aps5_sample_mask &= APS5_SAMPLE_MASK;\n#endif\n" + toHost;
+    } else if (hostMaskMember) {
+        result.epilogue += "#if defined(APS5_SAMPLE_MASK)\n    aps5_out.aps5_sample_mask = APS5_SAMPLE_MASK;\n" + toHost + "#endif\n";
     }
     // Primitive-ordered pixel shaders (the SPIR-V path's PixelInterlockOrderedEXT around the whole
     // program): the stage function brackets the guest body with raster-order-group accesses
@@ -979,10 +1061,14 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     // refuses [[early_fragment_tests]] on a function that returns [[depth]] or [[stencil]] (MSL
     // specification 5.1.2), so depth and stencil exports keep late tests here (Vulkan ignores those
     // writes under EarlyFragmentTests; TechnicalDebt metal-early-depth-export).
-    if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.psDepthExportEnable && !pixel.psStencilRefExportEnable) {
+    // Upstream 72518f64f: quad-masked pixel functions (they discard uncovered pixels) test late.
+    if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.QuadMasked() && !pixel.psDepthExportEnable && !pixel.psStencilRefExportEnable) {
         // Conservative rasterization discards in the stage function (MslConservative), which
         // early fragment tests would not wait for.
-        result.attributes = "#if !(defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE)\n[[early_fragment_tests]]\n#endif\n";
+        // MslAbi Version 15: a uniform PA_SC_AA_MASK (APS5_SAMPLE_MASK) is applied by the function's
+        // [[sample_mask]], which Metal applies after early tests; Vulkan's pipeline mask removes the
+        // samples before them, so those draws test late (MetalDraw refuses the memory-writing case).
+        result.attributes = "#if !(defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE) && !defined(APS5_SAMPLE_MASK)\n[[early_fragment_tests]]\n#endif\n";
         state.reflection.earlyFragmentTests = true;
     }
     if (state.usesValidMask) {

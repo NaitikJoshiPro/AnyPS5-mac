@@ -136,6 +136,12 @@ std::string MslTableField(DescriptorBindingKind kind) {
         return "flattened_srt";
     case DescriptorBindingKind::ShaderData:
         return "shader_data";
+    case DescriptorBindingKind::SamplerTable:
+        return "sampler_table";
+    case DescriptorBindingKind::ImageTableMap:
+        return "image_table_map";
+    case DescriptorBindingKind::ImageTable:
+        return "image_table";
     default:
         return "images" + std::to_string(static_cast<std::uint32_t>(kind));
     }

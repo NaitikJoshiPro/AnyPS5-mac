@@ -161,6 +161,16 @@ public:
     // Images (MslImage.cpp): the direct runtime-mode switch case being emitted, {selector function
     // constant id, mode index}, for Reflection::samplerModeUses; {0, ~0u} outside one.
     std::pair<std::uint32_t, std::uint32_t> imageModeCase {0u, ~0u};
+    // Images (MslImage.cpp): the image/sampler table access being emitted (MslAbi Version 15), as
+    // SpirvEmitterState::tableAccess: MSL expressions of the texture array element, the record's T#
+    // dword 3 (swizzle) and the sampler array element.
+    struct TableAccess {
+        bool active = false;
+        std::string element;
+        std::string dword3;
+        std::string samplerElement;
+    };
+    TableAccess tableAccess;
     // Descriptor kinds the emitted code references (TableResource): the table holds only these ranges,
     // as the SPIR-V path drops unused descriptor variables (so the binding plan drops them too).
     std::set<DescriptorBindingKind> usedKinds;
@@ -300,6 +310,13 @@ struct MslGraphicsInterface {
 // The clip distance that carries the emulated cull verdict: after the guest clip distances and the
 // all-zero position distance.
 [[nodiscard]] std::uint32_t MslCullClipSlot(const MslEmitterState& state);
+// Upstream 72518f64f/1ffc5f672: a pixel function's PA_SC_AA_MASK coverage of its quad pixel, for
+// quad-masked programs (ShaderPixelInputInfo::QuadMasked): the guest samples the pixel covers
+// (MslQuadCoverage, 16 bits; all ones without a partial sample mask) and whether the pixel is
+// uncovered (MslQuadUncovered, a bool expression over aps5_in and, for a partial sample mask, the
+// `uint aps5_sample_mask_in [[sample_mask]]` parameter EmitMslEntryPoint adds).
+[[nodiscard]] std::string MslQuadCoverage(const MslEmitterState& state);
+[[nodiscard]] std::string MslQuadUncovered(const MslEmitterState& state);
 [[nodiscard]] std::string PerVertexField(std::uint32_t location, std::uint32_t vertex);
 // The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
 // laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.

@@ -4,6 +4,7 @@
 // shared aperture (high dword 0x80000000) to LDS and the private aperture (0x70000000) to scratch.
 
 #include "MslBufferShared.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -13,8 +14,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t SharedApertureHigh = 0x80000000u;
-constexpr std::uint32_t PrivateApertureHigh = 0x70000000u;
+// SharedApertureHigh / PrivateApertureHigh: RdnaInstructionDecoder.hpp, shared with the aperture source reads.
 
 bool RoutesApertures(const MslEmitterState& state, const MemoryInfo& memory) {
     return memory.kind == ResourceKind::Flat && state.ThreadgroupStage();
