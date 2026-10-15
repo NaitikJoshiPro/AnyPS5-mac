@@ -658,6 +658,16 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
     return 0;
 }
 #else
+#ifdef __APPLE__
+// The host thread carries the guest thread's name, "g:" first (sample, spindump, Instruments and
+// tools/mac/profile_title.py tell guest threads from host ones by it). macOS names only the calling thread.
+static void NameHostThread(PthreadPrivate& self) {
+    std::lock_guard lock(self.nameLock);
+    const std::string name = "g:" + self.name;
+    pthread_setname_np(name.substr(0, 63).c_str());
+}
+#endif
+
 static void* StartNativeThread(void* opaque) {
     std::unique_ptr<NativeThreadArgs> args(static_cast<NativeThreadArgs*>(opaque));
     auto* self = args->guest->self;
@@ -672,6 +682,9 @@ static void* StartNativeThread(void* opaque) {
 #if defined(__linux__)
         self->hostTid = static_cast<int>(gettid());
         RegisterGuestStackMapping(self);
+#endif
+#ifdef __APPLE__
+        NameHostThread(*self);
 #endif
         args->initialized.set_value();
     } catch (...) {
@@ -969,6 +982,11 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+#elif defined(__APPLE__)
+    if (thread == CurrentGuestState().current) {
+        const std::string host = "g:" + thread->name;
+        pthread_setname_np(host.substr(0, 63).c_str());
+    }
 #endif
     return SCE_OK;
 }

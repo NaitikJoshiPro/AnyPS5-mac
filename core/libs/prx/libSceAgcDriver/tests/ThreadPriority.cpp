@@ -6,6 +6,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#ifdef __APPLE__
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 
 namespace {
 
@@ -33,6 +38,24 @@ void ParseTests() {
     }
 }
 
+void QosParseTests() {
+    for (const char* text : {static_cast<const char*>(nullptr), "", "user-interactive"})
+        Require(ParseHostThreadQos(text) == HostThreadQos::UserInteractive, std::string("APS5_WORKER_QOS=") + (text == nullptr ? "(unset)" : text) + " must put frame-path threads at user-interactive");
+    Require(ParseHostThreadQos("off") == HostThreadQos::Unchanged, "APS5_WORKER_QOS=off must leave the class alone");
+    Require(ParseHostThreadQos("user-initiated") == HostThreadQos::UserInitiated, "user-initiated");
+    Require(ParseHostThreadQos("default") == HostThreadQos::Default, "default");
+    Require(ParseHostThreadQos("utility") == HostThreadQos::Utility, "utility");
+    for (const char* text : {"background", "UI", "interactive", "1"}) {
+        bool threw = false;
+        try {
+            static_cast<void>(ParseHostThreadQos(text));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        Require(threw, std::string("APS5_WORKER_QOS=") + text + " must be rejected");
+    }
+}
+
 void ExpectRefused(const RealtimePlan& plan, const std::string& what) {
     Require(!plan.refusal.empty() && !plan.limit.has_value(), what + " must refuse real-time priority without touching RLIMIT_RTTIME");
 }
@@ -56,6 +79,25 @@ void PlanTests() {
     Require(kept.refusal.empty() && !kept.limit.has_value(), "limits rtkit already accepts must be left alone");
 }
 
+#ifdef __APPLE__
+// A frame-path thread is named after its role and runs at user-interactive QoS (D70).
+void RoleTest() {
+    std::string failure;
+    std::thread([&failure] {
+        try {
+            RaiseWorkerThreadPriority("queue 0x0 worker");
+            char name[64] = {};
+            pthread_getname_np(pthread_self(), name, sizeof(name));
+            if (std::string(name) != "queue 0x0 worker") failure = std::string("thread name is \"") + name + "\"";
+            else if (qos_class_self() != QOS_CLASS_USER_INTERACTIVE) failure = "QoS class is " + std::to_string(qos_class_self());
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+    }).join();
+    Require(failure.empty(), "RaiseWorkerThreadPriority: " + failure);
+}
+#endif
+
 void RefusalTest() {
     bool threw = false;
     try {
@@ -76,6 +118,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         ParseTests();
+        QosParseTests();
+#ifdef __APPLE__
+        RoleTest();
+#endif
         PlanTests();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

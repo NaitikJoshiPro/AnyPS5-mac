@@ -163,6 +163,9 @@ inline std::uint64_t PinTraced(const char* role, void* handle, std::uint64_t mas
 // Helper threads (deferred release, mirror refresh) are pinned only when APS5_HELPER_AFFINITY_MASK
 // names their cores.
 inline void PinHelperThread(const char* role) {
+#ifdef __APPLE__
+    pthread_setname_np(role); // sample, spindump and tools/mac/profile_title.py name the thread by it
+#endif
     static const std::uint64_t mask = MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK");
     if (mask != 0) PinTraced(role, nullptr, mask);
 }

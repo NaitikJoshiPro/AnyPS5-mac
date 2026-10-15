@@ -9,6 +9,7 @@
 #include "GuestGuards.hpp"
 #include "GuestProgram.hpp"
 #include "GuestSampler.hpp"
+#include "GuestStats.hpp"
 #include "Options.hpp"
 
 #include <FEXCore/Config/Config.h>
@@ -237,6 +238,7 @@ public:
             thread = guestCode.context->CreateThread();
         }
         GuestSampler::Register(thread);
+        GuestStats::Register(thread);
         thread->CurrentFrame->State.rip = rip;
         thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = rsp;
         callRet = mmap(nullptr, ThreadState::CALLRET_STACK_SIZE + 2 * Page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -265,6 +267,7 @@ public:
 
     ~GuestThread() {
         GuestSampler::Unregister(thread);
+        GuestStats::Unregister(thread);
         {
             std::lock_guard lock(threadsMutex);
             guestCode.context->DestroyThread(thread);
@@ -593,6 +596,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     RedirectGuestGuards(bridge, program, *state->context);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
+    GuestStats::Start();
     GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping,
                         [&bridge](std::uint64_t rip) { return bridge.StubName(rip); });
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
