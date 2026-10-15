@@ -1951,6 +1951,16 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 }
 
+void StorageTexture::keepComparable() {
+    std::vector<bool> missing(trackedLayers, false);
+    bool any = false;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        missing[layer] = !layerOriginal[layer] && !layerPending[layer];
+        any = any || missing[layer];
+    }
+    if (any) captureGuestBytes(&missing);
+}
+
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
     std::vector<bool> selected(trackedLayers, true);
@@ -3665,15 +3675,24 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // at their next use (behind this image's write-back), and never from a matching `original`,
     // since the fill leaves the bytes a CPU-path upload copied as they are.
     bool aliasedKeys = false;
+    // Outside the write watch no stamp will mark the range written for them: they keep (or save
+    // now) the bytes they compare against, and this fill's stored bytes then differ from them
+    // (DECISIONS D57).
+    std::vector<std::shared_ptr<StorageTexture>> untrackedOverlaps;
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
             if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
-            texture->layerOriginal.assign(texture->trackedLayers, false);
+            if (!GuestMemory::Watched(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes))) {
+                if (auto shared = texture->weak_from_this().lock()) untrackedOverlaps.push_back(std::move(shared));
+            } else {
+                texture->layerOriginal.assign(texture->trackedLayers, false);
+            }
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
     }
+    for (const auto& texture : untrackedOverlaps) texture->keepComparable();
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first clears of a surface with DCC keys (its own or
     // another image's over the same memory), with the pattern: a title that fills the keys to a
     // clear code right after makes the clear moot for that image (its next lookup re-uploads
@@ -3800,13 +3819,21 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // re-upload at their next use, behind this image's write-back).
     static_cast<void>(DiscardPendingInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
     FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this, "buffer copy destination", PublishScope::PartialUnits);
+    std::vector<std::shared_ptr<StorageTexture>> untrackedOverlaps;
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
-            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->layerOriginal.assign(texture->trackedLayers, false);
+            if (texture == this || texture->released || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            if (!GuestMemory::Watched(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes))) {
+                // As a fill's overlaps (D57): compared against saved bytes the copy will change.
+                if (auto shared = texture->weak_from_this().lock()) untrackedOverlaps.push_back(std::move(shared));
+                continue;
+            }
+            texture->layerOriginal.assign(texture->trackedLayers, false);
         }
     }
+    for (const auto& texture : untrackedOverlaps) texture->keepComparable();
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
