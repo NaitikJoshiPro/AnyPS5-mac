@@ -178,7 +178,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_port_ledger.py)
         add_test(NAME title_run_tool COMMAND ${Python3_EXECUTABLE} -I
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_title_run.py)
-        set_tests_properties(check_skips_macos gpu_suite_tool port_ledger_tool title_run_tool PROPERTIES TIMEOUT 120)
+        add_test(NAME profile_title_tool COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_profile_title.py)
+        set_tests_properties(check_skips_macos gpu_suite_tool port_ledger_tool title_run_tool profile_title_tool
+            PROPERTIES TIMEOUT 120)
         add_test(NAME unself COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_unself.py)
         add_test(NAME web_library_assets COMMAND ${Python3_EXECUTABLE}
