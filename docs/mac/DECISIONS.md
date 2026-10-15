@@ -541,3 +541,33 @@ Choice: Optimization/NanTestEliminator (after DenormalFlushEliminator, MSL targe
 Evidence: agc_metal_nan_test_elimination (G7, new): one program mixing results that cannot be NaNs with ones that can (raw input bits, inf - inf and 0 * inf of exp2 of a converted integer, fract of an infinity, rcp(0) * 0, min of two raw inputs) over 3,136 special-value pairs (NaN payloads and signs, infinities, zeros, denormals, integer extremes) and 12,288 random rows, in four float modes (IEEE on/off, FLOAT_MODE flush/keep): 1,604,096 results bit-identical with and without the pass, NaN tests 80 -> 58 (88 -> 70 IEEE, 73 -> 47 keep).
 Measured: ASTRO BOT's 2,082 replayed requests (with D62): MSL 975.3 -> 959.1 MB (-1.7%), 627,739 NaN tests of which 12,953 (2.1%) removed; the possible NaNs come from constant-buffer reads (305k tests), image/buffer vector results (94k + 19k + 6k), LDS/vector windows, f16 conversions (22k), interpolants (20k). Showcase 1.0.2 (45 s, APS5_METAL_DUMP_MSL, 19 libraries) 3.08 -> 3.03 MB (-1.5%); DOOM's one library unchanged. Small because title shaders compute on loaded data; a sound analysis cannot remove those tests (TechnicalDebt metal-nan-test-elimination).
 Also measured (task 4 of SHD9, not adopted): MSL without body indentation (a text-only experiment) took ASTRO's largest lane-local library 4.51 -> 2.04 MB but its cold library compile 6.38 s (three runs) -> 6.20, 7.04 and 6.51 s: indentation costs bytes, not compile time.
+## D70: Host threads carry their role's name; frame-path threads run at user-interactive QoS (2026-10-16)
+Context: M4 waste audit (PERF5). `sample` and the kernel's per-thread counters showed unnamed threads. Guest threads, queue workers, the presenter and the vblank clock all ran at the inherited default QoS. Under load from other processes (builds), macOS put ASTRO BOT's critical-path queue 0 worker on E cores for about half its time.
+Options: (a) leave it; (b) name threads only; (c) names plus QoS user-interactive for the frame path (queue workers, presenter, vblank), keeping utility/background for pipeline compiles (already set); (d) also raise guest threads (APS5_FEX_QOS).
+Measured (profile_title, ASTRO, build-perf5; per-thread P/E time from PROC_PIDTHREADCOUNTS):
+- Under contention, P at 1.4 GHz and Heavy pressure: queue 0 on P cores 76% with QoS (bq1) against 46% without (bq0).
+- Uncontended (cq1/cq0, dummy audio): 98% and 100% on P with and without QoS. Frame time follows the P clock, not the QoS: 398/1002 ms at 4.0 GHz with QoS, 385/825 ms at 3.36 GHz without.
+- APS5_FEX_QOS=user-interactive for guest threads (bg1): no separable effect; the clocks moved between runs.
+- When the P cluster is throttled to 1.4 GHz, E cores at 2.3 GHz match it per thread (P IPC 3.2-3.5 against E IPC 2.0), so placement matters less than the clock.
+Choice: (c). The names have no cost and make every profile readable: guest threads appear as `g:<guest name>`, plus `queue 0x.. worker`, `presenter`, `vblank`, `pipeline compile/prewarm/saver`, `release thread` and `mirror refresh`. The QoS keeps the frame path on P cores when something else loads the machine and costs nothing otherwise. APS5_WORKER_QOS=off|default|user-initiated|utility selects another class. Guest threads stay at the default (APS5_FEX_QOS still opts in).
+Evidence: tests agc_thread_priority (APS5_WORKER_QOS parsing; a worker thread gets its name and user-interactive QoS) and fex_fixtures. Logs .mac-work/logs/perf5/ab.
+
+## D71: aps5-fex reports FEX's translation statistics and keeps FEX's L2 lookup table (2026-10-16)
+Context: M4 asks for translation overhead: JIT compile time, code-cache misses, block linking. FEXCore keeps per-thread SHMStats counters, but only FEX's Linux and Windows frontends attach them, so aps5-fex had none.
+Choice:
+- `APS5_FEX_STATS=<seconds>` attaches a ThreadStats block to every guest thread (GuestStats.cpp). It prints one `[fex-stats]` line per window and at exit: blocks compiled, JIT/lookup time, lookup-cache misses, cache lock time, disk-cache hits, misses and lookup time, SMC. profile_title parses the lines. Off, FEXCore's counters stay null.
+- The guest sampler (APS5_FEX_SAMPLE) now tells translated code, FEX's dispatcher, displaced-access stubs and native code apart for each thread. Before this, samples outside the thread's current code buffer were filed under a stale RIP.
+- aps5-fex sets DisableL2Cache=0 and DynamicL1Cache=0, changing FEX's memory-saving defaults.
+Measured (ASTRO, warm caches):
+- With FEX's defaults: 20,000-28,000 lookup misses per 30 s after start-up, 50-230 ms per 30 s inside CompileCode.
+- With the L2 table and a fixed L1 (cl2): 1-514 misses and 0.2-32 ms per 30 s; RSS 2.28 GB against 2.24 GB at 241 s.
+- That is about 0.5% of a core and the occasional 230 ms window. The frame time could not be separated from the clock drift (346/580 ms at 4.05 GHz, Moderate/Nominal).
+- Cold disk cache: 28,730 blocks in the first 30 s at 122 us each. Warm: 0 compiled.
+- APS5_FEX_CONFIG=TSOEnabled=0 deadlocks ASTRO about 35 s in. TSO emulation stays.
+Evidence: fex fixture fex-stats; profile_title_tool (FexStatsTests, sampler kinds).
+
+## D73: Guest yield loops back off to short sleeps (2026-10-16)
+Context: macOS sched_yield returns at once when no other thread wants the core. A guest that waits by yielding in a loop therefore holds a core. In ASTRO run cq1 its three TBB worker threads each spent 247-264 of 3,271 samples in scePthreadYield: 0.26 core of busy-spinning.
+Options: (a) leave yields as host yields; (b) map a yield to a fixed short sleep, which would slow legitimate one-off yields; (c) adaptive: plain yields first, then sleeps that grow while the streak lasts.
+Choice: (c). YieldBackoff (libkernel Pthread/include/YieldBackoff.hpp) gives 64 plain yields per streak, then sleeps of 50 us doubling to 400 us. A gap of more than 1 ms between yields ends the streak. It applies to scePthreadYield, sched_yield and pthread_yield.
+Evidence: test guest_yield_backoff. Title measurements pending (PERF5's measurement turn).
