@@ -34,7 +34,7 @@ bool HdrRejected(const char* text) {
     return false;
 }
 
-// The console settings a title reads (D66): APS5_GAME_PRESET and APS5_HDR parsing.
+// The console settings a title reads (D68): APS5_GAME_PRESET and APS5_HDR parsing.
 void CheckParsing() {
     Require(ConsoleGamePresetPriorityFromText(nullptr) == ConsoleGamePresetPriorityPerformance);
     Require(ConsoleGamePresetPriorityFromText("") == ConsoleGamePresetPriorityPerformance);

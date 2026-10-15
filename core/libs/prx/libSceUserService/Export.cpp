@@ -76,7 +76,7 @@ int APS5_VABI sceUserServiceGetGamePresets(int user_id, UserServiceGamePresets* 
  // System-wide game presets of the user's profile (Settings > Saved Data and Game/App Settings > Game Presets).
  // Difficulty, view inversion, subtitles and audio language are "not specified" (0): the title keeps its own
  // defaults. priority is the "Performance Mode or Resolution Mode" preset, APS5_GAME_PRESET (performance by
- // default, D66). this_size is the caller's: only the fields inside it are written (Ghost of Yotei passes 48).
+ // default, D68). this_size is the caller's: only the fields inside it are written (Ghost of Yotei passes 48).
  if (presets == nullptr || user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }

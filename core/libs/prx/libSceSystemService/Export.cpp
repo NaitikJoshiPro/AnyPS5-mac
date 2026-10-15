@@ -231,7 +231,7 @@ int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLumi
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- // An SDR TV (APS5_HDR=0, the default) reports SDR reference white; an HDR TV a 1000-nit panel (D66).
+ // An SDR TV (APS5_HDR=0, the default) reports SDR reference white; an HDR TV a 1000-nit panel (D68).
  constexpr float SdrReferenceWhiteNits = 100.0f;
  constexpr float HdrPanelPeakNits = 1000.0f;
  const float peak = ConsoleHdrOutput() ? HdrPanelPeakNits : SdrReferenceWhiteNits;

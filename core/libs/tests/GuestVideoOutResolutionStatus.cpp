@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     Require(sceVideoOutGetOutputStatus(handle, &output) == 0);
     Require(status.refreshRate == output.refreshRate);
     Require(output.resolution == (expectedHeight >= 2160u ? 2u : 1u));
-    // The TV's dynamic range (APS5_HDR, D66): 1 SDR with no flags, or 2 HDR with flag bit 0.
+    // The TV's dynamic range (APS5_HDR, D68): 1 SDR with no flags, or 2 HDR with flag bit 0.
     const bool hdr = argc > 3 && std::string(argv[3]) == "hdr";
     Require(output.dynamicRange == (hdr ? 2u : 1u) && output.flags == (hdr ? 1u : 0u));
     Require(output.refreshRate == 3u);
