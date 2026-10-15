@@ -77,6 +77,8 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     }
     AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     AgcDriverCheckGuestMemory_nid_postfix(buffers, static_cast<std::size_t>(bufferNum) * sizeof(*buffers), alignof(VideoOutBuffers));
+    // Traced before the buffers are checked, so a refused registration still shows what the title asked for.
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] RegisterBuffers2(handle %d, set %d, %d buffers from %d): %ux%u pixel format 0x%llx tiling %u (display mode %s)\n", handle, setIndex, bufferNum, bufferIndexStart, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format), attribute->tiling_mode, VideoOutCurrentDisplayMode_nid_no_patch().name);
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     if (cfg->closing) {
@@ -101,7 +103,6 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
         AgcDriverCheckGuestMemory_nid_postfix(buffers[i].data, AgcDriverDisplayBufferSize_nid_postfix(display), 65536);
     }
     cfg->groups[setIndex] = group;
-    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] RegisterBuffers2(handle %d, set %d, %d buffers from %d): %ux%u pixel format 0x%llx tiling %u (display mode %s)\n", handle, setIndex, bufferNum, bufferIndexStart, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format), attribute->tiling_mode, VideoOutCurrentDisplayMode_nid_no_patch().name);
     cfg->width = attribute->width;
     cfg->height = attribute->height;
     for (int i = 0; i < bufferNum; i++) {
