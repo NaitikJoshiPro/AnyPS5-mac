@@ -35,6 +35,10 @@ WAIT_LEAVES = {
     "semaphore_wait_trap", "semaphore_timedwait_trap", "mach_wait_until", "__select", "__sigsuspend",
     "__sigwait", "__pselect", "poll", "__wait4", "__read_nocancel", "read", "__recvfrom", "__accept",
 }
+FILE_IO_LEAVES = {"stat", "lstat", "fstat", "stat64", "lstat64", "fstat64", "open", "__open", "__open_nocancel",
+                  "openat", "__openat", "close", "__close_nocancel", "pread", "__pread_nocancel", "__pread",
+                  "pwrite", "__pwrite_nocancel", "getdirentries64", "__getdirentries64", "fsync", "fcntl",
+                  "__fcntl", "getattrlist", "__getattrlist", "access", "__access_extended", "unlink", "rename"}
 YIELD_LEAVES = {"swtch_pri", "thread_switch", "sched_yield", "swtch", "__swtch_pri"}
 SLEEP_CALLERS = re.compile(r"(sceKernelUsleep|sceKernelNanosleep|usleep_nid|nanosleep_nid|SleepNanos|"
                            r"sceKernelSleep|scePthreadYield|sched_yield_nid)")
@@ -189,6 +193,10 @@ def classify_stack(path):
             (leaf_symbol.endswith("_trap") or leaf_symbol in WAIT_LEAVES):
         return "wait: GPU", short_symbol(_first_owner([frame for frame in path
                                                        if not METAL_MODULES.match(frame[1])])[0])
+    if leaf_symbol in ("start_wqthread", "thread_start") and len(path) <= 2:
+        return "idle: workqueue", leaf_symbol  # a parked or just-created pool thread with no frames of its own
+    if leaf_module == "libsystem_kernel.dylib" and leaf_symbol in FILE_IO_LEAVES:
+        return "kernel: file I/O", short_symbol(_first_owner(path)[0])
     if leaf_module == "<jit>":
         return "guest JIT code", "translated guest code"
     # Translation work is decided by the stack, not the leaf (the leaf is often malloc or memcpy).
@@ -231,15 +239,16 @@ def thread_role(thread):
     joined = " ".join(symbol for (symbol, _), _ in roots.most_common(60))
     for pattern, role in (
             (r"Aps5StartGuest|GuestCpu::Run", "guest main"),
-            (r"RunThread", "guest thread"),
             (r"QueueWorker|queueWorker|WorkerLoop|Driver::enqueue|DriverDetail::Driver::run", "queue worker"),
             (r"Presenter|presentLoop|PresentThread|presenter", "presenter"),
+            (r"vblankLoop", "vblank"),
             (r"PipelineCache::worker|PipelineCompil|compileWorker|Prewarm", "pipeline compiler"),
             (r"PipelineCache::saver", "pipeline saver"),
-            (r"Recorder::.*[Rr]elease|releaseLoop", "recorder release"),
+            (r"ReleaseThreadMain", "recorder release"),
+            (r"RunThread|StartNativeThread|Aps5GuestCallEntry|\?\?\?", "guest thread"),
             (r"AudioOut|Ngs2|SDL_RunAudio|AudioThread", "audio"),
             (r"DiskCache", "FEX disk cache"),
-            (r"VideoOut|Vblank|vblank", "videoout/vblank"),
+            (r"VideoOut|Vblank|vblank", "videoout"),
     ):
         if re.search(pattern, joined):
             return role

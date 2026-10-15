@@ -125,6 +125,11 @@ class SampleTests(unittest.TestCase):
         roles = {thread["key"]: thread["role"] for thread in summary["threads"]}
         self.assertEqual(roles["Thread_13"], "queue worker")
 
+    def test_file_io(self):
+        path = (("ResolvePath_nid_no_patch", "libc.prx"), ("std::__fs::filesystem::__status(path const&)", "libc++.1.dylib"),
+                ("stat", "libsystem_kernel.dylib"))
+        self.assertEqual(pp.classify_stack(path), ("kernel: file I/O", "ResolvePath_nid_no_patch"))
+
     def test_short_symbol(self):
         self.assertEqual(pp.short_symbol("A::(anonymous namespace)::Wait(id<X>, unsigned long) const"), "A::{anon}::Wait")
         self.assertEqual(pp.short_symbol("std::f<std::g<int>>(int)"), "std::f")
