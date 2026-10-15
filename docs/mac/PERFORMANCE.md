@@ -74,3 +74,52 @@ GPU waits are about 10% of samples. Two thirds of those are `StorageTexture::Ref
 - It uses the output status's dynamic range: an HDR answer (`APS5_HDR=1`) makes it register 3840x2160 with pixel format 0x8100070400000000 instead of 0x8100000000000000 (not decoded yet). It ignores the resolution class: 3840x2160 under class 1 and 2. Its 4K display buffers are its scan-out size on any TV; the scene renders at 1920x1080 / 2432x1368.
 - After registering it polls GetOutputStatus, GetHdrToneMapLuminance and GetGamePresets every frame. The "Performance Mode" preset (now the default, `APS5_GAME_PRESET=default` for Game Default) changed neither its render sizes nor its frame time in four interleaved runs; frame time tracked the P-cluster clock (1.7-3.7 GHz on a shared machine).
 - What would lower ASTRO's cost: the per-present `Driver.Packet.memory_wait` (560-800 ms) and the driver waits PERF3 is working on (D66 already moved the 4K display-buffer decode to the GPU), not the system answers.
+## Waste audit (PERF5, 2026-10-15)
+
+Tool: `tools/mac/profile_title.py run <ID> --tag T --seconds S --window START:LEN [--fex-sample 2] [--env K=V]` (one headless title_run under the GPU lock; `sample`, per-thread P/E counters, powermetrics, the driver trace, `[gputime]`, the guest sampler; report `<ID>-<TAG>-profile.md/json`). `profile_title.py report <log-dir> <ID> <TAG>` re-reads a run. "Cores" below is samples divided by samples per thread: the CPU kept busy (or the threads parked) on average. "ms/frame" multiplies that by the mean frame time.
+
+Sources so far (no new title runs were allowed after ~14:15 because the user needed the Mac):
+- DOOM: perf5 p0, build-metal before its d227f1e36 rebuild, 60 s run, window 20:30, sample 10 s, powermetrics 60 samples, Nominal pressure.
+- ASTRO: PERF3's baseline trace aA4 (a09b099c06d4, APS5_PRESENT_GPU_DECODE=0, seconds 80:60, 125 frames) and PERF3's `sample` asamp1 (14:10, 981 samples per thread, 113 threads), both re-read with profile_parse.
+- Showcase 1.0.2: PERF3's baseline trace sA2 (49 frames) and PERF1's `sample` base3.
+
+### ASTRO BOT (PPSA21564): frame mean 479 ms (p50 412, p99 1044)
+
+The critical path is queue worker 0x0. It is in a phase 99.9% of the time, 228 ms/frame of it waiting. The GPU is busy 243 ms/frame (about 50%). The async compute queues 0x40 and 0x48 wait on queue 0 for 365 and 451 ms/frame in `memory_wait`: they are idle because they depend on queue 0, which is not waste of their own.
+
+| # | Hog | ms/frame or share | Evidence | Owner | Proposed fix |
+|---|---|---|---|---|---|
+| 1 | `Recorder.Sync` inside draws (88 ms) and dispatches (63 ms) on queue 0 | 150 ms/frame of the critical path; meanwhile the GPU idles | trace aA4: Sync under Driver.Draw.draw_and_resource_release 55, Driver.Draw 32, Driver.Dispatch 63 | AGC driver (PERF3/DRV-D) | Find which resource forces each full GPU drain (storage-image refresh, CPU readback) and make it a ranged wait or a GPU-side copy |
+| 2 | Guest audio thread at 100% of a core in translated code | 1.0 core (98% of that thread's samples) | asamp1: 960 of 981 samples in JIT, hot PCs in two small clusters; only 16 bridge calls; AudioOut2MixPorts 9 | FEX/translation or HLE audio (PERF5, open) | Guest sampler run to name the loop: a free-running mixer (no pacing from our AudioOut2/Ngs2), a guest spin on a flag our HLE never sets, or real DSP made expensive by translation |
+| 3 | Host CPU work on queue 0: `EqualsCommittedUnsynced` and `copyCommitted` (snapshot compare and copy of untracked guest memory) | about 0.35 core, about 170 ms/frame on the critical path | asamp1: 242 + 104 samples of queue 0's 981 | AGC driver (DRV-D: write-tracked imports) | Write-tracked host imports so that Refresh skips the memcmp |
+| 4 | `GpuMutex.wait.label` in prepare_memory | 51 ms/frame | trace aA4 | AGC driver (PERF3) | Shorter GPU-mutex holds (presenter, queues 0x40 and 0x48 polling) |
+| 5 | `ColorTargetLayout::Offset` on the CPU | about 0.08 core, about 38 ms/frame on queue 0 | asamp1: 78 samples | AGC driver | Per-row or per-tile addressing instead of per-texel, or a GPU detile |
+| 6 | `Recorder.WaitSerial` + `memory_wait` on queue 0 | 26 + 47 ms/frame | trace aA4 | AGC driver (PERF3) | GPU completion pushed to the worker (MTLSharedEvent listener) instead of 1 ms polls |
+| 7 | File-loader guest thread: stat/open system calls under ResolveHostPath | about 0.26 core | asamp1: 185 ResolveHostPath (83 stat), 67 open | HLE libc/libkernel | Cache resolved host paths and their existence (the guest opens the same files again) |
+| 8 | Pipeline saver: SHA-256 and archive Save | about 0.10 core | asamp1: 79 SHA256 + 21 Save on "pipeline saver" | AGC driver / Metal pipeline cache | Save less often, or hash only new pipelines (D51 keeps earlier pipelines) |
+| 9 | Metal submission (`iokit_user_client_trap` on com.Metal4.SubmissionQueue) and Residency::Commit | 0.14 + 0.06 core | asamp1 | Metal backend | Fewer, larger batches; residency changes batched (D44) |
+| 10 | Translation (FEX compile, dispatcher, signals, thunks) | about 0.05 core in all | asamp1: compile 14, dispatcher 18, signals 6, thunks 11 samples (warm disk cache) | FEX | Not a hog after D49/D58; keep the disk cache warm |
+
+### Showcase 1.0.2 (PPSA99005 v1.0.2, fixed 4K): frame mean 558 ms (p50 562)
+
+The GPU is busy 420 ms/frame (75%) at 1.15-1.2 GHz (PERF2), so the title is GPU-bound. Queue 0 waits 316 ms/frame for submissions (Driver.WorkerWait) and 112 ms in `Recorder.Sync`; the presenter waits 58 ms in `Recorder.Sync`. The guest main thread sleeps about 98% of the time in `sceKernelUsleep(1000)` polling. The CPU totals about 0.6 of a core.
+
+| # | Hog | ms/frame or share | Evidence | Owner | Proposed fix |
+|---|---|---|---|---|---|
+| 1 | GPU scene time at 4K | 420 ms/frame | trace sA2 gpu track | MSL/recompiler (SHD9), driver | Internal-resolution override + MetalFX (MISSION M4); shader cost (SHD9 wave64 halving) |
+| 2 | CPU-GPU serialization: `Recorder.Sync` on queue 0 (112 ms) and the presenter (58 ms) | GPU idle gaps of about 140 ms/frame (25%) | trace sA2 | AGC driver (PERF3) | Same as ASTRO #1; present without a full drain (D60 revisited after write tracking) |
+| 3 | `StorageTexture::Refresh` compare and upload (memcmp + upload of 1.6 GB per 10 s) | about 48% of the worker's busy time | PERF1 base3 | DRV-D (write-tracked imports) | Write tracking on imported memory |
+| 4 | 4K display-buffer CPU decode under the GPU mutex | about 400 of 2649 samples on the presenter | PERF1 base3 | PERF3 (D66, GPU decode) | Landing |
+| 5 | Guest polling with `sceKernelUsleep(1000)` | wake-ups only, no CPU cost; adds up to 1 ms of latency per poll | PERF1 base3 | none (title behaviour) | Leave it: a 1 ms nanosleep costs about 1.1 ms on macOS |
+| 6 | Write-watch ticket lock yield (`GuestWriteWatchProtection`) and lease waits | about 3% of a core | PERF1 base3: 80 + 23 samples | libc write watch (PERF5) | Shorter hold or a reader path; small |
+
+### DOOM (PPSA99666, CPU baseline): p50 34.3 ms, p99 37.8 ms (30 fps title pacing)
+
+The process uses 0.17 cores, all on P cores (per-thread counters). The CPU is idle. Per frame, the presenter spends 15.8 ms in vblank_wait and 17.6 ms on work; the queue worker spends 21.7 ms in rendering_wait. The GPU is 82.7% active but at its lowest state (338-378 MHz) because the title paces itself at 30 fps. The GPU track shows 20.6 ms/frame for one compute dispatch.
+
+| # | Hog | ms/frame or share | Evidence | Owner | Proposed fix |
+|---|---|---|---|---|---|
+| 1 | `DecodeDisplayBuffer` on the presenter (CPU) | 0.13 core, 4.5 ms/frame | p0 sample: 888 of 6668 | PERF3 (D66) | GPU decode |
+| 2 | The GPU mutex held around the present: the queue worker waits | 0.62 core-equivalent parked (21 ms/frame), not CPU | p0 sample: 4118 GpuMutexType::lock on the queue worker | PERF3 | Shorter present section (D66) |
+| 3 | The guest game thread | 2.3% of a core | p0 counters | none | none: translation is not a factor for DOOM |
+| 4 | GPU DVFS at its lowest state while 83% active | no frame cost at 30 fps | p0 powermetrics | none | Only matters if the title wanted 60 fps |

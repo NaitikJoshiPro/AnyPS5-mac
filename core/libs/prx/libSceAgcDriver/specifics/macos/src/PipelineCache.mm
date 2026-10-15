@@ -484,6 +484,7 @@ void PipelineCache::prewarm(std::vector<StoredLibrary> stored) {
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> compiled{0};
     auto run = [&] {
+        pthread_setname_np("pipeline prewarm");
         pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
         for (std::size_t index = next.fetch_add(1); index < stored.size(); index = next.fetch_add(1)) {
             if (prewarmStop.load(std::memory_order_acquire)) break;
@@ -932,6 +933,7 @@ void PipelineCache::submit(std::function<void()> task) {
 }
 
 void PipelineCache::worker() {
+    pthread_setname_np("pipeline compile");
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     for (;;) {
         std::function<void()> task;
@@ -973,6 +975,7 @@ void PipelineCache::requestSave() {
 }
 
 void PipelineCache::saver() {
+    pthread_setname_np("pipeline saver");
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     std::unique_lock lock(saverMutex);
     for (;;) {

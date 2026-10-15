@@ -1,3 +1,7 @@
+#ifdef __APPLE__
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -354,7 +358,14 @@ VideoOutDriver::VideoOutDriver() {
             presentLoop(token, started);
         });
         attached.get();
-        vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
+        vblankThread = std::jthread([this](std::stop_token token) {
+#ifdef __APPLE__
+            // The vblank clock wakes guest flip waiters 60 times a second: named, and on P cores under load (D70).
+            pthread_setname_np("vblank");
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+            vblankLoop(token);
+        });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
     } catch (...) {
         if (vblankThread.joinable()) {

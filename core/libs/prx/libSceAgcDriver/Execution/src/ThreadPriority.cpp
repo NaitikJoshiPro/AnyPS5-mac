@@ -16,6 +16,7 @@
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #else
 #include <dlfcn.h>
 #include <sched.h>
@@ -274,6 +275,23 @@ void Raise(const char* role) {
 
 #elif defined(__APPLE__)
 
+// Names the thread after its role (sample, spindump and tools/mac/profile_title.py show it) and sets its QoS
+// class, which decides P-core or E-core placement under load (D70).
+void ApplyHostThreadRole(const char* role) {
+    pthread_setname_np(role);
+    static const HostThreadQos qos = ParseHostThreadQos(std::getenv("APS5_WORKER_QOS"));
+    qos_class_t wanted = QOS_CLASS_UNSPECIFIED;
+    switch (qos) {
+    case HostThreadQos::Unchanged: return;
+    case HostThreadQos::UserInteractive: wanted = QOS_CLASS_USER_INTERACTIVE; break;
+    case HostThreadQos::UserInitiated: wanted = QOS_CLASS_USER_INITIATED; break;
+    case HostThreadQos::Default: wanted = QOS_CLASS_DEFAULT; break;
+    case HostThreadQos::Utility: wanted = QOS_CLASS_UTILITY; break;
+    }
+    if (const int result = pthread_set_qos_class_self_np(wanted, 0); result != 0)
+        throw std::runtime_error(std::string("APS5_WORKER_QOS: ") + role + " pthread_set_qos_class_self_np failed (" + std::to_string(result) + ")");
+}
+
 void Raise(const char* role) {
     const bool realtime = RequestedMode() == ThreadPriorityMode::Realtime;
     thread_precedence_policy_data_t precedence{realtime ? 63 : 47};
@@ -298,6 +316,15 @@ void Raise(const char* role) {
 
 }
 
+HostThreadQos ParseHostThreadQos(const char* text) {
+    if (text == nullptr || *text == '\0' || std::strcmp(text, "user-interactive") == 0) return HostThreadQos::UserInteractive;
+    if (std::strcmp(text, "off") == 0) return HostThreadQos::Unchanged;
+    if (std::strcmp(text, "user-initiated") == 0) return HostThreadQos::UserInitiated;
+    if (std::strcmp(text, "default") == 0) return HostThreadQos::Default;
+    if (std::strcmp(text, "utility") == 0) return HostThreadQos::Utility;
+    throw std::invalid_argument(std::string("APS5_WORKER_QOS=") + text + " is not user-interactive, user-initiated, default, utility or off");
+}
+
 ThreadPriorityMode ParseThreadPriorityMode(const char* text) {
     if (text == nullptr || *text == '\0' || std::strcmp(text, "off") == 0) return ThreadPriorityMode::Off;
     if (std::strcmp(text, "high") == 0) return ThreadPriorityMode::High;
@@ -318,6 +345,9 @@ RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimit
 }
 
 void RaiseWorkerThreadPriority(const char* role) {
+#ifdef __APPLE__
+    ApplyHostThreadRole(role);
+#endif
     if (RequestedMode() == ThreadPriorityMode::Off) return;
     Raise(role);
 }
