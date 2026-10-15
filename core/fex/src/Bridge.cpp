@@ -306,6 +306,8 @@ constexpr VariadicExport VariadicExports[] = {
     {"sscanf_nid_postfix", GuestList, 2},
     {"sscanf_s_nid_postfix", GuestList, 2},
     {"swprintf_nid_postfix", GuestList, 3},
+    {"swprintf_s_nid_postfix", GuestList, 3},
+    {"swscanf_nid_postfix", GuestList, 2},
     {"swscanf_s_nid_postfix", GuestList, 2},
     {"syslog_nid_postfix", GuestList, 2},
     {"wprintf_nid_postfix", GuestList, 1},

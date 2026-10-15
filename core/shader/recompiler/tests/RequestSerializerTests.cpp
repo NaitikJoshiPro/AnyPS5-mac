@@ -11,6 +11,10 @@
 
 namespace {
 
+// Mac fork: version 30 appends float32DenormFlushNative (one byte) after upstream's version 29 layout.
+constexpr std::uint8_t kCurrentVersion = 30u;
+constexpr std::size_t kMacTailBytes = 1u;
+
 constexpr char kHistoricalVersion21[] =
     "NVNQQRUAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAAAAF4VjQSAQEBOTAAAAA=";
 constexpr char kVersion21WithF16Tail[] =
@@ -206,11 +210,11 @@ int main() {
             Require(request.graphics->draw.indexAddress == 0xabcdef3400u && request.graphics->draw.indexCount == 57u && request.graphics->draw.indexElementBytes == 4u && request.graphics->draw.instanceCount == 9u);
             Require(request.target.float16DenormPreserve == preserve);
             auto upgraded = bytes;
-            upgraded[4] = 29u;
+            upgraded[4] = kCurrentVersion;
             if (fixture.pixel) upgraded.insert(upgraded.begin() + 258u, {0u, 0u, 0u});
             if (fixture.pixel) InsertQuadMaskDefaults(upgraded);
             if (fixture.tessellation) upgraded.insert(upgraded.end() - 35u, 5u, 0u);
-            upgraded.insert(upgraded.end(), sizeof(std::uint64_t), 0u);
+            upgraded.insert(upgraded.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
             Require(serializer.Serialize(request) == EncodeBase64(upgraded));
             auto truncated = bytes;
             truncated.pop_back();
@@ -245,11 +249,11 @@ int main() {
                     layerRejected = std::string_view(error.what()) == "RequestSerializer: truncated data";
                 }
                 Require(layerRejected);
-                layered[4] = 29u;
+                layered[4] = kCurrentVersion;
                 layered.insert(layered.begin() + 259u, {0u, 0u});
                 InsertQuadMaskDefaults(layered);
                 if (fixture.tessellation) layered.insert(layered.end() - 35u, 5u, 0u);
-                layered.insert(layered.end(), sizeof(std::uint64_t), 0u);
+                layered.insert(layered.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
                 Require(serializer.Serialize(layerReplay.request) == EncodeBase64(layered));
             }
         }
@@ -270,10 +274,10 @@ int main() {
             Require(replay.request.context.pixel->rasterPrimitive == ShaderRecompiler::RasterPrimitive::Rectangle);
             Require(replay.request.context.vertex->paClVsOutCntl == 0x00050a05u);
             Require(replay.request.target.float16DenormPreserve == preserve);
-            bytes[4] = 29u;
+            bytes[4] = kCurrentVersion;
             bytes.insert(bytes.begin() + 259u, {0u, 0u});
             InsertQuadMaskDefaults(bytes);
-            bytes.insert(bytes.end(), sizeof(std::uint64_t), 0u);
+            bytes.insert(bytes.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
             Require(serializer.Serialize(replay.request) == EncodeBase64(bytes));
 
             auto truncated23 = DecodeBase64(encoded23);
@@ -394,13 +398,35 @@ int main() {
                 Require(request.graphics->draw.indexAddress == 0xabcdef3400u && request.graphics->draw.indexCount == 57u && request.graphics->draw.indexElementBytes == 4u && request.graphics->draw.instanceCount == 9u);
                 Require(request.target.float16DenormPreserve == preserve);
                 auto upgraded = bytes;
-                upgraded[4] = 29u;
+                upgraded[4] = kCurrentVersion;
                 if (fixture.pixel) upgraded.insert(upgraded.begin() + 259u, {0u, 0u});
                 if (fixture.pixel) InsertQuadMaskDefaults(upgraded);
-                upgraded.insert(upgraded.end(), sizeof(std::uint64_t), 0u);
+                upgraded.insert(upgraded.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
                 Require(serializer.Serialize(request) == EncodeBase64(upgraded));
             }
         }
+    }
+
+    for (const bool flush : {false, true}) {
+        ShaderRecompiler::RecompileRequest flushRequest{};
+        flushRequest.target.float32DenormFlushNative = flush;
+        auto bytes = DecodeBase64(serializer.Serialize(flushRequest));
+        Require(bytes.size() >= 9u && bytes[4] == kCurrentVersion && bytes.back() == static_cast<std::uint8_t>(flush));
+        Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.float32DenormFlushNative == flush);
+        auto invalid = bytes;
+        invalid.back() = 2u;
+        bool invalidRejected = false;
+        try {
+            static_cast<void>(serializer.Deserialize(EncodeBase64(invalid)));
+        } catch (const std::runtime_error& error) {
+            invalidRejected = std::string_view(error.what()) == "RequestSerializer: invalid float32DenormFlushNative value";
+        }
+        Require(invalidRejected);
+        auto version29 = bytes;
+        version29[4] = 29u;
+        version29.pop_back();
+        const auto upstream = serializer.Deserialize(EncodeBase64(version29));
+        Require(!upstream.request.target.float32DenormFlushNative);
     }
 
     ShaderRecompiler::RecompileRequest request{};
@@ -410,9 +436,9 @@ int main() {
         const auto replay = serializer.Deserialize(encoded);
         Require(replay.request.target.float16DenormPreserve == preserve);
         auto bytes = DecodeBase64(encoded);
-        Require(bytes.size() >= 8u && bytes[4] == 29u && bytes[5] == 0u && bytes[6] == 0u && bytes[7] == 0u);
+        Require(bytes.size() >= 8u && bytes[4] == kCurrentVersion && bytes[5] == 0u && bytes[6] == 0u && bytes[7] == 0u);
         auto future = bytes;
-        future[4] = 30u;
+        future[4] = kCurrentVersion + 1u;
         bool futureRejected = false;
         try {
             static_cast<void>(serializer.Deserialize(EncodeBase64(future)));

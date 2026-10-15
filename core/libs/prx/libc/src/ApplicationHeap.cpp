@@ -89,7 +89,10 @@ const void* replacementTable(const void* processParameters) {
 // _init_env, and libSceLibcInternal's malloc still works for them on the console. The first heap call
 // then sets the heap up as _init_env would: the title's replacement table when its process parameters
 // carry one, the default heap otherwise.
-void ensureRegistered() {
+// installDefault is false for the heap queries (malloc_stats_fast, malloc_usable_size): they initialize a
+// title's replacement table like upstream's lazy path, but a query alone never installs the default heap,
+// so a later _init_env (or ApplicationHeapInitialize) can still register the title's allocator.
+void ensureRegistered(bool installDefault) {
     {
         std::lock_guard lock(heapMutex);
         if (heapApi[0] != nullptr || heapFailure || heapFinalized) return;
@@ -104,15 +107,16 @@ void ensureRegistered() {
         ApplicationHeapInitialize_nid_no_patch(processParameters);
         return;
     }
+    if (!installDefault) return;
     std::lock_guard lock(heapMutex);
     if (heapApi[0] == nullptr && !heapFailure && !heapFinalized) heapApi = defaultApi();
 }
 
 // Upstream's lazy initialization entry point; ensureRegistered also covers titles without a replacement table.
-void ensureInitialized(std::unique_lock<std::mutex>& lock) {
+void ensureInitialized(std::unique_lock<std::mutex>& lock, bool installDefault = true) {
     if (heapApi[0] != nullptr || heapFailure || heapFinalized) return;
     lock.unlock();
-    ensureRegistered();
+    ensureRegistered(installDefault);
     lock.lock();
 }
 
@@ -283,7 +287,7 @@ int ApplicationHeapStatsFast_nid_no_patch(void* stats) {
     Stats statsFast;
     {
         std::unique_lock lock(heapMutex);
-        ensureInitialized(lock);
+        ensureInitialized(lock, false);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -298,7 +302,7 @@ std::size_t ApplicationHeapUsableSize_nid_no_patch(void* pointer) {
     UsableSize usableSize = nullptr;
     {
         std::unique_lock lock(heapMutex);
-        ensureInitialized(lock);
+        ensureInitialized(lock, false);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");

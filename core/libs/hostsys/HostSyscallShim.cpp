@@ -569,6 +569,11 @@ APS5_HOST_SHIM int setvbuf(FILE* __restrict stream, char* __restrict buffer, int
     return APS5_REAL(setvbuf)(stream, Host(buffer, bytes), mode, bytes);
 }
 
+// setbuf is setvbuf with BUFSIZ (or unbuffered for a null buffer), so the retained buffer gets the same alias.
+APS5_HOST_SHIM void setbuf(FILE* __restrict stream, char* __restrict buffer) {
+    APS5_REAL(setvbuf)(stream, Host(buffer, BUFSIZ), buffer != nullptr ? _IOFBF : _IONBF, BUFSIZ);
+}
+
 // Formatted into a host buffer, then written: a %s argument longer than the stream's buffer would otherwise go to
 // write(2) straight from guest memory.
 APS5_HOST_SHIM int vfprintf(FILE* __restrict stream, const char* __restrict format, va_list arguments) {
@@ -579,6 +584,14 @@ APS5_HOST_SHIM int fprintf(FILE* __restrict stream, const char* __restrict forma
     va_list arguments;
     va_start(arguments, format);
     const int result = Format(stream, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+APS5_HOST_SHIM int printf(const char* __restrict format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    const int result = Format(stdout, format, arguments);
     va_end(arguments);
     return result;
 }

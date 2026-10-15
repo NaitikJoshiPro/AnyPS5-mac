@@ -195,8 +195,8 @@ static void CheckUnsizedScan() {
     double real = 0;
     Require(swscanf_nid_postfix(u"1.5e3", u"%lf", &real) == 1 && real == 1500.0, "swscanf %lf");
     Require(swscanf_nid_postfix(u"1e+x", u"%lf", &real) == 0, "swscanf %lf incomplete exponent is a matching failure");
-    long double extended = 0;
-    Require(swscanf_nid_postfix(u"2.25", u"%Lf", &extended) == 1 && extended == 2.25L, "swscanf %Lf");
+    GuestLongDouble extended{};
+    Require(swscanf_nid_postfix(u"2.25", u"%Lf", &extended) == 1 && extended == GuestLongDoubleFromDouble(2.25), "swscanf %Lf");
     float single = 0;
     Require(swscanf_nid_postfix(u"-inf", u"%f", &single) == 1 && single == -std::numeric_limits<float>::infinity(), "swscanf %f infinity");
 

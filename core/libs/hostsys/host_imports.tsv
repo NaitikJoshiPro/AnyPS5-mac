@@ -196,6 +196,7 @@ gmtime_r	userspace	none
 h_errno	data	none	data symbol
 host_statistics64	userspace	none	MIG: arguments are copied into a message in userspace
 hypot	userspace	none	
+if_indextoname	userspace	none	Darwin copies the name in userspace (sysctl NET_RT_IFLIST into its own buffer, then strlcpy); libSceNetCtl passes a host buffer
 inet_ntop	userspace	none	
 inet_pton	userspace	none	
 ioctl	buffer	shim	IOCPARM_LEN(request) bytes when IOC_IN/IOC_OUT is set; IOC_VOID and size 0 pass the argument through (documented gap: a request that takes a pointer without encoding its size)
@@ -273,6 +274,7 @@ pow	userspace	none
 powf	userspace	none	
 pread	buffer	shim	buffer, length given
 preadv	buffer	shim	iovec array and its bases (copied when a base needs translating)
+printf	stdio	shim	formatted into a host buffer, then written: a long %s argument would otherwise reach write(2) from guest memory
 pthread_attr_destroy	userspace	none	
 pthread_attr_init	userspace	none	
 pthread_attr_setdetachstate	userspace	none	
@@ -313,11 +315,13 @@ pthread_setspecific	userspace	none	context pointer retained and handed back: ide
 pthread_sigmask	buffer	shim	sigset in and out
 pthread_threadid_np	userspace	none	
 putc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+putchar	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
 puts	stdio	shim	string; a long string or an unbuffered stream is written from it directly
 pwrite	buffer	shim	buffer, length given
 pwritev	buffer	shim	iovec array and its bases (copied when a base needs translating)
 qsort	userspace	none	
 raise	scalar	none	kernel call without a pointer argument
+rand	userspace	none	
 read	buffer	shim	buffer, length given
 readdir	userspace	none	
 readv	buffer	shim	iovec array and its bases (copied when a base needs translating)
@@ -339,6 +343,7 @@ sched_yield	scalar	none	kernel call without a pointer argument
 select	buffer	shim	fd_set words for nfds and the timeval
 send	buffer	shim	buffer, length given
 sendto	buffer	shim	buffer and socket address
+setbuf	retaining	shim	stream buffer retained by the FILE: translated (as setvbuf), the FILE never hands it back
 setenv	userspace	none	
 setjmp	userspace	none	jmp_buf on a host stack; the signal mask is saved by a libc-internal sigprocmask
 setrlimit	buffer	shim	rlimit struct
@@ -402,6 +407,7 @@ thread_info	userspace	none	MIG: arguments are copied into a message in userspace
 thread_policy_set	userspace	none	MIG: arguments are copied into a message in userspace
 time	userspace	none	
 times	userspace	none	
+timezone	data	none	data symbol
 truncate	path	shim	path string
 tzname	data	none	data symbol
 tzset	userspace	none	
