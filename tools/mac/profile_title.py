@@ -327,6 +327,14 @@ def markdown(result):
         out += ["", "## Guest time (guest sampler, top RIPs)", "",
                 f"{fex['samples']} samples over {fex['threads']} guest threads; of the top RIPs: " +
                 ", ".join(f"{kind} {100.0 * value / total:.0f}%" for kind, value in sorted(kinds.items(), key=lambda kv: -kv[1])), ""]
+        exact = fex.get("exact_kinds") or {}
+        if exact:
+            all_samples = sum(exact.values()) or 1.0
+            out.append("All guest-thread samples by where the host PC was: " + ", ".join(
+                f"{kind} {100.0 * value / all_samples:.1f}%" for kind, value in sorted(exact.items(), key=lambda kv: -kv[1])) + ".")
+            for share, thread, window, kinds in fex.get("busiest_translated", []):
+                out.append(f"- guest thread {thread} (window {window}): " + ", ".join(f"{k} {v:.1f}%" for k, v in kinds.items()))
+            out.append("")
         for module, offset, kind, host, samples in fex["hot"][:8]:
             out.append(f"- {module}+0x{offset:x} {kind} {host}: {samples:.0f}")
     out.append("")

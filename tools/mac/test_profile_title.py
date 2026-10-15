@@ -95,8 +95,9 @@ FEX_SAMPLE = """[fex-sample] sampling guest threads every 2 ms, report every 15 
 [fex-sample]          rax=4150029f rcx=500145300
 [fex-sample]    30.0% rip 0x1000 app.elf+0x397ee jit
 [fex-sample]    10.0% rip 0x104e7ec70 ?+0x104e7ec70 host libSceAgcDriver.prx`Submit+0x8
-[fex-sample] thread 3 "worker": 200 samples, 4 distinct RIPs
-[fex-sample]   100.0% rip 0x2000 app.elf+0x10 jit
+[fex-sample] thread 3 "worker": 200 samples, 4 distinct RIPs; jit 60.0% dispatcher 20.0% stub 10.0% native 10.0%
+[fex-sample]    60.0% rip 0x2000 app.elf+0x10 jit
+[fex-sample]    20.0% rip 0x2004 app.elf+0x14 dispatcher 0xfc00001000
 """
 
 
@@ -198,9 +199,12 @@ class LogLineTests(unittest.TestCase):
         self.assertEqual([rip["kind"] for rip in first], ["host", "jit", "host"])
         summary = pp.summarize_fex_sample(windows)
         self.assertEqual(summary["samples"], 1200)
-        self.assertAlmostEqual(summary["kinds"]["jit"], 300 + 200)
+        self.assertAlmostEqual(summary["kinds"]["jit"], 300 + 120)
+        self.assertEqual(windows[0]["threads"][1]["kinds"], {"jit": 60.0, "dispatcher": 20.0, "stub": 10.0, "native": 10.0})
+        self.assertAlmostEqual(summary["exact_kinds"]["dispatcher"], 40.0)
+        self.assertEqual(windows[0]["threads"][1]["rips"][1]["kind"], "dispatcher")
         self.assertAlmostEqual(summary["kinds"]["native wait/syscall/signal"], 500)
-        self.assertAlmostEqual(summary["kinds"]["native work"], 100)
+        self.assertAlmostEqual(summary["kinds"]["native work"], 100 + 40)
 
 
 class FexStatsTests(unittest.TestCase):
