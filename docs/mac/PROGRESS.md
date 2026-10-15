@@ -345,3 +345,27 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - VA8 (895ea2341 plus DRV-D's D57 code commits 73083537d b1112ac1c 68bf3f693 6f7a78af1 cherry-picked on a throwaway branch, since mac-native-metal alone dies on the storage-image store at ~170 s, run va8-noval1), APS5_DISPLACED_STACKS_NATIVE=32768, no validation, 300 s (va8-noval3): alive, 16 frames (one every 30 flips at 8-11 s, about 3 flips/s), past the intro into the opening cinematic (frame 15); 8,192 faults at 14.4 s and fewer than 16,384 by 300 s, 0 unpatched native faults, 0 SIGTRAP returns; title CPU 230 s in 271 s. With --validation (va8-val3): alive 300 s, 4,096 faults at 8.8 s and fewer than 8,192 by 300 s, 0 native.
 - No new native writer showed up (the milestone prints from the first native fault), so the rendering-phase storm was the per-draw libSceAgc/AgcDriver paths D58 already fixed (SetIndexSize_0600 and friends). Machine load differed between the two runs (DRV-D's ran during the evening's busy period), so take the flip-rate ratio as approximate; the fault counts are exact.
 - Next: ASTRO is now GPU/compile bound, not displaced-fault bound (DRV/SHD).
+
+## 2026-10-15 — M4 PERF1: first M4 profile (Showcase 1.0.2 + DOOM), GPU timing fix (D59), presentation changes measured and not adopted (D60), PERFORMANCE.md
+- New `docs/mac/PERFORMANCE.md`: measurement rules (driver trace p50/p99, interleaved A/B, P-cluster and GPU frequency per run via `sudo -n powermetrics`), the M4 resolution target (internal ~1080p or lower, MetalFX to a 16:9 output), baselines, and a table of every change.
+- Profile: Showcase 1.0.2 at 4K is GPU-bound, not CPU-bound. GPU active residency is 84-90%; the process uses ~0.6 of a core; the guest's main thread sleeps in `sceKernelUsleep(1000)` ~98% of the time.
+  - Queue worker: 55% idle. `StorageTexture::Refresh` takes ~48% of its busy time: GPU drains, `compareUntracked` memcmp, CPU uploads over host-imported (untracked) memory.
+  - Presenter: decodes the 4K display buffer on the CPU under the GPU mutex.
+  - `GuestAllocationsAcquire` is negligible here (5 samples of 15 s).
+  - DOOM paces itself at 30 fps on a cool machine. When throttled, its presenter held the GPU mutex 8.6 s per 10 s, and its worker waits on the GPU in `ReadRawShader`: a 2 MiB noted write range covers the 1 KiB shader, and all 106 such waits per 10 s read unchanged bytes.
+- D59 (landed): `[gputime]` leaves out timestamp pairs the GPU never wrote. Before, the totals were ~7e16 ms; after, Showcase uses 6.0-6.3 s of GPU per 10 s, of which storage uploads and write-backs (1.6 GB each way) take ~180 ms. Test: agc_metal_recorder (TimestampPairs).
+- D60 (not adopted, measured): two presentation changes.
+  - Resident present (branch perf1-resident; test agc_metal_resident_present passes): Showcase p50 424 -> 454 and 418 -> 490 ms. Untracked display memory refreshes the image every flip.
+  - Display GPU wait before the present takes the GPU mutex (branch perf1-prewait): neutral on both workloads; the full-hook variant regressed Showcase.
+- Verification on build-perf1 (RelWithDebInfo) at 5c95eb30b on 14ec0c7d2:
+  - CPU: `ctest -LE gpu -j4` 5101/5101.
+  - GPU: `gpu_suite G1 G4 --validation --build-first`: G1 193/193, G4 45/46 plus the allowlisted skip (agc_driver_draw_cache_reuse).
+  - Titles: DOOM 60 s --validation alive, 6 frames (title menu correct); Showcase 100 s --validation alive, 3 frames, 0 validation errors.
+- FINDING (DRV/SHD): Showcase 1.0.2's scene renders near-black. Only the HUD is bright; every other pixel is <= 15/255 in a full-resolution dump. The baseline at 4c337f14a has the same histogram, so it is not caused by D59/D60.
+- Logs: .mac-work/logs/perf1/ (BASELINES.txt, *-ab*, *-lw*, *-gw*, *-gt1, gate-*, gs-gate1).
+- Disk: 41.7 GB of 100 GB.
+- Next (owners):
+  - DRIVER, internal resolution override + MetalFX: Showcase's main lever.
+  - DRV-D, write-tracked imports: removes Refresh's memcmp/re-upload.
+  - DRIVER, precise pending-write ranges for raw shader reads: DOOM.
+  - DRIVER, render-pass GPU timing (TechnicalDebt metal-gpu-timing-render-ranges).
