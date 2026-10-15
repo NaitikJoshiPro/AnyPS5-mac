@@ -420,6 +420,9 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - Showcase: present 92-130 -> 4 ms per frame; p50 562-616 -> 279-524.
   - DOOM: Present 9.2-38.6 -> 3.6-5.8 ms per frame, still paced at 30 fps.
 - Tests: agc_metal_present_gpu_decode (new, G5) passes; agc_metal_offscreen_frames and agc_metal_metalfx_present pass; ctest -LE gpu 5105/5105 (build-perf3 on db1a9ad8c).
-- NOT GATED YET: main paused all GPU work (user needs the Mac). Owed after RESOURCES OK: gpu_suite G1 G4 G7 --validation --build-first; DOOM 60 s, Showcase 60 s and ASTRO capped runs with --validation; then land.
+- Gate (2026-10-16, build-perf3 on 0e6a2088d):
+  - `gpu_suite --validation G1 G4 G7 agc_metal_present_gpu_decode`: 304/318, plus 14 allowlisted skips, 0 failed (logs/perf3/gs-gate2).
+  - Titles with --validation: DOOM 60 s alive, 3 frames; Showcase 70 s alive, 3 frames; ASTRO 240 s alive.
+  - ASTRO under validation has no pipeline archive, so it is still compiling pipelines at 240 s and shows no frame yet. Without validation (200 s) it is alive with 4 frames (the Sony intro card). 0 validation errors in any run.
 - Next costs (owners): DRV-D, StorageTexture revalidation memcmp/copies and the Refresh upload sync (the largest share of queue 0's CPU and its GPU waits; write-tracked imports). DRIVER, CMASK materialisation (`ColorTargetLayout::Offset` per element), Residency::Commit per TryWrap, PipelineCache::PrepareCompute key building, async-queue dispatch recording under the GPU mutex. TOOLS, the cold Metal pipeline compiles that stall some runs for 100+ s.
 
