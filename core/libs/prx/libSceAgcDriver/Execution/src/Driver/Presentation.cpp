@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
@@ -77,6 +79,24 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             if (buffer != nullptr) require(buffer->width == window.width && buffer->height == window.height, "display buffer extent differs from output");
         }
 
+#ifdef __APPLE__
+        // macOS (the Metal device reads the display buffer on the CPU at every present, D57): the
+        // wait for the GPU writes recorded over it runs here, before the present section takes the
+        // GPU mutex. Taken from a depth of 0, the recorder waits with the mutex released, so the
+        // queue workers keep recording while the GPU finishes the frame; inside the present
+        // section (mutex held) the same wait held the mutex throughout. Only the wait moves: no
+        // pending image is stored here (the read below stores them as before, under the mutex, so
+        // a worker cannot dirty an image between its store and the read), and the read re-checks
+        // and waits for writes recorded meanwhile. APS5_PRESENT_LOCKED_WAIT=1 keeps the old order.
+        static const bool lockedWait = std::getenv("APS5_PRESENT_LOCKED_WAIT") != nullptr;
+        if (presentable && buffer != nullptr && !syncFlip && !lockedWait) {
+            const auto bytes = DisplayBufferSize(*buffer);
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(buffer->address, bytes)) recorder->SyncThrough(buffer->address, bytes, true);
+            timing.Mark("display_gpu_wait");
+        }
+#endif
         if (presentable && !syncFlip) {
             if (inFlight != 0) {
 
