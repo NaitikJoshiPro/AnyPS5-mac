@@ -527,7 +527,32 @@ void CheckImportWindow(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     for (std::size_t index = 0; index < pieces; ++index) GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(base + index * piece));
     munmap(region, mapped);
-    std::printf("import window: %zu ranges of 16 KiB: the front re-imported %llu KiB in all, a full window is one 8 MiB import, the next window's range stays alone; retired imports kept %llu KiB in the open batch\n", pieces, static_cast<unsigned long long>(imported >> 10u), static_cast<unsigned long long>((keptAfter - keptBefore) >> 10u));
+    // Two adjacent allocations that each cross a window boundary (a 3840x2160 surface allocated in two
+    // GL buffers, Showcase 1.0.2) join one import, so a resource spanning both has one (D65): with
+    // each imported alone, nothing held the surface and its results never reached guest memory.
+    {
+        const std::size_t large = window * 3u / 2u;
+        const std::size_t span = 2u * large;
+        void* bigRegion = mmap(nullptr, span + window, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        Require(bigRegion != MAP_FAILED, "import window: cannot map the two large allocations");
+        const auto bigBase = (reinterpret_cast<std::uint64_t>(bigRegion) + window - 1u) / window * window;
+        GuestAllocations::Mutation().Add(reinterpret_cast<void*>(bigBase), large, true, true, true);
+        GuestAllocations::Mutation().Add(reinterpret_cast<void*>(bigBase + large), large, true, true, true);
+        const Graphics::HostImport* spanning = nullptr;
+        const Graphics::HostImport* fromSecond = nullptr;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            spanning = Graphics::HostImportFor(context, bigBase + large - 4096u, 8192u);
+            fromSecond = Graphics::HostImportFor(context, bigBase + large + 4096u, 16u);
+        }
+        Require(spanning != nullptr && spanning->base == bigBase && spanning->bytes == span, "import window: a range across two adjacent large allocations has no single import (" + std::to_string(spanning != nullptr ? spanning->bytes : 0) + " bytes)");
+        Require(fromSecond == spanning, "import window: the second large allocation is not served by the joined import");
+        device.WaitIdle();
+        GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(bigBase));
+        GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(bigBase + large));
+        munmap(bigRegion, span + window);
+    }
+    std::printf("import window: %zu ranges of 16 KiB: the front re-imported %llu KiB in all, a full window is one 8 MiB import, the next window's range stays alone, adjacent large allocations share one import; retired imports kept %llu KiB in the open batch\n", pieces, static_cast<unsigned long long>(imported >> 10u), static_cast<unsigned long long>((keptAfter - keptBefore) >> 10u));
 }
 
 // BDA page table: BdaAbi::Header + Range[] over the registered guest allocations, translated in
