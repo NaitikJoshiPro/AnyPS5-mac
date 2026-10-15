@@ -15,16 +15,11 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     add_link_options(LINKER:-no_compact_unwind)
 endif()
 
-# A prx finds the others beside itself. The build-tree rpath would point a patched copy at the
-# unpatched libraries. dyld does not know $ORIGIN.
 if(APPLE)
     set(ANYPS5_PRX_RPATH "@loader_path")
 else()
     set(ANYPS5_PRX_RPATH "$ORIGIN")
 endif()
-function(configure_prx_rpath target)
-    set_target_properties(${target} PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH "${ANYPS5_PRX_RPATH}")
-endfunction()
 
 add_executable(nid_patcher
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/Sha1.cpp
@@ -69,6 +64,21 @@ if(MINGW)
     foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
         string(REPLACE "${runtimeLinkFlag}" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
     endforeach()
+
+    if(NOT EXISTS "${CMAKE_RANLIB}")
+        message(FATAL_ERROR "Stable import libraries require ranlib")
+    endif()
+    list(LENGTH CMAKE_CXX_CREATE_SHARED_LIBRARY linkCommandCount)
+    string(FIND "${CMAKE_CXX_CREATE_SHARED_LIBRARY}" "-Wl,--out-implib,<TARGET_IMPLIB> " implibOption)
+    if(NOT linkCommandCount EQUAL 1 OR implibOption EQUAL -1)
+        message(FATAL_ERROR "Expected one shared library link command that writes -Wl,--out-implib,<TARGET_IMPLIB>: ${CMAKE_CXX_CREATE_SHARED_LIBRARY}")
+    endif()
+    string(REPLACE "-Wl,--out-implib,<TARGET_IMPLIB> " "-Wl,--out-implib,<TARGET_IMPLIB>.new " linkCommand "${CMAKE_CXX_CREATE_SHARED_LIBRARY}")
+    set(CMAKE_CXX_CREATE_SHARED_LIBRARY
+            "\"${CMAKE_COMMAND}\" -E env SOURCE_DATE_EPOCH=0 ${linkCommand}"
+            "\"${CMAKE_RANLIB}\" -D <TARGET_IMPLIB>.new"
+            "\"${CMAKE_COMMAND}\" -E copy_if_different <TARGET_IMPLIB>.new <TARGET_IMPLIB>"
+    )
 endif()
 
 # D35: hidden definitions of read, write, recv, ... that translate displaced guest buffers before libSystem sees them.
@@ -93,7 +103,6 @@ set(LIBS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 add_subdirectory(${LIBC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/prx/libc)
 target_include_directories(libc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 configure_windows_unwind(libc)
-configure_prx_rpath(libc)
 link_host_syscall_shim(libc)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libc PRIVATE LINKER:-z,now)
@@ -124,6 +133,14 @@ endif()
 
 set(LIBC_UNPATCHED ${UNPATCHED_DIR}/libc.prx)
 set(LIBC_PATCHED ${PATCHED_DIR}/libc.prx)
+set(LIBC_EXPORT_LIST ${CMAKE_CURRENT_BINARY_DIR}/libc.exports)
+
+add_custom_command(
+        OUTPUT ${LIBC_EXPORT_LIST}
+        COMMAND $<TARGET_FILE:nid_patcher> --write-export-list ${LIBC_UNPATCHED} ${LIBC_EXPORT_LIST}
+        DEPENDS nid_patcher libc ${LIBC_UNPATCHED}
+        COMMENT "Listing libc exports"
+)
 
 add_custom_command(
         OUTPUT ${LIBC_PATCHED}
@@ -153,7 +170,6 @@ foreach(LIB_DIR ${LIBS_DIRS})
             configure_windows_unwind(${LIB_NAME})
         endif()
 
-        configure_prx_rpath(${LIB_NAME})
         link_host_syscall_shim(${LIB_NAME})
         if(LIB_NAME STREQUAL "libkernel")
             target_link_libraries(${LIB_NAME} PUBLIC libc)
@@ -188,9 +204,9 @@ foreach(LIB_DIR ${LIBS_DIRS})
                 OUTPUT ${PATCHED_FILE}
                 COMMAND ${CMAKE_COMMAND} -E copy ${UNPATCHED_FILE} ${PATCHED_FILE}
                 COMMAND ${APS5_MACHO_UNSIGN} ${PATCHED_FILE}
-                COMMAND $<TARGET_FILE:nid_patcher> ${LIB_NAME} --preserve-exports "${LIBC_UNPATCHED}" "${PATCHED_FILE}"
+                COMMAND $<TARGET_FILE:nid_patcher> ${LIB_NAME} --preserve-export-list "${LIBC_EXPORT_LIST}" "${PATCHED_FILE}"
                 COMMAND ${APS5_MACHO_SIGN} ${PATCHED_FILE}
-                DEPENDS nid_patcher ${LIB_NAME} ${UNPATCHED_FILE} ${LIBC_UNPATCHED}
+                DEPENDS nid_patcher ${LIB_NAME} ${UNPATCHED_FILE} ${LIBC_EXPORT_LIST}
                 COMMENT "Patching NIDs for ${LIB_NAME}"
         )
 
@@ -258,6 +274,10 @@ if(BUILD_TESTING)
         target_link_options(patched_libraries_tests PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
     add_test(NAME patched_libraries COMMAND patched_libraries_tests ${PATCHED_DIR})
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_elf_layout COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_elf_layout.py $<TARGET_FILE:nid_patcher>)
+    endif()
     add_test_executable(guest_kernel_sys_tests tests/GuestKernelSys.cpp)
     target_include_directories(guest_kernel_sys_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_kernel_sys_tests PRIVATE libkernel_sys libkernel libc)
@@ -283,6 +303,14 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME windows_write_watch COMMAND windows_write_watch_tests)
         set_tests_properties(windows_write_watch PROPERTIES TIMEOUT 20)
+    endif()
+
+    if(WIN32)
+        add_test_executable(undeliverable_host_exception_tests tests/UndeliverableHostException.cpp)
+        add_dependencies(undeliverable_host_exception_tests libc)
+        add_test(NAME undeliverable_host_exception COMMAND undeliverable_host_exception_tests $<TARGET_FILE:libc>)
+        set_tests_properties(undeliverable_host_exception PROPERTIES
+            PASS_REGULAR_EXPRESSION "C\\+\\+ exception St9bad_alloc raised on thread [0-9]+ cannot be delivered: 0x[0-9a-f]+ undeliverable_host_exception_tests\\.exe\\+0x[0-9a-f]+ has no unwind data")
     endif()
 
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
@@ -531,6 +559,16 @@ if(BUILD_TESTING)
             set_tests_properties(host_import_inventory_unclassified PROPERTIES PASS_REGULAR_EXPRESSION "error: malloc [(]imported by")
         endif()
     endif()
+
+    add_test_executable(MemoryPoolTest
+        tests/MemoryPoolTest.cpp
+        prx/libkernel/DirectMemory/MemoryPool.cpp
+    )
+    target_include_directories(MemoryPoolTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MINGW)
+        target_compile_options(MemoryPoolTest PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME MemoryPoolTest COMMAND MemoryPoolTest)
 
     add_test_executable(guest_acm_tests tests/GuestAcm.cpp)
     target_include_directories(guest_acm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

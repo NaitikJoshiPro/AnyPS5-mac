@@ -43,7 +43,7 @@ def key(kind, text):
 def relink(text, source, destination):
     def replace(match):
         target = match.group(1)
-        if re.match(r"^[a-z][a-z0-9+.-]*:", target):
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:|//", target):
             return match.group(0)
         path, _, anchor = target.partition("#")
         resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source), path)) if path else source
@@ -163,14 +163,14 @@ def apply_change(root, base, new, index_text):
         _, section, item, name = entry
         entries = load(name).setdefault(section, [])
         moved = relink(item, INDEX, debt_file(name))
-        position = len(entries)
+        position = 0 if anchor is None else len(entries)
         if anchor is not None and anchor[1] == section and anchor[3] == name:
             anchored = relink(anchor[2], INDEX, debt_file(name))
             if anchored in entries:
                 position = entries.index(anchored) + 1
         entries.insert(position, moved)
 
-    matcher = difflib.SequenceMatcher(None, [entry[2] for entry in before], [entry[2] for entry in after], autojunk=False)
+    matcher = difflib.SequenceMatcher(None, [entry[1:3] for entry in before], [entry[1:3] for entry in after], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue

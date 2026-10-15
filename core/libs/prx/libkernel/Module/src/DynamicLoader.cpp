@@ -28,6 +28,10 @@
 #include <link.h>
 #endif
 
+#ifdef _WIN32
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch();
+#endif
+
 namespace {
 thread_local std::array<char, 512> loaderError{};
 thread_local bool pendingError = false;
@@ -48,6 +52,7 @@ struct Module {
         if (owned && native) {
 #ifdef _WIN32
             FreeLibrary(static_cast<HMODULE>(native));
+            ForgetUnloadedUnwindImages_nid_no_patch();
 #else
             ::dlclose(native);
 #endif
@@ -71,26 +76,10 @@ void* Symbol(Module& module, const char* name) {
 #endif
 }
 #ifndef _WIN32
-std::uintptr_t MainProgramBase() {
 #ifdef __APPLE__
+// dyld has no link maps (dladdr1, dlinfo): the main program is the first image dyld loaded.
+std::uintptr_t MainProgramBase() {
     return reinterpret_cast<std::uintptr_t>(_dyld_get_image_header(0));
-#else
-    static const std::uintptr_t base = [] {
-        struct Scan {
-            std::uintptr_t value = 0;
-        };
-        Scan scan;
-        ::dl_iterate_phdr(
-            [](dl_phdr_info* info, size_t, void* data) {
-                auto* found = static_cast<Scan*>(data);
-                if (found->value == 0 && info->dlpi_name != nullptr && info->dlpi_name[0] == '\0') found->value = info->dlpi_addr;
-                return found->value == 0 ? 0 : 1;
-            },
-            &scan);
-        return scan.value;
-    }();
-    return base;
-#endif
 }
 
 bool FromGuestModule(void* address) {
@@ -100,6 +89,28 @@ bool FromGuestModule(void* address) {
     const std::string path(info.dli_fname);
     return path.ends_with(".prx");
 }
+#else
+const link_map* MainProgramMap() {
+    static const link_map* const map = [] {
+        void* handle = ::dlopen(nullptr, RTLD_LAZY);
+        link_map* found = nullptr;
+        const bool resolved = handle != nullptr && ::dlinfo(handle, RTLD_DI_LINKMAP, &found) == 0 && found != nullptr;
+        if (handle != nullptr) ::dlclose(handle);
+        if (!resolved) throw std::runtime_error("dlsym: cannot find the link map of the main program");
+        return found;
+    }();
+    return map;
+}
+
+bool FromGuestModule(void* address) {
+    Dl_info info{};
+    link_map* image = nullptr;
+    if (address == nullptr || !::dladdr1(address, &info, reinterpret_cast<void**>(&image), RTLD_DL_LINKMAP) || info.dli_fname == nullptr || image == nullptr) return false;
+    if (image == MainProgramMap()) return true;
+    const std::string path(info.dli_fname);
+    return path.ends_with(".prx");
+}
+#endif
 
 void* DefaultScopeSymbol(const char* symbolName) {
     auto* result = ::dlsym(RTLD_DEFAULT, symbolName);

@@ -28,6 +28,7 @@ inline constexpr std::uint32_t ExportPackingBase = 8224u;
 inline constexpr std::uint32_t DualSourceBlend = 8232u;
 inline constexpr std::uint32_t RasterPrimitive = 8233u;
 inline constexpr std::uint32_t LayerExported = 8234u;
+inline constexpr std::uint32_t StencilReferenceOffset = 8235u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 // Multisampled storage images on MSL backends (MslAbi Version 6): Metal shaders cannot write
@@ -38,8 +39,6 @@ inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t SampleCountBase = 12288u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;
 inline constexpr std::uint32_t DescriptorIndexStride = 128u;
-inline constexpr std::uint32_t ImageModeBase = 32768u;
-inline constexpr std::uint32_t ImageModeStride = 256u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
 // Unnormalized samplers that take the base level for implicit-LOD sampling, per sampler s at
 // UnnormalizedBaseLevelBase + s (upstream #1418).

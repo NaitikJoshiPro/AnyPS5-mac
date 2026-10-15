@@ -6,7 +6,6 @@
 #include <mutex>
 #include <utility>
 
-// std::atomic<std::shared_ptr<T>> is C++20, but libc++ does not ship it yet; there a mutex guards the pointer.
 #if defined(__cpp_lib_atomic_shared_ptr)
 template <class T>
 using AtomicSharedPtr = std::atomic<std::shared_ptr<T>>;

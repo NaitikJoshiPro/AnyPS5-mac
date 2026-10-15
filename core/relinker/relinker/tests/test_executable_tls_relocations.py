@@ -1,10 +1,9 @@
 """Initial-exec TLS relocations in the executable (R_X86_64_TPOFF64, DTPOFF64, DTPMOD64), as a PS5 eboot
 has them in its GOT. The Linux ELF keeps them dynamic and symbolless, with the variable's offset in the
-TLS block as the addend, for aps5-fex to resolve against where it puts the block (below the thread
-pointer, variant II); a named one against a defined STT_TLS symbol is folded the same way, and one
-against an import stays named, typed STT_TLS. The Windows (and macOS, which shares the relocation code)
-image resolves TPOFF64 and DTPOFF64 statically against its block, AlignUp(p_memsz, p_align) below the
-thread pointer, and rejects what it cannot express."""
+TLS block as the addend, for the dynamic loader to resolve against where it puts the block; a named one
+against a defined STT_TLS symbol is folded the same way, and one against an import stays named, typed
+STT_TLS. The Windows and macOS images resolve TPOFF64 and DTPOFF64 statically against their block,
+AlignUp(p_memsz, p_align) below the thread pointer, and reject what they cannot express."""
 
 from pathlib import Path
 import struct
@@ -13,21 +12,21 @@ import sys
 import tempfile
 
 from test_linux_load_alignment import fixture
+from test_macos_output import MachO
 from test_tls_function_coverage import pe_bytes_at
 
 PT_LOAD = 1
 PT_TLS = 7
 DTPMOD64, DTPOFF64, TPOFF64, TPOFF32 = 16, 17, 18, 23
 TLS_MEMSZ, TLS_ALIGN = 0x24, 16
-TLS_BLOCK = 0x30  # AlignUp(TLS_MEMSZ, TLS_ALIGN)
+TLS_BLOCK = 0x30
 STRINGS = b"\0Tls\0Data\0ImportedTls\0"
 TLS_NAME, DATA_NAME, IMPORT_NAME = 1, 5, 10
 
-# Symbol indexes in the fixture's symbol table.
 NULL, TLS_SYMBOL, DATA_SYMBOL, IMPORTED = 0, 1, 2, 3
 
 
-def image(relocations, tls=True):
+def image(relocations, tls=True, symbol_bytes=None):
     """The load-alignment fixture with a writable segment (vaddr 0x1000) holding a GOT and an 8-byte
     TLS template, a symbol table and the given (offset, type, symbol, addend) relocations."""
     data = fixture()
@@ -44,6 +43,8 @@ def image(relocations, tls=True):
     for index, (offset, kind, symbol, addend) in enumerate(relocations):
         struct.pack_into("<QQq", data, 0x4700 + index * 24, offset, symbol << 32 | kind, addend)
     tags = [(5, 0x600), (10, len(STRINGS)), (6, 0x900), (11, 24), (7, 0x700), (8, len(relocations) * 24), (9, 24), (0, 0)]
+    if symbol_bytes is not None:
+        tags.insert(-1, (0x6100003F, symbol_bytes))
     struct.pack_into("<IIQQQQQQ", data, 120, 2, 6, 0x4800, 0x800, 0x800, len(tags) * 16, len(tags) * 16, 8)
     for index, tag in enumerate(tags):
         struct.pack_into("<qQ", data, 0x4800 + index * 16, *tag)
@@ -88,6 +89,14 @@ def dynamic_relocations(elf):
     return result
 
 
+def macho_bytes_at(data, address, size):
+    for segment in MachO(data).segments:
+        if segment["vmaddr"] <= address and address + size <= segment["vmaddr"] + segment["filesize"]:
+            offset = segment["fileoff"] + address - segment["vmaddr"]
+            return data[offset:offset + size]
+    raise AssertionError(f"unmapped address {address:#x}")
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-exec-tls-") as directory:
@@ -109,6 +118,21 @@ def main():
         values = [struct.unpack("<q", pe_bytes_at(pe, 0x10000 + address, 8))[0] for address in (0x1000, 0x1008, 0x1010)]
         assert values == [4 - TLS_BLOCK, 8, 0x12 - TLS_BLOCK], values
 
+        result, output = relink(relinker, directory, "macos", image(local), "--macos")
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        macho = output.read_bytes()
+        values = [struct.unpack("<q", macho_bytes_at(macho, 0x140010000 + address, 8))[0] for address in (0x1000, 0x1008, 0x1010)]
+        assert values == [4 - TLS_BLOCK, 8, 0x12 - TLS_BLOCK], values
+
+        for kind in (DTPMOD64, DTPOFF64, TPOFF64):
+            for symbol, declared_bytes in ((TLS_SYMBOL, 24), (IMPORTED, 72)):
+                name = f"symbol-bounds-{kind}-{symbol}"
+                result, output = relink(relinker, directory, name,
+                                       image([(0x1000, kind, symbol, 0)], symbol_bytes=declared_bytes))
+                assert result.returncode == 2 and "Symbol table entry out of bounds" in result.stderr, (
+                    name, result.returncode, result.stdout, result.stderr)
+                assert not output.exists(), name
+
         failures = [
             ("tpoff32", [(0x1000, TPOFF32, NULL, 0)], True, (), "Unsupported relocation type 0x17"),
             ("not-tls-symbol", [(0x1000, TPOFF64, DATA_SYMBOL, 0)], True, (), "not STT_TLS"),
@@ -116,6 +140,8 @@ def main():
             ("dtpmod-addend", [(0x1000, DTPMOD64, NULL, 1)], True, (), "DTPMOD64 relocation has a nonzero addend"),
             ("windows-dtpmod", [(0x1000, DTPMOD64, NULL, 0)], True, ("--windows",), "DTPMOD64 relocation is not supported"),
             ("windows-import", [(0x1000, TPOFF64, IMPORTED, 0)], True, ("--windows",), "Imported TLS relocation"),
+            ("macos-dtpmod", [(0x1000, DTPMOD64, NULL, 0)], True, ("--macos",), "DTPMOD64 relocation is not supported"),
+            ("macos-import", [(0x1000, TPOFF64, IMPORTED, 0)], True, ("--macos",), "Imported TLS relocation"),
         ]
         for name, relocations, has_tls, flags, error in failures:
             result, output = relink(relinker, directory, name, image(relocations, has_tls), *flags)

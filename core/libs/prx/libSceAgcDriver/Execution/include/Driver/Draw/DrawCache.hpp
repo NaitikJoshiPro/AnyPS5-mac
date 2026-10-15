@@ -24,6 +24,12 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    std::shared_ptr<const ShaderSnapshot> tailContinuation;
+    std::uint32_t resourceRegister = 0;
+    bool nullPixel = false;
+    bool merged = false;
+    bool mergedPointerRequired = false;
+    std::uint32_t mergedPointer = 0;
 };
 
 struct DrawDecode {
@@ -33,6 +39,8 @@ struct DrawDecode {
     std::vector<ShaderRecompiler::ProgramRole> roles;
 };
 
+void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi);
+void InitializeMerged(const QueueState& queue, DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired, bool staticAbi);
 void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const ShaderRegistry& registry, bool staticAbi, bool includeFragment);
 
 struct PreparedGraphicsStage {
@@ -61,6 +69,14 @@ struct DrawEntry {
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
     std::uint64_t touched = 0;
     std::list<std::uint64_t>::iterator order;
+    std::uint64_t shape = 0;
+};
+
+using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
+
+struct StageDataHit {
+    std::vector<std::uint32_t> words;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
@@ -73,13 +89,31 @@ struct DrawEntryCounters {
 
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
+    std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
+    std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
+    std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
+    std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+class DrawKeySightings {
+public:
+    static constexpr std::size_t Ways = 4;
+    explicit DrawKeySightings(std::size_t keys);
+    bool SeenBefore(std::uint64_t key);
+
+private:
+    std::vector<std::uint64_t> keys;
+    std::vector<std::uint8_t> filled;
+    std::vector<std::uint8_t> next;
+    std::size_t bucketMask = 0;
 };
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };
 
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;

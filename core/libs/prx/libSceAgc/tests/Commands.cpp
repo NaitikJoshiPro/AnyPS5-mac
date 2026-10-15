@@ -18,12 +18,14 @@ extern "C" int APS5_VABI sceAgcSetCxRegIndirectPatchAddRegisters(std::uint32_t* 
 extern "C" int APS5_VABI sceAgcQueueEndOfPipeActionPatchData(std::uint32_t* cmd, std::uint64_t data);
 extern "C" int APS5_VABI sceAgcSetPacketPredication(std::uint32_t* packet, std::uint32_t predication);
 extern "C" std::uint32_t APS5_VABI sceAgcGetPacketSize(std::uint32_t* packet);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbEventWrite(CommandBuffer* buf, std::uint8_t eventType, const volatile void* address);
+extern "C" std::uint64_t APS5_VABI sceAgcDcbEventWriteGetSize(std::uint8_t eventType);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std::uint32_t op, std::uint32_t state);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbClearState(CommandBuffer* buf, std::uint32_t command);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbWaitUntilSafeForRendering(CommandBuffer* buf, std::uint32_t handle, std::uint32_t index);
 extern "C" int APS5_VABI sceAgcSuspendPoint();
-extern "C" int APS5_VABI sceAgcInit(std::uint64_t versionOrState, std::uint32_t stateVersion);
+extern "C" int APS5_VABI sceAgcInit(std::uint64_t version);
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaults();
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaultsInternal();
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaults2Internal(std::uint32_t version);
@@ -58,8 +60,6 @@ extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbAtomicGds_0900(CommandBuffer* buf, std::uint32_t control, std::uint32_t mode, std::uint32_t gdsOp, std::uint32_t src, std::uint16_t offset, std::uint16_t index, std::uint32_t mask, std::uint32_t data, std::uint64_t compareData, std::uint64_t extraData);
 
 namespace {
-
-constexpr int SCE_AGC_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80890001);
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -631,21 +631,17 @@ void testDefaults() {
     check(sceAgcInit_0090(&state, 8) == 0 && state == 0x12345678, "AGC initialization failed or modified caller state");
     check(sceAgcInit_0090(&state, 13) == 0 && state == 0x12345678, "AGC version 13 initialization changed caller state");
     expectFailure([] { sceAgcInit_0090(nullptr, 8); });
-    expectFailure([&] { sceAgcInit_0090(&state, 14); });
-    check(sceAgcInit(8, 0x55) == 0, "AGC version initialization failed");
-    check(sceAgcInit(13, 0x55) == 0, "AGC version 13 initialization failed");
+    check(sceAgcInit_0090(&state, 14) == 0 && state == 0x12345678, "out-of-range AGC initialization version changed caller state");
+    check(sceAgcInit(8) == 0, "AGC version initialization failed");
+    check(sceAgcInit(13) == 0, "AGC version 13 initialization failed");
+    check(sceAgcInit(14) == 0, "out-of-range AGC version did not return success");
+    check(sceAgcInit(0xffffffffu) == 0, "maximum AGC version did not return success");
+    check(sceAgcInit(0xffffc278u) == 0, "pointer-valued AGC argument did not return success");
     {
         std::uint64_t oopsState[8] = {};
-        const auto address = reinterpret_cast<std::uint64_t>(oopsState);
-        check(sceAgcInit(address, 0xd) == 0, "AGC (state, version) initialization failed");
-        check(sceAgcInit(address, 14) == static_cast<int>(0x80890001u), "AGC (state, 14) was accepted");
-        check(oopsState[0] == 0 && oopsState[7] == 0, "AGC (state, version) initialization changed caller state");
-        check(sceAgcInit(14, 0xd) == static_cast<int>(0x80890001u), "AGC version 14 was accepted");
-        check(sceAgcInit(0xffff, 0xd) == static_cast<int>(0x80890001u), "AGC version 0xffff was accepted");
+        check(sceAgcInit(reinterpret_cast<std::uint64_t>(oopsState)) == 0 && oopsState[0] == 0 && oopsState[7] == 0, "AGC (state, version) initialization failed or changed caller state");
+        check(sceAgcInit(0x200000000ull) == 0, "4 GiB-aligned state pointer was read as a table version");
     }
-    check(sceAgcInit(14, 0) == SCE_AGC_ERROR_INVALID_ARGUMENT, "unsupported AGC version did not return invalid argument");
-    expectFailure([] { sceAgcInit(0xffffffffu, 0xd); });
-    check(sceAgcInit(0xffffc278u, 14) == SCE_AGC_ERROR_INVALID_ARGUMENT, "pointer-valued AGC argument with version 14 did not return invalid argument");
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
@@ -657,6 +653,47 @@ void testDefaults() {
     check(internalDefaults != sceAgcGetRegisterDefaults(), "internal register defaults returned the public table");
     expectFailure([] { Agc::Command::GetRegisterDefaults(14, false, __func__); });
     expectFailure([] { Agc::Command::GetRegisterDefaults(0xffffffffu, true, __func__); });
+}
+
+void testEventWrite() {
+    Storage storage;
+    const auto* samplePacket = sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1000));
+    check(samplePacket == storage.words.data(), "incorrect event 0x38 return pointer");
+    check(storage.words[0] == 0xc0024600u, "incorrect event 0x38 packet header");
+    check(storage.words[1] == (0x100u | 0x38u), "incorrect event 0x38 first payload word");
+    check(storage.words[2] == 0x1000u, "incorrect event 0x38 low address word");
+    check(storage.words[3] == 0u, "incorrect event 0x38 high address word");
+    check(sceAgcDcbEventWriteGetSize(0x38) == 16, "incorrect event 0x38 size");
+    check(sceAgcDcbEventWriteGetSize(0x39) == 16, "incorrect event 0x39 size");
+
+    Storage sample39;
+    sceAgcDcbEventWrite(&sample39.buffer, 0x39, reinterpret_cast<const void*>(0x2008));
+    check(sample39.words[0] == 0xc0024600u && sample39.words[1] == (0x100u | 0x39u) && sample39.words[2] == 0x2008u && sample39.words[3] == 0u, "incorrect event 0x39 packet");
+
+    expectFailure([&] { sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1001)); });
+    expectFailure([&] { sceAgcDcbEventWrite(&storage.buffer, 0x40, nullptr); });
+
+    Storage partialFlush;
+    sceAgcDcbEventWrite(&partialFlush.buffer, 7, nullptr);
+    check(partialFlush.words[0] == 0xc0004600u && partialFlush.words[1] == 0x407u, "incorrect event 7 partial flush packet");
+    check(sceAgcDcbEventWriteGetSize(7) == 8, "incorrect event 7 size");
+
+    Storage partialFlush15;
+    sceAgcDcbEventWrite(&partialFlush15.buffer, 15, nullptr);
+    check(partialFlush15.words[0] == 0xc0004600u && partialFlush15.words[1] == 0x40fu, "incorrect event 15 partial flush packet");
+
+    Storage partialFlush16;
+    sceAgcDcbEventWrite(&partialFlush16.buffer, 16, nullptr);
+    check(partialFlush16.words[0] == 0xc0004600u && partialFlush16.words[1] == 0x410u, "incorrect event 16 partial flush packet");
+
+    Storage cacheFlushNull;
+    sceAgcDcbEventWrite(&cacheFlushNull.buffer, 0x16, nullptr);
+    check(cacheFlushNull.words[0] == 0xc0004600u && cacheFlushNull.words[1] == 0x16u, "incorrect event 0x16 null address packet");
+    check(sceAgcDcbEventWriteGetSize(0x16) == 8, "incorrect event 0x16 size");
+
+    Storage cacheFlushWithAddress;
+    sceAgcDcbEventWrite(&cacheFlushWithAddress.buffer, 0x16, reinterpret_cast<const void*>(0x2d2a10000ull));
+    check(cacheFlushWithAddress.words[0] == 0xc0004600u && cacheFlushWithAddress.words[1] == 0x16u, "incorrect event 0x16 with address packet");
 }
 
 }
@@ -727,6 +764,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         testPackets();
+        testEventWrite();
         testNop();
         testClearState();
         testIndexedIndirectDraws();

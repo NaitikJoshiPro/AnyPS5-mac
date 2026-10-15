@@ -108,10 +108,18 @@ void ensureRegistered() {
     if (heapApi[0] == nullptr && !heapFailure && !heapFinalized) heapApi = defaultApi();
 }
 
+// Upstream's lazy initialization entry point; ensureRegistered also covers titles without a replacement table.
+void ensureInitialized(std::unique_lock<std::mutex>& lock) {
+    if (heapApi[0] != nullptr || heapFailure || heapFinalized) return;
+    lock.unlock();
+    ensureRegistered();
+    lock.lock();
+}
+
 template<typename TCallback>
 TCallback callback(std::size_t index) {
-    ensureRegistered();
-    std::lock_guard lock(heapMutex);
+    std::unique_lock lock(heapMutex);
+    ensureInitialized(lock);
     if (heapFailure) std::rethrow_exception(heapFailure);
     if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
     if (heapApi[index] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -228,7 +236,6 @@ void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes
 }
 
 void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std::size_t alignment) {
-    ensureRegistered();
     if (bytes == 0) {
         ApplicationHeapFree_nid_no_patch(pointer);
         return nullptr;
@@ -236,7 +243,8 @@ void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std:
     requireAlignment(alignment);
     Realign realign;
     {
-        std::lock_guard lock(heapMutex);
+        std::unique_lock lock(heapMutex);
+        ensureInitialized(lock);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -274,7 +282,8 @@ int ApplicationHeapPosixAlign_nid_no_patch(void** pointer, std::size_t alignment
 int ApplicationHeapStatsFast_nid_no_patch(void* stats) {
     Stats statsFast;
     {
-        std::lock_guard lock(heapMutex);
+        std::unique_lock lock(heapMutex);
+        ensureInitialized(lock);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -288,7 +297,8 @@ int ApplicationHeapStatsFast_nid_no_patch(void* stats) {
 std::size_t ApplicationHeapUsableSize_nid_no_patch(void* pointer) {
     UsableSize usableSize = nullptr;
     {
-        std::lock_guard lock(heapMutex);
+        std::unique_lock lock(heapMutex);
+        ensureInitialized(lock);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");

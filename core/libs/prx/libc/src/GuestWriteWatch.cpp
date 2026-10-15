@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <dlfcn.h>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -11,6 +10,10 @@
 #include <shared_mutex>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 #if defined(__linux__)
 #include <cerrno>
@@ -50,8 +53,8 @@ constexpr std::uintptr_t PageBytes = 4096;
 class Watch {
 public:
     static Watch& Get() {
-        static Watch watch;
-        return watch;
+        static auto* watch = new Watch;
+        return *watch;
     }
 
     bool Available() const {
@@ -339,8 +342,8 @@ bool IsAlignmentFault(const void* context) {
 class Watch {
 public:
     static Watch& Get() {
-        static Watch watch;
-        return watch;
+        static auto* watch = new Watch;
+        return *watch;
     }
 
     bool Available() const {

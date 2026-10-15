@@ -1,4 +1,7 @@
 import os
+import json
+import ctypes
+import stat
 import sys
 import tarfile
 import tempfile
@@ -10,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import package_release
+import prepare_release_notes
 
 
 @contextmanager
@@ -143,6 +147,95 @@ class ReleasePackageTests(unittest.TestCase):
                         self.assertEqual(destination.read_bytes(), b"old " + name.encode())
                 self.assertEqual((output / "unrelated.txt").read_bytes(), b"unrelated")
 
+    @unittest.skipUnless(os.name == "nt", "Windows read-only replacement semantics")
+    def test_readonly_destinations_preserve_all_existing_assets(self):
+        names = ["prx-linux-v1.zip", "prx-linux-v1.tar.gz", "relinker-v1"]
+        for index, blocked in enumerate(names):
+            with self.subTest(blocked=blocked):
+                output = self.output / str(index)
+                output.mkdir(parents=True)
+                previous = {name: b"old " + name.encode() for name in names}
+                previous["unrelated.txt"] = b"unrelated"
+                for name, content in previous.items():
+                    (output / name).write_bytes(content)
+                destination = output / blocked
+                destination.chmod(stat.S_IREAD)
+                try:
+                    with self.assertRaises((OSError, RuntimeError)) as error:
+                        package_release.package("linux", self.build, output, "v1")
+                    self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, previous)
+                    self.assertIn("read-only", str(error.exception))
+                    self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+                finally:
+                    destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    @unittest.skipIf(os.name == "nt", "POSIX allows replacement in a writable directory")
+    def test_posix_readonly_destination_can_be_replaced(self):
+        self.output.mkdir()
+        destination = self.output / "prx-linux-v1.zip"
+        destination.write_bytes(b"old archive")
+        destination.chmod(stat.S_IREAD)
+        try:
+            package_release.package("linux", self.build, self.output, "v1")
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
+        finally:
+            destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    def file_link(self, link, target):
+        try:
+            link.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f"File symlinks unavailable: {error}")
+
+    def link_attributes(self, link, attributes):
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+        setter.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        setter.restype = ctypes.c_int
+        if not setter(str(link), attributes):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only symlink semantics")
+    def test_readonly_dangling_link_preserves_existing_assets(self):
+        self.output.mkdir()
+        tar = self.output / "prx-linux-v1.tar.gz"
+        binary = self.output / "relinker-v1"
+        tar.write_bytes(b"old tar")
+        binary.write_bytes(b"old executable")
+        link = self.output / "prx-linux-v1.zip"
+        self.file_link(link, "missing.zip")
+        self.link_attributes(link, stat.FILE_ATTRIBUTE_READONLY)
+        try:
+            self.assertFalse(link.exists())
+            with self.assertRaisesRegex(RuntimeError, "read-only"):
+                package_release.package("linux", self.build, self.output, "v1")
+            self.assertEqual(tar.read_bytes(), b"old tar")
+            self.assertEqual(binary.read_bytes(), b"old executable")
+            self.assertEqual(link.readlink(), Path("missing.zip"))
+            self.assertTrue(link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            self.assertEqual({path.name for path in self.output.iterdir()}, {tar.name, binary.name, link.name})
+        finally:
+            self.link_attributes(link, stat.FILE_ATTRIBUTE_NORMAL)
+
+    @unittest.skipUnless(os.name == "nt", "Windows link and target attributes are distinct")
+    def test_writable_link_to_readonly_target_can_be_replaced(self):
+        self.output.mkdir()
+        target = self.root / "original.zip"
+        target.write_bytes(b"original target")
+        link = self.output / "prx-linux-v1.zip"
+        self.file_link(link, target)
+        target.chmod(stat.S_IREAD)
+        try:
+            self.assertFalse(link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            package_release.package("linux", self.build, self.output, "v1")
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(target.read_bytes(), b"original target")
+            self.assertFalse(target.stat().st_mode & stat.S_IWRITE)
+            with zipfile.ZipFile(link) as archive:
+                self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
+        finally:
+            target.chmod(stat.S_IREAD | stat.S_IWRITE)
+
     def test_invalid_tag_creates_no_assets(self):
         with self.assertRaises(ValueError):
             package_release.package("linux", self.build, self.output, "../v1.0")
@@ -238,6 +331,41 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertEqual(sorted(file.name for file in output.iterdir()), sorted(names))
             for name in names:
                 self.assertEqual((output / name).read_bytes(), b"old " + name.encode())
+
+
+class ReleaseNotesTests(unittest.TestCase):
+    def test_short_notes_are_unchanged_including_unicode_at_limit(self):
+        for notes in ("", "## What's Changed\n* Fix\n", "я" * 125000):
+            self.assertEqual(prepare_release_notes.release_body(notes), notes)
+
+    def test_only_changes_section_is_removed_from_long_notes(self):
+        for newline in ("\n", "\r\n"):
+            for tail in ("## New Contributors\n* @example\n\n**Full Changelog**: URL\n",
+                         "**Full Changelog**: URL\n", ""):
+                with self.subTest(newline=newline, tail=tail):
+                    prefix = "Release introduction" + newline
+                    tail = tail.replace("\n", newline)
+                    notes = prefix + "## What's Changed" + newline + "* change\n" * 20000 + tail
+                    self.assertEqual(prepare_release_notes.release_body(notes), prefix + tail)
+
+    def test_oversized_remainder_is_not_shortened(self):
+        remainder = "## New Contributors\n" + "x" * 125001
+        notes = "## What's Changed\n* Fix\n\n" + remainder
+        self.assertEqual(prepare_release_notes.release_body(notes), remainder)
+        self.assertEqual(prepare_release_notes.release_body(remainder), remainder)
+
+    def test_full_notes_are_preserved_in_asset(self):
+        for notes in ("", "## What's Changed\n* Fix\n", "я" * 125000,
+                      "## What's Changed\n" + "* Fix\n" * 25000 + "## New Contributors\n* @example\n"):
+            with self.subTest(length=len(notes)), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "notes.json"
+                body = root / "body.md"
+                full = root / "dist/release-notes.md"
+                source.write_text(json.dumps({"body": notes}), encoding="utf-8")
+                prepare_release_notes.prepare_notes(source, body, full)
+                self.assertEqual(full.read_bytes(), notes.encode("utf-8"))
+                self.assertEqual(body.read_bytes(), prepare_release_notes.release_body(notes).encode("utf-8"))
 
 
 if __name__ == "__main__":
