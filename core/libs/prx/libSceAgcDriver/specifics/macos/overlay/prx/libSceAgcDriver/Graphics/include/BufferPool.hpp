@@ -56,6 +56,9 @@ public:
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
+    // Upstream's slab block size for a size class (Vulkan slabs; Metal pools whole buffers). Kept for the shared
+    // tests' expectations.
+    static VkDeviceSize SlabBlockBytes(std::size_t capacity);
     // A new allocation of `capacity` bytes (resident). Retained allocations are trimmed and the
     // allocation retried once when Metal refuses it.
     BufferAllocation Allocate(std::size_t capacity, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);

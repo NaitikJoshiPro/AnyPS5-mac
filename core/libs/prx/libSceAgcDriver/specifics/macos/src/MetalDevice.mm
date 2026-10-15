@@ -17,6 +17,8 @@
 #include "MetalNoCopy.h"
 #include "MetalVmTrace.h"
 #include "BdaAbi.hpp"
+#include "ImageTableAbi.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
@@ -518,6 +520,14 @@ void VulkanDevice::State::CheckFaults() {
     lastFaultStage = report.stage;
     if (report.reason == Bda::FaultReason::Unmapped) message += " (no guest allocation in the BDA page table covers it)";
     if (report.reason == Bda::FaultReason::Permission) message += " (a store to a read-only range of the BDA page table)";
+    if (report.reason == Bda::FaultReason::Overflow) message += " (Overflow)";
+    if (report.reason == Bda::FaultReason::InvalidTable) message += " (InvalidTable)";
+    if (report.reason == Bda::FaultReason::InvalidRectangle) message += " (InvalidRectangle)";
+    if (report.reason == Bda::FaultReason::Unaligned) message += " (Unaligned)";
+    if (report.reason == Bda::FaultReason::InvalidDescriptor) message += " (InvalidDescriptor)";
+    // MslAbi Version 15: upstream's report (BdaResources::CheckFault) from the bound tables' poison lists.
+    if (report.reason == Bda::FaultReason::ImageTable) throw std::runtime_error(Graphics::DescribeImageTableFault(report.stage, report.instruction, report.address, report.bytes));
+    if (report.reason == Bda::FaultReason::UnlinkedCall) message += " (UnlinkedCall: a call to a function the program was not linked with)";
     throw std::runtime_error(message);
 }
 
@@ -652,6 +662,8 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         //     the queue (GuestBufferMemory.mm), once nothing recorded can use them.
         if (context.device != VK_NULL_HANDLE) {
             try {
+                // Upstream 619be6979: the shared snapshot copies of address-based builds go with the device.
+                Graphics::ClearSnapshotCopies(context.device);
                 Graphics::ClearImageMirrors(context.device);
                 Graphics::ClearHostImports(context.device);
             } catch (const std::exception& error) {
@@ -740,6 +752,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // Vertex and mesh functions write [[render_target_array_index]] (layered draws, upstream #3763; the SPIR-V
             // header names the layer export through SPV_EXT_shader_viewport_index_layer, as upstream's devices do).
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityShaderViewportIndexLayerEXT));
+            // Upstream 30e85a3a2: the front end reads it only for tessellation (Recompiler.cpp
+            // RequestInputInfo -> TessellationConfiguration::drawParameters), where the local program
+            // reads BaseInstance (the object function passes aps5_draw.firstInstance) and the hull its
+            // draw-relative instance (aps5_group.y, MslTessellation.cpp). BaseInstance in any other
+            // stage stays refused by the MSL backend.
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDrawParameters));
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
@@ -808,6 +826,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.recorder = state->recorder.get();
             state->recorder->Activate();
             Graphics::PrepareImportWatch(context);
+            // Image and sampler tables (MslAbi Version 15): arrays of MTLResourceIDs in the stream, so
+            // the bounds are the ImageTableAbi budgets, the Tier 2 argument buffer texture limit
+            // (500,000 on Apple GPUs, Metal Feature Set Tables) and the device's sampler limit.
+            constexpr std::uint64_t ArgumentBufferTextures = 500000u;
+            context.imageTableCapacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint64_t>(ShaderRecompiler::RuntimeAbi::StageCount) * ShaderRecompiler::ImageTableAbi::ImageElementBudget, ArgumentBufferTextures));
+            const auto samplerLimit = std::min<std::uint64_t>(ShaderRecompiler::ImageTableAbi::SamplerElementBudget, static_cast<std::uint64_t>(state->device.maxArgumentBufferSamplerCount));
+            context.samplerTableCapacity = static_cast<std::uint32_t>(samplerLimit - samplerLimit % ShaderRecompiler::ImageTableAbi::SamplerEntryElements);
             // The image cache's Graphics twins (Texture/ShaderResources, D4/D5) take the complete Context.
             state->images->Attach(state->context);
             // Presentation (D6): the window's Metal layer, or headless targets when it has none.
@@ -1032,6 +1057,9 @@ void VulkanDevice::ReapRecorded() {
 // no copied writers (every guest buffer is wrapped in place), so no label waits behind a write-back
 // completion (5).
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    // Upstream d756f525f: APS5_STORE_AT_LABEL stores every pending storage-image result before each GPU label.
+    static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
+    if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (state->recorder == nullptr || bytes.empty() || bytes.size() > 65536u || address % 4u != 0u || bytes.size() % 4u != 0u) return 4;
     auto& recorder = *state->recorder;
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
@@ -1241,7 +1269,16 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
     return {};
 }
 
-std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t) {
+// Upstream 7fae4549e/da47083cc create compute pipelines in PrepareDispatch, before the GPU mutex.
+// The Metal device already does (PrepareDispatch below starts the build on the pipeline cache's
+// workers through PrepareCompute, which hold no GPU mutex); the cache counts each guest pipeline it builds (compiled or an
+// archive hit) and whether the obtaining thread held the GPU mutex.
+VulkanDevice::ComputePipelineCreation VulkanDevice::ComputePipelineCounts() {
+    const auto counts = Graphics::Metal::ComputePipelineCreationCounts();
+    return {counts.created, counts.underGpuMutex};
+}
+
+std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::uint64_t) {
     // As upstream: an incompatible runtime ABI is refused before anything is prepared.
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     // The pipeline starts building on the cache's workers; Dispatch waits for it.
@@ -1335,14 +1372,39 @@ void VulkanDevice::State::PlanBindings(const ShaderRecompiler::RecompileResult& 
     }
 }
 
+namespace {
+// Upstream d9e47d1e9's image table binds at RuntimeAbi::ImageTableBinding (StageCount x
+// Binding::Count, past every stage group): `binding % Count` would read it as group StageCount's
+// first binding, so it is named here (MslAbi Version 15 gives every stage function its own entry).
+ShaderRecompiler::RuntimeAbi::Binding TableKind(std::uint32_t binding) {
+    if (binding == ShaderRecompiler::RuntimeAbi::ImageTableBinding) return ShaderRecompiler::RuntimeAbi::Binding::ImageTable;
+    if (binding > ShaderRecompiler::RuntimeAbi::ImageTableBinding) throw std::runtime_error("Metal device: RuntimeAbi binding " + std::to_string(binding) + " lies past the image table binding");
+    return static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
+}
+
+bool TableRole(ShaderRecompiler::DescriptorRole role) {
+    return role == ShaderRecompiler::DescriptorRole::ImageTable || role == ShaderRecompiler::DescriptorRole::SamplerTable || role == ShaderRecompiler::DescriptorRole::ImageTableMap;
+}
+}
+
 void VulkanDevice::State::PlanImages(const ShaderRecompiler::RecompileResult& shader, Graphics::Metal::ImageBindings& imageBindings, StageBindings& plan) {
     const auto& reflection = shader.msl.Reflection();
     // Pairs samplers with images (ANISO_OVERRIDE, FORCE_DEGAMMA) and checks bindless metadata.
     imageBindings.Prepare(shader);
     if (reflection.table.bytes != 0u) {
         for (const auto& binding : shader.bindings) {
+            const auto kind = TableKind(binding.binding);
+            if (TableRole(binding.role)) {
+                // MslAbi Version 15: the build's arrays of texture and sampler MTLResourceIDs (one
+                // per element of the stage's table) and its finalized map (two words per entry).
+                if (reflection.table.Find(kind) == nullptr) continue;
+                const auto count = binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap ? (binding.guestDescriptor.size() + 1u) / 2u : static_cast<std::size_t>(binding.count);
+                std::vector<std::uint64_t> entries(std::max<std::size_t>(count, 1u), 0u);
+                imageBindings.Write(binding, entries);
+                plan.tableArrays.emplace_back(kind, std::move(entries));
+                continue;
+            }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages && binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
-            const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
             const auto* range = reflection.table.Find(kind);
             if (range == nullptr) continue;
             std::vector<std::uint64_t> entries(std::min(binding.count, range->count), 0u);
@@ -1398,8 +1460,9 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
     std::memset(upload.host, 0, reflection.table.bytes);
     auto* table = upload.host;
     for (const auto& binding : shader.bindings) {
+        const auto kind = TableKind(binding.binding);
+        if (TableRole(binding.role)) continue;  // plan.tableArrays, below
         const auto group = binding.binding / static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
-        const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
         if (group != static_cast<std::uint32_t>(reflection.group)) throw std::runtime_error("Metal device: a binding belongs to another stage group");
         const auto* range = reflection.table.Find(kind);
         if (range == nullptr) continue;
@@ -1478,11 +1541,26 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
             break;
         case ShaderRecompiler::DescriptorRole::GuestImages:
         case ShaderRecompiler::DescriptorRole::GuestSamplers:
+        case ShaderRecompiler::DescriptorRole::ImageTable:
+        case ShaderRecompiler::DescriptorRole::SamplerTable:
+        case ShaderRecompiler::DescriptorRole::ImageTableMap:
             break;
         }
     }
     for (const auto& [offset, values] : plan.imageEntries) {
         if (!values.empty()) std::memcpy(table + offset, values.data(), values.size() * sizeof(std::uint64_t));
+    }
+    // MslAbi Version 15: each table array lives in the stream (resident with the upload arena; the
+    // textures it names are the image cache's, resident while tracked, and the build that holds them
+    // is kept by the batch), and every entry of its range points at it (ImageTableSlots for images).
+    for (const auto& [kind, values] : plan.tableArrays) {
+        const auto* range = reflection.table.Find(kind);
+        if (range == nullptr) continue;
+        const auto bytes = values.size() * sizeof(std::uint64_t);
+        if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: an image or sampler table exceeds 4 GiB");
+        const auto data = stream.Write(std::as_bytes(std::span<const std::uint64_t>(values)), 16u);
+        auto* entries = reinterpret_cast<Abi::BufferEntry*>(table + range->offset);
+        for (std::uint32_t entry = 0; entry < range->count; ++entry) entries[entry] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
     }
     return upload.address;
 }

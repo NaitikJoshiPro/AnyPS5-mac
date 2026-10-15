@@ -575,6 +575,43 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const auto& vertexReflection = vertexResult.msl.Reflection();
     const auto* fragmentResult = fragment != nullptr ? fragment->program : nullptr;
     const Abi::Reflection* fragmentReflection = fragmentResult != nullptr ? &fragmentResult->msl.Reflection() : nullptr;
+    // Upstream 1ffc5f672 / 72518f64f (PA_SC_AA_MASK). A mask that differs between the four quad
+    // pixels is compiled into the fragment function (pixel.quadSampleMask / quadPixelMask from
+    // DrawDecode, part of the shader key): it writes its coverage or discards uncovered pixels and
+    // tests late (MslQuadCoverage). A mask that is the same for the whole quad is the Vulkan
+    // pipeline's pSampleMask; MTLRenderPipelineDescriptor has none, so the fragment function ANDs
+    // its [[sample_mask]] with APS5_SAMPLE_MASK (guest sample bits; the function shifts them by
+    // APS5_SAMPLE_BASE itself), a library macro and so part of the library and pipeline keys. Under
+    // the macro the function discards pixels whose covered samples the mask removes before its body
+    // (a mask of 0 runs no body, as Vulkan runs no invocation) and tests late (MslAbi Version 15).
+    // The remaining refusals are TechnicalDebt metal-pipeline-sample-mask.
+    const bool partialSampleMask = Graphics::PartialSampleMask(graphics);
+    const bool hostSampleMask = partialSampleMask && Graphics::UniformSampleMask(graphics);
+    if (partialSampleMask) {
+        if (fragmentReflection == nullptr) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a draw without a pixel program: Metal has no pipeline sample mask, the fragment function applies it (TechnicalDebt metal-pipeline-sample-mask)");
+        const bool tested = graphics.depth.has_value() && (graphics.depthTest || graphics.stencilTest || graphics.depthBoundsTest);
+        const bool earlyWithMemoryWrites = tested && Graphics::ShadersWriteMemory(std::span(fragment, 1u));
+        if (hostSampleMask) {
+            // Without outputs the function cannot remove the masked samples of a covered pixel from
+            // the depth and stencil writes (colour has no output to write; the discard keeps memory
+            // writes to the pixels Vulkan would run).
+            const bool outputs = fragmentReflection->colorOutputs != 0u || fragmentReflection->exportsDepth || fragmentReflection->exportsStencil || fragmentReflection->exportsSampleMask;
+            const bool keepsStencil = [&] {
+                const auto keeps = [](const VkStencilOpState& face) { return face.writeMask == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
+                return !graphics.stencilTest || (keeps(graphics.stencilFront) && keeps(graphics.stencilBack));
+            }();
+            const bool writesDepthStencil = graphics.depth.has_value() && ((graphics.depthTest && graphics.depthWrite) || !keepsStencil);
+            if (!outputs && writesDepthStencil) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a draw that writes depth or stencil, with a pixel program without outputs: Metal has no pipeline sample mask and the fragment function has no output to carry [[sample_mask]] (TechnicalDebt metal-pipeline-sample-mask)");
+            // The function drops [[early_fragment_tests]] under APS5_SAMPLE_MASK (Metal applies its
+            // [[sample_mask]] after early tests); a memory-writing program would then also run for
+            // pixels the tests reject.
+            if (fragmentReflection->earlyFragmentTests && earlyWithMemoryWrites) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a pixel program with early depth or stencil tests that writes memory: Metal applies the fragment function's [[sample_mask]] after early tests, so the program tests late (TechnicalDebt metal-pipeline-sample-mask)");
+        } else {
+            // Upstream ValidateSampleMask: the masked pixels are removed in the function, after the
+            // tests, which an early-tested program that writes memory cannot tolerate.
+            if (graphics.pixelEarlyZ && earlyWithMemoryWrites) Fail("a sample mask that differs between the pixels of a quad, from a pixel program with early depth or stencil tests that writes memory: the masked pixels are removed in the shader, after the tests (TechnicalDebt metal-pipeline-sample-mask)");
+        }
+    }
     // Mesh draws (B6 stage 5, MetalMesh.h): the "vertex" stage is the NGG primitive shader's mesh function.
     const bool mesh = vertexReflection.stage == Abi::Stage::Mesh && graphics.stages.mesh.has_value();
     // Tessellated draws (MetalTessellation.h): the "vertex" stage is the domain program; the local
@@ -874,6 +911,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // The sample count and positions are pass state.
     std::array<MTLSamplePosition, 8> samplePositions {};
     if (graphics.samples > 1u) {
+        // Upstream b6cde5698 passes patterns that differ between the pixels of the guest's 2x2 grid
+        // as a VK_EXT_sample_locations 2x2 grid; Metal's setSamplePositions takes one pattern for
+        // every pixel (docs/dev/TechnicalDebt.md). Pixel 0's pattern leads the array either way.
+        if (graphics.sampleLocationGrid) Fail("sample locations that vary between the pixels of the 2x2 grid (PA_SC_AA_SAMPLE_LOCS_PIXEL_*): Metal sets one sample pattern for every pixel");
         const auto locations = Graphics::SampleLocations(graphics);
         passKey = Mix(passKey, graphics.samples);
         for (std::uint32_t sample = 0; sample < graphics.samples; ++sample) {
@@ -935,6 +976,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
         if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
         if (conservativeMode != 0u) function.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
+        // The uniform PA_SC_AA_MASK (upstream HostSampleMask, guest sample bits; none when full).
+        if (hostSampleMask) function.macros.push_back({Abi::SampleMaskMacro, std::to_string(static_cast<std::uint32_t>(Graphics::HostSampleMask(graphics))) + "u"});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
@@ -1029,7 +1072,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     std::vector<std::vector<PipelinePass>> slicePipelines;
     if (slices > 1u && request.fragment.has_value()) request.fragment->macros.push_back({Abi::SampleCountMacro, std::to_string(graphics.samples)});
     slicePipelines.push_back(buildPipelinePasses(request));
-    const bool sliceSpecific = fragmentReflection != nullptr && (fragmentReflection->exportsSampleMask || fragmentReflection->perSample);
+    // APS5_SAMPLE_MASK makes the function write [[sample_mask]] (shifted by APS5_SAMPLE_BASE).
+    const bool sliceSpecific = fragmentReflection != nullptr && (fragmentReflection->exportsSampleMask || fragmentReflection->perSample || hostSampleMask);
     for (std::uint32_t slice = 1; slice < slices; ++slice) {
         if (!sliceSpecific) {
             slicePipelines.push_back(slicePipelines.front());

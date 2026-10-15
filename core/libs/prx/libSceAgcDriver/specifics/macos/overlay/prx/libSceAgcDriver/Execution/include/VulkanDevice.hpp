@@ -171,9 +171,18 @@ public:
         std::uint64_t aliased, created, noSource, shape, refused;
     };
     static CopyAliasing CopyAliasCounts();
+    // Compute pipelines created, and those created by a thread holding the GPU mutex (upstream
+    // 7fae4549e; on Metal the pipeline cache's background workers build them, PipelineCache.mm).
+    struct ComputePipelineCreation {
+        std::uint64_t created, underGpuMutex;
+    };
+    static ComputePipelineCreation ComputePipelineCounts();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
+    // Upstream's HDR10 swapchain selection (c9ba43bfb). Metal presents SDR: PQ display buffers are
+    // tone-mapped on the CPU decode (DisplayBuffer.cpp, PqToSdr.hpp); see docs/dev/TechnicalDebt.md.
+    void SelectDynamicRange(const DisplayBuffer* buffer);
     bool Presentable() const;
     bool DualSrcBlend() const;
     bool PrimitiveListRestart() const;
@@ -237,7 +246,7 @@ public:
     // records. Null when nothing is prepared: the resource cache may serve the dispatch (its
     // Revalidate stays under the mutex), or APS5_LOCKED_BUILD=1 keeps the whole build under it as
     // before. `shader` and `snapshots` must outlive the dispatch.
-    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0);
+    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0);
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);

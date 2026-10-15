@@ -150,6 +150,15 @@ struct DepthStencilRequest {
     bool operator==(const DepthStencilRequest&) const = default;
 };
 
+// Guest compute pipelines the caches built (compiled or an archive hit; process-wide), and those
+// built by a thread holding the GPU mutex (upstream 7fae4549e's VulkanDevice::ComputePipelineCounts:
+// PrepareDispatch starts the build on the cache's workers, outside the mutex).
+struct ComputePipelineCreation {
+    std::uint64_t created = 0;
+    std::uint64_t underGpuMutex = 0;
+};
+ComputePipelineCreation ComputePipelineCreationCounts();
+
 class PipelineCache {
 public:
     // `directory`: where the archive lives (empty: the default from the environment, see above).
@@ -214,6 +223,8 @@ private:
     id<MTLLibrary> library(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool prewarm);
     void prewarm(std::vector<StoredLibrary> stored);
     id<MTLComputePipelineState> buildCompute(const PipelineFunction& function);
+    // Compute(): `guest` counts a pipeline built for a guest kernel (ComputePipelineCreationCounts).
+    id<MTLComputePipelineState> compute(const PipelineFunction& function, bool guest);
     id<MTLRenderPipelineState> buildRender(const RenderPipelineRequest& request);
     id<MTLRenderPipelineState> buildMeshRender(const RenderPipelineRequest& request);
     MTL4FunctionDescriptor* functionDescriptor(const PipelineFunction& function);
@@ -232,7 +243,11 @@ private:
     id<MTLDevice> device = nil;
     id<MTL4Compiler> compiler = nil;
     id<MTL4PipelineDataSetSerializer> serializer = nil;
-    id<MTL4Archive> archive = nil;
+    // The archive generations this cache looks pipelines up in, newest first (empty: none). Every
+    // cache of a process loads the same set: the newest generation of the last run together with
+    // the generations its other devices wrote (upstream 8c8cd86cf: a process holds the windowless
+    // device next to its windowed replacement, and neither device's pipelines may be dropped).
+    NSArray<id<MTL4Archive>>* archives = nil;
     std::filesystem::path archivePath;
 
     mutable std::mutex mutex;

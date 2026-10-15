@@ -656,6 +656,55 @@ void CmdCopyImage(VkCommandBuffer commands, VkImage source, VkImageLayout, VkIma
     auto& stream = Stream(commands);
     id<MTLTexture> fromImage = TextureOfImage(source);
     id<MTLTexture> toImage = TextureOfImage(destination);
+    const auto* fromEntry = FindMetal(fromImage.pixelFormat);
+    const auto* toEntry = FindMetal(toImage.pixelFormat);
+    if (fromEntry != nullptr && toEntry != nullptr && fromImage.pixelFormat != toImage.pixelFormat && (fromEntry->blockWidth > 1u || toEntry->blockWidth > 1u)) {
+        // A size-compatible copy between a block-compressed and an uncompressed image (one texel of
+        // the uncompressed side per block, Vulkan's rule; upstream's block copy of a storage image
+        // into a BC texture): Metal copies textures of one pixel format only, so the blocks pass
+        // through stream memory (texture to buffer, then buffer to texture, same bytes per row).
+        if (fromEntry->bytes != toEntry->bytes || fromEntry->blockHeight != fromEntry->blockWidth || toEntry->blockHeight != toEntry->blockWidth) FailImages("an image copy between formats of different block sizes is not implemented");
+        struct Staged {
+            id<MTLTexture> to;
+            std::uint32_t level;
+            std::uint32_t slice;
+            MTLOrigin origin;
+            MTLSize size;
+            Upload bytes;
+            NSUInteger bytesPerRow;
+            NSUInteger bytesPerImage;
+        };
+        std::vector<Staged> staged;
+        auto encoder = stream.Compute();
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto& region = regions[index];
+            std::uint32_t sourceLevel = 0;
+            std::uint32_t destinationLevel = 0;
+            id<MTLTexture> from = LevelSource(fromImage, region.srcSubresource.mipLevel, &sourceLevel);
+            id<MTLTexture> to = LevelSource(toImage, region.dstSubresource.mipLevel, &destinationLevel);
+            // The extent counts the source's texels; one uncompressed texel is one block.
+            const auto fromSize = RegionSize(from, sourceLevel, region.extent);
+            if (fromSize.depth != 1u) FailImages("a block copy of a volume image is not implemented");
+            const NSUInteger blocksWide = (fromSize.width + fromEntry->blockWidth - 1u) / fromEntry->blockWidth;
+            const NSUInteger blocksHigh = (fromSize.height + fromEntry->blockHeight - 1u) / fromEntry->blockHeight;
+            const NSUInteger bytesPerRow = blocksWide * fromEntry->bytes;
+            const NSUInteger bytesPerImage = bytesPerRow * blocksHigh;
+            const auto toWidth = std::min<NSUInteger>(blocksWide * toEntry->blockWidth, std::max<NSUInteger>(to.width >> destinationLevel, 1u));
+            const auto toHeight = std::min<NSUInteger>(blocksHigh * toEntry->blockHeight, std::max<NSUInteger>(to.height >> destinationLevel, 1u));
+            for (std::uint32_t layer = 0; layer < std::max(region.srcSubresource.layerCount, 1u); ++layer) {
+                const auto upload = stream.Allocate(bytesPerImage, 16u);
+                [encoder copyFromTexture:from sourceSlice:region.srcSubresource.baseArrayLayer + layer sourceLevel:sourceLevel sourceOrigin:MTLOriginMake(region.srcOffset.x, region.srcOffset.y, 0) sourceSize:fromSize toBuffer:upload.buffer destinationOffset:upload.offset destinationBytesPerRow:bytesPerRow destinationBytesPerImage:bytesPerImage];
+                staged.push_back({to, destinationLevel, region.dstSubresource.baseArrayLayer + layer, MTLOriginMake(region.dstOffset.x, region.dstOffset.y, 0), MTLSizeMake(toWidth, toHeight, 1u), upload, bytesPerRow, bytesPerImage});
+            }
+        }
+        stream.Barrier();
+        encoder = stream.Compute();
+        for (const auto& piece : staged) {
+            [encoder copyFromBuffer:piece.bytes.buffer sourceOffset:piece.bytes.offset sourceBytesPerRow:piece.bytesPerRow sourceBytesPerImage:piece.bytesPerImage sourceSize:piece.size toTexture:piece.to destinationSlice:piece.slice destinationLevel:piece.level destinationOrigin:piece.origin];
+        }
+        stream.CountCommand();
+        return;
+    }
     auto encoder = stream.Compute();
     for (std::uint32_t index = 0; index < count; ++index) {
         const auto& region = regions[index];

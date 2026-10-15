@@ -4,6 +4,9 @@
 // copies, texture and storage image reads of the target's memory throw), the CMASK fast-clear model and
 // the per-device target list are upstream's, unchanged. CB resolves throw: the Metal draw path does not
 // render multisampled color targets yet (MetalDraw.mm, TechnicalDebt metal-d6-targets).
+// Upstream's target retirement on unmap (f7fd7569f), absorbed compute fills (5acd68f94), sampling a
+// target or a never-rendered uniform MSAA surface (4b71846fa, 6e6334e7e, 84f636494, d0cd50c82) and
+// FMASK decompress (9394a6f51) are ported; sampling goes through the D27 view of the host image.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -12,12 +15,15 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -28,6 +34,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -141,6 +149,18 @@ public:
         ++shadowToHost;
     }
 
+    // The sampled view of the host image (upstream 4b71846fa; on Metal the D27 view the MSL reads as
+    // texture2d_ms_array), after a pending fast clear or color memory fill (upstream 6e6334e7e) and the
+    // storage shadow's writes. Called with targetsMutex held.
+    std::shared_ptr<Texture> Sampled(VkComponentMapping components) {
+        ApplyFastClear(target);
+        SyncHost();
+        const std::array<std::uint32_t, 4> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)};
+        auto& texture = sampled[key];
+        if (texture == nullptr) texture = std::make_shared<Texture>(context, image, target.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
+        return texture;
+    }
+
     void SyncShadow() {
         if (shadow == VK_NULL_HANDLE) {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -177,8 +197,11 @@ public:
     Metal::HostSamples host;
     MultisampledCmask cmask;
     MultisampledColorFill colorFill;
+    // Cleared when the target's memory is unmapped (upstream f7fd7569f): a retired target is no longer
+    // found, guarded, filled or sampled; it is destroyed with the device's targets.
+    std::shared_ptr<std::atomic<bool>> active = std::make_shared<std::atomic<bool>>(true);
     // Sampled views for guest MSAA T#s (DECISIONS D27), by component mapping.
-    std::map<std::uint32_t, std::shared_ptr<Texture>> sampled;
+    std::map<std::array<std::uint32_t, 4>, std::shared_ptr<Texture>> sampled;
     // The storage shadow (made at the first guest storage use) and which side holds the newest
     // samples; copies made each way (for tests and the cost report).
     VkImage shadow = VK_NULL_HANDLE;
@@ -205,6 +228,7 @@ struct GuardedRange {
     std::uint64_t address;
     std::uint64_t bytes;
     std::uint32_t samples;
+    std::shared_ptr<std::atomic<bool>> active;
 };
 
 // Upstream 4d37c9336: winpthreads initializes a static rwlock on its first lock and fails a
@@ -237,7 +261,19 @@ void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
 }
 
-void guard(const Context& context, const ColorTarget& target) {
+// GuestAllocations' unmap observer (upstream f7fd7569f): a target whose whole guarded range is unmapped
+// is retired, so memory mapped there again is not taken for it.
+void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
+    std::unique_lock lock(guardedMutex());
+    std::erase_if(guarded(), [&](const auto& range) {
+        if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;
+        range.active->store(false, std::memory_order_release);
+        return true;
+    });
+    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+}
+
+void guard(const Context& context, const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active) {
     auto bytes = std::max<std::uint64_t>(target.bytes * target.samples, static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * target.samples);
     if (target.tileMode == ColorTileMode::RenderTarget && std::has_single_bit(target.elementBytes) && std::has_single_bit(target.samples)) {
         const auto log2Samples = std::countr_zero(target.samples);
@@ -249,10 +285,11 @@ void guard(const Context& context, const ColorTarget& target) {
         bytes = align(target.extent.width, blockWidth) * align(target.extent.height, blockHeight) * target.elementBytes * target.samples;
     }
     std::unique_lock lock(guardedMutex());
-    guarded().push_back({context.device, target.address, bytes, target.samples});
+    guarded().push_back({context.device, target.address, bytes, target.samples, active});
     anyGuarded().store(true, std::memory_order_release);
     static std::once_flag installed;
     std::call_once(installed, [] { GuestMemory::SetReadGuard(&guardReads); });
+    GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(&retireUnmapped);
 }
 
 std::mutex& targetsMutex() {
@@ -267,6 +304,7 @@ std::vector<std::unique_ptr<MultisampleTarget>>& targets() {
 
 MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
     for (const auto& target : targets()) {
+        if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || !sameTarget(target->target, use)) continue;
         target->cmask.CheckAddress(use.cmaskAddress);
         target->ApplyFastClear(use);
@@ -274,10 +312,62 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
         return *target;
     }
     targets().push_back(std::make_unique<MultisampleTarget>(context, use));
-    guard(context, use);
     auto& created = *targets().back();
+    guard(context, use, created.active);
     if (use.cmaskFastClear) created.cmask.SeedKeys(CurrentDccKeys(use.cmaskAddress, static_cast<std::uint64_t>(use.cmaskBytes) * 256u));
     created.ApplyFastClear(use);
+    return created;
+}
+
+// A multisampled texture no draw rendered to whose color memory holds one repeated 32-bit value
+// (upstream d0cd50c82): a target is made over it with that value as its pending clear, which the
+// first sample applies. Anything else refuses. Called with targetsMutex held.
+MultisampleTarget& createFilled(const Context& context, const GuestTextureResource& resource, VkFormat format) {
+    const auto refuse = [&](const std::string& reason) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "AGC graphics: sampling the %ux%u multisampled texture 0x%llx of %u samples, which no draw rendered to and ", resource.width, resource.height, static_cast<unsigned long long>(resource.baseAddress), resource.samples);
+        throw std::runtime_error(text + reason + ", is not implemented");
+    };
+    ColorTarget use{};
+    switch (resource.tileMode) {
+        case TextureTileMode::kStandard4KB: use.tileMode = ColorTileMode::Standard4KB; break;
+        case TextureTileMode::kStandard64KB: use.tileMode = ColorTileMode::Standard64KB; break;
+        case TextureTileMode::kR64KBX: use.tileMode = ColorTileMode::RenderTarget; break;
+        default: refuse("whose tile mode " + std::to_string(static_cast<int>(resource.tileMode)) + " has no modeled multisampled color footprint");
+    }
+    use.address = resource.baseAddress;
+    use.surfaceAddress = resource.baseAddress;
+    use.extent = {resource.width, resource.height};
+    use.surfaceExtent = use.extent;
+    use.format = format;
+    use.elementBytes = BytesPerElement(resource.format);
+    use.pipeBankXor = resource.pipeBankXor;
+    use.samples = resource.samples;
+    const auto bytes = MultisampledColorBytes(use);
+    if (bytes == 0) refuse("whose " + std::to_string(use.elementBytes) + "-byte elements have no modeled multisampled color footprint");
+    use.bytes = ColorTargetLayout(use.extent.width, use.extent.height, use.tileMode, use.elementBytes).Bytes();
+    char range[64];
+    std::snprintf(range, sizeof(range), "0x%llx+0x%llx", static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(bytes));
+    RequireNoMultisampleTarget(use.address, static_cast<std::size_t>(bytes), "sampling a multisampled texture no draw rendered to");
+    GuestMemory::FlushGpuWrites(use.address, static_cast<std::size_t>(bytes));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(use.address), static_cast<std::size_t>(bytes))) refuse(std::string("whose color memory ") + range + " is not mapped");
+    const auto* memory = reinterpret_cast<const std::byte*>(use.address);
+    std::uint32_t value = 0;
+    std::memcpy(&value, memory, sizeof(value));
+    char held[16];
+    std::snprintf(held, sizeof(held), "0x%08x", value);
+    const auto repeated = std::mismatch(memory + sizeof(value), memory + bytes, memory).first;
+    if (repeated != memory + bytes) {
+        char offset[32];
+        std::snprintf(offset, sizeof(offset), "+0x%llx", static_cast<unsigned long long>(repeated - memory));
+        refuse(std::string("whose color memory ") + range + " does not hold one repeated 32-bit value (" + held + " until " + offset + ")");
+    }
+    VkClearColorValue clear{};
+    if (!MultisampledFillClearColor(use, value, clear)) refuse(std::string("whose color memory ") + range + " holds " + held + ", which has no exact clear value in its format");
+    targets().push_back(std::make_unique<MultisampleTarget>(context, use));
+    auto& created = *targets().back();
+    guard(context, use, created.active);
+    created.colorFill.NoteFill(use.address, static_cast<std::size_t>(bytes), value);
     return created;
 }
 
@@ -400,6 +490,35 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
     return acquired.view;
 }
 
+// Upstream 4b71846fa's entry for Graphics/src/ShaderResources.cpp, whose Metal twin reaches the same
+// target through Metal::MultisampleSampledTexture (the T# words); kept for shared callers.
+std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
+    std::lock_guard lock(targetsMutex());
+    const auto format = ResolveTextureFormat(resource.format);
+    const MultisampleTarget* other = nullptr;
+    for (const auto& target : targets()) {
+        if (!target->active->load(std::memory_order_acquire)) continue;
+        if (target->context.device != context.device || target->target.surfaceAddress != resource.baseAddress) continue;
+        const auto& rendered = target->target;
+        if (rendered.format == format && rendered.extent.width == resource.width && rendered.extent.height == resource.height && rendered.samples == resource.samples && rendered.mip == 0) return target->Sampled(components);
+        other = target.get();
+    }
+    if (other == nullptr) {
+        Require(Recorder::Active() != nullptr, "a multisampled texture is only sampled by recorded draws and dispatches");
+        return createFilled(context, resource, format).Sampled(components);
+    }
+    char text[320];
+    std::snprintf(text, sizeof(text), "AGC graphics: sampling multisampled color target 0x%llx (%ux%u, %u samples, vk format %d) as a %ux%u texture of %u samples and guest format %u (vk %d) is not implemented", static_cast<unsigned long long>(resource.baseAddress), other->target.extent.width, other->target.extent.height, other->target.samples, static_cast<int>(other->target.format), resource.width, resource.height, resource.samples, resource.format, static_cast<int>(format));
+    throw std::runtime_error(text);
+}
+
+// FMASK decompress (upstream 9394a6f51): the samples live only in the host image, so the pass
+// applies the target's pending fast clear or fill there.
+void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget& target) {
+    std::lock_guard lock(targetsMutex());
+    acquire(context, target);
+}
+
 // Upstream records a render pass whose resolve attachment is the destination; on Metal the pass's
 // store action is MTLStoreActionMultisampleResolve, or, for the integer formats Metal does not
 // resolve, a fragment pass that takes sample 0 (Metal::ResolveMultisample, DECISIONS D27).
@@ -423,8 +542,10 @@ namespace Metal {
 namespace {
 
 // The multisampled color target a guest MSAA T# addresses (DECISIONS D27), after its pending CMASK
-// fast clear; `what` names the use in refusals. Called with targetsMutex held.
-MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const std::uint32_t> words, const char* what) {
+// fast clear or color memory fill; `what` names the use in refusals. A sampled T# over memory no
+// draw rendered to (`fillUnrendered`) gets a target holding its uniform color memory (upstream
+// d0cd50c82). Called with targetsMutex held.
+MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const std::uint32_t> words, const char* what, bool fillUnrendered) {
     Require(MultisampledDescriptor(words), std::string("a ") + what + " of a T# that is not 2D MSAA");
     const auto address = ((static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u)) & 0xffffffffffull) << 8u;
     const auto guestFormat = (words[1] >> 20u) & 0x1ffu;
@@ -443,12 +564,19 @@ MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const st
     Require(type == 14u || (layers == 1u && baseArray == 0u), std::string("AGC graphics: a 2D MSAA array T# over more than its first layer is not implemented (multisampled color targets have one layer)") + described);
     const auto format = ResolveTextureFormat(guestFormat);
     for (const auto& target : targets()) {
+        if (!target->active->load(std::memory_order_acquire)) continue;
         const auto& color = target->target;
         if (target->context.device != context.device || color.address != address) continue;
         Require(color.extent.width == width && color.extent.height == height && color.samples == samples, std::string("AGC graphics: a 2D MSAA T# disagrees with the multisampled color target at its address in extent or sample count") + described);
         Require(color.format == format, std::string("AGC graphics: a 2D MSAA T# reads a multisampled color target in another format, which is not implemented") + described);
         target->ApplyFastClear(color);
         return *target;
+    }
+    if (fillUnrendered) {
+        Require(Recorder::Active() != nullptr, "a multisampled texture is only sampled by recorded draws and dispatches");
+        auto& created = createFilled(context, DecodeTextureResource(words), format);
+        created.ApplyFastClear(created.target);
+        return created;
     }
     throw std::runtime_error(std::string("AGC graphics: a 2D MSAA T# addresses memory that is no multisampled color target; guest-written MSAA memory (sample layout, FMASK) is not modeled") + described);
 }
@@ -457,8 +585,7 @@ MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const st
 
 std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
     std::lock_guard lock(targetsMutex());
-    auto& target = TargetOfDescriptor(context, words, "sampled view");
-    target.SyncHost();
+    auto& target = TargetOfDescriptor(context, words, "sampled view", true);
     const auto swizzle = [](std::uint32_t select) {
         switch (select) {
         case 0: return VK_COMPONENT_SWIZZLE_ZERO;
@@ -471,17 +598,13 @@ std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::
         }
     };
     const auto selects = words[3] & 0xfffu;
-    auto& texture = target.sampled[selects];
-    if (texture == nullptr) {
-        const VkComponentMapping components{swizzle(selects & 7u), swizzle((selects >> 3u) & 7u), swizzle((selects >> 6u) & 7u), swizzle((selects >> 9u) & 7u)};
-        texture = std::make_shared<Texture>(target.context, target.image, target.target.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
-    }
-    return texture;
+    const VkComponentMapping components{swizzle(selects & 7u), swizzle((selects >> 3u) & 7u), swizzle((selects >> 6u) & 7u), swizzle((selects >> 9u) & 7u)};
+    return target.Sampled(components);
 }
 
 std::shared_ptr<Texture> MultisampleStorageTexture(const Context& context, std::span<const std::uint32_t> words) {
     std::lock_guard lock(targetsMutex());
-    auto& target = TargetOfDescriptor(context, words, "storage view");
+    auto& target = TargetOfDescriptor(context, words, "storage view", false);
     // Brought up to date before the access; the access (recorded after this) writes the shadow.
     target.SyncShadow();
     target.shadowNewer = true;
@@ -491,16 +614,28 @@ std::shared_ptr<Texture> MultisampleStorageTexture(const Context& context, std::
 MultisampleShadowStatistics MultisampleShadowCounts(std::uint64_t address) {
     std::lock_guard lock(targetsMutex());
     for (const auto& target : targets()) {
-        if (target->target.address == address) return {target->hostToShadow, target->shadowToHost};
+        if (target->active->load(std::memory_order_acquire) && target->target.address == address) return {target->hostToShadow, target->shadowToHost};
     }
     return {};
 }
 
 }
 
+// A compute fill a live target takes whole as its clear (upstream 5acd68f94): BufferFill skips
+// storing it to memory; NoteColorMetadataFill hands the target the clear.
+bool MultisampledColorFillAbsorbs(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    if (bytes == 0) return false;
+    std::lock_guard lock(targetsMutex());
+    return std::any_of(targets().begin(), targets().end(), [&](const auto& target) {
+        VkClearColorValue clear{};
+        return target->active->load(std::memory_order_acquire) && target->target.address == address && MultisampledColorBytes(target->target) == bytes && MultisampledFillClearColor(target->target, pattern, clear);
+    });
+}
+
 void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(targetsMutex());
     for (const auto& target : targets()) {
+        if (!target->active->load(std::memory_order_acquire)) continue;
         target->colorFill.NoteFill(address, bytes, pattern);
         const auto before = target->cmask.Keys();
         target->cmask.NoteFill(address, bytes, pattern);
@@ -516,6 +651,7 @@ void ClearMultisampleTargets(VkDevice device) {
     std::unique_lock guardLock(guardedMutex());
     std::erase_if(guarded(), [&](const auto& range) { return range.device == device; });
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    if (guarded().empty()) GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(nullptr);
 }
 
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {

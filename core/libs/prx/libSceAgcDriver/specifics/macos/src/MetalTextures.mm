@@ -236,7 +236,11 @@ ResourceCache::Key DispatchContentKey(const CompiledShader& shader, VkDevice dev
 }
 
 bool HasImages(const ShaderRecompiler::RecompileResult& shader) {
-    return std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers; });
+    // MslAbi Version 15: image and sampler tables (and their map) come from the build too.
+    return std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) {
+        using Role = ShaderRecompiler::DescriptorRole;
+        return binding.role == Role::GuestImages || binding.role == Role::GuestSamplers || binding.role == Role::ImageTable || binding.role == Role::SamplerTable || binding.role == Role::ImageTableMap;
+    });
 }
 
 }

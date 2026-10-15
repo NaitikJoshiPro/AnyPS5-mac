@@ -239,6 +239,9 @@ struct VulkanDevice::State {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         bool addressBased = false;
         std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> imageEntries;
+        // MslAbi Version 15: the image table, sampler table and table map arrays (WriteTable uploads
+        // each and points its table entries at it).
+        std::vector<std::pair<ShaderRecompiler::RuntimeAbi::Binding, std::vector<std::uint64_t>>> tableArrays;
     };
     void PlanBindings(const ShaderRecompiler::RecompileResult& shader, StageBindings& plan);
     void PlanImages(const ShaderRecompiler::RecompileResult& shader, Graphics::Metal::ImageBindings& images, StageBindings& plan);
