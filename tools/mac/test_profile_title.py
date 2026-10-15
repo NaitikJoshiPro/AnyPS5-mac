@@ -131,6 +131,11 @@ class SampleTests(unittest.TestCase):
                 ("stat", "libsystem_kernel.dylib"))
         self.assertEqual(pp.classify_stack(path), ("kernel: file I/O", "ResolvePath_nid_no_patch"))
 
+    def test_guest_event_flag_is_not_a_gpu_wait(self):
+        path = (("sceKernelWaitEventFlag", "libkernel.prx"), ("TimedWait::Condition::Wait()", "libkernel.prx"),
+                ("__psynch_cvwait", "libsystem_kernel.dylib"))
+        self.assertEqual(pp.classify_stack(path)[0], "wait: other")
+
     def test_short_symbol(self):
         self.assertEqual(pp.short_symbol("A::(anonymous namespace)::Wait(id<X>, unsigned long) const"), "A::{anon}::Wait")
         self.assertEqual(pp.short_symbol("std::f<std::g<int>>(int)"), "std::f")

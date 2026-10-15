@@ -295,7 +295,8 @@ def markdown(result):
         for category, count in sample["totals"].items():
             share = f"{100.0 * count / busy:.1f}" if busy and not category.startswith(("wait", "idle")) else "-"
             cores = count / per_thread
-            per_frame = f"{cores * frame_ms:.1f}" if frame_ms else "-"
+            # Parked threads are not time on the frame: ms per frame is shown for CPU work only.
+            per_frame = f"{cores * frame_ms:.1f}" if frame_ms and not category.startswith(("wait", "idle")) else "-"
             top = "; ".join(f"{detail} {n}" for detail, n in sample["details"].get(category, [])[:4])
             out.append(f"| {category} | {count} | {cores:.2f} | {per_frame} | {share} | {top} |")
         out += ["", "### Busiest threads", ""]
