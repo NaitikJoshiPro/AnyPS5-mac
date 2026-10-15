@@ -10,7 +10,7 @@
 #include <string_view>
 
 // The emulated console's user-level settings that the system libraries report to titles: the TV the console is
-// connected to and the user's game presets. They are the same for every title (no per-title answers, D61, D66).
+// connected to and the user's game presets. They are the same for every title (no per-title answers, D61, D68).
 //   APS5_DISPLAY_MODE  1080p (default) | 1440p | 2160p: the TV's output resolution (libSceVideoOut DisplayMode.cpp)
 //   APS5_HDR           0 (default, an SDR TV) | 1 (an HDR TV)
 //   APS5_GAME_PRESET   performance (default) | default: Settings > Game Presets > "Performance Mode or Resolution

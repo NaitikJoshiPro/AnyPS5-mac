@@ -172,7 +172,7 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     const auto& mode = VideoOutCurrentDisplayMode_nid_no_patch();
     status->resolution = mode.height >= 2160u ? 2u : 1u;
     // Dynamic range 1 is SDR, 2 HDR, with flag bit 0 set for HDR (SharpProspero VideoOutTypes.cs); the TV's
-    // (APS5_HDR, default SDR), the same for every title (D66).
+    // (APS5_HDR, default SDR), the same for every title (D68).
     const bool hdr = ConsoleHdrOutput();
     status->dynamicRange = hdr ? 2u : 1u;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
