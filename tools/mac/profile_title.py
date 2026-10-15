@@ -117,6 +117,8 @@ def cmd_run(args):
         raise SystemExit(f"--seconds {args.seconds} ends before the window {window[0]:g}:{window[1]:g} closes")
     env = dict(os.environ)
     env.update(DEFAULT_ENV)
+    if args.no_gputime:
+        env.pop("APS5_PROFILE_GPU", None)  # the driver enables [gputime] on any value, so the variable must be absent
     trace_dir = Path(f"{base}-trace")
     trace_dir.mkdir(exist_ok=True)
     env.update({"APS5_TRACE_SECONDS": f"{int(window[0])}:{int(window[1])}", "APS5_TRACE_DIR": str(trace_dir)})
@@ -374,6 +376,7 @@ def main(argv=None):
     run.add_argument("--max-load", type=float, default=8.0)
     run.add_argument("--validation", action="store_true")
     run.add_argument("--no-powermetrics", action="store_true")
+    run.add_argument("--no-gputime", action="store_true", help="leave APS5_PROFILE_GPU unset (timestamps cost ~1%% of queue 0)")
     run.add_argument("--audio-file", help="capture the title's audio to this file (SDL disk driver)")
     run.add_argument("--audio-device", action="store_true", help="play through the real audio device (default: SDL dummy driver)")
     comparison = sub.add_parser("compare", help="one table of several runs' frame times, clocks, CPU and JIT numbers")
