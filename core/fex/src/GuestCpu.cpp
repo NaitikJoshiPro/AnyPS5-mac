@@ -538,6 +538,12 @@ void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::
     // A locked access that crosses 16 bytes is emulated in the SIGBUS handler with two CASes, which tear under
     // contention unless such accesses share a lock (x86 makes them atomic). Only that slow path takes the lock.
     FEXCore::Config::Set(FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1");
+    // FEX's memory-saving lookup defaults (no L2 table, an L1 that shrinks) sent ASTRO BOT's indirect branches through
+    // CompileCode's map lookup 700-900 times a second per process (lookup-cache misses, APS5_FEX_STATS). The L2 table is
+    // a lazily touched virtual reservation; with it and a full-size L1 the misses drop to a few per 30 s (D71).
+    // APS5_FEX_CONFIG=DisableL2Cache=1,DynamicL1Cache=1 restores FEX's defaults.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLEL2CACHE, "0");
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DYNAMICL1CACHE, "0");
     for (const auto& [option, value] : config)
         FEXCore::Config::Set(option, value);
     LoadOptions();
