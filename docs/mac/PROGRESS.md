@@ -376,3 +376,23 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Tests: store_over_untracked (+fill over a pending image, fails with the drop restored: logs/drvd/gs-d57-neg2; +stored twice), agc_metal_recorder (+130 sampled passes, fails with PrepareSamplePass empty: gs-d57-neg).
 - Verified (build-drvd on 14ec0c7d2): ctest -LE gpu 5100/5101 (guest_kernel_fcntl, the known -j4 flake); gpu_suite --validation --build-first G1 G3 G4 G7: 361/375 passed, 14 allowlisted skips, 0 failures (logs/drvd/gate3-gs); DOOM 60 s --validation alive, frame 5 identical. After the rebase on d5f445246: store_over_untracked, agc_metal_recorder, agc_metal_draw_primitives pass (gs-d57-post).
 - Next: dark frames (Showcase is the easier repro), then STK's mip-count assertion.
+
+## 2026-10-15 — M4 PERF2: console display mode (D61), MetalFX spatial upscale in the Metal present (D61)
+- What the titles query and render at (APS5_TRACE_VIDEOOUT=1):
+  - Showcase 1.0.2: registers 3840x2160 before any query (eglSetDisplayModePS5(3840, 2160) in its main.c). Fixed 4K.
+  - ASTRO BOT: GetOutputStatus 6-7 times, then registers 3840x2160 under every mode. Its scene renders at 1920x1080 and 2432x1368; the size histograms are identical at display mode 1080p and 2160p.
+  - DOOM: registers 1920x1080.
+- Code: VideoOut reports APS5_DISPLAY_MODE (1080p default, 1440p, 2160p) from GetResolutionStatus and GetOutputStatus, not the registered buffers' size. The Metal present upscales through MTL4FXSpatialScaler when the aspect-fit rectangle is larger than the source; APS5_METALFX=0 restores the bilinear scaler. APS5_PRESENT_SIZE sizes headless targets (title_run's default drawable is 614x345). No render-target scaling (unsafe on guest memory; D61).
+- Measured (headless, interleaved A/B, powermetrics mid-run; PERFORMANCE.md):
+  - DOOM, 1080p into 2560x1440, bilinear vs MetalFX: p50/p99 33.4/41.6 for both (paced at 30 fps, P 4.0 GHz). Present 10.2 -> 10.7 ms per frame; GPU 420 -> 482 MHz.
+  - Showcase, mode 2160p vs 1080p: 203-215/259-268 vs 215-219/232 ms. No change.
+  - ASTRO, mode 2160p vs 1080p: 323/437 vs 336-347/395-438 ms. No change; dominated by Driver.Packet.memory_wait, 600-900 ms per present.
+  - No throttling in the A/B samples (P 3.4-4.05 GHz). The sA1 and aA3 samples were taken while other agents built (load 4-22).
+- Tests: agc_metal_metalfx_present (new), agc_metal_offscreen_frames (now APS5_METALFX=0), guest_video_out_resolution_status plus _1440p and _2160p.
+- Gate (build-perf2 on 9d30a531b):
+  - CPU: ctest -LE gpu -j4 5104/5105. guest_socket_read_write aborted under load and passed alone.
+  - GPU: gpu_suite G1 G4 G7 plus the new tests, --validation --build-first: 307/321 + 14 allowlisted skips, 0 failed.
+  - Titles, --validation: DOOM 60 s alive, 6 frames, MetalFX 1920x1080 -> 2560x1440. Showcase 60 s alive, 4 frames. ASTRO 150 s alive. 0 validation errors.
+- Logs: .mac-work/logs/perf2/ (measurements.jsonl, *.pm.txt, trace-*, gs-gate).
+- Disk: TOTAL used by project: 41.11G of 100G budget (warn at 85G). Disk free: 78.3G
+- Next (owners): DRIVER, ASTRO's memory_wait. DRIVER, the 4K display-buffer CPU decode per flip (a GPU detile/convert into the present). The VideoOut window size for the windowed MetalFX run (user). Showcase stays 4K unless a safe render-target scale is found.

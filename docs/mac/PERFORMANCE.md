@@ -12,7 +12,7 @@ Every optimisation is logged here with before/after numbers on at least two work
 
 ## Resolution target (M4)
 
-Measure and optimise for an **internal render resolution of about 1920x1080 or lower, upscaled with MetalFX to a 16:9 output** (letterboxing is fine), not native 4K. Showcase renders at its own 3840x2160 today because the driver has no resolution override yet. Its numbers below are a GPU-bound worst case: about 84-90% GPU active residency, with about 6 s of GPU batch time per 10 s. The internal-resolution override plus MetalFX (MISSION §8 M4) is the main lever for it.
+Measure and optimise for an **internal render resolution of about 1920x1080 or lower, upscaled with MetalFX to a 16:9 output** (letterboxing is fine), not native 4K. Showcase renders at its own 3840x2160 because the title fixes it (eglSetDisplayModePS5(3840, 2160)); the console display mode (D61, default 1080p) cannot lower it. Its numbers below are a GPU-bound worst case: about 84-90% GPU active residency, with about 6 s of GPU batch time per 10 s. The internal-resolution override plus MetalFX (MISSION §8 M4) is the main lever for it.
 
 ## Baselines (2026-10-14/15, build-perf1 at 4c337f14a, headless)
 
@@ -42,3 +42,14 @@ Profile of Showcase (base4, `sample` 15 s, guest sampler):
 | D60 | Resident present (present from the pending render target) | 424 / 478 -> 454 / 532; 418 / 519 -> 490 / 584 (GPU 0.83-1.07 GHz, 86-91% active) | not applicable (display buffer not pending) | no |
 | D60 | Display-buffer GPU wait before the present takes the GPU mutex (full flush hook) | 391 / 432 -> 585 / 633 | 47.2 / 56.9 -> 44.9 / 49.7; 46.6 / 61.1 -> 36.0 / 103.1 (throttled, P 1.36-1.57 GHz); 33.4 / 56.1 -> 33.4 / 37.4; 33.4 / 41.6 -> 33.4 / 40.9 (cool) | no |
 | D60 | Same, waiting for GPU writes only (no store outside the mutex) | 433 / 493 -> 418 / 517 | 33.4 / 41.6 -> 33.4 / 41.6 (x2, cool) | no |
+| D61 | Console display mode 1080p (reported by VideoOut) instead of 2160p | 203 / 259, 215 / 268 -> 219 / 232, 215 / 233 (2560x1440 target, GPU 1.15-1.20 GHz, ~70% active): fixed 4K title, no change | not applicable (DOOM registers 1080p) | yes (system behaviour; ASTRO 303 / 1598 (load 22), 323 / 437 -> 347 / 438, 336 / 395 ms, P 4.05 GHz, GPU 0.66-0.73 GHz: no change, its scene is already 1920x1080 / 2432x1368) |
+| D61 | MetalFX spatial upscale in the present (1080p -> 2560x1440) instead of bilinear | not applicable (4K source, downscale) | 33.38 / 41.62, 33.37 / 41.63 -> 33.36 / 41.63, 33.37 / 41.60 (P 3.97-4.0 GHz, cool; paced 30 fps); Present 10.2-10.3 -> 10.7 ms per frame, GPU 420 -> 482 MHz | yes (image quality; ~0.5 ms per present) |
+
+## Display resolution and upscaling (D61, PERF2, 2026-10-15)
+
+What the 3D workloads render at (`APS5_TRACE_VIDEOOUT=1`):
+- **Showcase 1.0.2** is fixed at 4K. It calls `eglSetDisplayModePS5(3840, 2160)` and registers 3840x2160 display buffers before it asks the system anything. The console display mode cannot lower it, and there is no safe general render-target scale (D61). Its frame time at 4K is the GPU-bound worst case.
+- **ASTRO BOT** reads the output class and then registers 3840x2160 display buffers under every mode. Its scene renders at 1920x1080 and 2432x1368 (dynamic resolution), and the title upscales to 4K itself. Its frame time is dominated by `Driver.Packet.memory_wait` (600-900 ms per present), not by resolution.
+- **DOOM** registers 1920x1080 display buffers. A 1080p source in a 16:9 output larger than 1080p is where MetalFX applies.
+
+Headless runs present into `APS5_PRESENT_SIZE=2560x1440` (the user's 2560x1664 panel letterboxed to 16:9). Without it, title_run's offscreen drawable is 614x345.
