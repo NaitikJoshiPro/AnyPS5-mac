@@ -411,3 +411,15 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - build-metal was stale (libSceAgcDriver.prx from Oct 14 19:14); rebuilt at d227f1e36 under buildlock before the pause.
 - Findings from existing ASTRO/Showcase traces and samples (PERF3 aA4/asamp1/sA2, PERF1 base3): ASTRO's critical path is queue 0 (Recorder.Sync 150 ms/frame inside draws and dispatches, the GPU 50% idle); one ASTRO guest audio thread runs 100% of a core in translated code (to be named with the guest sampler); translation itself (FEX compile, dispatcher, signals, thunks) is about 0.05 core. Draft tables on branch perf5 (PERFORMANCE.md "Waste audit").
 - Not landed yet (branch perf5, WIP 510b682e6, untested): thread names + frame-path QoS (D70), APS5_FEX_STATS translation statistics (D71). They need a build and A/B runs after RESOURCES OK.
+
+## 2026-10-15 — M4 PERF3: ASTRO's memory_wait explained; GPU display decode in the Metal present (D66)
+- memory_wait: about 95% of it is async compute queues 0x40/0x48 idling for queue 0's labels, which is not a cost. Queue 0's own share (24-34 ms per frame) waits for 0x40's CPU dispatch recording; the label handoff is about 5 ms. No commit or label-latency fix is warranted. Details: PERFORMANCE.md "ASTRO BOT: what memory_wait is".
+- D66, the GPU display decode: the present decodes the display buffer from its host import on the GPU (aps5_display_decode), ordered by the queue, with no CPU wait or decode under the GPU mutex. Fallbacks: frame dumps, unimported memory, a CPU write-back pending over the buffer. APS5_PRESENT_GPU_DECODE=0 turns it off.
+- Measured (interleaved A/B, Heavy thermal pressure the whole session; numbers in PERFORMANCE.md):
+  - ASTRO: present mutex hold 41-94 -> 4 ms per frame; queue 0's mutex wait 51-99 -> 12-14 ms per frame; p50/p99 412/1044 -> 333/502 (best pair).
+  - Showcase: present 92-130 -> 4 ms per frame; p50 562-616 -> 279-524.
+  - DOOM: Present 9.2-38.6 -> 3.6-5.8 ms per frame, still paced at 30 fps.
+- Tests: agc_metal_present_gpu_decode (new, G5) passes; agc_metal_offscreen_frames and agc_metal_metalfx_present pass; ctest -LE gpu 5105/5105 (build-perf3 on db1a9ad8c).
+- NOT GATED YET: main paused all GPU work (user needs the Mac). Owed after RESOURCES OK: gpu_suite G1 G4 G7 --validation --build-first; DOOM 60 s, Showcase 60 s and ASTRO capped runs with --validation; then land.
+- Next costs (owners): DRV-D, StorageTexture revalidation memcmp/copies and the Refresh upload sync (the largest share of queue 0's CPU and its GPU waits; write-tracked imports). DRIVER, CMASK materialisation (`ColorTargetLayout::Offset` per element), Residency::Commit per TryWrap, PipelineCache::PrepareCompute key building, async-queue dispatch recording under the GPU mutex. TOOLS, the cold Metal pipeline compiles that stall some runs for 100+ s.
+
