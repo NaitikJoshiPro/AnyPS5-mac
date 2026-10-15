@@ -369,3 +369,10 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - DRV-D, write-tracked imports: removes Refresh's memcmp/re-upload.
   - DRIVER, precise pending-write ranges for raw shader reads: DOOM.
   - DRIVER, render-pass GPU timing (TechnicalDebt metal-gpu-timing-render-ranges).
+
+## 2026-10-15 — M3 DRV-D: D57 (storage baselines for superseded images outside the write watch; Metal passes take their occlusion slot); ASTRO BOT shows its intro
+- ASTRO past D52/D53 refused "storing storage image results pending over memory outside the write watch" (a fill/copy over memory another image overlaps dropped that image's saved bytes; Metal imports unwatch their range) and then "an occlusion segment begins without a reset query slot" (MetalDraw never took a slot). Fixes: keepComparable at the FillClear and buffer-copy sites; Recorder::PrepareSamplePass before MetalDraw begins a pass. Tried and dropped (not shown necessary): a leaving-watch hook, DCC-clear capture, post-store re-save.
+- ASTRO (run d19, no validation, 300 s): alive, frames of the intro cinematic (Astro and a companion in a dark blue space scene, lens flare); d20 on the narrowed fix: alive 300 s. Frames are dark: PERF1 reports Showcase 1.0.2 near-black too, so it is likely a shared bug (next).
+- Tests: store_over_untracked (+fill over a pending image, fails with the drop restored: logs/drvd/gs-d57-neg2; +stored twice), agc_metal_recorder (+130 sampled passes, fails with PrepareSamplePass empty: gs-d57-neg).
+- Verified (build-drvd on 14ec0c7d2): ctest -LE gpu 5100/5101 (guest_kernel_fcntl, the known -j4 flake); gpu_suite --validation --build-first G1 G3 G4 G7: 361/375 passed, 14 allowlisted skips, 0 failures (logs/drvd/gate3-gs); DOOM 60 s --validation alive, frame 5 identical. After the rebase on d5f445246: store_over_untracked, agc_metal_recorder, agc_metal_draw_primitives pass (gs-d57-post).
+- Next: dark frames (Showcase is the easier repro), then STK's mip-count assertion.
