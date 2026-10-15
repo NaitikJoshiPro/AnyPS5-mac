@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -659,7 +660,18 @@ void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes)
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
-    return Watch::Get().Unregister(begin, begin + bytes);
+    // Debug aid: APS5_TRACE_LEAVING_WATCH names every unregistration that removed watched pages and
+    // its caller (image + offset).
+    static const bool trace = std::getenv("APS5_TRACE_LEAVING_WATCH") != nullptr;
+    const bool removed = Watch::Get().Unregister(begin, begin + bytes);
+    if (trace && removed) {
+        Dl_info info{};
+        const void* caller = __builtin_return_address(0);
+        const bool named = dladdr(caller, &info) != 0 && info.dli_fname != nullptr;
+        std::fprintf(stderr, "[leaving-watch] write watch unregistered 0x%llx+0x%llx (caller %s+0x%llx %s)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), named ? info.dli_fname : "?",
+            static_cast<unsigned long long>(named ? reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0), named && info.dli_sname != nullptr ? info.dli_sname : "");
+    }
+    return removed;
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);
