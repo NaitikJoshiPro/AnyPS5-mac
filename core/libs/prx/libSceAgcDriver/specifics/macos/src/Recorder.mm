@@ -263,6 +263,26 @@ struct BatchFeedback {
     double gpuEndSeconds = 0;
 };
 
+std::atomic<void (*)()>& CompletionListener() {
+    static std::atomic<void (*)()> listener{nullptr};
+    return listener;
+}
+
+MTLSharedEventListener* CompletionEventListener() {
+    static MTLSharedEventListener* const listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_queue_create("aps5.recorder.completions", DISPATCH_QUEUE_SERIAL)];
+    return listener;
+}
+
+// Calls the completion listener once `timeline` reaches `serial` (a free function: inside the
+// Recorder's members `id` names its member).
+void NotifyCompletion(id<MTLSharedEvent> timeline, std::uint64_t serial) {
+    [timeline notifyListener:CompletionEventListener() atValue:serial block:^(id<MTLSharedEvent> signaled, uint64_t value) {
+        static_cast<void>(signaled);
+        static_cast<void>(value);
+        if (auto* listener = CompletionListener().load(std::memory_order_acquire)) listener();
+    }];
+}
+
 struct FeedbackSink {
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::string>> errors;
@@ -1303,6 +1323,10 @@ std::uint64_t Recorder::PublishGeneration() {
 
 std::uint64_t Recorder::PendingCompletionLabels() {
     return completionLabels.load(std::memory_order_acquire);
+}
+
+void Recorder::SetCompletionListener(void (*listener)()) {
+    CompletionListener().store(listener, std::memory_order_release);
 }
 
 std::uint64_t Recorder::PendingWriteBackCompletions() {
@@ -3338,6 +3362,10 @@ void Recorder::Submit() {
         [metal->queue commit:commandBuffers count:1 options:options];
         [metal->queue signalEvent:metal->timeline value:serial];
     });
+    // D67: the batch's completion wakes the driver's waiters (they otherwise find it at their next poll).
+    if (CompletionListener().load(std::memory_order_acquire) != nullptr) {
+        NotifyCompletion(metal->timeline, serial);
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();

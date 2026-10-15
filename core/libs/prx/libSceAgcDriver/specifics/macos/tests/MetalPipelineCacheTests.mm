@@ -164,6 +164,22 @@ int Background() {
     const auto b = ComputeFunction(2u);
     if (PipelineCache::ComputeKey(a) == PipelineCache::ComputeKey(b)) return Fail("function constants are not part of the compute key");
     if (PipelineCache::ComputeKey(a) != PipelineCache::ComputeKey(ComputeFunction(1u))) return Fail("equal compute requests have different keys");
+    // D67: the key carries a digest of the source, not the source; equal sources in distinct shader
+    // objects share it, one changed byte does not, and From shares the result's shader.
+    {
+        auto copy = a;
+        copy.shader = std::make_shared<const ShaderRecompiler::MslShader>(*a.shader);
+        if (PipelineCache::ComputeKey(copy) != PipelineCache::ComputeKey(a)) return Fail("equal sources in two shader objects have different keys");
+        auto changed = *a.shader;
+        changed.source.back() = changed.source.back() == ' ' ? '\n' : ' ';
+        auto other = a;
+        other.shader = std::make_shared<const ShaderRecompiler::MslShader>(std::move(changed));
+        if (PipelineCache::ComputeKey(other) == PipelineCache::ComputeKey(a)) return Fail("a changed source keeps the compute key");
+        if (PipelineCache::ComputeKey(a).size() >= a.shader->source.size()) return Fail("the compute key still carries the whole source");
+        ShaderRecompiler::RecompileResult shared;
+        shared.msl = ShaderRecompiler::SharedMsl(*a.shader);
+        if (PipelineFunction::From(shared).shader != shared.msl.Pointer()) return Fail("PipelineFunction::From copied the shader");
+    }
     auto blended = RenderRequest();
     blended.colors[0].blending = true;
     blended.colors[0].sourceRgb = MTLBlendFactorSourceAlpha;

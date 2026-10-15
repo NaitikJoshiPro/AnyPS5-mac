@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_WAITMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_WAITMEMORY_HPP
 
+#include <condition_variable>
+#include <mutex>
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
 #include <chrono>
@@ -47,6 +49,15 @@ struct EpochBumps {
 };
 
 void PollSleep();
+// GPU batch completions (D67): PollSleep returns early on one; the Metal recorder's timeline listener
+// calls CompletionWakeNotify through the driver.
+struct CompletionWake {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint64_t epoch = 0;
+};
+CompletionWake& CompletionWakeState();
+void CompletionWakeNotify();
 
 }
 

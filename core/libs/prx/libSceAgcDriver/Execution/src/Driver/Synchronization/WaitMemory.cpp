@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -33,7 +34,25 @@ void PollSleep() {
         }
     }
 #endif
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    // D67: the same 200 us bound, cut short when the GPU finishes a batch (CompletionWake).
+    auto& wake = CompletionWakeState();
+    std::unique_lock lock(wake.mutex);
+    const auto seen = wake.epoch;
+    wake.changed.wait_for(lock, std::chrono::microseconds(200), [&] { return wake.epoch != seen; });
+}
+
+CompletionWake& CompletionWakeState() {
+    static CompletionWake* const wake = new CompletionWake;
+    return *wake;
+}
+
+void CompletionWakeNotify() {
+    auto& wake = CompletionWakeState();
+    {
+        std::lock_guard lock(wake.mutex);
+        ++wake.epoch;
+    }
+    wake.changed.notify_all();
 }
 
 int Driver::waitTimeoutMs() {

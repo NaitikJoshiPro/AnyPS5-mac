@@ -47,6 +47,10 @@ struct State {
     std::uint64_t buried = 0;
     std::uint64_t drained = 0;
     std::uint64_t queueCommits = 0;
+    // Sets changed with CommitBeforeQueue: committed by the next queue commit, before it (one
+    // [set commit] per batch instead of one per change; a kernel call each, D67).
+    std::vector<id<MTLResidencySet>> deferred;
+    std::uint64_t deferredCommits = 0;
 };
 
 inline State& Shared() {
@@ -59,12 +63,14 @@ struct Counters {
     std::uint64_t buried = 0;    // allocations ever kept past their removal
     std::uint64_t drained = 0;   // allocations released after a commit or Drain
     std::uint64_t queueCommits = 0;
+    std::size_t deferred = 0;          // sets waiting for the next queue commit to commit them
+    std::uint64_t deferredCommits = 0; // set commits a queue commit made for them
 };
 
 inline Counters Snapshot() {
     auto& state = Shared();
     std::lock_guard lock(state.lock);
-    return {state.graveyard.size(), state.buried, state.drained, state.queueCommits};
+    return {state.graveyard.size(), state.buried, state.drained, state.queueCommits, state.deferred.size(), state.deferredCommits};
 }
 
 namespace Detail {
@@ -133,12 +139,28 @@ inline void Commit(id<MTLResidencySet> set) {
     [set commit];
 }
 
+// [set commit] made by the next queue commit (CommitQueue), before the command buffers it commits:
+// for a set whose new allocations only recorded, not yet committed, work uses (D67). Every queue
+// commit of the driver goes through CommitQueue.
+inline void CommitBeforeQueue(id<MTLResidencySet> set) {
+    if (set == nil) return;
+    auto& state = Shared();
+    std::lock_guard lock(state.lock);
+    for (id<MTLResidencySet> pending : state.deferred) {
+        if (pending == set) return;
+    }
+    state.deferred.push_back(set);
+}
+
 // A queue commit (commit plus whatever must stay ordered with it, e.g. the timeline signal): runs
 // under the residency lock, then releases the allocations removed before it.
 template<typename Fn>
 void CommitQueue(Fn&& commit) {
     auto& state = Shared();
     std::lock_guard lock(state.lock);
+    for (id<MTLResidencySet> set : state.deferred) [set commit];
+    state.deferredCommits += state.deferred.size();
+    state.deferred.clear();
     commit();
     ++state.queueCommits;
     Detail::DrainLocked(state);

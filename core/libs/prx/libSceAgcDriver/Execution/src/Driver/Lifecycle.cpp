@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <atomic>
 #include <cstdint>
@@ -82,6 +83,10 @@ Driver& Driver::Get() {
 
 Driver::~Driver() {
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
+#ifdef __APPLE__
+    // D67: no completion may notify this driver's condition variable once it is destroyed.
+    Graphics::Recorder::SetCompletionListener(nullptr);
+#endif
     stop();
 }
 

@@ -230,6 +230,11 @@ id<MTL4CommandQueue> SharedQueue(id<MTLDevice> device) {
     return queue;
 }
 
+bool CommitEachWrapper() {
+    static const bool each = std::getenv("APS5_RESIDENCY_COMMIT_EACH") != nullptr;
+    return each;
+}
+
 std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
     return shader.msl.Reflection().workgroupMemoryStrideDwords;
 }
@@ -268,7 +273,10 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
     id<MTLBuffer> buffer = Metal::NewNoCopyBuffer(device, pageBegin, pageEnd - pageBegin, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (buffer == nil) return 0;
     ::AgcDriver::Metal::Residency::Add(residency, buffer);
-    ::AgcDriver::Metal::Residency::Commit(residency);
+    // Only recorded work uses the wrapper: the next queue commit commits the set first (D67;
+    // APS5_RESIDENCY_COMMIT_EACH=1 commits at once, as before).
+    if (CommitEachWrapper()) ::AgcDriver::Metal::Residency::Commit(residency);
+    else ::AgcDriver::Metal::Residency::CommitBeforeQueue(residency);
     wrappers.push_back({pageBegin, pageEnd, buffer});
     return buffer.gpuAddress + (address - pageBegin);
 }
@@ -331,7 +339,8 @@ void VulkanDevice::State::KeepWrapped(std::uint64_t address, std::uint64_t bytes
 void VulkanDevice::State::DropWrappersIfIdle() {
     if (recorder == nullptr || !recorder->Idle() || wrappers.empty()) return;
     for (const auto& wrapper : wrappers) ::AgcDriver::Metal::Residency::Remove(residency, wrapper.buffer);
-    ::AgcDriver::Metal::Residency::Commit(residency);
+    if (CommitEachWrapper()) ::AgcDriver::Metal::Residency::Commit(residency);
+    else ::AgcDriver::Metal::Residency::CommitBeforeQueue(residency);
     wrappers.clear();
     ++wrapperEpoch;
     // The cached BDA table points into the dropped wrappers and its lease pins the registry.

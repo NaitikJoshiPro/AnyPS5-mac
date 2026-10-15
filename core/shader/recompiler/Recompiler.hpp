@@ -526,6 +526,11 @@ public:
         return *shader;
     }
     [[nodiscard]] const std::string& Source() const { return Shader().source; }
+    // The shared shader itself (throws when empty, as Shader()).
+    [[nodiscard]] std::shared_ptr<const MslShader> Pointer() const {
+        static_cast<void>(Shader());
+        return shader;
+    }
     [[nodiscard]] const MslAbi::Reflection& Reflection() const { return Shader().reflection; }
     friend bool operator==(const SharedMsl& left, const SharedMsl& right) { return left.shader == right.shader || (left.shader != nullptr && right.shader != nullptr && *left.shader == *right.shader); }
 

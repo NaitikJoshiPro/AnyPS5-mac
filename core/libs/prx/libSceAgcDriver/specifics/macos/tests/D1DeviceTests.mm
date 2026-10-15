@@ -21,6 +21,7 @@
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -393,6 +394,41 @@ void CommitEmpty(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4Comman
     Require([event waitUntilSignaledValue:value timeoutMS:5000], "residency: an empty command buffer did not complete in 5 s");
 }
 
+// D67: a finished batch calls the recorder's completion listener (the driver's wake), and
+// CompletionWakeNotify wakes a PollSleep-style waiter at once.
+std::atomic<std::uint32_t> completionCalls{0};
+
+void CheckCompletionWake(AgcDriver::VulkanDevice& device) {
+    AgcDriver::Graphics::Recorder::SetCompletionListener(+[] { completionCalls.fetch_add(1, std::memory_order_relaxed); });
+    GuestBlock block(16384, true);
+    const std::array<std::uint32_t, 4> pattern {0x01020304u, 0xa0b0c0d0u, 0x55aa55aau, 0x00ff00ffu};
+    Require(device.FillBuffer(block.Address(), 4096, pattern), "completion wake: the fill was refused");
+    device.WaitIdle();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (completionCalls.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    AgcDriver::Graphics::Recorder::SetCompletionListener(nullptr);
+    Require(completionCalls.load() != 0, "completion wake: a finished batch did not call the completion listener");
+    Require(block.Words()[0] == pattern[0] && block.Words()[3] == pattern[3], "completion wake: the fill did not land");
+    auto& wake = AgcDriver::DriverDetail::CompletionWakeState();
+    std::uint64_t seen = 0;
+    {
+        std::lock_guard lock(wake.mutex);
+        seen = wake.epoch;
+    }
+    std::atomic<bool> woke{false};
+    std::thread waiter([&] {
+        std::unique_lock lock(wake.mutex);
+        woke = wake.changed.wait_for(lock, std::chrono::seconds(5), [&] { return wake.epoch != seen; });
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto notified = std::chrono::steady_clock::now();
+    AgcDriver::DriverDetail::CompletionWakeNotify();
+    waiter.join();
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - notified).count();
+    Require(woke.load() && ms < 1000.0, "completion wake: the waiter was not woken by CompletionWakeNotify");
+    std::printf("completion wake: %u listener calls; a waiter woke %.2f ms after the notify\n", completionCalls.load(), ms);
+}
+
 void CheckResidency(AgcDriver::VulkanDevice& device) {
     namespace Metal = AgcDriver::Graphics::Metal;
     namespace Residency = AgcDriver::Metal::Residency;
@@ -439,6 +475,22 @@ void CheckResidency(AgcDriver::VulkanDevice& device) {
     Require(first != nil && second != nil, "residency: RemoveAll released its allocations before the next queue commit");
     Residency::Drain();
     Require(first == nil && second == nil, "residency: Drain did not release the removed allocations");
+    // D67: CommitBeforeQueue defers a set's commit to the next queue commit (coalesced per set).
+    {
+        const auto before = Residency::Snapshot();
+        id<MTLBuffer> deferredBuffer = [metal newBufferWithLength:16384 options:MTLResourceStorageModeShared];
+        Residency::Add(set, deferredBuffer);
+        Residency::CommitBeforeQueue(set);
+        Residency::CommitBeforeQueue(set);
+        Require(Residency::Snapshot().deferred == 1, "residency: a deferred set commit was not queued once");
+        CommitEmpty(metal, queue, allocator, event, ++value);
+        const auto after = Residency::Snapshot();
+        Require(after.deferred == 0 && after.deferredCommits == before.deferredCommits + 1, "residency: the queue commit did not commit the deferred set");
+        Require([set containsAllocation:deferredBuffer], "residency: the deferred allocation is not in its set");
+        Residency::Remove(set, deferredBuffer);
+        Residency::CommitBeforeQueue(set);
+        CommitEmpty(metal, queue, allocator, event, ++value);
+    }
     // The race itself: one thread adds, removes and releases buffers in an attached set while this
     // one commits. Without the lock the debug layer traps within seconds (scratch probe, D44).
     std::atomic<bool> stop{false};
@@ -960,6 +1012,8 @@ int main(int argc, char** argv) {
             CheckOverlappingBuffers(*device);
         } else if (mode == "imports") {
             CheckImports(*device);
+        } else if (mode == "completion_wake") {
+            CheckCompletionWake(*device);
         } else if (mode == "residency") {
             CheckResidency(*device);
         } else if (mode == "import_window") {

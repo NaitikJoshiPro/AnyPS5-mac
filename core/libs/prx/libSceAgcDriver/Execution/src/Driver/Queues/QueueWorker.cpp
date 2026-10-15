@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
@@ -80,6 +81,19 @@ void Driver::run(std::uint32_t id) noexcept {
 
     GuestMemory::TagGpuLockThread(id);
     if (id == 0) StartWorkerSampler();
+#ifdef __APPLE__
+    // D67: a finished GPU batch wakes idle workers (reap) and memory waits at once.
+    // APS5_NO_COMPLETION_WAKE=1 leaves them to their 1 ms / 200 us polls.
+    static const bool completionWake = [] {
+        if (std::getenv("APS5_NO_COMPLETION_WAKE") != nullptr) return false;
+        Graphics::Recorder::SetCompletionListener(+[] {
+            CompletionWakeNotify();
+            Get().changed.notify_all();
+        });
+        return true;
+    }();
+    static_cast<void>(completionWake);
+#endif
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);

@@ -2,6 +2,9 @@
 #include "MetalPipelineCache.h"
 #include "ShaderCacheDirectory.hpp"
 
+#include <mutex>
+#include <string_view>
+#include <unordered_map>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -114,11 +117,43 @@ void AppendColor(std::string& key, const ColorAttachmentState& color) {
     key += ';';
 }
 
+// The source's part of a pipeline key (D67): its size and two independent 64-bit hashes, memoized per
+// shared shader (results share one immutable MslShader), instead of the whole source, which made
+// every lookup copy and compare megabytes (ASTRO's wave64 compute sources) on the queue worker.
+std::string SourceDigest(const std::shared_ptr<const ShaderRecompiler::MslShader>& shader) {
+    struct Memo {
+        std::weak_ptr<const ShaderRecompiler::MslShader> owner;
+        std::string digest;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<const ShaderRecompiler::MslShader*, Memo> memos;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = memos.find(shader.get()); found != memos.end() && found->second.owner.lock() == shader) return found->second.digest;
+    }
+    const auto& source = shader->source;
+    std::uint64_t fnv = 0xcbf29ce484222325ull;
+    for (const char value : source) fnv = (fnv ^ static_cast<std::uint8_t>(value)) * 0x100000001b3ull;
+    const auto other = static_cast<std::uint64_t>(std::hash<std::string_view>{}(source));
+    char text[64];
+    std::snprintf(text, sizeof(text), "%zu:%016llx%016llx", source.size(), static_cast<unsigned long long>(fnv), static_cast<unsigned long long>(other));
+    std::lock_guard lock(mutex);
+    if (memos.size() >= 8192) std::erase_if(memos, [](const auto& item) { return item.second.owner.expired(); });
+    memos[shader.get()] = Memo{shader, text};
+    return text;
+}
+
 void AppendFunction(std::string& key, const PipelineFunction& function) {
     if (function.shader == nullptr) throw std::runtime_error("Metal pipeline cache (work package D5): a pipeline function has no MSL shader");
-    key += std::to_string(function.shader->source.size());
-    key += ':';
-    key += function.shader->source;
+    // APS5_PIPELINE_KEY_SOURCE=1: the whole source, as before D67 (measurements).
+    static const bool wholeSource = std::getenv("APS5_PIPELINE_KEY_SOURCE") != nullptr;
+    if (wholeSource) {
+        key += std::to_string(function.shader->source.size());
+        key += ':';
+        key += function.shader->source;
+    } else {
+        key += SourceDigest(function.shader);
+    }
     for (const auto& [name, value] : function.macros) key += "|#" + name + "=" + value;
     for (const auto& [id, value] : function.constants) key += "|" + std::to_string(id) + "=" + std::to_string(value);
     key += '\n';
@@ -166,7 +201,8 @@ struct PipelineCache::Entry {
 
 PipelineFunction PipelineFunction::From(const ShaderRecompiler::RecompileResult& result) {
     PipelineFunction function;
-    function.shader = std::make_shared<const ShaderRecompiler::MslShader>(result.msl.Shader());
+    // Shared, not copied (D67): the result's shader is immutable.
+    function.shader = result.msl.Pointer();
     function.constants.reserve(result.specialization.size());
     for (const auto& constant : result.specialization) function.constants.emplace_back(constant.id, constant.value);
     return function;

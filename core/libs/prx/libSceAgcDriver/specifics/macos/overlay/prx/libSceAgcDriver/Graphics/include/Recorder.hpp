@@ -408,6 +408,10 @@ public:
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
+    // Called on a Metal thread each time the GPU finishes a submitted batch (the timeline event's
+    // listener, D67): the driver wakes its idle workers and memory waits to reap it at once instead
+    // of at their next poll. One process-wide listener; nullptr removes it.
+    static void SetCompletionListener(void (*listener)());
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
