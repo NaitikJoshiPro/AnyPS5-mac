@@ -476,6 +476,7 @@ guest_video_out_output_mode G5
 guest_video_out_resolution_status G5
 guest_video_out_resolution_status_1440p G5
 guest_video_out_resolution_status_2160p G5
+guest_video_out_resolution_status_hdr G5
 guest_video_out_wqhd_detection G5
 pad_input_mapping G5
 pad_sdl G5
