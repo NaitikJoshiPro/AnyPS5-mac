@@ -177,5 +177,7 @@ std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread);
 bool LiveGuestThreadExists(std::int64_t tid);
 bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& mask);
 bool SetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask mask);
+// scePthreadYield, sched_yield, pthread_yield: a yield that backs off to short sleeps in long streaks (D73).
+void GuestYield();
 
 #endif

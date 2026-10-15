@@ -1,5 +1,6 @@
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "../include/Pthread.hpp"
+#include "../include/YieldBackoff.hpp"
 #include "../include/ThreadLifecycle.hpp"
 #include "../include/WindowsThreadLocal.hpp"
 #include "../include/Cancel.hpp"
@@ -23,6 +24,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <chrono>
 #include <thread>
 #include <system_error>
 
@@ -1114,8 +1116,27 @@ Pthread APS5_VABI scePthreadSelf() {
     return CurrentGuestState().current;
 }
 
-void APS5_VABI scePthreadYield() {
+} // extern "C"
+
+void GuestYield() {
+    // D73: a guest that yields in a loop backs off to short sleeps instead of spinning a host core.
+    thread_local YieldBackoff backoff;
+    const auto now = [] {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    if (const auto sleep = backoff.Next(now()); sleep != 0) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(sleep));
+        backoff.Woke(now());
+        return;
+    }
     std::this_thread::yield();
+}
+
+extern "C" {
+
+void APS5_VABI scePthreadYield() {
+    GuestYield();
 }
 
 int APS5_VABI scePthreadCancel(Pthread thread) {
