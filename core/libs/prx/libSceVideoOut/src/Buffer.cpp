@@ -133,6 +133,9 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
     }
     AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     auto group = cfg->groups[setIndex];
+    if (VideoOutTraceEnabled_nid_no_patch() && (group.attribute.width != attribute->width || group.attribute.height != attribute->height || group.attribute.pixel_format != attribute->pixel_format)) {
+        std::fprintf(stderr, "[videoout] SubmitChangeBufferAttribute2(handle %d, set %d): %ux%u -> %ux%u pixel format 0x%llx\n", handle, setIndex, group.attribute.width, group.attribute.height, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format));
+    }
     group.attribute = *attribute;
     for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; ++i) {
         if (cfg->buffers[i].groupIndex != setIndex) continue;
