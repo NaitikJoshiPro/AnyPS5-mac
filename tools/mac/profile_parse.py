@@ -175,9 +175,9 @@ def classify_stack(path):
     blocking = leaf_symbol in WAIT_LEAVES or (
         leaf_module == "libsystem_kernel.dylib" and leaf_symbol.endswith("_trap") and
         re.search(r"(CFRunLoop|mach_msg_receive|dispatch_mach|_dispatch_sema|semaphore_wait|waitUntil|"
-                  r"WaitEvent|clock_get_time|nanosleep)", joined))
+                  r"::WaitEvent\(|clock_get_time|nanosleep)", joined))
     if blocking:
-        if re.search(r"(waitUntilSignaledValue|WaitEvent)", joined):
+        if re.search(r"(waitUntilSignaledValue|::WaitEvent\()", joined):
             return "wait: GPU", short_symbol(_first_owner(path)[0])
         if SLEEP_CALLERS.search(joined):
             return "wait: guest sleep", short_symbol(_first_owner(path)[0])
