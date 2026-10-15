@@ -1925,6 +1925,7 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
+std::atomic<std::uint64_t> timingInvalid{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
@@ -2455,7 +2456,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     for (std::size_t i = 0; i < stamps.size(); ++i) stamps[i] = static_cast<const MTL4TimestampHeapEntry*>(resolved.bytes)[i].timestamp;
     const auto period = metal->nanosecondsPerTick;
     if (!GpuTimingEnabled()) {
-        if (batch.batchTiming == 0 && stamps[1] >= stamps[0]) {
+        if (batch.batchTiming == 0 && Metal::TimestampPairValid(stamps[0], stamps[1])) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs);
@@ -2469,6 +2470,12 @@ void Recorder::readGpuTiming(Batch& batch) {
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+        // A stamp the GPU never wrote (MTLCounterErrorValue) or a pair out of order is left out and
+        // counted, instead of an unsigned difference of ~1.8e19 ticks.
+        if (!Metal::TimestampPairValid(stamps[i * 2], stamps[i * 2 + 1])) {
+            timingInvalid.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         const auto ns = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period;
         if (i == batch.batchTiming) {
             // The whole batch: apart from the per-program totals it contains.
@@ -2514,7 +2521,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap, %llu with an unwritten or reversed stamp); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges, static_cast<unsigned long long>(timingInvalid.exchange(0, std::memory_order_relaxed)));
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();

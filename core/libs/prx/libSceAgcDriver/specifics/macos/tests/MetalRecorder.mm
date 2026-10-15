@@ -504,6 +504,16 @@ void Timing(const Context& context) {
     if (!completed.empty()) Expect(completed.front().gpuStartNs > 0 && completed.front().gpuEndNs >= completed.front().gpuStartNs, "the batch stamps are " + std::to_string(completed.front().gpuStartNs) + " .. " + std::to_string(completed.front().gpuEndNs));
 }
 
+// A timestamp the GPU never wrote resolves to MTLCounterErrorValue (all ones); such a pair, a zero
+// stamp or a pair out of order measures nothing (before, the [gputime] line summed their unsigned
+// differences, ~1.8e19 ticks each).
+void TimestampPairs() {
+    constexpr std::uint64_t unwritten = ~std::uint64_t{0};
+    Expect(Metal::TimestampPairValid(100u, 100u) && Metal::TimestampPairValid(100u, 250u), "an ordered pair of written stamps is refused");
+    Expect(!Metal::TimestampPairValid(100u, unwritten) && !Metal::TimestampPairValid(unwritten, 100u) && !Metal::TimestampPairValid(unwritten, unwritten), "an unwritten stamp is accepted");
+    Expect(!Metal::TimestampPairValid(250u, 100u) && !Metal::TimestampPairValid(0u, 100u), "a reversed pair or a zero stamp is accepted");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -511,6 +521,7 @@ int main(int argc, char** argv) {
         MetalTest::Device device;
         const bool timing = argc == 2 && std::string_view(argv[1]) == "--timing";
         try {
+            TimestampPairs();
             if (timing) {
                 Timing(device.context);
             } else {
