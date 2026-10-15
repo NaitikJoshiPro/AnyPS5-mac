@@ -11,7 +11,16 @@
 // descriptorLayoutFlagTests; --descriptor-pool-reset-failure (agc_descriptor_pool_reset_failure) skips: Metal
 // descriptor pools are tokens whose reset cannot fail (TechnicalDebt metal-vulkan-internal-tests);
 // --sparse-buffer-holes (agc_sparse_buffer_holes) runs upstream's RunSparseBufferHoleTests over the Metal device's
-// Context, reading the copied bytes through the MTLBuffer the descriptor names.
+// Context, reading the copied bytes through the MTLBuffer the descriptor names; --address-space-teardown
+// (agc_driver_address_space_teardown) runs the Metal twin of addressSpaceTeardownTests; --alpha-to-coverage-state
+// (agc_driver_alpha_to_coverage_state), --undithered-alpha-to-coverage-state
+// (agc_driver_undithered_alpha_to_coverage_state) and --resource-content-key / --benchmark-resource-content-key run
+// upstream's checks as they are (register decoding and ShaderResources::ContentKey only); --buffer-budget-placement
+// skips as Vulkan-only (memory-type and heap choice of a buffer); --image-table-allocation, --image-table-snapshot
+// and --sampler-table-{lod-bias,anisotropy,reduction-compare} skip: they check Vulkan descriptor-set allocation and
+// vkCreateSampler on MockVulkan, while Metal's image and sampler tables are MslAbi v15 arrays of MTLResourceIDs
+// (exercised by the upstream ImageTable* execution tests). Of upstream's 104 checks (the 102 of Checks() plus RunBdaResourceTests
+// and RunTextureDetilerTests), 90 run on Metal, 4 of them through Metal twins; 14 are listed in VulkanOnly.
 
 #define main AgcDriverGraphicsVulkanMain
 #include "../../../tests/Graphics.cpp"
@@ -29,6 +38,8 @@
 #include <unistd.h>
 #include <functional>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -70,11 +81,28 @@ void DrawValidationChecks() {
     AgcDriver::Graphics::ValidateDepthBounds(unrestricted, bounded);
 }
 
+// Upstream main's pipeline cache lock check (it is inline in main, not a function): backend-neutral, as it is.
+void PipelineCacheSynchronizationChecks() {
+    AgcDriver::Graphics::PipelineCacheSynchronization synchronization;
+    auto pipelineUse = synchronization.LockForPipelineUse();
+    bool snapshotAcquired = false;
+    std::thread snapshot([&] { snapshotAcquired = synchronization.TryLockForSnapshot().owns_lock(); });
+    snapshot.join();
+    Require(!snapshotAcquired, "pipeline cache snapshot overlapped pipeline creation");
+    pipelineUse.unlock();
+    Require(synchronization.TryLockForSnapshot().owns_lock(), "pipeline cache snapshot stayed blocked after pipeline creation finished");
+}
+
+// Upstream main's order; RunBdaResourceTests and RunTextureDetilerTests take MockVulkan callbacks in main and
+// are listed in VulkanOnly only.
 std::vector<Check> Checks() {
     return {
+        {"pipelineCacheSynchronization", PipelineCacheSynchronizationChecks},
         {"drawValidation", DrawValidationChecks},
         {"RunGuestLeaseWaitTests", RunGuestLeaseWaitTests},
+        {"ResourceContentKeyTests", [] { ResourceContentKeyTests(false); }},
         {"stateTests", stateTests},
+        {"retainedPixelStageTests", retainedPixelStageTests},
         {"pipelineLibrarySetTests", pipelineLibrarySetTests},
         {"hdrComponentSwapTests", hdrComponentSwapTests},
         {"depthMaintenanceTests", depthMaintenanceTests},
@@ -100,6 +128,7 @@ std::vector<Check> Checks() {
         {"DisabledColorTests", DisabledColorTests},
         {"OpaqueDestinationAlphaTests", OpaqueDestinationAlphaTests},
         {"Color1555TargetTests", Color1555TargetTests},
+        {"BlendBypassTests", BlendBypassTests},
         {"CompactedExportTests", CompactedExportTests},
         {"ReversedComponentOrderTests", ReversedComponentOrderTests},
         {"ShadersWriteMemoryTests", ShadersWriteMemoryTests},
@@ -112,8 +141,11 @@ std::vector<Check> Checks() {
         {"MsaaEnableSingleSampleTests", MsaaEnableSingleSampleTests},
         {"clipDistanceTests", clipDistanceTests},
         {"framebufferLayerTests", framebufferLayerTests},
+        {"UnwrittenSampleLocationTests", UnwrittenSampleLocationTests},
+        {"quadPixelMaskTests", quadPixelMaskTests},
         {"ShaderStageTests", ShaderStageTests},
         {"NggVertexWorkgroupTests", NggVertexWorkgroupTests},
+        {"inactiveVertexPointSizeTests", inactiveVertexPointSizeTests},
         {"TuningFieldTests", TuningFieldTests},
         {"PixelInputLayoutTests", PixelInputLayoutTests},
         {"UnexportedPixelInputTests", UnexportedPixelInputTests},
@@ -129,10 +161,16 @@ std::vector<Check> Checks() {
         {"resourceTests", resourceTests},
         {"descriptorSnapshotTests", descriptorSnapshotTests},
         {"descriptorCacheTests", descriptorCacheTests},
+        {"bufferBudgetPlacementTests", bufferBudgetPlacementTests},
+        {"imageTableAllocationTests", imageTableAllocationTests},
+        {"imageTableSnapshotAllocationTests", imageTableSnapshotAllocationTests},
+        {"samplerTableNonSeamlessCubeTests", samplerTableNonSeamlessCubeTests},
+        {"samplerTableDeviceLimitTests", [] { samplerTableDeviceLimitTests(); }},
         {"misalignedShaderDataTests", misalignedShaderDataTests},
         {"debugBranchTests", debugBranchTests},
         {"textureCacheBudgetTests", textureCacheBudgetTests},
         {"sampledTextureBudgetTests", sampledTextureBudgetTests},
+        {"storageTextureBudgetTests", storageTextureBudgetTests},
         {"sampledBudgetReportTests", sampledBudgetReportTests},
         {"meshArgumentTests", meshArgumentTests},
         {"meshIndexBufferTests", meshIndexBufferTests},
@@ -141,6 +179,7 @@ std::vector<Check> Checks() {
         {"vertexCopyTests", vertexCopyTests},
         {"highestDrawIndexTests", highestDrawIndexTests},
         {"storeAtFlipTests", storeAtFlipTests},
+        {"storeAtLabelTests", storeAtLabelTests},
         {"nullVertexDescriptorTests", nullVertexDescriptorTests},
         {"vertexZeroFillTests", vertexZeroFillTests},
         {"vertexZeroFillMergeTests", vertexZeroFillMergeTests},
@@ -150,6 +189,7 @@ std::vector<Check> Checks() {
         {"floatControlsModeTests", floatControlsModeTests},
         {"barycentricEmulationTests", barycentricEmulationTests},
         {"copiedWriterIndirectOverlapTests", copiedWriterIndirectOverlapTests},
+        {"registeredReadableCoverTests", registeredReadableCoverTests},
         {"RunGuestAllocationTests", RunGuestAllocationTests},
         {"RunUnmappedGapTests", RunUnmappedGapTests},
         {"RunColorTargetLayoutTests", RunColorTargetLayoutTests},
@@ -233,6 +273,40 @@ void MetalDescriptorCacheTests() {
     expectFailure([&] { cache.Allocate(large, storageImages); }, "descriptor set exceeds the device's per-set descriptor limit");
     const std::array<VkDescriptorPoolSize, 1> uniformBuffers{{{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}}};
     expectFailure([&] { cache.Allocate(large, uniformBuffers); }, "descriptor set uses an unsupported descriptor type 6");
+    // Upstream's update-after-bind sets with a variable image table (2026-10): the same allocations and per-set
+    // limits; the layout and pool create flags and the variable count are Vulkan create-info fields MockVulkan
+    // records, which Metal's token layouts and pools do not keep, so the twin checks the cache's handles,
+    // counters and SetAllocation::updateAfterBind instead.
+    context.limits.maxDescriptorSetStorageBuffers = 16;
+    context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers = 8192;
+    context.descriptorIndexingLimits.maxPerStageUpdateAfterBindResources = 16384;
+    context.limits.maxPerStageDescriptorSampledImages = 2048;
+    {
+        AgcDriver::Graphics::DescriptorCache combined(context);
+        const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}, {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}}};
+        constexpr auto tableFlags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+        const std::array<VkDescriptorBindingFlags, 2> flags{VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, tableFlags};
+        const std::array<std::uint32_t, 9> key{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097, VK_SHADER_STAGE_FRAGMENT_BIT, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32, VK_SHADER_STAGE_FRAGMENT_BIT, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT};
+        const auto combinedLayout = combined.Layout(key, bindings, true, flags);
+        Require(combinedLayout != VK_NULL_HANDLE && combined.Layout(key, bindings, true, flags) == combinedLayout && combined.Counters().layoutHits == 1, "the combined descriptor layout was not reused");
+        const std::array<VkDescriptorPoolSize, 2> oversizedTable{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
+        const auto dedicatedTable = combined.Allocate(combinedLayout, oversizedTable, true, 3u);
+        Require(dedicatedTable.set != VK_NULL_HANDLE && combined.Counters().dedicatedPools == 1 && combined.Counters().sets == 1, "an oversized update-after-bind set with a variable image table did not get a dedicated pool");
+        combined.Free(dedicatedTable);
+        auto fittingBindings = bindings;
+        fittingBindings[0].descriptorCount = 17;
+        auto fittingKey = key;
+        fittingKey[2] = 17;
+        const auto fittingLayout = combined.Layout(fittingKey, fittingBindings, true, flags);
+        const std::array<VkDescriptorPoolSize, 2> fitting{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
+        const auto chainedTable = combined.Allocate(fittingLayout, fitting, true, 3u);
+        Require(chainedTable.set != VK_NULL_HANDLE && chainedTable.updateAfterBind && chainedTable.pool != dedicatedTable.pool && combined.Counters().dedicatedPools == 1, "a fitting update-after-bind set with a variable image table left the update-after-bind chain");
+        combined.Free(chainedTable);
+        const auto reused = combined.Allocate(fittingLayout, fitting, true, 0u);
+        Require(reused.set != VK_NULL_HANDLE && reused.pool == chainedTable.pool && reused.updateAfterBind, "reusing an update-after-bind pool lost an empty variable image table");
+        combined.Free(reused);
+        expectFailure([&] { combined.Allocate(fittingLayout, fitting, false, 3u); }, "descriptor set exceeds the device's per-set descriptor limit");
+    }
 }
 
 // descriptorLayoutFlagTests on Metal: the layout cache is keyed by the binding flags, and ShaderResources exports
@@ -396,6 +470,56 @@ int MetalSparseBufferHoles() {
     return passed ? 0 : 1;
 }
 
+// agc_driver_address_space_teardown on Metal (upstream abc997b0d, ported to GuestBufferMemory.mm's
+// ClearImageMirrors): upstream's addressSpaceTeardownTests over the Metal device's Context instead of a mock one
+// with a made-up VkDevice. context.device is the Metal device's handle, the one MetalDevice.mm's teardown passes to
+// ClearImageMirrors. Deviations: the build runs under GuestMemory::GpuMutex as the Metal driver's builds do
+// (released before the guest block is freed, so the free sees the same state as upstream's), and the host imports
+// are cleared at the end so no no-copy buffer outlives the device; upstream's MockVulkan leak check has no
+// counterpart.
+void MetalAddressSpaceTeardownTests() {
+    setenv("APS5_NO_LEASE_MIRROR", "1", 1);
+    @autoreleasepool {
+        MetalGraphicsDevice device;
+        const auto& context = device.Attach([](AgcDriver::Graphics::Context& context) {
+            context.bufferDeviceAddress = true;
+            context.limits.maxStorageBufferRange = 1u << 27;
+        });
+        void* block = GuestHeap::GuestHeapAlignForGpu_nid_postfix(16, 64);
+        const auto before = AgcDriver::Graphics::LeaseCounters().cacheDrops;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            {
+                AgcDriver::Graphics::GuestBufferMemory memory(context);
+                memory.AcquireRegistered();
+                Require(memory.HoldsLease(), "address-based build holds no lease before device teardown");
+                memory.Upload(true);
+                memory.WriteBack();
+                Require(!memory.HoldsLease(), "completed address-based build kept its own lease");
+            }
+            AgcDriver::Graphics::ClearImageMirrors(context.device);
+        }
+        GuestHeap::GuestHeapFree_nid_postfix(block);
+        Require(AgcDriver::Graphics::LeaseCounters().cacheDrops == before, "device teardown left the cached address space pinning guest allocations");
+        AgcDriver::Graphics::ClearHostImports(context.device);
+    }
+}
+
+// Upstream modes this twin does not run, with the skip line ctest shows (exit 77).
+struct SkippedMode {
+    const char* flag;
+    const char* line;
+};
+
+const std::vector<SkippedMode> SkippedModes{
+    {"--buffer-budget-placement", "skipped, bufferBudgetPlacementTests is Vulkan-only: it checks which VkMemoryType and heap a host-coherent Buffer allocates from under VK_EXT_memory_budget; a Metal Buffer is one shared MTLBuffer in unified memory, with no memory types or heaps to choose between"},
+    {"--image-table-allocation", "skipped, the Metal twin of --image-table-allocation (imageTableAllocationTests) is not written: it checks the variable-count Vulkan descriptor set, while Metal's image tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
+    {"--image-table-snapshot", "skipped, the Metal twin of --image-table-snapshot (imageTableSnapshotAllocationTests) is not written: it checks the variable-count Vulkan descriptor set, while Metal's image tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
+    {"--sampler-table-lod-bias", "skipped, the Metal twin of --sampler-table-lod-bias (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
+    {"--sampler-table-anisotropy", "skipped, the Metal twin of --sampler-table-anisotropy (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
+    {"--sampler-table-reduction-compare", "skipped, the Metal twin of --sampler-table-reduction-compare (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
+};
+
 // earlyFragmentTestsTests on Metal (upstream fdefd7660): the MSL fragment function carries
 // [[early_fragment_tests]] (reflection earlyFragmentTests) for the same DB_SHADER_CONTROL values that
 // declare EarlyFragmentTests in SPIR-V, except that Metal refuses the attribute on a function returning
@@ -436,6 +560,14 @@ void MetalEarlyFragmentTestsTests() {
         request.context.pixel->alphaToCoverage = true;
         const auto replayed = serializer.Deserialize(serializer.Serialize(request));
         Require(!MetalDeclaresEarlyFragmentTests(request) && !MetalDeclaresEarlyFragmentTests(replayed.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with alpha-to-coverage declared early fragment tests");
+        // Upstream 72518f64f: a quad-masked pixel function discards uncovered pixels, so it tests late.
+        request = depthExportRequest(shaderControl);
+        request.context.pixel->quadPixelMask = 0x1u;
+        const auto masked = serializer.Deserialize(serializer.Serialize(request));
+        Require(!MetalDeclaresEarlyFragmentTests(request) && !MetalDeclaresEarlyFragmentTests(masked.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with a quad pixel mask declared early fragment tests");
+        // Upstream reads the driver's view (DeclaresEarlyFragmentTests over the SPIR-V); the Metal driver reads the
+        // MSL reflection, which MetalDeclaresEarlyFragmentTests checks against the stage function.
+        Require(MetalDeclaresEarlyFragmentTests(depthExportRequest(shaderControl)), "the driver did not read early fragment tests from a recompiled pixel shader");
     }
 }
 
@@ -448,9 +580,9 @@ struct Twin {
 // Upstream checks of MockVulkan objects whose Metal behaviour is checked by a twin instead.
 const std::vector<Twin> MetalTwins{
     {"descriptorPoolTests", "pools never exhaust, one chain pool is recycled", MetalDescriptorPoolTests},
-    {"descriptorCacheTests", "dedicated pools for oversized sets, per-set limits", MetalDescriptorCacheTests},
+    {"descriptorCacheTests", "dedicated pools for oversized sets, per-set limits, update-after-bind sets with a variable image table", MetalDescriptorCacheTests},
     {"copiedWriterIndirectOverlapTests", "copied vs direct written ranges over a Metal host import", MetalCopiedWriterIndirectOverlapTests},
-    {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export", MetalEarlyFragmentTestsTests},
+    {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export or a quad pixel mask", MetalEarlyFragmentTestsTests},
 };
 
 const Twin* TwinOf(const std::string& name) {
@@ -472,6 +604,11 @@ const std::vector<std::pair<std::string, std::string>> VulkanOnly{
     {"RunTextureDetilerTests", "detile dispatch descriptors on MockVulkan: D4 (TextureDetiler twin)"},
     {"pipelineLibrarySetTests", "graphics pipeline library layouts through MockVulkan: Metal has no pipeline libraries (TechnicalDebt metal-graphics-pipeline-libraries)"},
     {"RunGuestSamplerResourceTests", "checks the VkSamplerCreateInfo chain through a captured vkCreateSampler (Context.deviceProc); Sampler.mm builds MTLSamplerDescriptors instead, checked by agc_metal_sampler_reduction and agc_metal_images: D5"},
+    {"bufferBudgetPlacementTests", "Vulkan-only: the VkMemoryType and heap a host-coherent Buffer allocates from under VK_EXT_memory_budget; a Metal Buffer is one shared MTLBuffer in unified memory"},
+    {"imageTableAllocationTests", "the bounded variable-count image table set on MockVulkan; Vulkan descriptor sets only (Metal tables: MslAbi v15 arrays)"},
+    {"imageTableSnapshotAllocationTests", "an empty image table in a draw snapshot on MockVulkan; Vulkan descriptor sets only (Metal tables: MslAbi v15 arrays)"},
+    {"samplerTableNonSeamlessCubeTests", "sampler table entries and their vkCreateSampler flags on MockVulkan; Vulkan samplers only (Metal tables: MslAbi v15 arrays)"},
+    {"samplerTableDeviceLimitTests", "sampler table entries refused by device limits on MockVulkan; Vulkan samplers only (Metal tables: MslAbi v15 arrays)"},
 };
 
 bool Listed(const std::string& name) {
@@ -511,21 +648,26 @@ int Probe() {
     return 0;
 }
 
+// One upstream mode: its checks, then the line upstream prints when they pass (none for the silent modes).
+int RunMode(const Check& check, const char* passed) {
+    const auto error = Run(check);
+    if (!error.empty()) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+    if (passed != nullptr) std::cout << passed << '\n';
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
-        const auto error = Run({"descriptorLayoutFlagTests", MetalDescriptorLayoutFlagTests});
-        if (!error.empty()) {
-            std::cerr << error << '\n';
-            return 1;
-        }
-        std::cout << "Descriptor layout cache and exported binding flags passed on Metal\n";
-        return 0;
-    }
-    if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
-        setenv("APS5_PIN_WAIT_MS", "200", 1);
-        setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
+    // As upstream's main, for every mode.
+    setenv("APS5_PIN_WAIT_MS", "200", 1);
+    setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
+    const std::string_view mode = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
+    if (mode == "--descriptor-layout-flags") return RunMode({"descriptorLayoutFlagTests", MetalDescriptorLayoutFlagTests}, "Descriptor layout cache and exported binding flags passed on Metal");
+    if (mode == "--sparse-buffer-holes") {
         try {
             return MetalSparseBufferHoles();
         } catch (const std::exception& error) {
@@ -533,25 +675,35 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
+    if (mode == "--address-space-teardown") return RunMode({"addressSpaceTeardownTests", MetalAddressSpaceTeardownTests}, "address-space device teardown releases cached guest allocations (Metal device)");
+    if (mode == "--undithered-alpha-to-coverage-state") return RunMode({"UnditheredAlphaToCoverageTests", UnditheredAlphaToCoverageTests}, "Existing undithered alpha-to-coverage states passed");
+    if (mode == "--resource-content-key" || mode == "--benchmark-resource-content-key") {
+        const bool benchmark = mode == "--benchmark-resource-content-key";
+        return RunMode({"ResourceContentKeyTests", [benchmark] { ResourceContentKeyTests(benchmark); }}, nullptr);
+    }
+    if (mode == "--alpha-to-coverage-state") {
+        return RunMode({"alphaToCoverageState", [] {
+            MsaaEnableSingleSampleTests();
+            AlphaToCoverageTests();
+        }}, "Alpha-to-coverage state and refusal tests passed");
+    }
+    for (const auto& skipped : SkippedModes) {
+        if (mode == skipped.flag) {
+            std::cout << skipped.line << '\n';
+            return 77;
+        }
+    }
+    if (mode == "--descriptor-pool-reset-failure") {
         std::cout << "skipped, the device has no Vulkan descriptor pools: Metal descriptor pools are tokens whose reset cannot fail, so the termination on a failed reset is unreachable\n";
         return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--covered-centroid-state") {
-        // agc_driver_covered_centroid_state (upstream fdefd7660): register decoding only, as upstream.
-        const auto error = Run({"multisampleTests", multisampleTests});
-        if (!error.empty()) {
-            std::cerr << error << '\n';
-            return 1;
-        }
-        std::cout << "Covered-centroid and multisample state checks passed\n";
-        return 0;
-    }
-    setenv("APS5_PIN_WAIT_MS", "200", 1);
-    setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
-    if (argc == 2 && std::string_view(argv[1]) == "--probe") return Probe();
+    // agc_driver_covered_centroid_state (upstream fdefd7660): register decoding only, as upstream.
+    if (mode == "--covered-centroid-state") return RunMode({"multisampleTests", multisampleTests}, "Covered-centroid and multisample state checks passed");
+    if (mode == "--probe") return Probe();
     if (argc != 1) {
-        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state]\n";
+        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key";
+        for (const auto& skipped : SkippedModes) std::cerr << " | " << skipped.flag;
+        std::cerr << "]\n";
         return 2;
     }
     std::size_t ran = 0;
@@ -567,7 +719,7 @@ int main(int argc, char** argv) {
         ++ran;
         if (twin != nullptr) twins += std::string(twins.empty() ? "" : ", ") + twin->name + " (" + twin->what + ")";
     }
-    std::cout << "Graphics validation tests passed on Metal: " << ran << " checks, through Metal twins: " << twins << "; not run, Vulkan-only:";
+    std::cout << "Graphics validation tests passed on Metal: " << ran << " checks, through Metal twins: " << twins << "; not run (Vulkan-only, or a Metal gap named with its owner):";
     for (const auto& [name, reason] : VulkanOnly) std::cout << ' ' << name << " (" << reason << ')';
     std::cout << '\n';
     return 0;

@@ -1,8 +1,9 @@
 # Skips the macOS (Metal) GPU suite may report, checked by tools/check_skips.py --job macos (docs/mac/M2_DESIGN.md D-M2-8).
 # One line per test: <test> | <reason: Python regex searched in the test's "skipped, ..." line, no "|"> | <docs/dev/TechnicalDebt.md anchor>
 # Only documented Apple GPU or Metal limits belong here (TechnicalDebt.md "Metal skips (macOS)"), and Vulkan-internal
-# tests whose behaviour has no Metal counterpart. f64 and 64-bit atomics are emulated, never allowlisted. A line whose
-# test ran instead of skipping is reported as stale: remove it.
+# tests whose behaviour has no Metal counterpart, and tests of another host OS's kernel API that macOS lacks (Linux udmabuf).
+# Metal driver features not written yet are never listed: their tests skip naming the TechnicalDebt anchor and fail the check.
+# f64 and 64-bit atomics are emulated, never allowlisted. A line whose test ran instead of skipping is reported as stale: remove it.
 agc_driver_draw_cache_reuse | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_pipeline_library | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_pipeline_library_off | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
@@ -18,3 +19,6 @@ agc_driver_pipeline_optimized_readback_d16_fast | graphics pipeline libraries ar
 agc_driver_pipeline_optimized_readback_d32 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_d32_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 guest_video_out_high_frame_rate | current display does not provide 120 Hz | metal-display-120hz
+agc_driver_draw_cache_reuse_verify | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_host_import_sparse | udmabuf imports are Linux only | macos-linux-udmabuf
+agc_driver_sparse_dma_buf_import | udmabuf imports are Linux only | macos-linux-udmabuf

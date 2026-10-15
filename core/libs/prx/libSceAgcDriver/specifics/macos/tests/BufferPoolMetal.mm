@@ -2,7 +2,11 @@
 // reuse rules of the buffer pool on Metal buffers, plus what is new on Metal: every allocation is
 // resident on the queue (a GPU fill through a CommandBatch lands in a pooled buffer), device-local
 // buffers are private storage, every buffer has a GPU address. The upstream test's slab cases
-// have no Metal counterpart (the pool has no slabs, see BufferPool.hpp).
+// have no Metal counterpart (the pool has no slabs, see BufferPool.hpp). Neither has upstream's HostPlacement
+// (d04e98320): a device buffer that does not fit the VK_EXT_memory_budget budget of a discrete device-local heap goes
+// to a memory type on the host heap and skips the device tier on release. Apple GPUs have unified memory: one heap
+// (recommendedMaxWorkingSetSize, BufferPool.mm), private and shared storage both live in it, so there is no other
+// heap to place into and nothing for the case to observe.
 
 #include "MetalTestDevice.h"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"

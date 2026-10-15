@@ -16,6 +16,11 @@
 // - #5097: the ancillary word's render target index is [[render_target_array_index]] times the
 //   LayerExported function constant, and a pipeline whose vertex function writes no layer links;
 // - #4279: GDS plain reads and writes are relaxed atomics (the coherent gds buffer).
+// Upstream sync to 721db55dc:
+// - #5492 (731575c80): ds_add_f32 flushes operands and result per FLOAT_MODE and stores NaNs as the
+//   hardware does (aps5_lds_fadd32);
+// - #5176 (46a1cc0fc, 3a7e82a17): ds_ordered_count adds the first active lane's operand to the GDS
+//   counter at offset0 (no M0 base).
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -96,6 +101,11 @@ alignas(256) constexpr std::array<std::uint32_t, 22> F16CompareCode{
 
 // tests/ShaderMemory.cpp verifyCoherentGds: ds_read_b32 and ds_write_b32 on GDS.
 alignas(256) constexpr std::array<std::uint32_t, 9> GdsCode{0x34000082u, 0xbefc03ffu, 0x0000ffffu, 0xd8da0000u, 0x01000000u, 0xbf8cc07fu, 0xd8360080u, 0x00000100u, 0xbf810000u};
+
+// ds_add_f32 v0, v1 gds (v1 = 1.0) after M0 = 0xffff.
+alignas(256) constexpr std::array<std::uint32_t, 8> GdsAddF32Code{0x34000082u, 0xbefc03ffu, 0x0000ffffu, 0x7e0202f2u, 0xd8560000u, 0x00000100u, 0xbf8cc07fu, 0xbf810000u};
+// tests/execution/GdsAppendConsume.cpp OrderedCode: ds_ordered_count v5, v1 offset0:16 offset1:3 gds.
+alignas(256) constexpr std::array<std::uint32_t, 10> OrderedCountCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe0310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
 
 alignas(256) std::array<std::uint32_t, 64> Backing{};
 
@@ -333,6 +343,23 @@ void CoherentGds(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& targ
     std::puts("GDS: coherent reads and writes");
 }
 
+void GdsAddF32(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto result = RecompileCompute(target, GdsAddF32Code);
+    const std::string source(result.msl.Source());
+    // FLOAT_MODE 0xc0 keeps no f32 denormals: operands and result flush.
+    Require(Has(source, "aps5_lds_fadd32(") && Has(source, ", true, true)"), "ds_add_f32: the add does not flush operands and result as FLOAT_MODE says");
+    static_cast<void>(MustCompile(device, "ds_add_f32", result, @{}));
+    std::puts("ds_add_f32: hardware flush and NaN rules");
+}
+
+void OrderedCount(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto result = RecompileCompute(target, OrderedCountCode);
+    const std::string source(result.msl.Source());
+    Require(Has(source, "aps5_amt") && Has(source, "atomic_fetch_add_explicit(") && Has(source, " = 4u;"), "ds_ordered_count: the first lane's operand is not added at offset0 / 4");
+    static_cast<void>(MustCompile(device, "ds_ordered_count", result, @{}));
+    std::puts("ds_ordered_count: first active lane's operand added to the GDS counter");
+}
+
 }
 
 int main() {
@@ -354,6 +381,8 @@ int main() {
             EarlyTests(metal, target);
             LayerField(metal, target);
             CoherentGds(metal, target);
+            GdsAddF32(metal, target);
+            OrderedCount(metal, target);
         }
         std::puts("msl upstream parity check passed");
         return 0;

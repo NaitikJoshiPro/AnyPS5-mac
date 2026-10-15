@@ -5,7 +5,12 @@
 // device differs: instead of a Vulkan device whose vkCmdCopyImageToBuffer / vkCmdCopyBufferToImage are counted
 // through an intercepted vkGetDeviceProcAddr, the Context is the Metal image cache's and the same two counters are
 // fed by the Metal::ImageProbe copy hooks (depth surface plane copies to the staging buffer, staging to plane copy
-// fills: MetalVulkanImages.h NoteImageCopy).
+// fills: MetalVulkanImages.h NoteImageCopy). Upstream sync 3: main runs upstream's later cases too, as upstream's
+// main does: RecordedUploads (875ecc139: a recorded plane upload counts toward Recorder::OpenKeptBytes),
+// RunCubeGather and RunCubeTiledSlice (03b7cb5a1: a cube gathered at the descriptor's layer offsets, 6 surface copies
+// and 1 plane fill). Upstream's main gives them a Context with a TextureDetiler of its own; the image cache's Context
+// already carries the Metal detiler, so the twin passes it as is (RunCubeGather and RunCubeTiledSlice still make
+// their own detiler over it, as written).
 
 #define main AgcDriverDepthPlaneGuestLayersVulkanMain
 #include "../../../tests/execution/DepthPlaneGuestLayers.cpp"
@@ -30,8 +35,8 @@ public:
 };
 
 // The Metal test device as upstream's Device: GetContext() is the image cache's Context (detiler, placeholders,
-// sampler and texture caches); no recorder is active, as upstream's test has none (the copies run in one-shot
-// CommandBatches).
+// sampler and texture caches); no recorder is active outside RecordedUploads, as upstream's (the copies run in
+// one-shot CommandBatches).
 class Device {
 public:
     Device() : cache(test.device, test.queue) {
@@ -68,7 +73,11 @@ int main() {
             Require(AgcDriver::GuestMemory::Watched(block.Address(), BlockBytes), "depth plane guest layers: the guest block is not write-watched");
             AgcDriver::Graphics::Metal::SetImageProbe(&counter);
             try {
-                Run(device.GetContext(), block);
+                const auto& context = device.GetContext();
+                Run(context, block);
+                RecordedUploads(context, block);
+                RunCubeGather(context, block);
+                RunCubeTiledSlice(context, block);
             } catch (...) {
                 AgcDriver::Graphics::Metal::SetImageProbe(nullptr);
                 throw;

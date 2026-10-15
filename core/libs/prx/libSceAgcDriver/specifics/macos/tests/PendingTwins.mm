@@ -1,7 +1,9 @@
 // Metal twin of the execution tests that drive Vulkan objects directly (twins/T1-tests.cmake swaps it for each of
 // their sources). Each executable is told apart by its name: a Vulkan-only behaviour skips with the reason
-// tools/mac/m2_skip_allowlist.txt accepts; any other skips naming the work package that owns its Metal port. The
-// package that ports one moves its source pair from twins/T1-tests.cmake to its own twin list.
+// tools/mac/m2_skip_allowlist.txt accepts; a test of a driver feature the Metal driver does not have yet skips naming
+// the feature and its docs/dev/TechnicalDebt.md anchor (not allowlisted: tools/check_skips.py --job macos reports it
+// until the feature exists); any other skips naming the work package that owns its Metal port. The package that
+// ports one moves its source pair from twins/T1-tests.cmake (or twins/UPSYNC3-tests.cmake) to its own twin list.
 
 #include <cstdio>
 #include <cstring>
@@ -14,6 +16,7 @@ struct Pending {
     const char* tests;
     const char* owner;
     const char* vulkanOnly;
+    const char* metalGap = nullptr;
 };
 
 constexpr Pending Tests[] = {
@@ -30,6 +33,8 @@ int main(int, char** argv) {
         if (executable != test.executable) continue;
         if (test.vulkanOnly != nullptr) {
             std::puts(test.vulkanOnly);
+        } else if (test.metalGap != nullptr) {
+            std::puts(test.metalGap);
         } else {
             std::printf("skipped, the Metal twin of %s is not written yet: work package %s\n", test.tests, test.owner);
         }
