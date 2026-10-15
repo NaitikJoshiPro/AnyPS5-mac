@@ -2223,6 +2223,14 @@ void Recorder::PrepareSampleSlot() {
     if (!segmentSlotReady(*open)) takeSegmentPool(*open);
 }
 
+void Recorder::PrepareSamplePass() {
+    GuestMemory::AssertGpuLockHeld("Recorder::PrepareSamplePass");
+    if (!countingSamples || !segmentMode()) return;
+    ensureOpen();
+    if (open->segmentActive) endSegment(*open);
+    if (!segmentSlotReady(*open)) takeSegmentPool(*open);
+}
+
 void Recorder::EndPassSamples() {
     if (open != nullptr && open->segmentActive) endSegment(*open);
 }

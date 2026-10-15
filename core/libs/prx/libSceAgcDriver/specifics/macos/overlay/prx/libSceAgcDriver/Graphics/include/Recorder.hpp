@@ -209,6 +209,11 @@ public:
     void NoteSampledDraw(VkCommandBuffer commands);
     bool QueuesSampleDumps() const;
     void PrepareSampleSlot();
+    // macOS: before a draw begins a new render pass (MetalDraw.mm), which binds the visibility result
+    // buffer at its start: the previous pass's occlusion segment ends and a counter slot is ready
+    // (a fresh pool when the batch's is used up), whether or not the recorder still counts a pass as
+    // open (PrepareSampleSlot's precondition).
+    void PrepareSamplePass();
     void EndPassSamples();
     // macOS: occlusion samples are counted by render passes into a visibility result buffer. The
     // render pass begun after PrepareSampleSlot must name this buffer (a bridged id<MTLBuffer>) as

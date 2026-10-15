@@ -1194,6 +1194,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             encoder = stream.Render();
             if (encoder == nil) Fail("the recorder continued a render pass that has no encoder");
         } else {
+            // The occlusion counter slot of the pass's visibility buffer (an occlusion query open in
+            // the guest's command stream: ASTRO BOT's first sampled draw threw "an occlusion segment
+            // begins without a reset query slot", nothing on this path took a slot).
+            recorder.PrepareSamplePass();
             // Tiled targets load from guest memory (CPU detile into upload memory, then a copy).
             std::vector<id<MTLTexture>> textures;
             cache.passTextures.clear();
