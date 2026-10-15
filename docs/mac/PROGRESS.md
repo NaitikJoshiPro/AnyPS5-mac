@@ -396,3 +396,11 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Logs: .mac-work/logs/perf2/ (measurements.jsonl, *.pm.txt, trace-*, gs-gate).
 - Disk: TOTAL used by project: 41.11G of 100G budget (warn at 85G). Disk free: 78.3G
 - Next (owners): DRIVER, ASTRO's memory_wait. DRIVER, the 4K display-buffer CPU decode per flip (a GPU detile/convert into the present). The VideoOut window size for the windowed MetalFX run (user). Showcase stays 4K unless a safe render-target scale is found.
+
+## 2026-10-15 — M3 DRV-D: dark frames were a D44 import-window regression (D65)
+- Showcase 1.0.2 near-black (PERF1) and ASTRO's dark intro: render targets spanning two guest allocations had no single host import since D44's 8 MiB window; their results never reached guest memory. APS5_HOST_IMPORT_WINDOW_MIB=0 rendered both; fix: adjacent window-crossing allocations join one import. New diagnostic: APS5_TRACE_STAMP=<hex address>.
+- Showcase 1.0.2 renders its scene again (sc-j1); ASTRO intro frames now show the lit ship interior with Astro and companion (d21, frame_011). Test: agc_metal_device_import_window (+adjacent large allocations; negative check gs-d61-neg).
+
+## 2026-10-15 — M3 DRV-D: STK's mip-count assertion (D64)
+- The T# decode is right (radeonsi block view of a 512x512 compressed texture: 128x128 16-byte blocks, 10 levels; AMD keeps levels past 1x1 as 1x1). The Metal image shim clamps the host levels and backs each further guest level with a 1x1 texture of its own (STK views level 8). Test agc_metal_image_mip_overflow (negative: Metal's descriptor assertion). STK alive at its 90 s cap (run stk4); one earlier run (stk1) ended at the pre-existing "submission 56 did not retire in 5 s" (also at VA7's plain base).
+- --validation gpu_suites are blocked machine-wide since ~09:30 by Apple MTLCompilerService crashes (patchReflection) under shader validation; D65/D64 land after the validation gate (coord notice).
