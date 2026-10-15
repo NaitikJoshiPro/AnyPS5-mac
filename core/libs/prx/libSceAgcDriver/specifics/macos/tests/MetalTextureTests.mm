@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "RuntimeAbi.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -433,11 +434,74 @@ int Reduction() {
 
 }
 
+// A T# that declares more levels than its dimensions have (STK through radeonsi: a 128x128 block
+// view of a 512x512 BC texture with 10 levels; Metal asserted "MTLTextureDescriptor requests 10
+// mipmap levels, but the dimensions (128, 128, 1) can only support a maximum of 8", then the guest
+// viewed level 8): the host image has the 8 levels its dimensions allow and levels 8 and 9 are 1x1
+// textures of their own (AMD keeps every level past 1x1 as another 1x1 level): copies of them
+// round-trip, a view of level 9 is a one-level 1x1 view, a view from level 1 has 7 levels
+// (DECISIONS D64).
+int MipOverflow() {
+    AgcDriver::Graphics::MetalTest::Device device;
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R32G32B32A32_UINT;
+    info.extent = {128u, 128u, 1u};
+    info.mipLevels = 10;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkImage image = VK_NULL_HANDLE;
+    Check(Vk::CreateImage(device.context.device, &info, nullptr, &image) == VK_SUCCESS, "a 128x128 image declared with 10 levels is created");
+    id<MTLTexture> texture = TextureOfImage(image);
+    Check(texture != nil && texture.mipmapLevelCount == 8u, "the host image holds the 8 levels 128x128 allows (has " + std::to_string(texture != nil ? texture.mipmapLevelCount : 0u) + ")");
+    Buffer upload(device.context, 64u, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Buffer readback(device.context, 64u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    for (std::uint32_t index = 0; index < 16u; ++index) reinterpret_cast<std::uint32_t*>(upload.Bytes().data())[index] = 0x1000u + index;
+    std::memset(readback.Bytes().data(), 0xee, 64u);
+    std::array<VkBufferImageCopy, 2> regions{};
+    for (std::uint32_t index = 0; index < 2u; ++index) {
+        regions[index].bufferOffset = index * 16u;
+        regions[index].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, index == 0u ? 7u : 9u, 0u, 1u};
+        regions[index].imageExtent = {1u, 1u, 1u};
+    }
+    {
+        CommandBatch batch(device.context);
+        Vk::CmdCopyBufferToImage(batch.Handle(), upload.Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2u, regions.data());
+        Stream(batch.Handle()).PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        Vk::CmdCopyImageToBuffer(batch.Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 2u, regions.data());
+        batch.SubmitAndWait();
+    }
+    const auto* words = reinterpret_cast<const std::uint32_t*>(readback.Bytes().data());
+    Check(words[0] == 0x1000u && words[3] == 0x1003u, "level 7 (1x1) round-trips through the host image");
+    Check(words[4] == 0x1004u && words[7] == 0x1007u, "level 9 (past the host image's levels) round-trips through its own texture");
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R32G32B32A32_UINT;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1u, VK_REMAINING_MIP_LEVELS, 0u, 1u};
+    VkImageView view = VK_NULL_HANDLE;
+    Check(Vk::CreateImageView(device.context.device, &viewInfo, nullptr, &view) == VK_SUCCESS && TextureOfView(view).mipmapLevelCount == 7u, "a view from level 1 has the 7 remaining host levels");
+    Vk::DestroyImageView(device.context.device, view, nullptr);
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1u, 9u, 0u, 1u};
+    Check(Vk::CreateImageView(device.context.device, &viewInfo, nullptr, &view) == VK_SUCCESS && TextureOfView(view).mipmapLevelCount == 7u, "a view from level 1 of 9 declared levels is clamped to 7");
+    Vk::DestroyImageView(device.context.device, view, nullptr);
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 9u, 1u, 0u, 1u};
+    Check(Vk::CreateImageView(device.context.device, &viewInfo, nullptr, &view) == VK_SUCCESS && TextureOfView(view).mipmapLevelCount == 1u && TextureOfView(view).width == 1u, "a view of level 9 is a one-level 1x1 view");
+    Vk::DestroyImageView(device.context.device, view, nullptr);
+    Vk::DestroyImage(device.context.device, image, nullptr);
+    std::puts("PASS: agc_metal_image_mip_overflow");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
         try {
             if (argc == 2 && std::strcmp(argv[1], "--detile") == 0) return Detile();
             if (argc == 2 && std::strcmp(argv[1], "--images") == 0) return Images();
+            if (argc == 2 && std::strcmp(argv[1], "--mip-overflow") == 0) return MipOverflow();
             if (argc == 2 && std::strcmp(argv[1], "--reduction") == 0) return Reduction();
             if (argc == 2 && std::strcmp(argv[1], "--detile-gpu") == 0) return DetileGpu();
             if (argc == 2 && std::strcmp(argv[1], "--color-transfer") == 0) return ColorTransfer();

@@ -549,6 +549,7 @@ agc_metal_device_submission G7
 agc_metal_device_teardown G7
 agc_metal_device_teardown_exit G7
 agc_metal_images G7
+agc_metal_image_mip_overflow G7
 agc_metal_library_store G7
 agc_metal_msaa_ranges G7
 agc_metal_msl_compile G7
