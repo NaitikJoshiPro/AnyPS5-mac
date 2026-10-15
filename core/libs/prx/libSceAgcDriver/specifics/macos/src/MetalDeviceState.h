@@ -55,6 +55,8 @@ struct PresentedFrame {
     std::uint64_t frames = 0;
 };
 PresentedFrame LastPresentedFrame();
+// Presents the MetalFX spatial scaler upscaled (D61).
+std::uint64_t MetalFxPresents();
 
 [[noreturn]] inline void Unimplemented(const char* what, const char* package) {
     throw std::runtime_error(std::string("Metal device: ") + what + " is not implemented yet (" + package + ", docs/mac/M2_DESIGN.md)");

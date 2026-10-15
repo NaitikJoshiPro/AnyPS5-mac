@@ -68,7 +68,7 @@ foreach(agcMetalTarget IN LISTS agcMetalTargets)
         if(CMAKE_CXX_COMPILER_LAUNCHER)
             set_property(TARGET ${agcMetalTarget} PROPERTY OBJCXX_COMPILER_LAUNCHER ${CMAKE_CXX_COMPILER_LAUNCHER})
         endif()
-        target_link_libraries(${agcMetalTarget} PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+        target_link_libraries(${agcMetalTarget} PRIVATE "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework Foundation")
     endif()
 endforeach()
 

@@ -9,7 +9,10 @@
 //                                   CPU-read indirect draws, instancing)
 //   agc_metal_draw_tests offscreen  (agc_metal_offscreen_frames: headless presentation, a window
 //                                   without a Metal layer: pixels scaled aspect-fit over black,
-//                                   clears, slots retired; read back via APS5_METAL_PRESENT_READBACK)
+//                                   clears, slots retired; read back via APS5_METAL_PRESENT_READBACK;
+//                                   APS5_METALFX=0: the bilinear scaler, exact pixels)
+//   agc_metal_draw_tests metalfx    (agc_metal_metalfx_present: D61's MetalFX spatial upscale in the
+//                                   present: upscales through MetalFX, downscales and clears do not)
 #include "../src/MetalDeviceState.h"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
@@ -391,6 +394,71 @@ void CheckOffscreen(AgcDriver::VulkanDevice& device) {
     std::puts("offscreen: aspect-fit scaling, letterbox, clear, slot retirement passed");
 }
 
+// MetalFX present (D61): an upscale goes through the MetalFX spatial scaler into the aspect-fit
+// rectangle (flat regions keep their color, letterbox rows stay black); a downscale and a clear do not.
+void CheckMetalFx(AgcDriver::VulkanDevice& device) {
+    Require(device.Presentable(), "the headless window is not presentable");
+    const auto before = AgcDriver::Metal::MetalFxPresents();
+    const auto quadrantImage = [](std::uint32_t width, std::uint32_t height, const std::array<std::uint32_t, 4>& colors) {
+        std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4u);
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) {
+                const auto color = colors[(y >= height / 2u ? 2u : 0u) + (x >= width / 2u ? 1u : 0u)];
+                std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4u, &color, 4u);
+            }
+        }
+        return pixels;
+    };
+    const auto near = [](std::uint32_t a, std::uint32_t b, int tolerance) {
+        for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
+            const int difference = static_cast<int>((a >> shift) & 0xffu) - static_cast<int>((b >> shift) & 0xffu);
+            if (difference > tolerance || difference < -tolerance) return false;
+        }
+        return true;
+    };
+    // 32x18 (16:9) into 64x48: the rectangle is 64x36 at y 6, a 2x upscale.
+    constexpr std::array<std::uint32_t, 4> colors {0xffc03020u, 0xff20c030u, 0xff3020c0u, 0xffa0a0a0u};
+    device.PresentPixels(32u, 18u, quadrantImage(32u, 18u, colors));
+    device.WaitIdle();
+    auto frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(frame.width == 64u && frame.height == 48u, "the MetalFX present read back " + std::to_string(frame.width) + "x" + std::to_string(frame.height));
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 1u, "the 2x upscale did not go through MetalFX");
+    const auto at = [&](std::uint32_t x, std::uint32_t y) {
+        std::uint32_t value;
+        std::memcpy(&value, frame.pixels.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4u, 4u);
+        return value;
+    };
+    Require(at(32u, 2u) == 0xff000000u && at(5u, 5u) == 0xff000000u && at(32u, 45u) == 0xff000000u && at(60u, 42u) == 0xff000000u, "the letterbox rows are not opaque black");
+    for (const auto& [x, y, quadrant] : std::array<std::array<std::uint32_t, 3>, 4> {{{10u, 13u, 0u}, {54u, 13u, 1u}, {10u, 35u, 2u}, {54u, 35u, 3u}}}) {
+        Require(near(at(x, y), colors[quadrant], 3), "MetalFX changed a flat region at " + std::to_string(x) + "," + std::to_string(y) + ": " + std::to_string(at(x, y)));
+    }
+    // A sharp edge stays inside the range of its two sides (no ringing beyond them past the tolerance).
+    for (std::uint32_t x = 28u; x < 36u; ++x) {
+        const auto value = at(x, 13u);
+        const auto red = (value >> 16u) & 0xffu;
+        Require(red >= 0x20u - 8u && red <= 0xc0u + 8u, "the upscaled edge rings at x " + std::to_string(x));
+    }
+    // A new source size makes a new scaler: 48x27 into the same target (rectangle 64x36).
+    device.PresentPixels(48u, 27u, quadrantImage(48u, 27u, colors));
+    device.WaitIdle();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 2u, "the 48x27 upscale did not go through MetalFX");
+    Require(near(at(10u, 13u), colors[0], 3) && near(at(54u, 35u), colors[3], 3), "the second MetalFX scaler's flat regions are wrong");
+    // A downscale (128x96 into 64x48) keeps the bilinear scaler.
+    device.PresentPixels(128u, 96u, quadrantImage(128u, 96u, colors));
+    device.WaitIdle();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 2u, "a downscale went through MetalFX");
+    Require(at(10u, 10u) == colors[0] && at(54u, 40u) == colors[3], "the bilinear downscale is wrong");
+    // A clear-only present.
+    Require(device.PresentClear(32u, 18u, true), "a headless clear was not presented");
+    device.FinishPresent();
+    device.QueuePresent();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 2u && at(10u, 13u) == 0xff000000u, "the clear-only present is wrong");
+    std::puts("metalfx: 2x upscale through MetalFX, letterbox, flat regions, new scaler size, bilinear downscale, clear passed");
+}
+
 void NoDrawableSize(void*, std::uint32_t* width, std::uint32_t* height) {
     *width = 64u;
     *height = 48u;
@@ -404,7 +472,7 @@ int main(int argc, char** argv) {
     static int windowToken = 0;
     AgcDriver::PresentationWindow window {&windowToken, {}, nullptr, &NoDrawableSize, 64u, 48u, nullptr};
     try {
-        device = mode == "offscreen" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
+        device = mode == "offscreen" || mode == "metalfx" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
     } catch (const std::exception& error) {
         std::printf("skipped, no usable Metal device: %s\n", error.what());
         return Skipped;
@@ -416,6 +484,8 @@ int main(int argc, char** argv) {
             CheckPrimitives(*device);
         } else if (mode == "offscreen") {
             CheckOffscreen(*device);
+        } else if (mode == "metalfx") {
+            CheckMetalFx(*device);
         } else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;

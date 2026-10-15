@@ -116,6 +116,7 @@ vector_fused_multiply_add G0
 vector_mad_legacy G0
 vector_min_max_med16 G0
 wave32_wide_subgroup G0
+agc_driver_bda_long_allocation G1
 agc_driver_bda_span_reads G1
 agc_driver_bitfield_mask G1
 agc_driver_branch_past_endpgm G1
@@ -209,7 +210,6 @@ agc_driver_guarded_null_pointer G1
 agc_driver_half_expansion G1
 agc_driver_host_import_at_map G1
 agc_driver_host_import_pieces G1
-agc_driver_bda_long_allocation G1
 agc_driver_host_import_teardown G1
 agc_driver_image_by G1
 agc_driver_image_pck_n G1
@@ -468,11 +468,14 @@ guest_rendering_wait G4
 agc_driver_flip G5
 agc_driver_flip_compute G5
 agc_driver_present_mode G5
+agc_metal_metalfx_present G5
 agc_metal_offscreen_frames G5
 guest_buffer_reuse G5
 guest_video_out_high_frame_rate G5
 guest_video_out_output_mode G5
 guest_video_out_resolution_status G5
+guest_video_out_resolution_status_1440p G5
+guest_video_out_resolution_status_2160p G5
 guest_video_out_wqhd_detection G5
 pad_input_mapping G5
 pad_sdl G5

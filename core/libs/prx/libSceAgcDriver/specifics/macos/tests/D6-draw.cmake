@@ -13,4 +13,7 @@ foreach(agcMetalDrawMode IN ITEMS targets primitives)
 endforeach()
 # Headless presentation (no window opens: the PresentationWindow has no Metal layer).
 add_test(NAME agc_metal_offscreen_frames COMMAND agc_metal_draw_tests offscreen)
-set_tests_properties(agc_metal_offscreen_frames PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)
+set_tests_properties(agc_metal_offscreen_frames PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1;APS5_METALFX=0" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)
+# D61: upscaling presents go through the MetalFX spatial scaler (the default).
+add_test(NAME agc_metal_metalfx_present COMMAND agc_metal_draw_tests metalfx)
+set_tests_properties(agc_metal_metalfx_present PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)

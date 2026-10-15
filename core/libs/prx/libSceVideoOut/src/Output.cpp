@@ -6,9 +6,11 @@
 #include <mutex>
 #include <stdexcept>
 #include <cmath>
+#include <cstdio>
 
 #include "SceTypes.hpp"
 #include "prx/libSceVideoOut/include/Output.hpp"
+#include "prx/libSceVideoOut/include/DisplayMode.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
@@ -165,13 +167,16 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    status->resolution = (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
+    // The output resolution is the console display mode's (the TV's), not the registered buffers' (D61).
+    const auto& mode = VideoOutCurrentDisplayMode_nid_no_patch();
+    status->resolution = mode.height >= 2160u ? 2u : 1u;
     status->dynamicRange = 1;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     status->flags = 0;
     status->reserved[0] = 0;
     status->reserved[1] = 0;
     status->reserved[2] = 0;
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] GetOutputStatus(handle %d): resolution class %u (display mode %s), buffers %ux%u\n", handle, status->resolution, mode.name, cfg->width, cfg->height);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -189,11 +194,15 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     *status = VideoOutResolutionStatus{};
-    status->fullWidth = cfg->width;
-    status->fullHeight = cfg->height;
-    status->paneWidth = cfg->width;
-    status->paneHeight = cfg->height;
+    // A console reports its output (the TV's resolution), whatever size the title's buffers have: the
+    // display engine scales them (D61).
+    const auto& mode = VideoOutCurrentDisplayMode_nid_no_patch();
+    status->fullWidth = mode.width;
+    status->fullHeight = mode.height;
+    status->paneWidth = mode.width;
+    status->paneHeight = mode.height;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] GetResolutionStatus(handle %d): %ux%u (display mode %s), buffers %ux%u\n", handle, mode.width, mode.height, mode.name, cfg->width, cfg->height);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -235,6 +244,7 @@ int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options)
 
 int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
     const int result = validateOutputConfig(handle, mode, options, reservedPtr, reserved);
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] IsOutputSupported(handle %d, mode 0x%llx): %d\n", handle, static_cast<unsigned long long>(mode), result != 0 ? result : 1);
     if (result != 0) {
         return result;
     }

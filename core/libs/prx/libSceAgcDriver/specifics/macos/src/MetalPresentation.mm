@@ -12,6 +12,11 @@
 // oldest beyond `keep` (FlipInFlight). Frame dumps (APS5_DUMP_FRAMES, _EVERY, APS5_DUMP_SCALE) are
 // written from the decoded source pixels, as upstream's APS5_NO_GPU_DUMP path.
 // Test hook: APS5_METAL_PRESENT_READBACK=1 copies every presented frame back (Metal::LastPresentedFrame).
+// Upscaling (D61): when the aspect-fit rectangle is larger than the source in both dimensions, a
+// MetalFX spatial scaler (MTL4FXSpatialScaler, perceptual color) upscales the source to the
+// rectangle's size and the scaler pipeline copies that 1:1 into the target; downscales and equal
+// sizes keep the bilinear scaler. APS5_METALFX=0 always uses the bilinear scaler. Headless targets
+// take the window's drawable size, or APS5_PRESENT_SIZE=<w>x<h> (measurements of a 16:9 output).
 
 #include "MetalDeviceState.h"
 #include "MetalCommandStream.h"
@@ -20,9 +25,11 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "MetalResidency.h"
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -31,9 +38,11 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -198,6 +207,37 @@ bool Readback() {
     return readback;
 }
 
+// APS5_METALFX: 0 turns the MetalFX upscale off (the bilinear scaler presents every frame).
+bool MetalFxRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_METALFX");
+        if (value == nullptr || *value == '\0') return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        Fail(std::string("APS5_METALFX must be 0 or 1, not '") + value + "'");
+    }();
+    return requested;
+}
+
+// APS5_PRESENT_SIZE=<width>x<height>: the size of the headless targets (default: the window's drawable size).
+bool HeadlessSizeOverride(std::uint32_t& width, std::uint32_t& height) {
+    static const std::pair<std::uint32_t, std::uint32_t> size = [] {
+        const char* value = std::getenv("APS5_PRESENT_SIZE");
+        if (value == nullptr || *value == '\0') return std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
+        const auto end = value + std::strlen(value);
+        std::uint32_t parsedWidth = 0;
+        std::uint32_t parsedHeight = 0;
+        const auto first = std::from_chars(value, end, parsedWidth);
+        const auto second = first.ec == std::errc{} && first.ptr != end && *first.ptr == 'x' ? std::from_chars(first.ptr + 1, end, parsedHeight) : std::from_chars_result{first.ptr, std::errc::invalid_argument};
+        if (second.ec != std::errc{} || second.ptr != end || parsedWidth == 0u || parsedHeight == 0u || parsedWidth > 16384u || parsedHeight > 16384u) Fail(std::string("APS5_PRESENT_SIZE must be <width>x<height> (1-16384), not '") + value + "'");
+        return std::pair{parsedWidth, parsedHeight};
+    }();
+    if (size.first == 0u) return false;
+    width = size.first;
+    height = size.second;
+    return true;
+}
+
 // APS5_METAL_TRACE: presenter attach, every present and every drawable handed to the display.
 bool PresentTrace() {
     static const bool trace = std::getenv("APS5_METAL_TRACE") != nullptr;
@@ -219,6 +259,11 @@ VulkanDevice::PresentStatistics& Counters() {
     return counters;
 }
 
+std::atomic<std::uint64_t>& UpscaledPresents() {
+    static std::atomic<std::uint64_t> count {0};
+    return count;
+}
+
 }
 
 namespace Metal {
@@ -226,6 +271,10 @@ namespace Metal {
 PresentedFrame LastPresentedFrame() {
     std::lock_guard lock(FrameMutex());
     return LastFrame();
+}
+
+std::uint64_t MetalFxPresents() {
+    return UpscaledPresents().load();
 }
 
 // The device's presentation state (made by AttachPresentation, destroyed by Teardown once the
@@ -251,6 +300,13 @@ struct Presenter {
     id<MTLSamplerState> filter = nil;
     id<MTL4ArgumentTable> arguments = nil;
     id<MTLTexture> source = nil;
+    // The MetalFX upscale (D61): the scaler of one input and output size, its output (the size of the
+    // aspect-fit rectangle) and the fence that orders it after the source upload. `fxUnavailable`:
+    // the device or the scaler refused, the bilinear scaler presents from then on.
+    id<MTL4FXSpatialScaler> fx = nil;
+    id<MTLTexture> fxOutput = nil;
+    id<MTLFence> fxFence = nil;
+    bool fxUnavailable = false;
     struct Slot {
         std::uint64_t serial;
         id<CAMetalDrawable> drawable;
@@ -270,6 +326,48 @@ struct Presenter {
     void Resident(id<MTLAllocation> allocation) {
         ::AgcDriver::Metal::Residency::Add(residency, allocation);
         ::AgcDriver::Metal::Residency::Commit(residency);
+    }
+
+    // The MetalFX scaler and output for an upscale of `width` x `height` to `outputWidth` x `outputHeight`
+    // (made again when a size changes); false when MetalFX is not available here (reported once).
+    bool PrepareUpscale(id<MTL4Compiler> compiler, std::uint32_t width, std::uint32_t height, std::uint32_t outputWidth, std::uint32_t outputHeight, const std::function<void()>& retire) {
+        if (fxUnavailable) return false;
+        if (fx != nil && fx.inputWidth == width && fx.inputHeight == height && fx.outputWidth == outputWidth && fx.outputHeight == outputHeight) return true;
+        const auto unavailable = [&](const std::string& why) {
+            fxUnavailable = true;
+            std::fprintf(stderr, "[metal] MetalFX upscale unavailable (%s): the bilinear scaler presents\n", why.c_str());
+            return false;
+        };
+        if (![MTLFXSpatialScalerDescriptor supportsMetal4FX:device]) return unavailable("the device has no Metal 4 spatial scaler");
+        if (compiler == nil) return unavailable("no Metal 4 compiler");
+        // Earlier presents read the old output: they finish first.
+        if (fx != nil) retire();
+        if (fxOutput != nil) {
+            ::AgcDriver::Metal::Residency::Remove(residency, fxOutput);
+            fxOutput = nil;
+        }
+        fx = nil;
+        MTLFXSpatialScalerDescriptor* descriptor = [MTLFXSpatialScalerDescriptor new];
+        descriptor.colorTextureFormat = MTLPixelFormatBGRA8Unorm;
+        descriptor.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
+        descriptor.inputWidth = width;
+        descriptor.inputHeight = height;
+        descriptor.outputWidth = outputWidth;
+        descriptor.outputHeight = outputHeight;
+        // The display buffer holds display-referred (gamma-encoded) color.
+        descriptor.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        fx = [descriptor newSpatialScalerWithDevice:device compiler:compiler];
+        if (fx == nil) return unavailable("the scaler for " + std::to_string(width) + "x" + std::to_string(height) + " to " + std::to_string(outputWidth) + "x" + std::to_string(outputHeight) + " was refused");
+        MTLTextureDescriptor* output = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:outputWidth height:outputHeight mipmapped:NO];
+        output.storageMode = MTLStorageModePrivate;
+        output.usage = fx.outputTextureUsage | MTLTextureUsageShaderRead;
+        fxOutput = [device newTextureWithDescriptor:output];
+        if (fxOutput == nil) Fail("cannot create the MetalFX output texture");
+        Resident(fxOutput);
+        if (fxFence == nil) fxFence = [device newFence];
+        if (fxFence == nil) Fail("cannot create the MetalFX fence");
+        if (PresentTrace()) std::fprintf(stderr, "[metal] MetalFX spatial scaler %ux%u to %ux%u\n", width, height, outputWidth, outputHeight);
+        return true;
     }
 
     void MakeOffscreen() {
@@ -312,6 +410,7 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     std::uint32_t width = window.width;
     std::uint32_t height = window.height;
     if (window.getDrawableSize != nullptr) window.getDrawableSize(window.context, &width, &height);
+    if (presenter->layer == nil) HeadlessSizeOverride(width, height);
     presenter->width = width;
     presenter->height = height;
     // ANYPS5_PRESENT_MODE (upstream #4106): a CAMetalLayer presents FIFO (display sync) or
@@ -368,6 +467,7 @@ void* VulkanDevice::Window() const {
 void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     auto* presenter = state->presenter.get();
     if (presenter == nullptr) return;
+    if (presenter->layer == nil && width != 0u && height != 0u) HeadlessSizeOverride(width, height);
     if (width == 0u || height == 0u) {
         presenter->width = 0;
         presenter->height = 0;
@@ -456,9 +556,15 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     auto& recorder = *state->recorder;
     @autoreleasepool {
         const bool hasSource = !pixels.empty();
+        if (hasSource && (width == 0u || height == 0u || width > 16384u || height > 16384u || pixels.size() != static_cast<std::size_t>(width) * height * 4u)) Fail("invalid source image for the present");
+        const auto targetWidth = static_cast<std::uint32_t>(presenter->target.width);
+        const auto targetHeight = static_cast<std::uint32_t>(presenter->target.height);
+        const AspectFitRect rect = hasSource ? ComputeContainRect_nid_postfix(width, height, targetWidth, targetHeight) : AspectFitRect{};
+        const bool upscale = hasSource && MetalFxRequested() && rect.width > width && rect.height > height && presenter->PrepareUpscale(state->compiler, width, height, rect.width, rect.height, [this] { RetirePresents(0); });
+        MTLTextureUsage sourceUsage = MTLTextureUsageShaderRead;
+        if (upscale) sourceUsage |= presenter->fx.colorTextureUsage;
         if (hasSource) {
-            if (width == 0u || height == 0u || width > 16384u || height > 16384u || pixels.size() != static_cast<std::size_t>(width) * height * 4u) Fail("invalid source image for the present");
-            if (presenter->source == nil || presenter->source.width != width || presenter->source.height != height) {
+            if (presenter->source == nil || presenter->source.width != width || presenter->source.height != height || (presenter->source.usage & sourceUsage) != sourceUsage) {
                 if (presenter->source != nil) {
                     // Earlier presents read the old source: they finish first.
                     RetirePresents(0);
@@ -466,7 +572,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                 }
                 MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
                 descriptor.storageMode = MTLStorageModePrivate;
-                descriptor.usage = MTLTextureUsageShaderRead;
+                descriptor.usage = sourceUsage;
                 presenter->source = [state->device newTextureWithDescriptor:descriptor];
                 if (presenter->source == nil) Fail("cannot create the present source texture");
                 presenter->Resident(presenter->source);
@@ -478,6 +584,20 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             id<MTL4ComputeCommandEncoder> copy = stream.Compute();
             [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:static_cast<NSUInteger>(width) * 4u sourceBytesPerImage:pixels.size() sourceSize:MTLSizeMake(width, height, 1) toTexture:presenter->source destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             stream.CountCommand();
+            if (upscale) {
+                // MetalFX encodes its own passes into the batch: it waits for the fence the upload
+                // updates and updates it when its output is written; the scaler pass waits for it.
+                [copy updateFence:presenter->fxFence afterEncoderStages:MTLStageBlit | MTLStageDispatch];
+                stream.EndEncoder();
+                presenter->fx.colorTexture = presenter->source;
+                presenter->fx.outputTexture = presenter->fxOutput;
+                presenter->fx.inputContentWidth = width;
+                presenter->fx.inputContentHeight = height;
+                presenter->fx.fence = presenter->fxFence;
+                [presenter->fx encodeToCommandBuffer:stream.CommandBuffer()];
+                stream.CountCommand();
+                UpscaledPresents().fetch_add(1u);
+            }
         }
         MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
         pass.colorAttachments[0].texture = presenter->target;
@@ -485,10 +605,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, opaque ? 1.0 : 0.0);
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTL4RenderCommandEncoder> encoder = stream.BeginRender(pass);
+        if (upscale) [encoder waitForFence:presenter->fxFence beforeEncoderStages:MTLRenderStageFragment];
         if (hasSource) {
-            const auto targetWidth = static_cast<std::uint32_t>(presenter->target.width);
-            const auto targetHeight = static_cast<std::uint32_t>(presenter->target.height);
-            const auto rect = ComputeContainRect_nid_postfix(width, height, targetWidth, targetHeight);
             const std::array<float, 4> ndc {
                 2.0f * static_cast<float>(rect.x) / static_cast<float>(targetWidth) - 1.0f,
                 1.0f - 2.0f * static_cast<float>(rect.y) / static_cast<float>(targetHeight),
@@ -496,7 +614,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                 1.0f - 2.0f * static_cast<float>(rect.y + static_cast<std::int32_t>(rect.height)) / static_cast<float>(targetHeight)};
             const auto rectUpload = stream.Write(std::as_bytes(std::span(ndc)), 16u);
             [presenter->arguments setAddress:rectUpload.address atIndex:0];
-            [presenter->arguments setTexture:presenter->source.gpuResourceID atIndex:0];
+            [presenter->arguments setTexture:(upscale ? presenter->fxOutput : presenter->source).gpuResourceID atIndex:0];
             [presenter->arguments setSamplerState:presenter->filter.gpuResourceID atIndex:0];
             [encoder setRenderPipelineState:presenter->scaler];
             [encoder setArgumentTable:presenter->arguments atStages:MTLRenderStageVertex | MTLRenderStageFragment];
@@ -526,7 +644,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         if (presenter->drawable != nil) [state->queue waitForDrawable:presenter->drawable];
         const auto serial = recorder.SubmitAndEpoch();
         if (presenter->drawable != nil) [state->queue signalDrawable:presenter->drawable];
-        if (PresentTrace()) std::fprintf(stderr, "[metal] present %llu: source %ux%u%s into %lux%lu, %s, batch %llu\n", static_cast<unsigned long long>(Counters().presents + 1u), width, height, hasSource ? "" : " (clear)", static_cast<unsigned long>(presenter->target.width), static_cast<unsigned long>(presenter->target.height), presenter->drawable != nil ? "drawable" : "offscreen", static_cast<unsigned long long>(serial));
+        if (PresentTrace()) std::fprintf(stderr, "[metal] present %llu: source %ux%u%s into %lux%lu%s, %s, batch %llu\n", static_cast<unsigned long long>(Counters().presents + 1u), width, height, hasSource ? "" : " (clear)", static_cast<unsigned long>(presenter->target.width), static_cast<unsigned long>(presenter->target.height), upscale ? (", MetalFX to " + std::to_string(rect.width) + "x" + std::to_string(rect.height)).c_str() : "", presenter->drawable != nil ? "drawable" : "offscreen", static_cast<unsigned long long>(serial));
         presenter->slots.push_back({serial, presenter->drawable, readback, static_cast<std::uint32_t>(presenter->target.width), static_cast<std::uint32_t>(presenter->target.height)});
         presenter->queuePending = presenter->drawable != nil;
         presenter->target = nil;
