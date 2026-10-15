@@ -588,7 +588,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
                 ImageResource shape;
                 shape.dimension = element.dimension;
-                physical.imageShapes.push_back(ImageShapeForResource(shape));
+                physical.imageShapes.push_back(ImageShapeForResource(shape, false));
                 physical.imageDepthCompare.push_back(element.depthCompare);
                 physical.imageWritten.push_back(false);
                 physical.imageAtomic.push_back(false);

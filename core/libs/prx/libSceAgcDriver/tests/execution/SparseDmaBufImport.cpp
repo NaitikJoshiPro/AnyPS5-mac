@@ -18,7 +18,7 @@
 #include <iostream>
 #include <mutex>
 
-#ifdef _WIN32
+#if !defined(__linux__)
 int main() {
     std::printf("skipped, udmabuf imports are Linux only\n");
     return VulkanTestSkipped;
