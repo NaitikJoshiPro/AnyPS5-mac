@@ -78,27 +78,49 @@ GPU waits are about 10% of samples. Two thirds of those are `StorageTexture::Ref
 
 Tool: `tools/mac/profile_title.py run <ID> --tag T --seconds S --window START:LEN [--fex-sample 2] [--env K=V]` (one headless title_run under the GPU lock; `sample`, per-thread P/E counters, powermetrics, the driver trace, `[gputime]`, the guest sampler; report `<ID>-<TAG>-profile.md/json`). `profile_title.py report <log-dir> <ID> <TAG>` re-reads a run. "Cores" below is samples divided by samples per thread: the CPU kept busy (or the threads parked) on average. "ms/frame" multiplies that by the mean frame time.
 
-Sources so far (no new title runs were allowed after ~14:15 because the user needed the Mac):
+Sources:
 - DOOM: perf5 p0, build-metal before its d227f1e36 rebuild, 60 s run, window 20:30, sample 10 s, powermetrics 60 samples, Nominal pressure.
-- ASTRO: PERF3's baseline trace aA4 (a09b099c06d4, APS5_PRESENT_GPU_DECODE=0, seconds 80:60, 125 frames) and PERF3's `sample` asamp1 (14:10, 981 samples per thread, 113 threads), both re-read with profile_parse.
+- ASTRO: PERF5 runs on build-perf5 (logs .mac-work/logs/perf5/ab: awarm, bq*, bg1, cq*, cl2, ct0), plus PERF3's asamp1 sample.
 - Showcase 1.0.2: PERF3's baseline trace sA2 (49 frames) and PERF1's `sample` base3.
 
-### ASTRO BOT (PPSA21564): frame mean 479 ms (p50 412, p99 1044)
+### ASTRO BOT (PPSA21564)
 
-The critical path is queue worker 0x0. It is in a phase 99.9% of the time, 228 ms/frame of it waiting. The GPU is busy 243 ms/frame (about 50%). The async compute queues 0x40 and 0x48 wait on queue 0 for 365 and 451 ms/frame in `memory_wait`: they are idle because they depend on queue 0, which is not waste of their own.
+**Run cq1:** build-perf5 at 933f3325c, SDL dummy audio, warm FEX and shader caches, seconds 180:60 of 270. p50 398 ms, p99 1002 ms, 139 presents. P cores ran at 4.0 GHz, E cores at 2.2 GHz; the GPU at 733 MHz, 44.5% active; Heavy thermal pressure. The process used 0.8 cores, 96% of it on P cores.
 
-| # | Hog | ms/frame or share | Evidence | Owner | Proposed fix |
+**What the frame waits on.** Queue worker 0x0 is the critical path: it is in a phase for 432 of 434 ms per frame, and 313 ms of that is not in a wait. The GPU is busy 144 ms per frame (33%). The async queues 0x40 and 0x48 wait for queue 0 for 367 and 417 ms in `memory_wait`. That is idleness caused by the dependency, not their own cost.
+
+**The frame follows the P-core clock.** Queue 0's non-wait time per frame was 656 ms at 1.4 GHz (awarm, Heavy) and 363 ms at 3.1 GHz (bq0b), and the frame time moves with it:
+
+| P GHz | pressure | p50 / p99 ms | run |
+|---|---|---|---|
+| 1.4 | Heavy | 712 / 2002 | awarm (device audio) |
+| 2.27 | Moderate | 586 / 1539 | bg1 (device audio) |
+| 3.1 | Heavy/Moderate | 455 / 874 | bq0b (device audio) |
+| 3.36 | Heavy | 385 / 825 | cq0 (dummy audio) |
+| 4.0 | Heavy | 398 / 1002 | cq1 (dummy audio) |
+| 4.05 | Moderate/Nominal | 346 / 580 | cl2 (dummy audio) |
+
+On the fanless Air in a 38 °C room, the P cluster throttled to 1.4 GHz for minutes at a time. At that point E cores (2.27 GHz) do as much per thread as P cores, so where a thread is placed stops mattering. Thermals are the largest single factor in ASTRO's frame time on this machine.
+
+| # | Hog | Cost | Evidence (cq1 unless noted) | Owner | Proposed fix |
 |---|---|---|---|---|---|
-| 1 | `Recorder.Sync` inside draws (88 ms) and dispatches (63 ms) on queue 0 | 150 ms/frame of the critical path; meanwhile the GPU idles | trace aA4: Sync under Driver.Draw.draw_and_resource_release 55, Driver.Draw 32, Driver.Dispatch 63 | AGC driver (PERF3/DRV-D) | Find which resource forces each full GPU drain (storage-image refresh, CPU readback) and make it a ranged wait or a GPU-side copy |
-| 2 | Guest audio thread at 100% of a core in translated code | 1.0 core (98% of that thread's samples) | asamp1: 960 of 981 samples in JIT, hot PCs in two small clusters; only 16 bridge calls; AudioOut2MixPorts 9 | FEX/translation or HLE audio (PERF5, open) | Guest sampler run to name the loop: a free-running mixer (no pacing from our AudioOut2/Ngs2), a guest spin on a flag our HLE never sets, or real DSP made expensive by translation |
-| 3 | Host CPU work on queue 0: `EqualsCommittedUnsynced` and `copyCommitted` (snapshot compare and copy of untracked guest memory) | about 0.35 core, about 170 ms/frame on the critical path | asamp1: 242 + 104 samples of queue 0's 981 | AGC driver (DRV-D: write-tracked imports) | Write-tracked host imports so that Refresh skips the memcmp |
-| 4 | `GpuMutex.wait.label` in prepare_memory | 51 ms/frame | trace aA4 | AGC driver (PERF3) | Shorter GPU-mutex holds (presenter, queues 0x40 and 0x48 polling) |
-| 5 | `ColorTargetLayout::Offset` on the CPU | about 0.08 core, about 38 ms/frame on queue 0 | asamp1: 78 samples | AGC driver | Per-row or per-tile addressing instead of per-texel, or a GPU detile |
-| 6 | `Recorder.WaitSerial` + `memory_wait` on queue 0 | 26 + 47 ms/frame | trace aA4 | AGC driver (PERF3) | GPU completion pushed to the worker (MTLSharedEvent listener) instead of 1 ms polls |
-| 7 | File-loader guest thread: stat/open system calls under ResolveHostPath | about 0.26 core | asamp1: 185 ResolveHostPath (83 stat), 67 open | HLE libc/libkernel | Cache resolved host paths and their existence (the guest opens the same files again) |
-| 8 | Pipeline saver: SHA-256 and archive Save | about 0.10 core | asamp1: 79 SHA256 + 21 Save on "pipeline saver" | AGC driver / Metal pipeline cache | Save less often, or hash only new pipelines (D51 keeps earlier pipelines) |
-| 9 | Metal submission (`iokit_user_client_trap` on com.Metal4.SubmissionQueue) and Residency::Commit | 0.14 + 0.06 core | asamp1 | Metal backend | Fewer, larger batches; residency changes batched (D44) |
-| 10 | Translation (FEX compile, dispatcher, signals, thunks) | about 0.05 core in all | asamp1: compile 14, dispatcher 18, signals 6, thunks 11 samples (warm disk cache) | FEX | Not a hog after D49/D58; keep the disk cache warm |
+| 1 | Queue 0's CPU work in the driver | about 313 ms/frame on the critical path; CPU-clock bound | trace: work 313 of 432 ms; sample on queue 0 (bq0b): AGC driver 54% of samples | AGC driver (PERF3/DRV-D) | Items 2-5 |
+| 2 | `EqualsCommittedUnsynced` + `copyCommitted`: snapshot compare and copy of untracked guest memory | 22% + 5% of queue 0 (bq0b); 990 + 187 samples process-wide | sample | DRV-D | Write-tracked host imports |
+| 3 | `Recorder.Sync` inside draws and dispatches | 63 ms/frame on queue 0, while the GPU idles | trace | PERF3 | Ranged waits instead of full drains |
+| 4 | `Metal::Residency::Commit` | 10% of queue 0 (bq0b); 450 samples | sample | Metal backend (PERF3/DRV-D) | Batch residency-set changes per submission |
+| 5 | `MaterializeDcc` / `MaterializeCmask` on the CPU | about 10% of queue 0; 286 + 55 samples | sample | AGC driver | GPU-side DCC materialisation, or skip DCC that nothing samples |
+| 6 | TBB worker threads spinning in `scePthreadYield` | 0.26 core (3 threads × 8%) when present | sample cq1: 247-264 samples each | PERF5 (libkernel) | Yield back-off (D73) |
+| 7 | GPU-mutex waits (`GpuMutex.wait.label`, gpu_mutex_wait) | 726 samples parked process-wide | sample | PERF3 (D66 cut the present's part) | Shorter holds |
+| 8 | AvPlayer h264 (FFmpeg) decode of the intro movies | 0.15 core, all on its own threads | sample: receiveFrames, cabac | HLE libs | Hardware decode (VideoToolbox) |
+| 9 | Guest audio thread (SceSndzAudioOutMain) | 8% of a core at 3.6 GHz (cq1); 19-23% at 1.4 GHz; 96-100% in earlier scenes (PERF3 asamp1, a1) | counters; AudioOut2 trace: 93.9 pushes/s = real time (512-sample grains at 48 kHz), so its work is paced, not a spin | FEX/translation | Translation cost of the title's mixer. TSOEnabled=0 cannot be measured on the title (it hangs, see below) |
+| 10 | FEX lookup-cache misses and translation | 20-28k misses per 30 s, 50-230 ms per 30 s inside CompileCode; translation otherwise about 0.01 core with a warm disk cache | APS5_FEX_STATS | PERF5 (FEX) | L2 lookup table on (D71) |
+| 11 | Profiling's own cost: `beginTiming` / `WriteTimestamp` (APS5_PROFILE_GPU=1) | about 1% of queue 0 | sample | tool | Off in timing runs (`profile_title.py run --no-gputime`; the driver enables it for any value of the variable) |
+
+Translation-specific findings:
+- With a cold disk cache FEX compiles about 28,700 blocks in the first 30 s (3.5 s of JIT, 122 us per block). Warm, JIT time is 0.2-0.8% of a core and comes only from lookup misses.
+- `TSOEnabled=0` (APS5_FEX_CONFIG) deadlocks ASTRO about 35 s in. FEX's TSO emulation is required. Hardware TSO (ACTLR_EL1.TSOEN) is per-thread state that macOS gives only to Rosetta; on macOS 14.4+ only a Hypervisor.framework guest can set it.
+- The guest sampler filed samples outside a thread's code buffer under one stale RIP, so on ASTRO 78-92% of the audio thread's samples looked like `libc.prx.guest.prx+0x6dbb0 host`. It now separates translated code, FEX's dispatcher, displaced-access stubs and native code per thread.
+- A fresh build directory has a cold shader cache (`build-*/core/fex/shader_cache`). ASTRO then shows no frames for 150+ s ("a compute pipeline still compiling after 5 s"). Warm it before measuring.
 
 ### Showcase 1.0.2 (PPSA99005 v1.0.2, fixed 4K): frame mean 558 ms (p50 562)
 
