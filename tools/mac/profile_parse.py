@@ -475,8 +475,9 @@ def parse_gputime(text):
 
 
 _FEX_WINDOW = re.compile(r"\[fex-sample\] window (\d+): ([\d.]+) s, (\d+) guest threads")
-_FEX_THREAD = re.compile(r'\[fex-sample\] thread (\d+) "(.*)": (\d+) samples, (\d+) distinct RIPs')
-_FEX_RIP = re.compile(r"\[fex-sample\]\s+([\d.]+)% rip 0x([0-9a-f]+) (\S+)\+0x([0-9a-f]+) (jit|host)\s*(.*)$")
+_FEX_THREAD = re.compile(r'\[fex-sample\] thread (\d+) "(.*)": (\d+) samples, (\d+) distinct RIPs'
+                         r'(?:; jit ([\d.]+)% dispatcher ([\d.]+)% stub ([\d.]+)% native ([\d.]+)%)?')
+_FEX_RIP = re.compile(r"\[fex-sample\]\s+([\d.]+)% rip 0x([0-9a-f]+) (\S+)\+0x([0-9a-f]+) (jit|host|dispatcher|stub)\s*(.*)$")
 
 
 def parse_fex_sample(text):
@@ -497,6 +498,9 @@ def parse_fex_sample(text):
         if match and window is not None:
             thread = {"thread": int(match.group(1)), "name": match.group(2), "samples": int(match.group(3)),
                       "rips": []}
+            if match.group(5) is not None:
+                thread["kinds"] = {name: float(match.group(6 + index - 1)) for index, name in
+                                   enumerate(("jit", "dispatcher", "stub", "native"), start=0)}
             window["threads"].append(thread)
             continue
         match = _FEX_RIP.search(line)
@@ -527,7 +531,17 @@ def summarize_fex_sample(windows):
                     kind = "native work"
                 kinds[kind] += samples
                 hot[(rip["module"], rip["offset"], rip["kind"], rip["host"].split("+0x")[0])] += samples
-    return {"samples": sum(totals.values()), "threads": len(totals), "kinds": dict(kinds),
+    exact = collections.Counter()
+    busiest = []
+    for window in windows:
+        for thread in window["threads"]:
+            for name, pct in thread.get("kinds", {}).items():
+                exact[name] += pct * thread["samples"] / 100.0
+            if "kinds" in thread:
+                busiest.append((100.0 - thread["kinds"]["native"], thread["thread"], window["index"], thread["kinds"]))
+    busiest.sort(key=lambda entry: -entry[0])
+    return {"samples": sum(totals.values()), "threads": len(totals), "kinds": dict(kinds), "exact_kinds": dict(exact),
+            "busiest_translated": busiest[:6],
             "hot": [(module, offset, kind, host, samples) for (module, offset, kind, host), samples in hot.most_common(12)]}
 
 

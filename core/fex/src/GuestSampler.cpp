@@ -39,9 +39,15 @@ struct Registered {
 };
 
 // One RIP of one thread over a report window.
+// Where a sample landed when it was not in a translated block: FEX's dispatcher (block lookup, linking, handlers),
+// a displaced-access stub (D31/D49) or native code (our libraries, the system).
+enum class Kind : unsigned { Jit, Dispatcher, Stub, Native, Count };
+constexpr const char* KindNames[] = {"jit", "dispatcher", "stub", "native"};
+
 struct Hits {
     std::uint64_t count = 0;
     bool inJit = false;
+    Kind kind = Kind::Native;
     std::uint64_t hostPc = 0;          // last sample
     std::uint64_t signalled = 0;       // samples caught entering a signal handler
     int signal = 0;                    // last such signal, its si_code and fault address
@@ -57,6 +63,7 @@ struct Sampler {
     unsigned nextIndex = 0;
     std::map<std::tuple<unsigned, std::uint64_t, bool>, Hits> stats;
     std::map<unsigned, std::uint64_t> totals;
+    std::map<unsigned, std::array<std::uint64_t, static_cast<unsigned>(Kind::Count)>> kinds;
     std::map<unsigned, std::string> names; // threads seen in this window, by index
     FEXCore::Context::Context* context = nullptr;
     const GuestModules* modules = nullptr;
@@ -171,6 +178,28 @@ bool Take(const Registered& entry, FEXCore::Context::Context* context, Snapshot&
     return ok;
 }
 
+// The dispatcher's entry points all lie in one small JIT-emitted buffer (Dispatcher.cpp sets them together).
+bool InDispatcher(const ThreadState* thread, std::uint64_t pc) {
+    const auto& pointers = thread->CurrentFrame->Pointers;
+    const std::uint64_t entries[] = {pointers.DispatcherLoopTop, pointers.DispatcherLoopTopFillSRA, pointers.ExitFunctionLinker,
+                                     pointers.ThreadStopHandlerSpillSRA, pointers.ThreadPauseHandlerSpillSRA,
+                                     pointers.ThreadDispatchSyscallHandler, pointers.SignalReturnHandlerRT, pointers.LUDIVHandler,
+                                     pointers.F64FPREM1Handler};
+    std::uint64_t low = ~0ull, high = 0;
+    for (const auto entry : entries)
+        if (entry != 0) {
+            low = std::min(low, entry);
+            high = std::max(high, entry);
+        }
+    return low <= high && pc >= low && pc < high + 4096;
+}
+
+bool InDisplacedStub(std::uint64_t pc) {
+    using Query = bool (*)(std::uintptr_t);
+    static const auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "GuestDisplacedIsStubPc_nid_no_patch"));
+    return query != nullptr && query(pc);
+}
+
 void SampleOnce(Sampler& sampler) {
     std::lock_guard lock(sampler.mutex);
     if (sampler.context == nullptr) return;
@@ -194,6 +223,12 @@ void SampleOnce(Sampler& sampler) {
             hits.gpr[i] = inJit && host < snapshot.x.size() ? snapshot.x[host] : snapshot.stateGpr[i];
         }
         ++sampler.totals[entry.index];
+        const Kind kind = inJit ? Kind::Jit
+                          : InDispatcher(entry.thread, snapshot.pc) ? Kind::Dispatcher
+                          : InDisplacedStub(snapshot.pc)            ? Kind::Stub
+                                                                    : Kind::Native;
+        ++sampler.kinds[entry.index][static_cast<unsigned>(kind)];
+        hits.kind = kind;
         if (!sampler.names.contains(entry.index)) {
             char name[64] {};
             pthread_getname_np(entry.pthread, name, sizeof(name));
@@ -290,8 +325,10 @@ void GuestSampler::Report(std::FILE* out) {
         for (const auto& [key, hits] : sampler.stats)
             if (std::get<0>(key) == index) rows.emplace_back(key, hits);
         std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
-        std::fprintf(out, "[fex-sample] thread %u \"%s\": %" PRIu64 " samples, %zu distinct RIPs\n", index, sampler.names[index].c_str(), total,
-                     rows.size());
+        const auto& kinds = sampler.kinds[index];
+        std::fprintf(out, "[fex-sample] thread %u \"%s\": %" PRIu64 " samples, %zu distinct RIPs; jit %.1f%% dispatcher %.1f%% stub %.1f%% native %.1f%%\n",
+                     index, sampler.names[index].c_str(), total, rows.size(), 100.0 * double(kinds[0]) / double(total),
+                     100.0 * double(kinds[1]) / double(total), 100.0 * double(kinds[2]) / double(total), 100.0 * double(kinds[3]) / double(total));
         for (std::size_t i = 0; i < rows.size() && i < sampler.top; ++i) {
             const auto& [key, hits] = rows[i];
             const std::uint64_t rip = std::get<1>(key);
@@ -302,6 +339,8 @@ void GuestSampler::Report(std::FILE* out) {
                          location.module.c_str(), location.offset);
             if (hits.inJit) {
                 std::fprintf(out, " jit\n");
+            } else if (hits.kind == Kind::Dispatcher || hits.kind == Kind::Stub) {
+                std::fprintf(out, " %s 0x%" PRIx64 "\n", KindNames[static_cast<unsigned>(hits.kind)], hits.hostPc);
             } else {
                 Dl_info info {};
                 if (dladdr(reinterpret_cast<const void*>(hits.hostPc), &info) != 0 && info.dli_fname != nullptr) {
@@ -325,6 +364,7 @@ void GuestSampler::Report(std::FILE* out) {
     std::fflush(out);
     sampler.stats.clear();
     sampler.totals.clear();
+    sampler.kinds.clear();
     sampler.names.clear();
     sampler.windowStart = now;
 }
