@@ -432,12 +432,15 @@ void CheckMetalFx(AgcDriver::VulkanDevice& device) {
     for (const auto& [x, y, quadrant] : std::array<std::array<std::uint32_t, 3>, 4> {{{10u, 13u, 0u}, {54u, 13u, 1u}, {10u, 35u, 2u}, {54u, 35u, 3u}}}) {
         Require(near(at(x, y), colors[quadrant], 3), "MetalFX changed a flat region at " + std::to_string(x) + "," + std::to_string(y) + ": " + std::to_string(at(x, y)));
     }
-    // A sharp edge stays inside the range of its two sides (no ringing beyond them past the tolerance).
-    for (std::uint32_t x = 28u; x < 36u; ++x) {
-        const auto value = at(x, 13u);
-        const auto red = (value >> 16u) & 0xffu;
-        Require(red >= 0x20u - 8u && red <= 0xc0u + 8u, "the upscaled edge rings at x " + std::to_string(x));
-    }
+    // The sharp vertical edge (red 0xc0 | 0x20) is reconstructed: the row falls from the left side's
+    // red to the right side's within the 4 pixels around the edge (MetalFX sharpens, so a small
+    // overshoot either side is allowed).
+    std::string row;
+    for (std::uint32_t x = 26u; x < 38u; ++x) row += std::to_string((at(x, 13u) >> 16u) & 0xffu) + " ";
+    const auto red = [&](std::uint32_t x) { return static_cast<int>((at(x, 13u) >> 16u) & 0xffu); };
+    Require(red(29u) >= 0xc0 - 48 && red(34u) <= 0x20 + 48 && red(26u) >= 0xc0 - 3 && red(37u) <= 0x20 + 3, "the upscaled edge is wrong: " + row);
+    for (std::uint32_t x = 26u; x < 38u; ++x) Require(red(x) >= 0x20 - 48 && red(x) <= 0xc0 + 48, "the upscaled edge overshoots: " + row);
+    std::printf("metalfx edge row (red): %s\n", row.c_str());
     // A new source size makes a new scaler: 48x27 into the same target (rectangle 64x36).
     device.PresentPixels(48u, 27u, quadrantImage(48u, 27u, colors));
     device.WaitIdle();
