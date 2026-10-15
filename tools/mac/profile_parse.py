@@ -566,3 +566,18 @@ def frame_critical_path(trace, wait_hint=re.compile(r"(wait|Sync|WaitSerial|GpuM
         })
     threads.sort(key=lambda entry: -entry["busy_ms"])
     return {"frames": count, "frame_ms": frame_ms, "threads": threads}
+
+
+_FEX_STATS = re.compile(r"\[fex-stats\] window (\d+): ([\d.]+) s, (\d+) guest threads; JIT (\d+) blocks in ([\d.]+) ms "
+                        r"\(([\d.]+) us each\), lookup-cache misses (\d+), cache lock read ([\d.]+) ms write ([\d.]+) ms, "
+                        r"disk cache (\d+) hits (\d+) misses \(([\d.]+) ms lookup\), SMC (\d+)")
+
+
+def parse_fex_stats(text):
+    """`[fex-stats]` lines (APS5_FEX_STATS, core/fex/src/GuestStats.cpp), one dict per window."""
+    keys = ("window", "seconds", "threads", "jit_blocks", "jit_ms", "jit_us_each", "cache_misses", "read_lock_ms",
+            "write_lock_ms", "disk_hits", "disk_misses", "disk_lookup_ms", "smc")
+    rows = []
+    for match in _FEX_STATS.finditer(text):
+        rows.append({key: (float(value) if "." in value else int(value)) for key, value in zip(keys, match.groups())})
+    return rows

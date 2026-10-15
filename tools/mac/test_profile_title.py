@@ -203,6 +203,21 @@ class LogLineTests(unittest.TestCase):
         self.assertAlmostEqual(summary["kinds"]["native work"], 100)
 
 
+class FexStatsTests(unittest.TestCase):
+    def test_parse(self):
+        line = ("[fex-stats] window 2: 30.0 s, 57 guest threads; JIT 1200 blocks in 350.5 ms (292.1 us each), lookup-cache "
+                "misses 40000, cache lock read 1.5 ms write 0.2 ms, disk cache 900 hits 300 misses (12.0 ms lookup), SMC 3; "
+                "total JIT 5000 blocks in 2000.0 ms")
+        rows = pp.parse_fex_stats("noise\n" + line + "\n")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["window"], 2)
+        self.assertEqual(rows[0]["jit_blocks"], 1200)
+        self.assertAlmostEqual(rows[0]["jit_ms"], 350.5)
+        self.assertEqual(rows[0]["cache_misses"], 40000)
+        self.assertEqual(rows[0]["disk_misses"], 300)
+        self.assertEqual(rows[0]["smc"], 3)
+
+
 class TraceTests(unittest.TestCase):
     def test_critical_path(self):
         events = [
@@ -235,8 +250,12 @@ class ReportTests(unittest.TestCase):
             level = {"instructions": 0, "cycles": 0, "time": 0, "energy_nj": 0}
             Path(f"{base}-threadcounts.json").write_text(json.dumps({
                 "ns_per_tick": 1.0, "t0": 0.0, "t1": 1.0, "before": {"5": {"name": "", "levels": [level, level]}},
-                "after": {"5": {"name": "w", "levels": [dict(level, time=500_000), level]}}}))
+                "after": {"5": {"name": "w", "levels": [dict(level, time=500_000_000), level]}}}))
             result = profile_title.build_report(Path(directory), "T", "x")
+            row = profile_title.compare_row(result)
+            self.assertEqual(row["tag"], "x")
+            self.assertAlmostEqual(row["cores"], 0.5)
+            self.assertIn("| x |", profile_title.compare(Path(directory), "T", ["x"]))
             self.assertIn("sample", result)
             self.assertEqual(result["threads_cpu"]["rows"][0]["name"], "w")
             text = Path(f"{base}-profile.md").read_text()
