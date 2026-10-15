@@ -772,6 +772,18 @@ ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address,
         while (last + 1 < lease.size() && lease[last + 1]->address + lease[last + 1]->bytes <= high && continuesRun(*lease[last], *lease[last + 1])) ++last;
         if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
     }
+    if (alone) {
+        // A run of allocations that each cross a window boundary (large ones: render targets, big
+        // buffers) is joined as before the window existed (D44 bounds small ranges growing a heap):
+        // an image spanning two such adjacent allocations then has one import (Showcase 1.0.2's
+        // 3840x2160 HDR surfaces span two GL allocations; with each imported alone, nothing held
+        // the image's range and its results never reached guest memory: the scene read black,
+        // DECISIONS D65). Every allocation of the run joins from any of them, so the run is the
+        // same whichever address asks.
+        const auto crosses = [&](const GuestAllocations::Range& range) { return range.address / window != (range.address + range.bytes - 1) / window; };
+        while (first > 0 && crosses(*lease[first - 1]) && continuesRun(*lease[first - 1], *lease[first])) --first;
+        while (last + 1 < lease.size() && crosses(*lease[last + 1]) && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    }
     if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
     ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
     if (run.bytes > MaxImportBytes) {
