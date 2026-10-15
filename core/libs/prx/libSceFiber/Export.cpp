@@ -362,8 +362,20 @@ static std::uint8_t* StackTop(const Fiber* fiber) {
     return fiber->hostStack ? fiber->hostStack + fiber->hostStackBytes : fiber->context + fiber->contextSize;
 }
 
+// The stack window the executing fiber uses, as the guest sees it (sceFiberGetInfo's addr_context).
 static std::uint64_t* SizedWindow(const Fiber* fiber) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    // The bridge runs the guest on its own context (Enter), not on the host stack, and the context may be
+    // displaced guest memory (D31, D33): native reads and writes go through ContextWords.
+    return reinterpret_cast<std::uint64_t*>(fiber->context);
+#else
     return reinterpret_cast<std::uint64_t*>(StackTop(fiber) - fiber->contextSize);
+#endif
+}
+
+// SizedWindow for native access.
+static std::uint64_t* ContextWords(const Fiber* fiber) {
+    return GuestArena::HostRange(SizedWindow(fiber), fiber->contextSize);
 }
 
 #ifdef _WIN32
@@ -572,7 +584,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     AllocateHostStack(fiber);
     fiber->contextSizeCheck = g_contextSizeCheck.load(std::memory_order_relaxed);
     if (fiber->contextSizeCheck) {
-        auto* words = SizedWindow(fiber);
+        auto* words = ContextWords(fiber);
         std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
     }
     PinStack(addr_context, size_context);
@@ -680,7 +692,7 @@ int32_t APS5_VABI sceFiberGetInfo(FiberObject* object, FiberInfo* fiber_info) {
     std::memcpy(fiber_info->name, fiber->name, sizeof(fiber_info->name));
     fiber_info->size_context_margin = static_cast<uint64_t>(-1);
     if (fiber->contextSizeCheck) {
-        const auto* words = SizedWindow(fiber);
+        const auto* words = ContextWords(fiber);
         const auto* end = words + fiber->contextSize / sizeof(std::uint64_t);
         fiber_info->size_context_margin = static_cast<uint64_t>(std::find_if(words, end, [](std::uint64_t word) { return word != FIBER_CONTEXT_FILL; }) - words) * sizeof(std::uint64_t);
     }

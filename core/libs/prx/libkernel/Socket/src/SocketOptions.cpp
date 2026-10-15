@@ -123,9 +123,14 @@ int GetSocketLevelOption(std::uintptr_t native, SocketOptionState& state, int ty
         if (::getsockopt(handle, SOL_SOCKET, nativeOption, reinterpret_cast<NativeOptionOutput>(&enabled), &size)) return HostError();
         number = enabled != 0 ? option : 0;
     } else if (option == GuestAcceptConnection) {
+#ifdef __APPLE__
+        // XNU's getsockopt has no SO_ACCEPTCONN (ENOPROTOOPT): listen records it instead.
+        const int listening = state.listening ? 1 : 0;
+#else
         int listening = 0;
         socklen_t size = sizeof(listening);
         if (::getsockopt(handle, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<NativeOptionOutput>(&listening), &size)) return HostError();
+#endif
         number = listening != 0 ? GuestAcceptConnection : 0;
     } else if (option == GuestType) {
         number = type;

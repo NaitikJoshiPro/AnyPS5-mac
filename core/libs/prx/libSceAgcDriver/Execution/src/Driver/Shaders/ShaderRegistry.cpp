@@ -391,7 +391,8 @@ static bool RelocatedRegisters(const ShaderSnapshot& snapshot, Shader used, cons
     const std::size_t bytes = registered.num_sh_registers * sizeof(ShaderRegister);
     if (bytes == 0 || bound == nullptr || address < snapshot.headerAddress || address - snapshot.headerAddress > snapshot.header.size() || snapshot.header.size() - (address - snapshot.headerAddress) < bytes) return false;
     GuestMemory::CheckRange(bound, bytes, alignof(ShaderRegister));
-    return std::memcmp(static_cast<const void*>(bound), snapshot.header.data() + (address - snapshot.headerAddress), bytes) == 0;
+    // The relocated list is guest memory (the caller's fused shader memory): compare it through its host view (D31, D33).
+    return std::memcmp(static_cast<const void*>(GuestArena::HostRange(bound, bytes)), snapshot.header.data() + (address - snapshot.headerAddress), bytes) == 0;
 }
 
 bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {

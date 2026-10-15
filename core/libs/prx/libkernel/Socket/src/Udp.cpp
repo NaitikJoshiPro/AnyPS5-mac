@@ -960,7 +960,10 @@ int APS5_VABI listen_nid_postfix(int descriptor, int backlog) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     if (socket->type != 1) return Fail(45);
-    return ::listen(socket->value, backlog) ? Fail(NativeError()) : 0;
+    if (::listen(socket->value, backlog)) return Fail(NativeError());
+    std::lock_guard lock(socket->modeMutex);
+    socket->options.listening = true;
+    return 0;
 }
 int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* length) {
     const auto listener = Lookup(descriptor);
@@ -1025,7 +1028,24 @@ int APS5_VABI shutdown_nid_postfix(int descriptor, int how) {
     const auto socket = Lookup(descriptor);
     if (!socket) return Fail(9);
     if (how < 0 || how > 2) return Fail(22);
-    if (::shutdown(socket->value, how)) return Fail(NativeError());
+    if (::shutdown(socket->value, how)) {
+#ifdef __APPLE__
+        // XNU refuses SHUT_RD with ENOTCONN once the peer has shut its sending side (SS_CANTRCVMORE), where
+        // FreeBSD's soshutdown still shuts the receive side and flushes what is queued (sorflush). A socket
+        // that still has a peer gets the same: the queued bytes are discarded and the send side shut down
+        // for SHUT_RDWR. An unconnected socket keeps ENOTCONN.
+        sockaddr_storage peer{};
+        socklen_t peerLength = sizeof(peer);
+        if (errno != ENOTCONN || how == 1 || ::getpeername(socket->value, reinterpret_cast<sockaddr*>(&peer), &peerLength) != 0)
+            return Fail(NativeError());
+        char discarded[4096];
+        while (::recv(socket->value, discarded, sizeof(discarded), MSG_DONTWAIT) > 0) {
+        }
+        if (how == 2 && ::shutdown(socket->value, SHUT_WR) && errno != ENOTCONN) return Fail(NativeError());
+#else
+        return Fail(NativeError());
+#endif
+    }
     std::lock_guard lock(socket->modeMutex);
     if (how != 1) socket->receiveShut = true;
     if (how != 0) socket->sendShut = true;

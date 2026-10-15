@@ -153,7 +153,13 @@ int main() {
     Require(sceKernelFstat(pair[1], &status) == 0 && status.st_mode == 0140666 && status.st_size == 5);
     Require(shutdown_nid_postfix(pair[0], 1) == 0);
     Require(fstat_nid_disambig1_nid_postfix(pair[0], &status) == 0 && status.st_mode == 0140444);
-#ifndef _WIN32
+#ifdef __APPLE__
+    // XNU's soshutdown(SHUT_RD) flushes the receive buffer (sorflush), as FreeBSD's does: the queued bytes
+    // are gone, so the read bits drop at once and recv sees the end of the stream.
+    Require(shutdown_nid_postfix(pair[1], 0) == 0);
+    Require(fstat_nid_disambig1_nid_postfix(pair[1], &status) == 0 && status.st_mode == 0140222 && status.st_size == 0);
+    Require(recv_nid_postfix(pair[1], received, sizeof(received), 0) == 0);
+#elif !defined(_WIN32)
     Require(shutdown_nid_postfix(pair[1], 0) == 0);
     Require(fstat_nid_disambig1_nid_postfix(pair[1], &status) == 0 && status.st_mode == 0140666 && status.st_size == 5);
     Require(recv_nid_postfix(pair[1], received, sizeof(received), 0) == 5);

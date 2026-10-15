@@ -1467,6 +1467,11 @@ int lookup_host(int rid, const char* hostname, const char* func, int family, std
     }
     for (const addrinfo* entry = results; entry != nullptr; entry = entry->ai_next) {
         if (entry->ai_family != family) continue;
+#ifdef __APPLE__
+        // Apple's getaddrinfo answers an IPv6 query for an IPv4 literal with its v4-mapped form even without
+        // AI_V4MAPPED; FreeBSD's finds no IPv6 address, so mapped results are not IPv6 answers here.
+        if (family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<const sockaddr_in6*>(entry->ai_addr)->sin6_addr)) continue;
+#endif
         std::array<std::uint8_t, 16> address{};
         if (family == AF_INET6) std::memcpy(address.data(), &reinterpret_cast<const sockaddr_in6*>(entry->ai_addr)->sin6_addr, 16);
         else std::memcpy(address.data(), &reinterpret_cast<const sockaddr_in*>(entry->ai_addr)->sin_addr, 4);

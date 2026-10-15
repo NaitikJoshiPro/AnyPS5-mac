@@ -77,9 +77,20 @@ static GuestThreadState& CurrentGuestState() {
     return state;
 #endif
 }
-static std::mutex stackLock;
-static std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>> liveStacks;
-static std::map<std::uintptr_t, std::size_t> protectedStackPages;
+// Process-owned: mprotect asks for the guest stacks from atexit handlers and late static destructors
+// (guest_memory_lifetime), after a destroyed mutex would fail the lock (EINVAL on macOS).
+struct StackRegistry {
+    std::mutex lock;
+    std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>> live;
+    std::map<std::uintptr_t, std::size_t> protectedPages;
+};
+static StackRegistry& Stacks() {
+    static auto* registry = new StackRegistry;
+    return *registry;
+}
+static std::mutex& stackLock = Stacks().lock;
+static auto& liveStacks = Stacks().live;
+static auto& protectedStackPages = Stacks().protectedPages;
 #if defined(__linux__)
 struct GuestStackMapping {
     std::uintptr_t mappingEnd;
