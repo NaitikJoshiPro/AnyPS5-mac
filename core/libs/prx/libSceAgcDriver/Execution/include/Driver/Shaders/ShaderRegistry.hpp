@@ -87,6 +87,7 @@ struct ShaderSnapshot {
     std::shared_ptr<const RegisteredShaderState> registeredState;
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
+    std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
 };
 
 

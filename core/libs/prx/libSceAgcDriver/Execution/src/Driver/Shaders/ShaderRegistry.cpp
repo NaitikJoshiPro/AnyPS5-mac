@@ -22,6 +22,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <list>
 #include <map>
 #include <mutex>
@@ -139,12 +140,25 @@ std::map<std::uint64_t, std::uint64_t> rawGraphicsRanges;
 }
 
 void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot) {
-    const auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);
+    if (snapshot.rawGraphicsNoted->load(std::memory_order_acquire)) return;
+    auto begin = snapshot.codeAddress;
+    auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);
     {
         std::lock_guard lock(rawGraphicsMutex);
-        auto& recorded = rawGraphicsRanges[snapshot.codeAddress];
-        recorded = std::max(recorded, end);
+        auto next = rawGraphicsRanges.upper_bound(begin);
+        if (next != rawGraphicsRanges.begin() && std::prev(next)->second >= begin) {
+            const auto previous = std::prev(next);
+            begin = previous->first;
+            end = std::max(end, previous->second);
+            rawGraphicsRanges.erase(previous);
+        }
+        while (next != rawGraphicsRanges.end() && next->first <= end) {
+            end = std::max(end, next->second);
+            next = rawGraphicsRanges.erase(next);
+        }
+        rawGraphicsRanges.emplace(begin, end);
     }
+    snapshot.rawGraphicsNoted->store(true, std::memory_order_release);
     rawGraphicsDrawn.store(true, std::memory_order_relaxed);
 }
 
@@ -153,11 +167,10 @@ bool RawGraphicsDrawn() {
 }
 
 bool RawGraphicsDrawnIn(std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return false;
     std::lock_guard lock(rawGraphicsMutex);
-    for (auto found = rawGraphicsRanges.begin(); found != rawGraphicsRanges.end() && found->first < end; ++found) {
-        if (found->second > begin) return true;
-    }
-    return false;
+    const auto next = rawGraphicsRanges.lower_bound(end);
+    return next != rawGraphicsRanges.begin() && std::prev(next)->second > begin;
 }
 
 namespace {
