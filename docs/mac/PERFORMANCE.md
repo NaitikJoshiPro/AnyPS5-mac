@@ -44,6 +44,7 @@ Profile of Showcase (base4, `sample` 15 s, guest sampler):
 | D60 | Same, waiting for GPU writes only (no store outside the mutex) | 433 / 493 -> 418 / 517 | 33.4 / 41.6 -> 33.4 / 41.6 (x2, cool) | no |
 | D61 | Console display mode 1080p (reported by VideoOut) instead of 2160p | 203 / 259, 215 / 268 -> 219 / 232, 215 / 233 (2560x1440 target, GPU 1.15-1.20 GHz, ~70% active): fixed 4K title, no change | not applicable (DOOM registers 1080p) | yes (system behaviour; ASTRO 303 / 1598 (load 22), 323 / 437 -> 347 / 438, 336 / 395 ms, P 4.05 GHz, GPU 0.66-0.73 GHz: no change, its scene is already 1920x1080 / 2432x1368) |
 | D61 | MetalFX spatial upscale in the present (1080p -> 2560x1440) instead of bilinear | not applicable (4K source, downscale) | 33.38 / 41.62, 33.37 / 41.63 -> 33.36 / 41.63, 33.37 / 41.60 (P 3.97-4.0 GHz, cool; paced 30 fps); Present 10.2-10.3 -> 10.7 ms per frame, GPU 420 -> 482 MHz | yes (image quality; ~0.5 ms per present) |
+| D68 | Game preset "Performance Mode" (GetGamePresets priority 1) instead of Game Default (0); system answers from one set of console settings | not applicable (Showcase does not read presets) | not applicable (DOOM does not import GetGamePresets) | yes (system behaviour; ASTRO A/B/B/A 308.6 / 424.1, 435.3 / 883.9, 328.9 / 388.2, 394.3 / 1232.2 ms with P 3.7, 1.8, 3.3, 2.2 GHz and GPU 0.6-0.87 GHz: frame time follows the P-cluster clock, not the preset; display buffers 3840x2160 and scene 1920x1080 / 2432x1368 in every run) |
 
 ## Display resolution and upscaling (D61, PERF2, 2026-10-15)
 
@@ -53,3 +54,10 @@ What the 3D workloads render at (`APS5_TRACE_VIDEOOUT=1`):
 - **DOOM** registers 1920x1080 display buffers. A 1080p source in a 16:9 output larger than 1080p is where MetalFX applies.
 
 Headless runs present into `APS5_PRESENT_SIZE=2560x1440` (the user's 2560x1664 panel letterboxed to 16:9). Without it, title_run's offscreen drawable is 614x345.
+
+## What ASTRO BOT asks before it sizes its output (D68, PERF4, 2026-10-15)
+
+- Before RegisterBuffers2 it calls only `sceSystemServiceParamGetInt(1)` (language), `sceSystemServiceGetStatus` and `sceVideoOutGetOutputStatus` once. It imports no GetResolutionStatus, IsOutputSupported, GetDeviceCapabilityInfo or ConfigureOutput.
+- It uses the output status's dynamic range: an HDR answer (`APS5_HDR=1`) makes it register 3840x2160 with pixel format 0x8100070400000000 instead of 0x8100000000000000 (not decoded yet). It ignores the resolution class: 3840x2160 under class 1 and 2. Its 4K display buffers are its scan-out size on any TV; the scene renders at 1920x1080 / 2432x1368.
+- After registering it polls GetOutputStatus, GetHdrToneMapLuminance and GetGamePresets every frame. The "Performance Mode" preset (now the default, `APS5_GAME_PRESET=default` for Game Default) changed neither its render sizes nor its frame time in four interleaved runs; frame time tracked the P-cluster clock (1.7-3.7 GHz on a shared machine).
+- What would lower ASTRO's cost: the per-present `Driver.Packet.memory_wait` (560-800 ms, PERF3) and the 4K display-buffer decode in the present (PERF3, D66), not the system answers.
