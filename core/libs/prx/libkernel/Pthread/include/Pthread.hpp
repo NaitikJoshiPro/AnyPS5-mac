@@ -164,5 +164,7 @@ void SetLiveGuestThreadsAffinity(KernelCpumask mask);
 KernelCpumask LiveGuestThreadsAffinity();
 bool GuestThreadIsLive(const PthreadPrivate* thread);
 bool LiveGuestThreadExists(std::int64_t tid);
+// scePthreadYield, sched_yield, pthread_yield: a yield that backs off to short sleeps in long streaks (D73).
+void GuestYield();
 
 #endif
