@@ -663,7 +663,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
     }
 
-    if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
+    // Per-vertex fragment inputs of points and lines draw in the triangle-vertices mode with one or
+    // two guest vertices per primitive (MslAbi Version 14, PrimitiveVerticesMacro; DECISIONS D69):
+    // the vertex path only. Conservative rasterization and cull distances stay triangle-only.
+    const bool pointsOrLines = primitive.topologyClass != MTLPrimitiveTopologyClassTriangle;
+    if (triangleVertices && (graphics.rectList || (pointsOrLines && (conservativeMode != 0u || mesh)))) {
+        Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : mesh ? "mesh points or lines" : "points or lines"));
+    }
+    const std::uint32_t primitiveVertices = primitive.topologyClass == MTLPrimitiveTopologyClassPoint ? 1u : primitive.topologyClass == MTLPrimitiveTopologyClassLine ? 2u : 3u;
     // The mesh path fetches rect-list indices like any list (DECISIONS D41); the vertex function's
     // expansion counts vertex ids.
     if (graphics.rectList && draw.indexed && !mesh) Fail("indexed rect lists");
@@ -904,6 +911,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (cullPoints) request.vertex.macros.push_back({Abi::CullPointsMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
+        if (primitiveVertices != 3u) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
         if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         if (perVertex) {
             request.vertex.macros.push_back({Abi::PerVertexLocationsMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations)) + "u"});
@@ -1434,7 +1442,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             header.viewport[3] = graphics.viewport.height;
             header.depthRange[0] = graphics.viewport.minDepth;
             header.depthRange[1] = graphics.viewport.maxDepth;
-            header.triangles = static_cast<std::uint32_t>(fanIndices.size() / 3u);
+            header.triangles = static_cast<std::uint32_t>(fanIndices.size() / primitiveVertices);
             header.flags = (conservativeMode != 0u ? Abi::TriangleFlagConservative : 0u) | (perVertex ? Abi::TriangleFlagPerVertex : 0u);
             std::memcpy(table.data(), &header, sizeof(header));
             auto* ids = reinterpret_cast<std::uint32_t*>(table.data() + sizeof(header));

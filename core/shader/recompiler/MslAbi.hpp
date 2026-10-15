@@ -99,7 +99,9 @@ namespace ShaderRecompiler::MslAbi {
 //   corners' per-vertex values in the primitive record (user(aps5_pv<L>_<j>)). A mesh holds at most
 //   MeshTriangleVerticesPrimitives(maxPrimitives) triangles, so the driver draws the grid (mesh
 //   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.
-inline constexpr std::uint32_t Version = 13u;
+// Version 14: vertex functions in the triangle-vertices mode take PrimitiveVerticesMacro (1 for
+//   points, 2 for lines, default 3): per-vertex fragment inputs of points and lines (DECISIONS D69).
+inline constexpr std::uint32_t Version = 14u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
@@ -304,6 +306,10 @@ inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
 //   unshared vertices per output triangle, MeshTriangleVerticesSplits threadgroups per subgroup);
 //   no buffer: the corners come from the guest's own primitive export;
 inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
+// Version 14: vertex (with TriangleVerticesMacro): the guest vertices per primitive when the draw is
+// a point (1) or line (2) list: host vertex v runs the guest program for guestVertex[N * (v / N) +
+// 0..N-1] and emits corner v % N; corners N..2 repeat the primitive's last vertex. Unset: 3.
+inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
 // - vertex and mesh (with TriangleVerticesMacro): the fragment function's

@@ -534,11 +534,21 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "#elif " + TriangleVerticesCondition() + "\n";
         text += "    device const Aps5TriangleVertices& aps5_tv = *reinterpret_cast<device const Aps5TriangleVertices*>(aps5_triangles);\n";
         text += "    device const uint* aps5_tv_ids = aps5_triangles + 8u;\n";
-        text += "    const uint aps5_triangle = aps5_vertex_id / 3u;\n";
-        text += "    const uint aps5_corner = aps5_vertex_id % 3u;\n";
+        // MslAbi Version 14: points and lines draw in the same mode with PrimitiveVerticesMacro guest
+        // vertices per primitive (1 or 2, default 3); the corners past them repeat the last vertex.
+        const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
+        text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
+        text += "    const uint aps5_triangle = aps5_vertex_id / " + primitiveVertices + ";\n";
+        text += "    const uint aps5_corner = aps5_vertex_id % " + primitiveVertices + ";\n";
         text += "    Aps5VertexOut aps5_v[3] = {};\n";
         for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
-            text += "    " + call("aps5_tv_ids[aps5_triangle * 3u + " + std::to_string(vertex) + "u]", "aps5_v[" + std::to_string(vertex) + "]", vertex) + "\n";
+            const auto slot = "aps5_v[" + std::to_string(vertex) + "]";
+            const auto guest = call("aps5_tv_ids[aps5_triangle * " + primitiveVertices + " + " + std::to_string(vertex) + "u]", slot, vertex);
+            if (vertex == 0u) {
+                text += "    " + guest + "\n";
+                continue;
+            }
+            text += "#if " + primitiveVertices + " > " + std::to_string(vertex) + "u\n    " + guest + "\n#else\n    " + slot + " = aps5_v[" + std::to_string(vertex - 1u) + "];\n#endif\n";
         }
         text += "    aps5_out = aps5_v[aps5_corner];\n";
         for (const auto& output : state.program.Info().outputs) {
