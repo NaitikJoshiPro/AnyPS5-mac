@@ -128,6 +128,15 @@ def cmd_run(args):
                "--frames", str(args.frames), "--max-load", str(args.max_load)]
     if args.validation:
         command.append("--validation")
+    # Silent by default: the audio goes to SDL's dummy driver, or with --audio-file to a file (title_run's disk
+    # driver). Either changes how the title's audio thread is paced, so the report records which one ran.
+    if args.audio_file:
+        command += ["--audio-file", args.audio_file]
+    elif not args.audio_device:
+        env["SDL_AUDIODRIVER"] = "dummy"
+    audio = args.audio_file or ("device" if args.audio_device else "dummy")
+    Path(f"{base}-profile-args.json").write_text(json.dumps({"audio": audio, "env": parse_env(args.env),
+                                                             "window": list(window), "build": args.build}))
     print("profile:", " ".join(command), flush=True)
     runner = subprocess.Popen(command, env=env)
     stop = threading.Event()
@@ -157,6 +166,9 @@ def build_report(log_dir, title, tag):
     summary_path = Path(f"{base}-summary.json")
     if summary_path.exists():
         result["run"] = json.loads(summary_path.read_text())
+    args_path = Path(f"{base}-profile-args.json")
+    if args_path.exists():
+        result["args"] = json.loads(args_path.read_text())
     log_text = Path(f"{base}.log").read_text(errors="replace") if Path(f"{base}.log").exists() else ""
 
     trace_dir = Path(f"{base}-trace")
@@ -211,7 +223,8 @@ def compare_row(result):
     power = result.get("power") or {}
     row = {"tag": result["tag"], "presents": summary.get("presents"), "p50": frame.get("p50"), "p99": frame.get("p99"),
            "p_mhz": power.get("p_active_mhz"), "e_mhz": power.get("e_active_mhz"), "gpu_mhz": power.get("gpu_mhz"),
-           "gpu_active": power.get("gpu_active_pct"), "pressure": "/".join(sorted(power.get("pressure", {}))) or "-"}
+           "gpu_active": power.get("gpu_active_pct"), "pressure": "/".join(sorted(power.get("pressure", {}))) or "-",
+           "audio": (result.get("args") or {}).get("audio", "device")}
     threads = (result.get("threads_cpu") or {}).get("rows", [])
     seconds = (result.get("threads_cpu") or {}).get("seconds") or 1.0
     total = sum(entry["cpu_ms"] for entry in threads)
@@ -230,7 +243,7 @@ def compare_row(result):
 def compare(log_dir, title, tags):
     rows = [compare_row(build_report(Path(log_dir), title, tag)) for tag in tags]
     columns = ["tag", "presents", "p50", "p99", "cores", "p_share", "top_thread", "p_mhz", "e_mhz", "gpu_mhz", "gpu_active",
-               "pressure", "jit"]
+               "pressure", "audio", "jit"]
     lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
     for row in rows:
         cells = []
@@ -252,6 +265,8 @@ def markdown(result):
     run = result.get("run", {})
     if run:
         out.append(f"Run: verdict {run.get('verdict')}, {run.get('wall_s')} s, validation {run.get('validation')}.")
+    if result.get("args"):
+        out.append(f"Audio output: {result['args'].get('audio')}; extra environment: {result['args'].get('env')}.")
     summary = result.get("trace_summary") or {}
     if summary:
         frame = summary.get("frame_ms", {})
@@ -359,6 +374,8 @@ def main(argv=None):
     run.add_argument("--max-load", type=float, default=8.0)
     run.add_argument("--validation", action="store_true")
     run.add_argument("--no-powermetrics", action="store_true")
+    run.add_argument("--audio-file", help="capture the title's audio to this file (SDL disk driver)")
+    run.add_argument("--audio-device", action="store_true", help="play through the real audio device (default: SDL dummy driver)")
     comparison = sub.add_parser("compare", help="one table of several runs' frame times, clocks, CPU and JIT numbers")
     comparison.add_argument("log_dir")
     comparison.add_argument("title")
