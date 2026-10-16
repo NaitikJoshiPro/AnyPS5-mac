@@ -619,6 +619,8 @@ private:
     std::shared_ptr<Buffer> savedBytes;
     std::vector<std::uint64_t> savedTicket;
     std::uint64_t lastSaveTicket = 0;
+    // The site that last dropped saved bytes (named in the untracked write-back refusal).
+    const char* originalDroppedBy = nullptr;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

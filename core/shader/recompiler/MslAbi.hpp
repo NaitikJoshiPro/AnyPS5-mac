@@ -104,7 +104,7 @@ namespace ShaderRecompiler::MslAbi {
 // Version 16: mesh functions take PrimitiveVerticesMacro too (DECISIONS D75): point and line draws
 //   output metal::topology::point / line with the primitive export's first one or two indices, in
 //   the plain and the triangle-vertices mode (N unshared vertices per primitive).
-// Version 17: reserved for DRV-D (D76-D78, not landed at the sync).
+// Version 17: not used (DRV-D's D78 had it before its rebase onto sync4; D78 is Version 20).
 // Version 18 (upstream sync UPSYNC3, DECISIONS D72; was 15 on branch sync3):
 // - fragment: APS5_SAMPLE_MASK (SampleMaskMacro), the uniform PA_SC_AA_MASK in guest sample bits
 //   (upstream 1ffc5f672 HostSampleMask, the Vulkan pipeline's pSampleMask): the function ANDs its
@@ -175,12 +175,34 @@ namespace ShaderRecompiler::MslAbi {
 //   LDS lock is set free by one invocation and released with an exchange (upstream 4864a7480,
 //   317a323ee); ds_ordered_count swap (upstream b0558ce95) and the ordered count's operand from the
 //   first active lane's half (upstream fcc426b6a).
-inline constexpr std::uint32_t Version = 19u;
+// Version 20 (DECISIONS D78; Version 17 on branch drvd-land2 before the rebase onto sync4): point
+//   and line draws in the triangle-vertices mode output and read only their own corners' per-vertex
+//   fields (PrimitiveVerticesMacro in the fragment function too); mesh point draws need no staging
+//   (MeshPointSplitVertices, PointSplitVerticesMacro).
+inline constexpr std::uint32_t Version = 20u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
 // a subgroup's primitives are split over the grid's z dimension in equal parts.
 inline constexpr std::uint32_t MeshMaxVertices = 256u;
+// Version 20 (DECISIONS D78): point draws in the mesh function's triangle-vertices mode need no
+// staging: every vertex record carries its own per-vertex values (user(aps5_pv<L>_0)) and corner
+// weight, and each point takes its vertex's. Metal's mesh output holds at most MeshMaxOutputBytes,
+// so the subgroup's vertices are split over the grid's z in runs of MeshPointSplitVertices
+// (PointSplitVerticesMacro); a point belongs to the run holding its vertex. The record estimate:
+// position, parameters, per-vertex values, weights and point size at 16 bytes each, 16 bytes a
+// primitive.
+inline constexpr std::uint32_t MeshMaxOutputBytes = 32768u;
+inline constexpr std::uint32_t MeshPointSplitVertices(std::uint32_t maxVertices, std::uint32_t maxPrimitives, std::uint32_t parameters, std::uint32_t perVertexLocations) {
+    const std::uint32_t record = 16u * (1u + parameters + perVertexLocations) + 32u;
+    const std::uint32_t primitives = maxPrimitives * 16u;
+    const std::uint32_t available = primitives < MeshMaxOutputBytes ? MeshMaxOutputBytes - primitives : 0u;
+    const std::uint32_t vertices = available / record;
+    return vertices == 0u ? 1u : vertices < maxVertices ? vertices : (maxVertices == 0u ? 1u : maxVertices);
+}
+inline constexpr std::uint32_t MeshPointSplits(std::uint32_t maxVertices, std::uint32_t splitVertices) {
+    return maxVertices == 0u ? 1u : (maxVertices + splitVertices - 1u) / splitVertices;
+}
 inline constexpr std::uint32_t MeshTriangleVerticesSplits(std::uint32_t maxPrimitives) {
     constexpr std::uint32_t limit = MeshMaxVertices / 3u;
     return maxPrimitives == 0u ? 1u : (maxPrimitives + limit - 1u) / limit;
@@ -413,11 +435,17 @@ inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
 // 0..N-1] and emits corner v % N; corners N..2 repeat the primitive's last vertex. Unset: 3.
 // Version 16: mesh (any mode): the draw's topology class, 1 for points, 2 for lines (the output
 // topology and the indices read from each primitive export).
+// Version 20 (DECISIONS D78): vertex, mesh and fragment in the triangle-vertices mode: the per-vertex
+// corner fields user(aps5_pv<L>_<j>) exist for j < N only; the fragment function reads corners past
+// N from corner N - 1. The triangle-vertices mesh<> holds N x MeshTriangleVerticesPrimitives vertices.
 inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
 // Version 16: vertex and mesh: 1 when the draw is a point list (DECISIONS D75). A function whose guest
 // program exports no point size then writes [[point_size]] 1.0 (Metal leaves an unwritten size
 // undefined; Vulkan's maintenance5 default is 1.0; PA_SU_POINT_SIZE is not applied).
 inline constexpr const char* PointsMacro = "APS5_POINTS";
+// Version 20 (DECISIONS D78): mesh, triangle-vertices mode of a point draw: MeshPointSplitVertices,
+// the vertices each threadgroup outputs (threadgroup z outputs [z x it, (z + 1) x it)).
+inline constexpr const char* PointSplitVerticesMacro = "APS5_POINT_SPLIT_VERTICES";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
 // - vertex and mesh (with TriangleVerticesMacro): the fragment function's

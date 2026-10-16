@@ -28,7 +28,15 @@ namespace ShaderRecompiler {
 std::string TriangleVertexMacroDefaults() {
     return "#ifndef APS5_PER_VERTEX_LOCATIONS\n#define APS5_PER_VERTEX_LOCATIONS 0\n#endif\n"
            "#ifndef APS5_PER_VERTEX_LOCATIONS_HI\n#define APS5_PER_VERTEX_LOCATIONS_HI 0\n#endif\n"
-           "#ifndef APS5_BARYCENTRICS\n#define APS5_BARYCENTRICS 0\n#endif\n";
+           "#ifndef APS5_BARYCENTRICS\n#define APS5_BARYCENTRICS 0\n#endif\n"
+           "#ifndef APS5_PRIMITIVE_VERTICES\n#define APS5_PRIMITIVE_VERTICES 3u\n#endif\n";
+}
+
+// Per-vertex corner fields of a point or line draw (MslAbi Version 16, DECISIONS D78): corners past
+// the primitive's vertices repeat its last one, so they are not output; `corner` 0 always is.
+std::string CornerField(std::uint32_t location, std::uint32_t corner, const std::string& declaration) {
+    if (corner == 0u) return declaration;
+    return "#if APS5_PRIMITIVE_VERTICES > " + std::to_string(corner) + "u\n" + declaration + "#endif\n";
 }
 
 std::string TriangleVerticesCondition() {
@@ -906,7 +914,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         for (const auto& output : state.program.Info().outputs) {
             if (output.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(output.location) + "\n";
-            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += CornerField(output.location, vertex, "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n");
             text += "#endif\n";
         }
         text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
@@ -976,14 +984,21 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += "#if " + TriangleVerticesCondition() + "\n";
         text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
         text += "#if (APS5_BARYCENTRICS & 2)\n    float3 aps5_bwl [[user(aps5_bwl)]];\n#endif\n";
+        // Point draws (MslAbi Version 20, DECISIONS D78): each vertex carries its own per-vertex values.
+        text += "#if APS5_PRIMITIVE_VERTICES == 1u\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n    float4 " + PerVertexField(output.location, 0u) + " [[user(aps5_" + PerVertexField(output.location, 0u) + ")]];\n#endif\n";
+        }
+        text += "#endif\n";
         text += "#endif\n";
         text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
         if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
-        text += "#if " + TriangleVerticesCondition() + "\n";
+        text += "#if (" + TriangleVerticesCondition() + ") && APS5_PRIMITIVE_VERTICES > 1u\n";
         for (const auto& output : state.program.Info().outputs) {
             if (output.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(output.location) + "\n";
-            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += CornerField(output.location, vertex, "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n");
             text += "#endif\n";
         }
         text += "#endif\n";
@@ -1003,7 +1018,9 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
             text += "#if " + primitiveVertices + " == 1u\n#define APS5_MESH_TOPOLOGY metal::topology::point\n#elif " + primitiveVertices + " == 2u\n#define APS5_MESH_TOPOLOGY metal::topology::line\n#else\n#define APS5_MESH_TOPOLOGY metal::topology::triangle\n#endif\n";
             text += "#if " + TriangleVerticesCondition() + "\n";
-            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(3u * split) + ", " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n";
+            text += "#if " + primitiveVertices + " == 1u\n#ifndef " + std::string(MslAbi::PointSplitVerticesMacro) + "\n#define " + std::string(MslAbi::PointSplitVerticesMacro) + " " + std::to_string(meshOutput.vertices) + "u\n#endif\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::string(MslAbi::PointSplitVerticesMacro) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n#else\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, APS5_PRIMITIVE_VERTICES * " + std::to_string(split) + "u, " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n#endif\n";
             text += "#else\n";
             text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n";
             text += "#endif\n\n";
@@ -1014,6 +1031,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     if (stage != IrShaderStage::Pixel) state.Fail("only vertex, mesh and pixel graphics stages are implemented in the MSL backend so far (work package B6)");
     const auto& pixel = PixelInfo(state);
     text += "#ifndef APS5_VERTEX_OUTPUTS\n#define APS5_VERTEX_OUTPUTS 0xffffffff\n#endif\n#ifndef APS5_VERTEX_OUTPUTS_HI\n#define APS5_VERTEX_OUTPUTS_HI 0xffffffff\n#endif\n";
+    text += "#ifndef APS5_PRIMITIVE_VERTICES\n#define APS5_PRIMITIVE_VERTICES 3u\n#endif\n";
     text += "#ifndef APS5_SAMPLE_BASE\n#define APS5_SAMPLE_BASE 0\n#endif\n";
     text += "struct Aps5FragmentIn {\n    float4 aps5_position [[position]];\n";
     std::string accessors;
@@ -1052,9 +1070,15 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         const auto macro = location < 32u ? std::string("APS5_VERTEX_OUTPUTS") : std::string("APS5_VERTEX_OUTPUTS_HI");
         const auto guard = "#if ((" + macro + " >> " + std::to_string(location % 32u) + ") & 1)\n";
         text += guard;
-        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(location, vertex) + " [[user(aps5_" + PerVertexField(location, vertex) + "), flat]];\n";
+        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += CornerField(location, vertex, "    float4 " + PerVertexField(location, vertex) + " [[user(aps5_" + PerVertexField(location, vertex) + "), flat]];\n");
         text += "#endif\n";
-        accessors += guard + "#define aps5_pv_" + std::to_string(location) + "(v, c) aps5_in.pv" + std::to_string(location) + "_##v[c]\n#else\n#define aps5_pv_" + std::to_string(location) + "(v, c) 0.0f\n#endif\n";
+        // Point and line draws (D78) read their missing corners from the last one they have.
+        const auto name = "aps5_pv_" + std::to_string(location);
+        const auto field = "aps5_in.pv" + std::to_string(location) + "_";
+        accessors += guard + "#define " + name + "(v, c) " + name + "_##v(c)\n#define " + name + "_0(c) " + field + "0[c]\n";
+        accessors += "#if APS5_PRIMITIVE_VERTICES > 1u\n#define " + name + "_1(c) " + field + "1[c]\n#else\n#define " + name + "_1(c) " + field + "0[c]\n#endif\n";
+        accessors += "#if APS5_PRIMITIVE_VERTICES > 2u\n#define " + name + "_2(c) " + field + "2[c]\n#else\n#define " + name + "_2(c) " + name + "_1(c)\n#endif\n";
+        accessors += "#else\n#define " + name + "(v, c) 0.0f\n#endif\n";
     }
     // The corner weights at each location read (DECISIONS D38): one location takes its qualifier,
     // several make the weights an interpolant<>.

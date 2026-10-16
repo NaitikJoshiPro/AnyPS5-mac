@@ -2565,6 +2565,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
+            originalDroppedBy = "upload";
         } else {
             captureGuestBytes(nullptr);
         }
@@ -2618,6 +2619,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
+            originalDroppedBy = "upload #2";
         } else {
             captureGuestBytes(layers);
         }
@@ -4285,6 +4287,7 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
         layerPending[layer] = false;
         layerOriginal[layer] = false;
         cancelStoredSave(layer);
+        originalDroppedBy = "evictStale";
     }
     if (!anyLayerPending()) {
         ++dropped;
@@ -4349,6 +4352,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             texture->layerPending.assign(texture->trackedLayers, false);
             texture->layerOriginal.assign(texture->trackedLayers, false);
             texture->cancelStoredSaves();
+            texture->originalDroppedBy = "DiscardPendingInside";
             it = pending.textures.erase(it);
             ++discarded;
         } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
@@ -4362,6 +4366,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 texture->layerPending[unit] = false;
                 texture->layerOriginal[unit] = false;
                 texture->cancelStoredSave(unit);
+                texture->originalDroppedBy = "DiscardPendingInside #2";
                 unitsDropped.fetch_add(1, std::memory_order_relaxed);
                 dropped = true;
             }
@@ -4565,6 +4570,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     recorder->EndGpuTiming(timing, guestBytes);
     layerOriginal.assign(trackedLayers, false);
     cancelStoredSaves();
+    originalDroppedBy = "clearByKeysFill";
     uploadedKeys = keys;
     filledKeys = DccKeys::Uncompressed;
     keyProof = {};
@@ -4665,6 +4671,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
                 if (auto shared = texture->weak_from_this().lock()) untrackedOverlaps.push_back(std::move(shared));
             } else {
                 texture->forgetSavedOver(begin, bytes);
+                texture->originalDroppedBy = "FillClear";
             }
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
@@ -4719,6 +4726,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     if (watched) {
         layerOriginal.assign(trackedLayers, false);
         cancelStoredSaves();
+        originalDroppedBy = "FillClear #2";
     }
     uploadedKeys = DccKeys::Uncompressed;
     if (layer != WholeImage && trackedLayers > 1) {
@@ -4802,6 +4810,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
                 continue;
             }
             texture->forgetSavedOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            texture->originalDroppedBy = "CopyFrom";
         }
     }
     for (const auto& texture : untrackedOverlaps) texture->keepComparable();
@@ -4856,6 +4865,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         layerOriginal.assign(trackedLayers, false);
         cancelStoredSaves();
+        originalDroppedBy = "CopyFrom #2";
     } else {
         captureGuestBytes(nullptr);
     }
@@ -5155,6 +5165,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (!layers[layer]) continue;
             layerOriginal[layer] = false;
             cancelStoredSave(layer);
+            originalDroppedBy = "writeBackLayers";
         }
     };
     bool unsavedOutsideWatch = false;
@@ -5247,7 +5258,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         char where[160];
         std::snprintf(where, sizeof(where), " (image 0x%llx+0x%llx, %u layers; write watch covers it now: %d, first unsaved layer %u)", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0,
             static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
-        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where);
+        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where + " (saved bytes last dropped at " + (originalDroppedBy != nullptr ? originalDroppedBy : "none: never saved") + ")");
     }
         // Outside the write watch the stored bytes are what the next store compares with.
         const auto saveUnits = GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? std::vector<std::uint32_t>{} : prepareStoredSave(layers, skippedLayer);
@@ -5430,7 +5441,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         char where[160];
         std::snprintf(where, sizeof(where), " (image 0x%llx+0x%llx, %u layers; write watch covers it now: %d, first unsaved layer %u)", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0,
             static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
-        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where);
+        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where + " (saved bytes last dropped at " + (originalDroppedBy != nullptr ? originalDroppedBy : "none: never saved") + ")");
     }
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();

@@ -220,6 +220,8 @@ void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler:
     } mutableCopy];
     // MslAbi Version 18: the uniform PA_SC_AA_MASK as MetalDraw passes it (guest sample bits).
     if (sampleMask != nil) fragmentMacros[@(Abi::SampleMaskMacro)] = sampleMask;
+    // DECISIONS D78: points and lines output and read only their own corners.
+    if (primitiveVertices != 3u) fragmentMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
     id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, fragmentMacros);
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = vertexFunction;
