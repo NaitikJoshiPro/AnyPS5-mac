@@ -197,6 +197,7 @@ def build_report(log_dir, title, tag):
             "totals": dict(sampled["totals"].most_common()),
             "details": {category: details.most_common(8) for category, details in sampled["details"].items()},
             "threads": sampled["threads"][:24],
+            "all_threads": [{"tid": entry["tid"], "busy": entry["busy"], "total": entry["total"]} for entry in sampled["threads"]],
         }
 
     pm_path = Path(f"{base}-pm.txt")
@@ -291,8 +292,12 @@ def markdown(result):
         rows = threads["rows"]
         total = sum(row["cpu_ms"] for row in rows)
         p_total = sum(row["p_ms"] for row in rows)
-        sampled = {str(entry["tid"]): 100.0 * entry["busy"] / entry["total"]
-                   for entry in (result.get("sample") or {}).get("threads", []) if entry.get("total")}
+        # sample(1) lists a thread again under each dispatch queue it served: sum them per thread id.
+        busy_total = {}
+        for entry in (result.get("sample") or {}).get("all_threads", []):
+            busy, total = busy_total.get(str(entry["tid"]), (0, 0))
+            busy_total[str(entry["tid"])] = (busy + entry["busy"], total + entry["total"])
+        sampled = {tid: 100.0 * busy / total for tid, (busy, total) in busy_total.items() if total}
         out += ["", f"## CPU per thread over {threads['seconds']:.1f} s (P/E time from the kernel's per-thread counters)", "",
                 f"Process: {total / 1000.0 / threads['seconds']:.2f} cores, {100.0 * p_total / total if total else 0:.0f}% "
                 "of it on P cores.", "",
