@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <bit>
@@ -20,6 +21,9 @@ void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, st
 }
 
 bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget) {
+    // The packets are read natively in bulk: a displaced command buffer (D31, D33) at its alias, not through the fault
+    // path. Guest addresses (targets, the rewind tail) stay guest addresses.
+    const auto* host = GuestArena::HostRange(guest, words * sizeof(std::uint32_t));
     require(words <= budget, "command buffer jumps exceed the copy limit (a jump loop?)");
     budget -= words;
     std::vector<std::pair<std::size_t, std::size_t>> guarded;
@@ -32,7 +36,7 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         for (const auto& range : guarded) require(range.first >= next, "conditional execution range ends inside a packet");
     };
     for (std::size_t cursor = 0; cursor < words;) {
-        const auto header = guest[cursor];
+        const auto header = host[cursor];
         if (Pm4::FillerPacket(header)) {
             reach(cursor, cursor + 1);
             submission.commands.push_back(header);
@@ -41,18 +45,18 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         }
         const auto count = (header & 0xc0000000u) == 0xc0000000u ? Pm4::PacketWords(header) : words - cursor;
         if ((header & 0xc0000000u) != 0xc0000000u || count > words - cursor) {
-            submission.commands.insert(submission.commands.end(), guest + cursor, guest + words);
+            submission.commands.insert(submission.commands.end(), host + cursor, host + words);
             return false;
         }
         reach(cursor, cursor + count);
         const auto opcode = (header >> 8u) & 0xffu;
         if (opcode == 0x3fu && count == 14) {
-            const auto mode = guest[cursor + 1] & 3u;
+            const auto mode = host[cursor + 1] & 3u;
             require(mode == 1u || mode == 2u, "invalid COND_INDIRECT_BUFFER mode");
-            require(((guest[cursor + 1] >> 8u) & 7u) == 0u, "a COND_INDIRECT_BUFFER with a comparison is not implemented");
+            require(((host[cursor + 1] >> 8u) & 7u) == 0u, "a COND_INDIRECT_BUFFER with a comparison is not implemented");
             require(!Pm4::Predicated(header), "a predicated COND_INDIRECT_BUFFER is not implemented");
-            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 8] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 9] & 0xffffu) << 32u));
-            const std::size_t targetWords = guest[cursor + 10] & 0xfffffu;
+            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(host[cursor + 8] & ~3u) | (static_cast<std::uintptr_t>(host[cursor + 9] & 0xffffu) << 32u));
+            const std::size_t targetWords = host[cursor + 10] & 0xfffffu;
             if (targetWords != 0) {
                 GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
                 if (copySegment(submission, target, targetWords, budget)) {
@@ -65,15 +69,15 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         }
         if (opcode == 0x3fu) {
             require(count == 4, "invalid INDIRECT_BUFFER size");
-            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 1] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 2] & 0xffffu) << 32u));
-            const std::size_t targetWords = guest[cursor + 3] & 0xfffffu;
-            const bool chain = (guest[cursor + 3] & (1u << 20u)) != 0;
+            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(host[cursor + 1] & ~3u) | (static_cast<std::uintptr_t>(host[cursor + 2] & 0xffffu) << 32u));
+            const std::size_t targetWords = host[cursor + 3] & 0xfffffu;
+            const bool chain = (host[cursor + 3] & (1u << 20u)) != 0;
             require(!chain || guarded.empty(), "a chained INDIRECT_BUFFER inside a conditional execution range is not implemented");
             GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
             if (Pm4::Predicated(header)) {
                 require(!chain, "predicated command buffer chains are not implemented");
                 const auto start = submission.commands.size();
-                submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
+                submission.commands.insert(submission.commands.end(), host + cursor, host + cursor + count);
                 require(!copySegment(submission, target, targetWords, budget), "a REWIND inside a predicated command buffer is not implemented");
                 for (auto inner = start + count; inner < submission.commands.size(); inner += Pm4::PacketWords(submission.commands[inner])) {
                     const auto innerHeader = submission.commands[inner];
@@ -91,12 +95,12 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
             cursor += count;
             continue;
         }
-        if (opcode == 0x22u && count == 5) guarded.emplace_back(cursor + count + Pm4::ConditionalWords(std::span(guest + cursor, count)), submission.commands.size());
-        submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
+        if (opcode == 0x22u && count == 5) guarded.emplace_back(cursor + count + Pm4::ConditionalWords(std::span(host + cursor, count)), submission.commands.size());
+        submission.commands.insert(submission.commands.end(), host + cursor, host + cursor + count);
         cursor += count;
         if (opcode == 0x59u) {
             require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
-            submission.rewindTail = guest + cursor;
+            submission.rewindTail = guest + cursor; // the guest address: polled and reported later
             submission.rewindWords = words - cursor;
             return true;
         }
@@ -186,7 +190,7 @@ void Driver::reserveOutputs(Submission& submission) {
 
 void Driver::executeRewindTail(const Submission& stalled) {
     PerformanceTimer timing("Driver.Rewind");
-    std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
+    std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(GuestArena::HostPointer(stalled.rewindTail - 1))); // polled at the alias if displaced
     if ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
         struct BlockedWait {
@@ -389,8 +393,9 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
         if (std::find(submission.labelWrites.begin(), submission.labelWrites.end(), dword) != submission.labelWrites.end()) return;
         if (worker != workers.end() && worker->second.unfinishedWrites.contains(dword)) return;
     }
-    std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(address);
-    if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address + 4)) << 32u;
+    const auto label = GuestArena::HostRange(static_cast<std::uintptr_t>(address), bytes); // alias if displaced (D31, D33)
+    std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(label);
+    if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(label + 4)) << 32u;
     if (Pm4::WaitComparesValue(packet, value)) submission.heldAtSubmit.insert(cursor);
 }
 

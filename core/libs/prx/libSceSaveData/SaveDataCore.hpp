@@ -22,6 +22,7 @@
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
 
 namespace savedata {
@@ -290,7 +291,7 @@ std::filesystem::path save_blocks_path(const std::filesystem::path& directory) {
 }
 
 bool write_blob(const std::filesystem::path& path, const void* data, std::size_t size) {
-    if (!replace_file(path, data, size)) return false;
+    if (!replace_file(path, GuestArena::HostRange(data, size), size)) return false; // guest buffer: alias if displaced (D31, D33)
     RecordWrittenPath_nid_no_patch(path);
     return true;
 }
@@ -300,7 +301,7 @@ bool read_blob(const std::filesystem::path& path, void* data, std::size_t size) 
     if (!file) {
         return false;
     }
-    file.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+    file.read(static_cast<char*>(GuestArena::HostRange(data, size)), static_cast<std::streamsize>(size)); // guest buffer: alias if displaced (D31, D33)
     return static_cast<std::size_t>(file.gcount()) == size;
 }
 
@@ -532,7 +533,7 @@ int mount_internal(const SceSaveDataDirName* dir_name, std::uint32_t mount_mode,
     slot.mount_point = mount_point;
     slot.dir_name = requested;
     slot.directory = directory;
-    std::memcpy(mount_result->mount_point.data, mount_point.c_str(), mount_point.size() + 1);
+    std::memcpy(GuestArena::HostRange(mount_result->mount_point.data, mount_point.size() + 1), mount_point.c_str(), mount_point.size() + 1); // alias if displaced (D31, D33)
     mount_result->required_blocks = 0;
     mount_result->mount_status = created ? 1u : 0u;
     return SD_OK;
@@ -721,7 +722,7 @@ int get_param_internal(const SaveDataMountPoint* mount_point, std::uint32_t para
         if (param_buf_size < sizeof(param)) {
             return SD_ERROR_PARAMETER;
         }
-        std::memcpy(param_buf, &param, sizeof(param));
+        std::memcpy(GuestArena::HostRange(param_buf, sizeof(param)), &param, sizeof(param)); // guest buffers: alias if displaced (D31, D33)
         written = sizeof(param);
     } else if (param_type == SD_PARAM_USER_PARAM || param_type == SD_PARAM_MTIME) {
         const std::size_t size = param_type == SD_PARAM_USER_PARAM ? sizeof(param.user_param)
@@ -729,7 +730,7 @@ int get_param_internal(const SaveDataMountPoint* mount_point, std::uint32_t para
         if (param_buf_size < size) {
             return SD_ERROR_PARAMETER;
         }
-        std::memcpy(param_buf,
+        std::memcpy(GuestArena::HostRange(param_buf, size),
                     param_type == SD_PARAM_USER_PARAM
                         ? static_cast<const void*>(&param.user_param)
                         : static_cast<const void*>(&param.mtime),
@@ -744,8 +745,9 @@ int get_param_internal(const SaveDataMountPoint* mount_point, std::uint32_t para
             return SD_ERROR_PARAMETER;
         }
         const std::size_t length = std::min<std::size_t>(std::strlen(field), param_buf_size - 1);
-        std::memcpy(param_buf, field, length);
-        static_cast<char*>(param_buf)[length] = '\0';
+        auto* text = static_cast<char*>(GuestArena::HostRange(param_buf, length + 1));
+        std::memcpy(text, field, length);
+        text[length] = '\0';
         written = length + 1;
     }
     if (got_size != nullptr) {
@@ -801,7 +803,7 @@ int set_param_internal(const SaveDataMountPoint* mount_point, std::uint32_t para
             return SD_ERROR_PARAMETER;
         }
         const std::size_t length = std::min(param_buf_size, capacity - 1);
-        const char* text = static_cast<const char*>(param_buf);
+        const char* text = static_cast<const char*>(GuestArena::HostRange(param_buf, length));
         const char* end = static_cast<const char*>(std::memchr(text, '\0', length));
         std::memset(field, 0, capacity);
         std::memcpy(field, text, end != nullptr ? static_cast<std::size_t>(end - text) : length);
@@ -1172,7 +1174,7 @@ int transferring_mount_internal(const SaveDataTransferringMount* mount,
     slot.mount_point = mount_point;
     slot.dir_name = mount->dir_name->data;
     slot.directory = directory;
-    std::memcpy(mount_result->mount_point.data, mount_point.c_str(), mount_point.size() + 1);
+    std::memcpy(GuestArena::HostRange(mount_result->mount_point.data, mount_point.size() + 1), mount_point.c_str(), mount_point.size() + 1); // alias if displaced (D31, D33)
     mount_result->required_blocks = 0;
     mount_result->mount_status = 0;
     return SD_OK;

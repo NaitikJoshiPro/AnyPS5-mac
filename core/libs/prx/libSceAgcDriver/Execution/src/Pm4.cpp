@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include <algorithm>
 #include <thread>
@@ -348,7 +349,13 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
         case 0x28:
             graphics();
             size(3);
-            require((packet[1] & 0x7fffffffu) == 0 && (packet[2] & 0x7fffffffu) == 0, "CONTEXT_CONTROL register loading and shadowing are not implemented");
+            // Bit 31 of each dword (UPDATE_LOAD_ENABLES / UPDATE_SHADOW_ENABLES) latches the enable bits below it;
+            // with it clear the CP leaves the enables alone and the dword does nothing ("set load_enable otherwise
+            // this package is just NOPs", Linux amdgpu gfx_v10_0_ring_emit_cntxcntl). oops-mesa's fence stream
+            // sends (0x200, address >> 8) and retires on hardware.
+            for (const auto control : {packet[1], packet[2]}) {
+                require((control & 0x80000000u) == 0 || (control & 0x7fffffffu) == 0, "CONTEXT_CONTROL register loading and shadowing are not implemented");
+            }
             break;
         case 0x46: {
             require((packet[1] & ~0x73fu) == 0, "unsupported EVENT_WRITE flags or reserved bits");
@@ -373,6 +380,15 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
                     graphics();
                     size(2);
                     require(eventIndex == 0, "invalid VGT_FLUSH event index");
+                    break;
+                case 0x0e:
+                    // BREAK_BATCH closes the primitive binner's current batch (Mesa emits it with index 0 on the
+                    // graphics queue when binning is allowed: si_state.c, ac_shadowed_regs.c). Binning changes
+                    // neither memory nor rendered results and this driver executes packets in order, so the
+                    // event is an ordering point like the other non-memory events.
+                    graphics();
+                    size(2);
+                    require(eventIndex == 0, "invalid BREAK_BATCH event index");
                     break;
                 case 0x39:
                     graphics();
@@ -525,7 +541,9 @@ bool WaitSatisfied(std::span<const std::uint32_t> packet) {
 
 bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
-    const auto source = address(packet[2], packet[3]);
+    // Labels in the displaced window (D31/D33: STK's buffers at 0x400000000) are polled at their alias, so a
+    // poll does not take the fault handler's path on every load.
+    const auto source = GuestArena::HostRange(static_cast<std::uintptr_t>(address(packet[2], packet[3])), wide ? 8u : 4u);
     const std::uint64_t value = wide ? *reinterpret_cast<const volatile std::uint64_t*>(source) : *reinterpret_cast<const volatile std::uint32_t*>(source);
     return waitCompares(packet, wide, value);
 }

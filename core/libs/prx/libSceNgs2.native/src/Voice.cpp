@@ -98,6 +98,7 @@ static void SetMatrixLevels(Ngs2Voice& voice, std::uint32_t matrixId, const floa
     if (matrixId >= voice.matrices.size() || numLevels == 0 || numLevels > NGS2_MAX_CHANNELS * NGS2_MAX_CHANNELS || levels == nullptr) {
         APS5_INVALID_ARG_EX;
     }
+    levels = Ngs2Host(levels, numLevels * sizeof(float));
     auto& matrix = voice.matrices[matrixId];
     matrix.resize(numLevels);
     for (std::uint32_t i = 0; i < numLevels; i++) matrix[i] = std::clamp(levels[i], -MAX_MATRIX_LEVEL, MAX_MATRIX_LEVEL);
@@ -170,30 +171,37 @@ static void SetupSampler(Ngs2Voice& voice, const Ngs2WaveformFormat& format) {
     if (format.waveform_type == SCE_NGS2_WAVEFORM_TYPE_ATRAC9) Ngs2SetupAtrac9(voice, format);
 }
 
+// A waveform block's data through its host view: rendering reads it per sample (WaveformData() maps it back for the guest).
+static const std::uint8_t* BlockData(const Ngs2SamplerVoiceWaveformBlocksParam& param, const Ngs2WaveformBlock& block) {
+    return Ngs2Host(static_cast<const std::uint8_t*>(param.data) + block.data_offset, block.data_size);
+}
+
 static void AppendStreamData(Ngs2Voice& voice, const Ngs2SamplerVoiceWaveformBlocksParam& param, std::size_t frameBytes) {
     if (voice.waveformType == SCE_NGS2_WAVEFORM_TYPE_ATRAC9) {
         const bool pendingWaveform = voice.atrac9.remainingSamples != 0 ||
             std::any_of(voice.blocks.begin(), voice.blocks.end(), [](const Ngs2Block& block) { return block.info.num_samples != 0; });
         if (!pendingWaveform) throw std::invalid_argument("NGS2: appending compressed data requires a waveform");
+        const auto* blocks = Ngs2Host(param.blocks, param.num_blocks * sizeof(*param.blocks));
         for (std::uint32_t i = 0; i < param.num_blocks; ++i) {
-            auto block = param.blocks[i];
+            auto block = blocks[i];
             if (block.data_size == 0) continue;
             block.num_samples = 0;
             block.num_skip_samples = 0;
             block.num_repeats = 0;
-            voice.blocks.push_back({static_cast<const std::uint8_t*>(param.data) + block.data_offset, block});
+            voice.blocks.push_back({BlockData(param, block), block});
         }
         return;
     }
     if (voice.blocks.empty() || !voice.blocks.back().streaming) throw std::runtime_error("NGS2: appending waveform data to a voice without a streaming waveform is not implemented");
     auto& stream = voice.blocks.back();
+    const auto* blocks = Ngs2Host(param.blocks, param.num_blocks * sizeof(*param.blocks));
     for (std::uint32_t i = 0; i < param.num_blocks; i++) {
-        const auto& block = param.blocks[i];
+        const auto& block = blocks[i];
         if (block.data_size == 0) continue;
         if (block.data_size % frameBytes != 0 || block.num_skip_samples != 0 || block.num_repeats != 0) {
             throw std::runtime_error("NGS2: appending a waveform block with skipped samples, repeats or a partial frame is not implemented");
         }
-        stream.pieces.push_back({static_cast<const std::uint8_t*>(param.data) + block.data_offset, stream.availableFrames, block.data_size / frameBytes});
+        stream.pieces.push_back({BlockData(param, block), stream.availableFrames, block.data_size / frameBytes});
         stream.availableFrames += block.data_size / frameBytes;
     }
 }
@@ -219,8 +227,9 @@ static void AddWaveformBlocks(Ngs2Voice& voice, const Ngs2SamplerVoiceWaveformBl
     }
     voice.acceptsBlocks = (param.flags & SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE) != 0;
     const bool allowsSilence = (param.flags & SCE_NGS2_WAVEFORM_BLOCKS_FLAG_SILENCE) != 0;
+    const auto* blocks = Ngs2Host(param.blocks, param.num_blocks * sizeof(*param.blocks));
     for (std::uint32_t i = 0; i < param.num_blocks; i++) {
-        const auto& block = param.blocks[i];
+        const auto& block = blocks[i];
         if (block.num_samples == 0 && block.data_size == 0) continue;
         if (allowsSilence && block.data_size == 0) {
             if (voice.waveformType == SCE_NGS2_WAVEFORM_TYPE_ATRAC9) throw std::runtime_error("NGS2: a dataless waveform block under the silence flag is not implemented for ATRAC9 voices");
@@ -235,7 +244,7 @@ static void AddWaveformBlocks(Ngs2Voice& voice, const Ngs2SamplerVoiceWaveformBl
         if (block.num_samples == 0 || (bytes > block.data_size && !streaming && !compressedStream)) {
             throw std::invalid_argument("NGS2: waveform block " + std::to_string(i) + " does not fit its data");
         }
-        voice.blocks.push_back({static_cast<const std::uint8_t*>(param.data) + block.data_offset, block});
+        voice.blocks.push_back({BlockData(param, block), block});
         if (streaming) {
             auto& stream = voice.blocks.back();
             stream.streaming = true;
@@ -381,9 +390,14 @@ int APS5_VABI sceNgs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamHe
     std::lock_guard lock(Ngs2Mutex());
     auto& voice = CheckedVoice(voice_handle);
     if (param_list == nullptr) APS5_INVALID_ARG_EX;
-    for (const auto* param = param_list;; param = reinterpret_cast<const Ngs2VoiceParamHeader*>(reinterpret_cast<const std::uint8_t*>(param) + param->next)) {
-        ApplyParam(voice, *param);
-        if (param->next == 0) break;
+    // Each parameter through its host view (the list lives in guest memory, possibly displaced); `next` stays a
+    // byte offset from the guest address.
+    for (const auto* param = reinterpret_cast<const std::uint8_t*>(param_list);;) {
+        const auto* header = GuestArena::HostPointer(reinterpret_cast<const Ngs2VoiceParamHeader*>(param));
+        const auto* host = Ngs2Host(reinterpret_cast<const Ngs2VoiceParamHeader*>(param), std::max<std::size_t>(header->size, sizeof(*header)));
+        ApplyParam(voice, *host);
+        if (host->next == 0) break;
+        param += host->next;
     }
     return SCE_NGS2_OK;
 }
@@ -392,6 +406,7 @@ int APS5_VABI sceNgs2VoiceRunCommands(uintptr_t voice_handle, const Ngs2VoiceCom
     std::lock_guard lock(Ngs2Mutex());
     auto& voice = CheckedVoice(voice_handle);
     if (commands == nullptr && num_commands != 0) APS5_INVALID_ARG_EX;
+    commands = Ngs2Host(commands, num_commands * sizeof(*commands));
     for (std::size_t i = 0; i < num_commands; i++) {
         const auto& command = commands[i];
         const std::uint32_t index = command.id >> 24;
@@ -414,6 +429,7 @@ int APS5_VABI sceNgs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* state
     if (state == nullptr) return SCE_NGS2_ERROR_INVALID_OUT_ADDRESS;
     std::lock_guard lock(Ngs2Mutex());
     const auto& voice = CheckedVoice(voice_handle);
+    state = Ngs2Host(state, state_size); // polled per voice per frame: one host view, not a fault per field
     switch (voice.rack->rackId) {
         case SCE_NGS2_RACK_ID_SAMPLER: {
             if (state_size != sizeof(Ngs2SamplerVoiceState)) return SCE_NGS2_ERROR_INVALID_OUT_SIZE;
@@ -424,7 +440,7 @@ int APS5_VABI sceNgs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* state
             sampler.num_decoded_samples = voice.decodedSamples;
             sampler.decoded_data_size = voice.decodedBytes;
             sampler.user_data = voice.blocks.empty() ? 0 : voice.blocks.front().info.user_data;
-            sampler.waveform_data = voice.WaveformData();
+            sampler.waveform_data = reinterpret_cast<const std::uint8_t*>(Ngs2GuestHandle(voice.WaveformData())); // the guest's address
             return SCE_NGS2_OK;
         }
         case SCE_NGS2_RACK_ID_REVERB: {
@@ -450,6 +466,7 @@ int APS5_VABI sceNgs2VoiceGetPortInfo(uintptr_t voice_handle, uint32_t port, Ngs
     std::lock_guard lock(Ngs2Mutex());
     auto& voice = CheckedVoice(voice_handle);
     const auto& source = PortAt(voice, port);
+    info = Ngs2Host(info, sizeof(*info));
     *info = {};
     info->matrix_id = source.matrix;
     info->volume = source.volume;
@@ -464,7 +481,7 @@ int APS5_VABI sceNgs2VoiceQueryInfo(uintptr_t voice_handle, uint32_t info_id, vo
     switch (info_id) {
         case SCE_NGS2_VOICE_INFO_CHANNELS: {
             if (info_size != sizeof(Ngs2VoiceChannelsInfo)) return SCE_NGS2_ERROR_INVALID_OUT_SIZE;
-            *static_cast<Ngs2VoiceChannelsInfo*>(info) = {voice.channels, 0};
+            *Ngs2Host(static_cast<Ngs2VoiceChannelsInfo*>(info), info_size) = {voice.channels, 0};
             return SCE_NGS2_OK;
         }
         default: throw std::runtime_error("NGS2: voice info " + Ngs2Hex(info_id) + " is not implemented");
@@ -474,7 +491,7 @@ int APS5_VABI sceNgs2VoiceQueryInfo(uintptr_t voice_handle, uint32_t info_id, vo
 int APS5_VABI sceNgs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state_flags) {
     if (state_flags == nullptr) return SCE_NGS2_ERROR_INVALID_OUT_ADDRESS;
     std::lock_guard lock(Ngs2Mutex());
-    *state_flags = CheckedVoice(voice_handle).stateFlags;
+    *Ngs2Host(state_flags, sizeof(*state_flags)) = CheckedVoice(voice_handle).stateFlags;
     return SCE_NGS2_OK;
 }
 

@@ -2,6 +2,7 @@
 #define _CRT_RAND_S
 #endif
 #include "prx/libc/include/HostEntropy.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -15,7 +16,8 @@
 #endif
 
 void HostEntropy_nid_no_patch(void* buffer, std::size_t size) {
-    auto* bytes = static_cast<unsigned char*>(buffer);
+    // Callers pass guest buffers; getentropy is a system call, which a displaced guest address (D31, D33) would fail.
+    auto* bytes = static_cast<unsigned char*>(GuestArena::HostRange(buffer, size));
 #ifdef _WIN32
     for (std::size_t offset = 0; offset < size; offset += sizeof(unsigned int)) {
         unsigned int value = 0;

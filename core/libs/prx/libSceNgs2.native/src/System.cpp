@@ -32,14 +32,14 @@ std::recursive_mutex& Ngs2Mutex() {
 
 Ngs2System* Ngs2FindSystem(Ngs2Handle handle) {
     auto& systems = Systems();
-    const auto found = std::find(systems.begin(), systems.end(), reinterpret_cast<Ngs2System*>(handle));
+    const auto found = std::find(systems.begin(), systems.end(), reinterpret_cast<Ngs2System*>(GuestArena::HostAddress(handle)));
     return found == systems.end() ? nullptr : *found;
 }
 
 Ngs2Rack* Ngs2FindRack(Ngs2Handle handle) {
     for (auto* system : Systems()) {
         for (auto* rack : system->racks) {
-            if (reinterpret_cast<Ngs2Handle>(rack) == handle) return rack;
+            if (Ngs2GuestHandle(rack) == handle) return rack;
         }
     }
     return nullptr;
@@ -63,7 +63,7 @@ void* Ngs2Place(const Ngs2ContextBufferInfo* bufferInfo, std::size_t size, std::
     if (reinterpret_cast<std::uintptr_t>(bufferInfo->host_buffer) % alignment != 0) {
         throw std::invalid_argument("NGS2: the context buffer is not aligned to " + std::to_string(alignment) + " bytes");
     }
-    return bufferInfo->host_buffer;
+    return Ngs2Host(bufferInfo->host_buffer, size);
 }
 
 int Ngs2ReleaseBuffer(const Ngs2BufferAllocator& allocator, Ngs2ContextBufferInfo bufferInfo, Ngs2ContextBufferInfo* outBufferInfo) {
@@ -109,7 +109,7 @@ static int CreateSystem(const Ngs2SystemOption& option, const Ngs2ContextBufferI
     system->allocator = allocator;
     system->uid = nextUid++;
     Systems().push_back(system);
-    *handle = reinterpret_cast<Ngs2Handle>(system);
+    *Ngs2Host(handle, sizeof(*handle)) = Ngs2GuestHandle(system);
     return SCE_NGS2_OK;
 }
 
@@ -130,7 +130,7 @@ int APS5_VABI sceNgs2SystemCreate(const Ngs2SystemOption* option, const Ngs2Cont
     const auto checked = CheckedSystemOption(option);
     if (buffer_info == nullptr) APS5_INVALID_ARG_EX;
     std::lock_guard lock(Ngs2Mutex());
-    return CreateSystem(checked, *buffer_info, {}, handle);
+    return CreateSystem(checked, *Ngs2Host(buffer_info, sizeof(*buffer_info)), {}, handle);
 }
 
 int APS5_VABI sceNgs2SystemCreateWithAllocator(const Ngs2SystemOption* option, const Ngs2BufferAllocator* allocator, uintptr_t* handle) {
@@ -241,7 +241,12 @@ int APS5_VABI sceNgs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuffe
     auto* system = Ngs2FindSystem(system_handle);
     if (system == nullptr) return SCE_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     if (buffer_info == nullptr || num_buffer_info == 0) APS5_INVALID_ARG_EX;
-    Ngs2RenderSystem(*system, buffer_info, num_buffer_info);
+    // Per audio tick: the buffer list and the output buffers through their host views (a render into displaced
+    // memory would otherwise fault on every store).
+    std::vector<Ngs2RenderBufferInfo> outputs(Ngs2Host(buffer_info, num_buffer_info * sizeof(*buffer_info)),
+                                              Ngs2Host(buffer_info, num_buffer_info * sizeof(*buffer_info)) + num_buffer_info);
+    for (auto& output : outputs) output.buffer = Ngs2Host(output.buffer, output.buffer_size);
+    Ngs2RenderSystem(*system, outputs.data(), num_buffer_info);
     return SCE_NGS2_OK;
 }
 

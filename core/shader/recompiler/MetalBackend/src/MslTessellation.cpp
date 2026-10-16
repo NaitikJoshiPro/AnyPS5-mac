@@ -254,7 +254,7 @@ std::string EmitMslTessellationStage(MslEmitterState& state, std::vector<std::st
     text += "constexpr constant uint aps5_tess_payload_words = " + U32(stage == IrShaderStage::Local ? 0u : PayloadWords(state)) + ";\n\n";
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
-    text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n\n";
+    text += ")\n{\n" + MslFunctionStatements(state, state.prologue) + "}\n\n";
     std::vector<std::string> names;
     for (const auto& declaration : role.signature) names.push_back(NameOf(declaration));
     for (std::size_t index = 0; index < helperParameters.size(); ++index) {

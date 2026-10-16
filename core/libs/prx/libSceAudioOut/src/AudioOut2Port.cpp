@@ -9,6 +9,7 @@
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "AudioOut2Internal.hpp"
 #include "AudioOut2PadMix.hpp"
 
@@ -67,6 +68,11 @@ static const AudioOut2StereoFold* StereoFoldFor(std::uint32_t channels) {
     return found == std::end(STEREO_FOLDS) ? nullptr : found;
 }
 
+// The guest's port buffer is read natively per grain: a displaced one (D31, D33) by its alias, translated once.
+static const void* HostPortData(const AudioOut2Port& port, const void* data, std::uint32_t frames) {
+    return GuestArena::HostRange(data, static_cast<std::size_t>(frames) * port.channels * (port.int16 ? sizeof(std::int16_t) : sizeof(float)));
+}
+
 static void ReadFrame(const AudioOut2Port& port, const void* data, std::uint32_t frame, float* in) {
     const auto first = static_cast<std::size_t>(frame) * port.channels;
     for (std::uint32_t c = 0; c < port.channels; c++) {
@@ -75,6 +81,7 @@ static void ReadFrame(const AudioOut2Port& port, const void* data, std::uint32_t
 }
 
 static void AccumulatePadPort(const AudioOut2Port& port, const void* data, AudioOut2Route route, float* out, std::uint32_t frames) {
+    data = HostPortData(port, data, frames);
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
         ReadFrame(port, data, frame, in);
@@ -83,6 +90,7 @@ static void AccumulatePadPort(const AudioOut2Port& port, const void* data, Audio
 }
 
 static void AccumulatePort(const AudioOut2Port& port, const void* data, float* out, std::uint32_t frames) {
+    data = HostPortData(port, data, frames);
     const auto& fold = *port.fold;
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
@@ -157,7 +165,7 @@ static void TraceAttribute(AudioOut2PortHandle handle, const AudioOut2Port& port
         for (std::size_t index = 0; index < words && used < sizeof(values); index++) {
             std::uint32_t bits = 0;
             float value = 0.0f;
-            std::memcpy(&bits, static_cast<const std::uint8_t*>(attribute.value) + index * sizeof(bits), sizeof(bits));
+            std::memcpy(&bits, GuestArena::HostRange(static_cast<const std::uint8_t*>(attribute.value), attribute.value_size) + index * sizeof(bits), sizeof(bits));
             std::memcpy(&value, &bits, sizeof(value));
             used += static_cast<std::size_t>(std::snprintf(values + used, sizeof(values) - used, " %08x(%g)", bits, static_cast<double>(value)));
         }
@@ -225,6 +233,7 @@ int APS5_VABI sceAudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortSt
     std::lock_guard lock(g_portsLock);
     if (!FromHandle(port)) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!state) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
+    state = GuestArena::HostPointer(state); // may be displaced guest memory (D31, D33)
     state->output = OUTPUT_MAIN;
     state->num_channels = AUDIO_OUT2_OUTPUT_CHANNELS;
     state->volume = VOLUME_MAX;
@@ -238,13 +247,15 @@ int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle port, const Audi
     auto* entry = FromHandle(port);
     if (!entry) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!attributes && num != 0) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
+    // The attribute array and the values may be displaced guest memory (D31, D33); the PCM data pointer stays a guest pointer.
+    if (num != 0) attributes = GuestArena::HostRange(attributes, num * sizeof(*attributes));
     for (uint32_t index = 0; index < num; index++) {
         const auto& attribute = attributes[index];
         const char* verdict = "ignored";
         if (attribute.value == nullptr) {
             verdict = "null value";
         } else if (attribute.attribute_id == ATTRIBUTE_DATA && attribute.value_size == sizeof(entry->data)) {
-            std::memcpy(&entry->data, attribute.value, sizeof(entry->data));
+            std::memcpy(&entry->data, GuestArena::HostRange(attribute.value, sizeof(entry->data)), sizeof(entry->data));
             entry->queuedData.push_back(entry->data);
             if (entry->queuedData.size() > QUEUED_DATA_MAX) entry->queuedData.pop_front();
             entry->repeatedData = entry->data != nullptr && (entry->lastBuffer == nullptr || entry->lastBuffer == entry->data) ? entry->data : nullptr;
@@ -252,7 +263,7 @@ int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle port, const Audi
             entry->dataSets++;
             verdict = "pcm data pointer";
         } else if (attribute.attribute_id == ATTRIBUTE_VOLUME && entry->channels != 0 && attribute.value_size == entry->channels * sizeof(float)) {
-            std::memcpy(entry->volume, attribute.value, attribute.value_size);
+            std::memcpy(entry->volume, GuestArena::HostRange(attribute.value, attribute.value_size), attribute.value_size);
             verdict = "volume";
         }
         const auto traces = entry->attributeTraces++;

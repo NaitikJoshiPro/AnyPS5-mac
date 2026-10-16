@@ -98,7 +98,8 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
-    void KeepThroughHold(std::shared_ptr<void> object);
+    // bytes: counted in the open batch's kept bytes (BoundKeptBytes), as Keep's.
+    void KeepThroughHold(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();
@@ -122,6 +123,9 @@ public:
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // Whether an unfinished batch that writes the range also has completion actions (a CPU write-back
+    // may land over it when the batch finishes; D66).
+    bool CompletionWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -208,6 +212,11 @@ public:
     void NoteSampledDraw(VkCommandBuffer commands);
     bool QueuesSampleDumps() const;
     void PrepareSampleSlot();
+    // macOS: before a draw begins a new render pass (MetalDraw.mm), which binds the visibility result
+    // buffer at its start: the previous pass's occlusion segment ends and a counter slot is ready
+    // (a fresh pool when the batch's is used up), whether or not the recorder still counts a pass as
+    // open (PrepareSampleSlot's precondition).
+    void PrepareSamplePass();
     void EndPassSamples();
     // macOS: occlusion samples are counted by render passes into a visibility result buffer. The
     // render pass begun after PrepareSampleSlot must name this buffer (a bridged id<MTLBuffer>) as
@@ -560,6 +569,9 @@ private:
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
+        // When its command buffer began (ensureOpen): an MTL4 command buffer committed long after it
+        // began fails with MTL4CommandQueueErrorTimeout (see Recorder::BeforeLongWait).
+        std::chrono::steady_clock::time_point openedAt{};
         // macOS: occlusion samples are counted in segment mode only (see SampleVisibilityBuffer):
         // `segments` identifies the visibility result buffer `segmentPool` holds.
         std::shared_ptr<void> samplePool;

@@ -27,6 +27,7 @@
 #include "MetalMesh.h"
 #include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -40,6 +41,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "MetalResidency.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -343,7 +345,8 @@ Graphics::ColorTargetLayout TiledGuestLayout(const DrawCache::TiledTarget& targe
 
 void DetileTarget(const DrawCache::TiledTarget& target, std::span<std::byte> linear) {
     const auto layout = TiledGuestLayout(target);
-    const auto* guest = reinterpret_cast<const std::byte*>(target.address);
+    // Whole-surface native access: a displaced target (D31, D33) at its alias, not through the fault path.
+    const auto* guest = reinterpret_cast<const std::byte*>(GuestArena::HostRange(target.address, layout.Bytes()));
     if (!target.tail) {
         layout.Detile(std::span<const std::byte>(guest, layout.Bytes()), linear);
         return;
@@ -356,7 +359,7 @@ void DetileTarget(const DrawCache::TiledTarget& target, std::span<std::byte> lin
 
 void TileTarget(const DrawCache::TiledTarget& target, std::span<const std::byte> linear) {
     const auto layout = TiledGuestLayout(target);
-    auto* guest = reinterpret_cast<std::byte*>(target.address);
+    auto* guest = reinterpret_cast<std::byte*>(GuestArena::HostRange(target.address, layout.Bytes()));
     if (!target.tail) {
         layout.Tile(linear, std::span<std::byte>(guest, layout.Bytes()));
         return;
@@ -424,8 +427,8 @@ static void CheckInputsClearOfTarget(Settle settle, const Graphics::State& graph
                     maxIndex = draw.firstVertex + draw.indexCount - 1u;
                 } else {
                     settle(indexBegin, indexBytes);
-                    const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(indexBegin), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart && !listTopology);
+                    // Lists restart too (PrimitiveListRestart: the index expansion below).
+                    const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, static_cast<std::size_t>(indexBytes))), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart);
                     if (highest) maxIndex = *highest + draw.firstVertex;
                 }
             }
@@ -460,7 +463,7 @@ void VulkanDevice::State::MaterializeCmask(const Graphics::ColorTarget& color, G
     const auto bytes = layout.Bytes();
     if (color.cmaskBytes != bytes) Fail("CMASK size differs from the color target's CMASK layout");
     SettleRange(color.cmaskAddress, bytes);
-    const auto* mask = reinterpret_cast<const std::uint8_t*>(color.cmaskAddress);
+    const auto* mask = reinterpret_cast<const std::uint8_t*>(GuestArena::HostRange(color.cmaskAddress, bytes)); // alias if displaced (D31, D33)
     if (std::all_of(mask, mask + bytes, [](std::uint8_t value) { return value == 0xffu; })) return;
     std::vector<std::uint32_t> cleared;
     for (std::uint32_t tileY = 0; tileY < layout.TilesY(); ++tileY) {
@@ -604,7 +607,16 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool cullTriangles = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassTriangle;
     const bool cullPoints = cullDistances && !graphics.rectList && primitive.topologyClass == MTLPrimitiveTopologyClassPoint;
     const bool triangleVertices = conservativeMode != 0u || perVertex || cullTriangles;
-    if ((mesh || tess) && triangleVertices) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws"));
+    // Mesh draws run per-vertex fragment inputs in the mesh function's triangle-vertices mode (MslAbi
+    // Version 13: unshared vertices, the subgroup split over the grid's z). Its conservative
+    // rasterization (D21's corner math needs the viewport record) is not written; mesh cull
+    // distances throw in the recompiler.
+    if ((mesh && conservativeMode != 0u) || (tess && triangleVertices)) {
+        // Name what the draw needed.
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), " (per-vertex locations 0x%llx, emulated barycentrics 0x%x, conservative mode %u, cull distances %u)", static_cast<unsigned long long>(fragmentReflection != nullptr ? fragmentReflection->perVertexLocations : 0u), fragmentReflection != nullptr ? fragmentReflection->emulatedBarycentrics : 0u, conservativeMode, vertexReflection.cullDistances);
+        Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + (tess ? " of tessellated draws" : " of mesh draws") + detail);
+    }
     if (tess && (draw.indirect || graphics.rectList)) Fail(draw.indirect ? "indirect tessellated draws (refused as upstream)" : "tessellated rect lists");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
@@ -635,19 +647,33 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
     if (calls.empty()) return;
     Graphics::Metal::MeshDrawPlan meshPlan;
+    std::uint32_t meshSplits = 1u;
     if (mesh) {
         std::span<const std::byte> indices;
         if (draw.indexed) {
             const auto bytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
             state.SettleRange(draw.indexAddress, bytes);
-            indices = std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), bytes);
+            indices = std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostRange(draw.indexAddress, bytes)), bytes);
         }
         meshPlan = Graphics::Metal::PlanMeshDraw(graphics, draw, indices);
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
+        if (triangleVertices) {
+            meshSplits = Abi::MeshTriangleVerticesSplits(graphics.stages.mesh->maxPrimitives);
+            if (static_cast<std::uint64_t>(meshPlan.groups) * meshPlan.instances * meshSplits > Graphics::Metal::MaxMeshThreadgroupsPerGrid) Fail("a triangle-vertices mesh draw of " + std::to_string(meshPlan.groups) + " groups x " + std::to_string(meshPlan.instances) + " instances x " + std::to_string(meshSplits) + " splits exceeds the mesh grid");
+        }
     }
 
-    if (triangleVertices && (graphics.rectList || primitive.topologyClass != MTLPrimitiveTopologyClassTriangle)) Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
-    if (graphics.rectList && draw.indexed) Fail("indexed rect lists");
+    // Per-vertex fragment inputs of points and lines draw in the triangle-vertices mode with one or
+    // two guest vertices per primitive (MslAbi Version 14, PrimitiveVerticesMacro; DECISIONS D69):
+    // the vertex path only. Conservative rasterization and cull distances stay triangle-only.
+    const bool pointsOrLines = primitive.topologyClass != MTLPrimitiveTopologyClassTriangle;
+    if (triangleVertices && (graphics.rectList || (pointsOrLines && (conservativeMode != 0u || mesh)))) {
+        Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : mesh ? "mesh points or lines" : "points or lines"));
+    }
+    const std::uint32_t primitiveVertices = primitive.topologyClass == MTLPrimitiveTopologyClassPoint ? 1u : primitive.topologyClass == MTLPrimitiveTopologyClassLine ? 2u : 3u;
+    // The mesh path fetches rect-list indices like any list (DECISIONS D41); the vertex function's
+    // expansion counts vertex ids.
+    if (graphics.rectList && draw.indexed && !mesh) Fail("indexed rect lists");
     if (draw.indexed && draw.indexSize != 2u && draw.indexSize != 4u) Fail("index size " + std::to_string(draw.indexSize));
 
     // Guest ranges of both stages, the vertex fetches, the indices and the color targets.
@@ -880,18 +906,31 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         request.objectThreads = linked->objectThreads;
         request.meshGroups = linked->maxMeshThreadgroups;
     }
-    if (graphics.rectList) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
+    // Mesh draws expand rect lists from the mesh configuration (DECISIONS D41), not the macro.
+    if (graphics.rectList && !mesh) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
     if (cullPoints) request.vertex.macros.push_back({Abi::CullPointsMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
+        if (primitiveVertices != 3u) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
         if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         if (perVertex) {
             request.vertex.macros.push_back({Abi::PerVertexLocationsMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations)) + "u"});
             request.vertex.macros.push_back({Abi::PerVertexLocationsHighMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations >> 32u)) + "u"});
             request.vertex.macros.push_back({Abi::BarycentricsMacro, std::to_string(fragmentReflection->emulatedBarycentrics) + "u"});
         }
+        // The vertex path rotates its expansion on the CPU; the mesh function rotates each primitive.
+        if (mesh && graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT) request.vertex.macros.push_back({Abi::ProvokingLastMacro, "1"});
     }
     if (graphics.negativeOneToOne) request.vertex.macros.push_back({Abi::DepthNegativeOneToOneMacro, "1"});
+    if (graphics.windowSpacePosition) {
+        // The window-space epilogue is in the vertex and mesh stage functions; the tessellation
+        // pipeline's domain output and the triangle-vertices corner math work on clip positions.
+        // The mesh function's triangle-vertices mode remaps each staged vertex before it is copied.
+        if (tess || (triangleVertices && !mesh)) throw std::runtime_error(std::string("Metal draw: window-space positions (PA_CL_VTE_CNTL 0x300) with ") + (tess ? "tessellation" : "a triangle-vertices draw") + " are not implemented");
+        request.vertex.macros.push_back({Abi::WindowSpaceMacro, "1"});
+        request.vertex.macros.push_back({Abi::WindowSpaceWidthMacro, std::to_string(static_cast<std::uint32_t>(graphics.viewport.width))});
+        request.vertex.macros.push_back({Abi::WindowSpaceHeightMacro, std::to_string(static_cast<std::uint32_t>(graphics.viewport.height))});
+    }
     if (fragmentResult != nullptr) {
         auto function = Graphics::Metal::PipelineFunction::From(*fragmentResult);
         function.macros.push_back({Abi::VertexOutputsMacro, std::to_string(static_cast<std::uint32_t>(vertexReflection.outputLocations)) + "u"});
@@ -1034,7 +1073,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const auto& parameters = fragment->program->fragmentParameters;
         if (std::any_of(parameters.begin(), parameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flatP10; })) Fail("v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
     }
-    const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
+    // Indexed lists with primitive restart (PrimitiveListRestart) expand too: Metal restarts strips
+    // only, and a restart index ends a list's current primitive (its incomplete vertices dropped,
+    // as VK_EXT_primitive_topology_list_restart and the guest's VGT reset index do).
+    const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const bool listRestart = draw.indexed && graphics.primitiveRestart && listTopology && !graphics.rectList;
+    const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
     if (expand) {
@@ -1042,7 +1086,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (draw.indexed) {
             state.SettleRange(indexBegin, indexBytes);
             guest.resize(indexBytes);
-            std::memcpy(guest.data(), reinterpret_cast<const void*>(indexBegin), indexBytes);
+            std::memcpy(guest.data(), reinterpret_cast<const void*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes);
         }
         const auto indexAt = [&](std::uint32_t position) -> std::uint32_t {
             if (draw.indexSize == 2u) {
@@ -1094,6 +1138,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
                 for (std::size_t k = 0; k + 1 < n; k += 2) line(v[k], v[k + 1]);
                 break;
+            case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+                fanIndices.insert(fanIndices.end(), v.begin(), v.end());
+                break;
             case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
                 for (std::size_t i = 0; i + 1 < n; ++i) line(v[i], v[i + 1]);
                 break;
@@ -1110,7 +1157,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     continue;
                 }
                 const auto value = indexAt(call.first + position);
-                if (strips && graphics.primitiveRestart && value == restart) {
+                if ((strips || listTopology) && graphics.primitiveRestart && value == restart) {
                     flush();
                     continue;
                 }
@@ -1155,6 +1202,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             encoder = stream.Render();
             if (encoder == nil) Fail("the recorder continued a render pass that has no encoder");
         } else {
+            // The occlusion counter slot of the pass's visibility buffer (an occlusion query open in
+            // the guest's command stream: ASTRO BOT's first sampled draw threw "an occlusion segment
+            // begins without a reset query slot", nothing on this path took a slot).
+            recorder.PrepareSamplePass();
             // Tiled targets load from guest memory (CPU detile into upload memory, then a copy).
             std::vector<id<MTLTexture>> textures;
             cache.passTextures.clear();
@@ -1316,8 +1367,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (cache.rasterOrder == nil) {
                 cache.rasterOrder = [state.device newBufferWithLength:Abi::RasterOrderBytes options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
                 if (cache.rasterOrder == nil) Fail("cannot allocate the raster order buffer");
-                [state.residency addAllocation:cache.rasterOrder];
-                [state.residency commit];
+                ::AgcDriver::Metal::Residency::Add(state.residency, cache.rasterOrder);
+                ::AgcDriver::Metal::Residency::Commit(state.residency);
             }
             rasterOrderAddress = cache.rasterOrder.gpuAddress;
         }
@@ -1376,10 +1427,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         std::uint64_t indexLength = 0;
         MTLIndexType indexType = draw.indexSize == 2u ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         const bool expanded = expand;
-        const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle) : primitive.type;
+        const auto drawType = expand ? (primitive.topologyClass == MTLPrimitiveTopologyClassLine ? MTLPrimitiveTypeLine : primitive.topologyClass == MTLPrimitiveTopologyClassPoint ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle) : primitive.type;
         const auto& drawCalls = expanded ? fanCalls : calls;
         const bool indexedDraw = (draw.indexed || expanded) && !triangleVertices;
-        if (triangleVertices) {
+        if (triangleVertices && !mesh) {
             // The triangle-vertices table (MslAbi v5, vertex slot TriangleVertices): the header, then
             // every triangle's guest vertex ids (the expansion's lists with each call's base vertex),
             // drawn non-indexed: host vertex v of a call starting at table index f is v = f + i.
@@ -1391,7 +1442,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             header.viewport[3] = graphics.viewport.height;
             header.depthRange[0] = graphics.viewport.minDepth;
             header.depthRange[1] = graphics.viewport.maxDepth;
-            header.triangles = static_cast<std::uint32_t>(fanIndices.size() / 3u);
+            header.triangles = static_cast<std::uint32_t>(fanIndices.size() / primitiveVertices);
             header.flags = (conservativeMode != 0u ? Abi::TriangleFlagConservative : 0u) | (perVertex ? Abi::TriangleFlagPerVertex : 0u);
             std::memcpy(table.data(), &header, sizeof(header));
             auto* ids = reinterpret_cast<std::uint32_t*>(table.data() + sizeof(header));
@@ -1413,7 +1464,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 state.KeepWrapped(indexBegin, indexBytes);
             } else {
                 state.SettleRange(indexBegin, indexBytes);
-                const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(indexBegin), indexBytes), 16u);
+                const auto upload = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes), 16u);
                 indexAddress = upload.address;
             }
             indexLength = indexBytes;
@@ -1447,8 +1498,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     continue;
                 }
                 if (mesh) {
-                    // Grid (mesh groups, instances): the mesh function's WorkgroupId x and y.
-                    [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
+                    // Grid (mesh groups, instances, splits): the mesh function's WorkgroupId x and y;
+                    // z splits each subgroup's triangles in the triangle-vertices mode (MslAbi v13).
+                    [encoder drawMeshThreadgroups:MTLSizeMake(meshPlan.groups, meshPlan.instances, meshSplits) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(vertexReflection.threadsPerThreadgroup[0], 1, 1)];
                     stream.CountCommand();
                     ++recorded;
                     held->objects.push_back(pass.pipeline);
@@ -1583,7 +1635,8 @@ bool VulkanDevice::DualSrcBlend() const {
 }
 
 bool VulkanDevice::PrimitiveListRestart() const {
-    return false;
+    // Indexed list draws with restart go through the CPU index expansion (MetalDraw.mm `listRestart`).
+    return true;
 }
 
 bool VulkanDevice::SamplerFilterMinmax() const {
@@ -1696,9 +1749,23 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
         Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, 1u, destination.arraySlice));
         return;
     }
+    // DCC targets (upstream Draw.cpp RunColorMetadataPass): fast-clear keys store the clear texel and comp-to-single
+    // keys each block's first texel in guest memory, and the keys are left uncompressed, exactly as before a draw
+    // (MaterializeDcc). The image cache's resident image of the target, if any, reloads from guest memory.
+    const auto* imageContext = state->images->ImageContext();
     for (const auto& color : pass.targets) {
-        if (color.dccAddress != 0u) Fail("CB metadata passes over DCC-compressed targets");
-        state->MaterializeCmask(color, nullptr);
+        std::shared_ptr<Graphics::StorageTexture> resident;
+        if (color.tileMode != Graphics::ColorTileMode::Linear && imageContext != nullptr) {
+            resident = Graphics::CachedStorageSurface(*imageContext, Graphics::SurfaceForTarget(color));
+            if (resident != nullptr && resident->GuestBytes() != color.bytes) resident = nullptr;
+        }
+        if (color.dccAddress != 0u) {
+            state->SettleRange(color.dccAddress, Graphics::DccKeyBytes(color.bytes));
+            if (pass.mode == Graphics::ColorMetadataPass::Mode::EliminateFastClear && Graphics::CurrentDccKeys(color.dccAddress, color.bytes) == Graphics::DccKeys::ClearSingle)
+                Fail("CB fast-clear eliminate over comp-to-single DCC keys (whether it expands them is not modeled)");
+            state->MaterializeDcc(color, resident.get());
+        }
+        state->MaterializeCmask(color, resident.get());
     }
 }
 

@@ -158,8 +158,21 @@ void Driver::run(std::uint32_t id) noexcept {
                         }
                         lock.lock();
                         if (ready()) break;
-                        if (id == 0 && allQueuesIdle() && !completionsPending()
-                            && (!storeIdleResults || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
+                        if (id == 0 && allQueuesIdle() && !completionsPending()) {
+                            if (idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck) continue;
+                            if (!storeIdleResults) {
+                                // Nothing to store yet: re-check after a short wait instead of at once. Results can
+                                // become pending without a notification (completion labels landing), so the wait is
+                                // bounded; an immediate re-check spun a full core whenever the GPU sat idle (ASTRO
+                                // BOT sample: 1325/1325 samples of queue 0 in this loop, contending the mutex).
+                                const auto idleEpochAtPause = idleEpoch.load(std::memory_order_acquire);
+                                changed.wait_for(lock, std::chrono::milliseconds(1), [&] {
+                                    return ready() || idleEpoch.load(std::memory_order_acquire) != idleEpochAtPause;
+                                });
+                                if (ready()) break;
+                                continue;
+                            }
+                        }
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
                         changed.wait(lock, [&] { return ready() || (id == 0 && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait); });

@@ -16,12 +16,15 @@
 #include "../src/MetalDeviceState.h"
 #include "../src/MetalCommandStream.h"
 #include "../src/MetalMemoryBudget.h"
+#include "../src/MetalResidency.h"
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -35,6 +38,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -367,6 +373,186 @@ void CheckImports(AgcDriver::VulkanDevice& device) {
         Require(mprotect(block.Words(), 65536, PROT_READ | PROT_WRITE) == 0, "imports: cannot restore the block");
     }
     std::puts("host imports: GPU atomics reach the CPU's pages (made over write-watched pages, reseeded, CPU read-only)");
+}
+
+// D44 (1): residency-set changes from another thread while the queue commits. The recorder's release
+// thread removes and releases retired imports' buffers while the queue worker commits; a commit walks
+// the attached sets (under the debug layer: applyResidencySets, which type-checks each allocation),
+// so an unserialized release crashed it (SuperTuxKart under --validation). MetalResidency.h
+// serializes both and keeps removed allocations alive until the next queue commit returned.
+void CommitEmpty(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4CommandAllocator> allocator, id<MTLSharedEvent> event, std::uint64_t value) {
+    [allocator reset];
+    id<MTL4CommandBuffer> commands = [device newCommandBuffer];
+    [commands beginCommandBufferWithAllocator:allocator];
+    [commands endCommandBuffer];
+    id<MTL4CommandBuffer> list[1] = {commands};
+    AgcDriver::Metal::Residency::CommitQueue([&] {
+        [queue commit:list count:1];
+        [queue signalEvent:event value:value];
+    });
+    Require([event waitUntilSignaledValue:value timeoutMS:5000], "residency: an empty command buffer did not complete in 5 s");
+}
+
+void CheckResidency(AgcDriver::VulkanDevice& device) {
+    namespace Metal = AgcDriver::Graphics::Metal;
+    namespace Residency = AgcDriver::Metal::Residency;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    id<MTLDevice> metal = Metal::DeviceOf(context);
+    id<MTL4CommandQueue> queue = Metal::QueueOf(context);
+    Require(metal != nil && queue != nil, "residency: the device's Context carries no MTLDevice or queue");
+    id<MTL4CommandAllocator> allocator = [metal newCommandAllocator];
+    id<MTLSharedEvent> event = [metal newSharedEvent];
+    NSError* error = nil;
+    id<MTLResidencySet> set = [metal newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+    Require(set != nil && allocator != nil && event != nil, "residency: cannot create the test objects");
+    Residency::Attach(queue, set);
+    std::uint64_t value = 0;
+    // A removed allocation outlives its last driver reference until the next queue commit returned.
+    __weak id<MTLBuffer> watched = nil;
+    @autoreleasepool {
+        id<MTLBuffer> buffer = [metal newBufferWithLength:16384 options:MTLResourceStorageModeShared];
+        watched = buffer;
+        Residency::Add(set, buffer);
+        Residency::Commit(set);
+        CommitEmpty(metal, queue, allocator, event, ++value);
+        Residency::Remove(set, buffer);
+        Residency::Commit(set);
+        buffer = nil;
+    }
+    Require(watched != nil, "residency: a removed allocation was released before the next queue commit");
+    CommitEmpty(metal, queue, allocator, event, ++value);
+    Require(watched == nil, "residency: a removed allocation outlived the queue commit after its removal");
+    // RemoveAll keeps every allocation of the set the same way; Drain releases them without a commit.
+    __weak id<MTLBuffer> first = nil;
+    __weak id<MTLBuffer> second = nil;
+    @autoreleasepool {
+        id<MTLBuffer> a = [metal newBufferWithLength:16384 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b = [metal newBufferWithLength:16384 options:MTLResourceStorageModeShared];
+        first = a;
+        second = b;
+        Residency::Add(set, a);
+        Residency::Add(set, b);
+        Residency::Commit(set);
+        Residency::RemoveAll(set);
+        Residency::Commit(set);
+    }
+    Require(first != nil && second != nil, "residency: RemoveAll released its allocations before the next queue commit");
+    Residency::Drain();
+    Require(first == nil && second == nil, "residency: Drain did not release the removed allocations");
+    // The race itself: one thread adds, removes and releases buffers in an attached set while this
+    // one commits. Without the lock the debug layer traps within seconds (scratch probe, D44).
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint32_t> churned{0};
+    std::thread churn([&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            @autoreleasepool {
+                id<MTLBuffer> buffer = [metal newBufferWithLength:16384 options:MTLResourceStorageModeShared];
+                Residency::Add(set, buffer);
+                Residency::Commit(set);
+                Residency::Remove(set, buffer);
+                Residency::Commit(set);
+            }
+            churned.fetch_add(1, std::memory_order_relaxed);
+        }
+        stop.store(true, std::memory_order_release);
+    });
+    std::uint32_t commits = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+        @autoreleasepool {
+            CommitEmpty(metal, queue, allocator, event, ++value);
+        }
+        ++commits;
+    }
+    churn.join();
+    CommitEmpty(metal, queue, allocator, event, ++value);
+    Require(Residency::Snapshot().graveyard == 0, "residency: the graveyard is not empty after a queue commit");
+    Residency::Detach(queue, set);
+    std::printf("residency: removed allocations live until the next queue commit (Remove, RemoveAll, Drain); %u commits beside %u add/remove/release rounds on another thread\n", commits, churned.load());
+}
+
+// D44 (2): host imports join adjacent allocations only over whole 8 MiB windows on the Metal device,
+// as on upstream's Vulkan device. A heap growing 16 KiB at a time re-imported the whole chain at every
+// growth before (SuperTuxKart: 106 GB of imports in 60 s, ~20 GiB of retired no-copy buffers in one
+// batch's residency, which Metal refused at commit with MTL4CommandQueueErrorTimeout). A retired
+// import's bytes now also count against the open batch's kept-byte budget.
+void CheckImportWindow(AgcDriver::VulkanDevice& device) {
+    namespace Graphics = AgcDriver::Graphics;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    Require(context.hostImportAlignment == 16384u, "import window: the Metal device does not import host memory in 16 KiB pages");
+    constexpr std::size_t window = std::size_t{8} << 20u;
+    constexpr std::size_t piece = 16384u;
+    constexpr std::size_t pieces = window / piece + 64u;
+    const std::size_t mapped = 3u * window;
+    void* region = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    Require(region != MAP_FAILED, "import window: cannot map the heap");
+    const auto base = (reinterpret_cast<std::uint64_t>(region) + window - 1u) / window * window;
+    std::uint64_t imported = 0;
+    std::uint64_t keptBefore = 0;
+    std::uint64_t keptAfter = 0;
+    const Graphics::HostImport* joined = nullptr;
+    const Graphics::HostImport* next = nullptr;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = Graphics::Recorder::Active();
+        Require(recorder != nullptr, "import window: the device has no active recorder");
+        keptBefore = recorder->OpenKeptBytes();
+        std::uint64_t lastBase = 0;
+        std::uint64_t lastBytes = 0;
+        const void* lastBuffer = nullptr;
+        for (std::size_t index = 0; index < pieces; ++index) {
+            auto* range = reinterpret_cast<void*>(base + index * piece);
+            GuestAllocations::Mutation().Add(range, piece, true, true, true);
+            // The newest range and the heap's first byte are both used by the GPU after each growth.
+            const auto* newest = Graphics::HostImportFor(context, base + index * piece, 16);
+            Require(newest != nullptr, "import window: range " + std::to_string(index) + " was not imported");
+            const auto* front = Graphics::HostImportFor(context, base, 16);
+            Require(front != nullptr, "import window: the heap's first range lost its import");
+            if (front->base != lastBase || front->bytes != lastBytes || reinterpret_cast<const void*>(front->buffer) != lastBuffer) {
+                imported += front->bytes;
+                lastBase = front->base;
+                lastBytes = front->bytes;
+                lastBuffer = reinterpret_cast<const void*>(front->buffer);
+            }
+        }
+        joined = Graphics::HostImportFor(context, base, 16);
+        next = Graphics::HostImportFor(context, base + window, 16);
+        Require(joined != nullptr && joined->base == base && joined->bytes == window, "import window: a full 8 MiB window is not one import (" + std::to_string(joined != nullptr ? joined->bytes : 0) + " bytes)");
+        Require(next != nullptr && next->base == base + window && next->bytes == piece, "import window: a range of the next, partly filled window joined a span (" + std::to_string(next != nullptr ? next->bytes : 0) + " bytes)");
+        keptAfter = recorder->OpenKeptBytes();
+    }
+    // Unbounded spans re-import the front's whole chain at each growth: ~pieces^2 / 2 * 16 KiB (> 2 GiB).
+    Require(imported <= 2u * window, "import window: the heap's front was re-imported " + std::to_string(imported >> 20u) + " MiB over " + std::to_string(pieces) + " growths");
+    Require(keptAfter >= keptBefore + window / 2u, "import window: retired imports did not count against the open batch's kept bytes (" + std::to_string(keptBefore) + " -> " + std::to_string(keptAfter) + ")");
+    device.WaitIdle();
+    for (std::size_t index = 0; index < pieces; ++index) GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(base + index * piece));
+    munmap(region, mapped);
+    // Two adjacent allocations that each cross a window boundary (a 3840x2160 surface allocated in two
+    // GL buffers, Showcase 1.0.2) join one import, so a resource spanning both has one (D65): with
+    // each imported alone, nothing held the surface and its results never reached guest memory.
+    {
+        const std::size_t large = window * 3u / 2u;
+        const std::size_t span = 2u * large;
+        void* bigRegion = mmap(nullptr, span + window, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        Require(bigRegion != MAP_FAILED, "import window: cannot map the two large allocations");
+        const auto bigBase = (reinterpret_cast<std::uint64_t>(bigRegion) + window - 1u) / window * window;
+        GuestAllocations::Mutation().Add(reinterpret_cast<void*>(bigBase), large, true, true, true);
+        GuestAllocations::Mutation().Add(reinterpret_cast<void*>(bigBase + large), large, true, true, true);
+        const Graphics::HostImport* spanning = nullptr;
+        const Graphics::HostImport* fromSecond = nullptr;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            spanning = Graphics::HostImportFor(context, bigBase + large - 4096u, 8192u);
+            fromSecond = Graphics::HostImportFor(context, bigBase + large + 4096u, 16u);
+        }
+        Require(spanning != nullptr && spanning->base == bigBase && spanning->bytes == span, "import window: a range across two adjacent large allocations has no single import (" + std::to_string(spanning != nullptr ? spanning->bytes : 0) + " bytes)");
+        Require(fromSecond == spanning, "import window: the second large allocation is not served by the joined import");
+        device.WaitIdle();
+        GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(bigBase));
+        GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(bigBase + large));
+        munmap(bigRegion, span + window);
+    }
+    std::printf("import window: %zu ranges of 16 KiB: the front re-imported %llu KiB in all, a full window is one 8 MiB import, the next window's range stays alone, adjacent large allocations share one import; retired imports kept %llu KiB in the open batch\n", pieces, static_cast<unsigned long long>(imported >> 10u), static_cast<unsigned long long>((keptAfter - keptBefore) >> 10u));
 }
 
 // BDA page table: BdaAbi::Header + Range[] over the registered guest allocations, translated in
@@ -774,6 +960,10 @@ int main(int argc, char** argv) {
             CheckOverlappingBuffers(*device);
         } else if (mode == "imports") {
             CheckImports(*device);
+        } else if (mode == "residency") {
+            CheckResidency(*device);
+        } else if (mode == "import_window") {
+            CheckImportWindow(*device);
         } else if (mode == "submission") {
             CheckSplit(*device);
             CheckIndirect(*device);

@@ -337,7 +337,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
+        std::fprintf(stderr, "[dispatch-io] shader 0x%llx groups %ux%ux%u threads %ux%ux%u indirect 0x%llx%s\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], compute.numThreads[0], compute.numThreads[1], compute.numThreads[2],
+            static_cast<unsigned long long>(indirectArguments), words.c_str());
     }
 
     const auto rethrow = [&](const std::exception& error) {

@@ -5,6 +5,7 @@ in fex_toolchain.py are there, and run them with aps5-fex.
 
 Each program reports its result through its exit status and standard output."""
 import os
+import re
 import pathlib
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fex_fixtures
 import fex_toolchain
+from nid import nid
 
 MACOS = pathlib.Path(__file__).resolve().parents[2] / "relinker" / "relinker" / "tests" / "macos"
 HERE = pathlib.Path(__file__).resolve().parent
@@ -43,7 +45,41 @@ def current_umask():
     return mask
 
 
-CHECKS = {"opening": created_with_mode}
+def sampled_spin(directory):
+    """The sampler's report names the guest loop and the polled address (pc_sample.cpp)."""
+    # Global symbols carry their NIDs (fex_toolchain.nidify).
+    poll, poll_size = fex_toolchain.symbol(directory / "input.elf", nid("sample_poll"))
+    flag, _ = fex_toolchain.symbol(directory / "input.elf", nid("sampleFlag"))
+    lines = (directory / "stderr.txt").read_text().splitlines()
+    rows = [line.split() for line in lines if line.startswith("[fex-sample]") and "% rip 0x" in line]
+    if not rows:
+        return "no [fex-sample] rows in stderr: " + " | ".join(lines[-5:])
+    # "[fex-sample] 97.0% rip 0x... eboot.elf+0x... jit", then the register line that follows it.
+    best = max(range(len(rows)), key=lambda i: float(rows[i][1].rstrip("%")))
+    rip = int(rows[best][3], 16)
+    offset = int(rows[best][4].rsplit("+", 1)[1], 16)
+    base = rip - offset
+    if not poll <= offset < poll + poll_size or rows[best][-1] != "jit":
+        return f"hottest row {' '.join(rows[best])} is not in sample_poll [{poll:#x}, {poll + poll_size:#x})"
+    index = [i for i, line in enumerate(lines) if line.startswith("[fex-sample]") and "% rip 0x" in line][best]
+    values = dict(item.split("=") for item in lines[index + 1].split()[1:] + lines[index + 2].split()[1:])
+    if int(values["rdi"], 16) != base + flag:
+        return f"rdi={values['rdi']} at the hot RIP, expected sampleFlag at {base + flag:#x}"
+    return None
+
+
+def sites_forgotten(directory):
+    """With APS5_FEX_CLEAR_CODE=1 the freed code buffers must release their displaced-access sites."""
+    text = (directory / "stderr.txt").read_text(errors="replace")
+    forgotten = [int(m) for m in re.findall(r"\[displaced\] code freed .*?: (\d+) sites forgotten", text)]
+    if os.environ.get("APS5_FEX_CLEAR_CODE") == "1" and not any(forgotten):
+        return "no freed code buffer released displaced-access sites (expected '[displaced] code freed ...: N sites forgotten')"
+    return None
+
+
+CHECKS = {"opening": created_with_mode, "pc-sample": sampled_spin, "displaced-churn": sites_forgotten}
+ENVIRONMENT = {"pc-sample": {"APS5_FEX_SAMPLE": "1", "APS5_FEX_SAMPLE_REPORT": "60"},
+               "displaced-churn": {"APS5_DISPLACED_TRACE": "1"}}
 
 
 def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
@@ -67,6 +103,13 @@ def compiled_executable(directory, sources, libraries, extra=(), tpoff=False):
         renamed.append(obj.with_suffix(".nid.o"))
     (fex_toolchain.link_tpoff_executable if tpoff else fex_toolchain.link_executable)(renamed, stubs, directory / "input.elf")
     fex_toolchain.make_header_room(directory / "input.elf")
+
+
+def with_exports(directory, sources, libraries):
+    """Like compiled_executable (linked as a shared object, so its default-visibility symbols are in .dynsym),
+    with the PS5 tag that makes the relinker keep them as exports."""
+    compiled_executable(directory, sources, libraries, tpoff=True)
+    fex_toolchain.export_symbols(directory / "input.elf")
 
 
 def with_process_parameters(directory, sources, libraries, extra=()):
@@ -140,6 +183,9 @@ COMPILED = {
     "fibers": (lambda d: compiled_executable(d, [str(HERE / "fibers.cpp")],
                {"libc.prx": ["exit"], "libSceFiber.prx": ["_sceFiberInitializeImpl", "sceFiberRun", "sceFiberSwitch",
                 "sceFiberReturnToThread"]}), 43),
+    "fibers-control": (lambda d: compiled_executable(d, [str(HERE / "fibers_control.cpp")],
+                       {"libc.prx": ["exit"], "libSceFiber.prx": ["_sceFiberInitializeImpl", "sceFiberRun", "sceFiberSwitch",
+                        "sceFiberReturnToThread"]}), 43),
     "zen2": (lambda d: compiled_executable(d, [str(HERE / "zen2.cpp")],
              {"libc.prx": ["exit"], "libkernel.prx": ["mmap", "munmap"]}, ["-march=znver2", "-O2"]), 43),
     "heap": (lambda d: with_process_parameters(d, [str(HERE / "heap.cpp")],
@@ -161,6 +207,8 @@ COMPILED = {
                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 47),
     "tls-exec": (lambda d: compiled_executable(d, [str(HERE / "tls_exec.cpp")], {"libc.prx": ["exit"],
                  "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}, tpoff=True), 43),
+    "tls-exec-dynamic": (lambda d: compiled_executable(d, [str(HERE / "tls_exec_dynamic.cpp")], {"libc.prx": ["exit"],
+                         "libkernel.prx": ["scePthreadCreate", "scePthreadJoin", "__tls_get_addr"]}, tpoff=True), 43),
     "image-protect": (lambda d: compiled_executable(d, [str(HERE / "image_protect.cpp")], {"libc.prx": ["exit"],
                       "libkernel.prx": ["sceKernelMprotect", "sceKernelQueryMemoryProtection"]}), 43),
     "unaligned": (lambda d: compiled_executable(d, [str(HERE / "unaligned.cpp")], {"libc.prx": ["exit"],
@@ -170,8 +218,18 @@ COMPILED = {
     "console-syscall": (lambda d: compiled_executable(d, [str(HERE / "console_syscall.cpp")], {"libc.prx": ["exit"]}), 43),
     "displaced": (lambda d: compiled_executable(d, [str(HERE / "displaced.cpp")], {"libc.prx": ["exit", "memset", "memcpy"],
                   "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "sceKernelMunmap"]}, ["-O2"]), 43),
+    "displaced-churn": (lambda d: compiled_executable(d, [str(HERE / "displaced_churn.cpp")], {"libc.prx": ["exit"],
+                        "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "scePthreadCreate",
+                        "scePthreadJoin"]}, ["-O2"]), 43),
+    "displaced-unaligned": (lambda d: compiled_executable(d, [str(HERE / "displaced_unaligned.cpp")], {"libc.prx": ["exit"],
+                            "libkernel.prx": ["sceKernelAllocateDirectMemory", "sceKernelMapDirectMemory", "scePthreadCreate",
+                            "scePthreadJoin"]}, ["-O2"]), 43),
+    "guest-guards": (lambda d: with_exports(d, [str(HERE / "guest_guards.cpp")], {"libc.prx": ["exit"],
+                     "libkernel.prx": ["scePthreadCreate", "scePthreadJoin"]}), 43),
+    "cpuid-brand": (lambda d: compiled_executable(d, [str(HERE / "cpuid_brand.cpp")], {"libc.prx": ["exit"]}), 43),
     "kernel-sys": (lambda d: compiled_executable(d, [str(HERE / "kernel_sys.cpp")], {"libc.prx": ["exit"],
                    "libkernel.prx": ["pathconf"]}), 43),
+    "pc-sample": (lambda d: compiled_executable(d, [str(HERE / "pc_sample.cpp")], {"libc.prx": ["exit"]}, ["-O2"]), 43),
     "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
                    "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }
@@ -207,7 +265,9 @@ def main():
                 continue
             if not (directory / "libs").exists():
                 (directory / "libs").symlink_to(libraries, target_is_directory=True)
-            executed = subprocess.run([str(runner), "eboot.elf"], cwd=directory, capture_output=True, text=True, timeout=60)
+            executed = subprocess.run([str(runner), "eboot.elf"], cwd=directory, capture_output=True, text=True, timeout=60,
+                                      env={**os.environ, **ENVIRONMENT.get(name, {})})
+            (directory / "stderr.txt").write_text(executed.stderr)
             if executed.returncode != status or (output is not None and executed.stdout != output):
                 failures.append(f"{name}: exit {executed.returncode}, expected {status}; output {executed.stdout!r}, "
                                 f"expected {output!r}; {executed.stderr.strip()[-400:]}")

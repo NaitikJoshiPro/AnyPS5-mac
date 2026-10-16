@@ -7,6 +7,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/DisplayMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 AgcDriver::DisplayBuffer DescribeVideoOutBuffer(const VideoOutBuffer& buffer, const BufferAttributeGroup& group) {
@@ -76,6 +77,8 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     }
     AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     AgcDriverCheckGuestMemory_nid_postfix(buffers, static_cast<std::size_t>(bufferNum) * sizeof(*buffers), alignof(VideoOutBuffers));
+    // Traced before the buffers are checked, so a refused registration still shows what the title asked for.
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] RegisterBuffers2(handle %d, set %d, %d buffers from %d): %ux%u pixel format 0x%llx tiling %u (display mode %s)\n", handle, setIndex, bufferNum, bufferIndexStart, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format), attribute->tiling_mode, VideoOutCurrentDisplayMode_nid_no_patch().name);
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     if (cfg->closing) {
@@ -131,6 +134,9 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
     }
     AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     auto group = cfg->groups[setIndex];
+    if (VideoOutTraceEnabled_nid_no_patch() && (group.attribute.width != attribute->width || group.attribute.height != attribute->height || group.attribute.pixel_format != attribute->pixel_format)) {
+        std::fprintf(stderr, "[videoout] SubmitChangeBufferAttribute2(handle %d, set %d): %ux%u -> %ux%u pixel format 0x%llx\n", handle, setIndex, group.attribute.width, group.attribute.height, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format));
+    }
     group.attribute = *attribute;
     for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; ++i) {
         if (cfg->buffers[i].groupIndex != setIndex) continue;

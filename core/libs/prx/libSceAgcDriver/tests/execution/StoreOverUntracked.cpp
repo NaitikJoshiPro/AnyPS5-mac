@@ -57,12 +57,12 @@ std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels) {
+std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels, std::uint32_t side = Side) {
     const auto address = AddressOf(texels);
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((Side - 1u) & 3u) << 30u),
-        ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
         0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
         0u,
         0u,
@@ -91,9 +91,9 @@ void Dispatch(std::span<const std::uint32_t> code, std::uint32_t threads, std::u
     AgcDriver::Submit(&packet, 0);
 }
 
-void Store(const std::uint32_t* texels) {
+void Store(const std::uint32_t* texels, std::uint32_t side = Side) {
     std::array<std::uint32_t, 16> userData{};
-    const auto texture = TextureDescriptor(texels);
+    const auto texture = TextureDescriptor(texels, side);
     std::copy(texture.begin(), texture.end(), userData.begin() + 8);
     Dispatch(StoreCode, 8, static_cast<std::uint32_t>(userData.size()) << 1u, userData, 1);
 }
@@ -290,6 +290,80 @@ Outcome Run(const Case& test) {
 
 }
 
+// Two write-backs over memory the watch never covered: a CPU write between them is kept by the second
+// (the image is uploaded again from the bytes the first stored, which then vouch for the comparison).
+Outcome RunStoredTwice() {
+    Surface surface;
+    auto* bytes = surface.Bytes();
+    const auto address = surface.Address();
+    std::unique_lock hold(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    Store(surface.Texels());
+    Settle(hold, surface, Stored);
+    {
+        // Read through the driver: it waits for the stores into the range to land.
+        std::vector<std::byte> whole(SurfaceBytes);
+        AgcDriver::GuestMemory::Read(address, whole);
+        Require(Holds(reinterpret_cast<const std::uint32_t*>(whole.data()), Stored), "store over untracked: the first result was not stored");
+    }
+    auto* cpu = bytes + 0xe000;
+    for (std::size_t offset = 0; offset < Page; ++offset) static_cast<volatile std::uint8_t*>(cpu)[offset] = Pattern(offset);
+    Store(surface.Texels());
+    // The surface holds the first result already: pending is all that tells the second one apart.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        hold.lock();
+        if (StorageTexture::AnyPending()) break;
+        hold.unlock();
+        if (std::chrono::steady_clock::now() >= deadline) return Outcome::Missed;
+        std::this_thread::yield();
+    }
+    StorageTexture::FlushAllPending("store over untracked fixture");
+    hold.unlock();
+    const auto lost = LostBytes(cpu);
+    if (lost == 0) return Outcome::Kept;
+    std::fprintf(stderr, "[store over untracked] stored twice: %zu of 0x%zx CPU-written bytes lost to the second result\n", lost, Page);
+    return Outcome::Lost;
+}
+
+// A fill of one image over memory the watch never covered, while another image over the same bytes
+// holds results pending (DECISIONS D57): the pending image keeps the guest bytes it compares
+// against (it used to lose them and its write-back refused: "storing storage image results pending
+// over memory outside the write watch without the guest bytes saved before them", ASTRO BOT).
+Outcome RunFillOverPending() {
+    Surface surface;
+    const auto address = surface.Address();
+    constexpr std::uint32_t SmallSide = 128;
+    std::unique_lock hold(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    Store(surface.Texels(), SmallSide);
+    Settle(hold, surface, Stored);
+    Store(surface.Texels());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        hold.lock();
+        if (StorageTexture::AnyPending()) break;
+        hold.unlock();
+        if (std::chrono::steady_clock::now() >= deadline) return Outcome::Missed;
+        std::this_thread::yield();
+    }
+    const auto small = StorageTexture::FindLive(address, Block);
+    const auto whole = StorageTexture::FindLive(address, SurfaceBytes);
+    Require(small != nullptr && whole != nullptr && small != whole, "store over untracked: the two images over the surface are not both live");
+    const std::array<std::uint32_t, 4> pattern{Filled, Filled, Filled, Filled};
+    const char* refusal = nullptr;
+    if (!small->FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal)) {
+        hold.unlock();
+        std::fprintf(stderr, "[store over untracked] fill over a pending image: not run, the fill was refused (%s)\n", refusal != nullptr ? refusal : "?");
+        return Outcome::Kept;
+    }
+    StorageTexture::FlushAllPending("store over untracked fixture");
+    hold.unlock();
+    std::vector<std::byte> bytes(SurfaceBytes);
+    AgcDriver::GuestMemory::Read(address, bytes);
+    // The fill came after the result in program order: its bytes stand where they overlap.
+    Require(Holds(reinterpret_cast<const std::uint32_t*>(bytes.data()), Filled), "store over untracked: the fill did not reach guest memory");
+    return Outcome::Kept;
+}
+
 int main() {
     try {
         {
@@ -316,6 +390,17 @@ int main() {
             for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = Run(test);
             Require(outcome != Outcome::Missed, "store over untracked: the result was never held pending");
             kept = outcome == Outcome::Kept && kept;
+        }
+        {
+            auto outcome = Outcome::Missed;
+            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunStoredTwice();
+            Require(outcome != Outcome::Missed, "store over untracked: the second result was never held pending");
+            kept = outcome == Outcome::Kept && kept;
+        }
+        {
+            auto outcome = Outcome::Missed;
+            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunFillOverPending();
+            Require(outcome != Outcome::Missed, "store over untracked: the pending image beside the fill was never held pending");
         }
         Require(kept, "a pending storage result was stored over bytes the CPU wrote to untracked memory");
         AgcDriverShutdown_nid_postfix();

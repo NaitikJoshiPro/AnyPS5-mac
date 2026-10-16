@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
+#include "MetalResidency.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -69,8 +70,8 @@ void ImageCache::TrackBuffer(id<MTLBuffer> buffer) {
     if (tornDown || buffer == nil) return;
     auto& count = residentCounts[(__bridge void*)buffer];
     if (count++ == 0u) {
-        [residency addAllocation:buffer];
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Add(residency, buffer);
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
 }
 
@@ -80,9 +81,9 @@ void ImageCache::UntrackBuffer(id<MTLBuffer> buffer) {
     const auto found = residentCounts.find((__bridge void*)buffer);
     if (found == residentCounts.end()) return;
     if (--found->second == 0u) {
-        [residency removeAllocation:buffer];
+        ::AgcDriver::Metal::Residency::Remove(residency, buffer);
         residentCounts.erase(found);
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
 }
 
@@ -102,7 +103,7 @@ ImageCache::ImageCache(id<MTLDevice> device, id<MTL4CommandQueue> queue) : devic
     NSError* error = nil;
     residency = [device newResidencySetWithDescriptor:descriptor error:&error];
     if (residency == nil) Fail("cannot create the image residency set");
-    if (queue != nil) [queue addResidencySet:residency];
+    if (queue != nil) ::AgcDriver::Metal::Residency::Attach(queue, residency);
 }
 
 ImageCache::~ImageCache() {
@@ -141,6 +142,8 @@ void ImageCache::Attach(const Context& deviceContext) {
     limits.maxImageArrayLayers = std::max(limits.maxImageArrayLayers, 2048u);
     context.samplerAnisotropy = true;
     context.samplerFilterMinmax = true;
+    // Indexed lists with primitive restart expand on the CPU (MetalDraw.mm), as PrimitiveListRestart says.
+    context.primitiveListRestart = true;
     placeholderImages = std::make_unique<PlaceholderImages>(context);
     context.placeholderImages = placeholderImages.get();
     upstreamSamplers = std::make_unique<SamplerCache>();
@@ -173,9 +176,9 @@ void ImageCache::Teardown() noexcept {
     std::lock_guard lock(mutex);
     if (tornDown) return;
     tornDown = true;
-    if (queue != nil && residency != nil) [queue removeResidencySet:residency];
-    [residency removeAllAllocations];
-    [residency commit];
+    if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
+    ::AgcDriver::Metal::Residency::RemoveAll(residency);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     residentCounts.clear();
 }
 
@@ -186,11 +189,11 @@ void ImageCache::MakeResident(std::span<const id<MTLTexture>> textures) {
         if (texture == nil) continue;
         auto& count = residentCounts[(__bridge void*)texture];
         if (count++ == 0u) {
-            [residency addAllocation:texture];
+            ::AgcDriver::Metal::Residency::Add(residency, texture);
             changed = true;
         }
     }
-    if (changed) [residency commit];
+    if (changed) ::AgcDriver::Metal::Residency::Commit(residency);
 }
 
 void ImageCache::Release(std::span<const id<MTLTexture>> textures) {
@@ -202,12 +205,12 @@ void ImageCache::Release(std::span<const id<MTLTexture>> textures) {
         const auto found = residentCounts.find((__bridge void*)texture);
         if (found == residentCounts.end()) continue;
         if (--found->second == 0u) {
-            [residency removeAllocation:texture];
+            ::AgcDriver::Metal::Residency::Remove(residency, texture);
             residentCounts.erase(found);
             changed = true;
         }
     }
-    if (changed) [residency commit];
+    if (changed) ::AgcDriver::Metal::Residency::Commit(residency);
 }
 
 namespace {

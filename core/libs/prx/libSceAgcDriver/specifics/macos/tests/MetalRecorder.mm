@@ -344,6 +344,68 @@ void OcclusionSamples(const MetalTest::Device& device) {
     Expect(total == 64u * 64u, "SamplesTotal is " + std::to_string(total) + ", expected 4096");
 }
 
+// Occlusion samples over many passes, as MetalDraw records them (DECISIONS D57): each new pass takes
+// its counter slot with PrepareSamplePass before it begins (the previous pass's segment ends there),
+// and 130 passes outrun one visibility buffer's 128 slots. Every pass counts its draw.
+void OcclusionPasses(const MetalTest::Device& device) {
+    const auto& context = device.context;
+    NSError* error = nil;
+    id<MTLLibrary> library = [device.device newLibraryWithSource:@(SampleShaders) options:nil error:&error];
+    Expect(library != nil, "the occlusion test shaders do not compile: " + Metal::Describe(error));
+    if (library == nil) return;
+    MTLRenderPipelineDescriptor* pipelineDescriptor = [MTLRenderPipelineDescriptor new];
+    pipelineDescriptor.vertexFunction = [library newFunctionWithName:@"FullScreen"];
+    pipelineDescriptor.fragmentFunction = [library newFunctionWithName:@"Solid"];
+    pipelineDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = [device.device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
+    Expect(pipeline != nil, "the occlusion test pipeline: " + Metal::Describe(error));
+    if (pipeline == nil) return;
+    MTLTextureDescriptor* textureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16 mipmapped:NO];
+    textureDescriptor.usage = MTLTextureUsageRenderTarget;
+    textureDescriptor.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> texture = [device.device newTextureWithDescriptor:textureDescriptor];
+    id<MTLResidencySet> residency = [device.device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+    [residency addAllocation:texture];
+    [residency commit];
+    [device.queue addResidencySet:residency];
+    constexpr std::uint32_t Passes = 130;
+    std::uint64_t total = 0;
+    std::string failure;
+    {
+        Lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        recorder.CountSamples();
+        // The counter is the device's (shared with the recorders of earlier checks): a delta.
+        const auto before = recorder.SamplesTotal();
+        try {
+            for (std::uint32_t index = 0; index < Passes; ++index) {
+                const auto start = recorder.StartDrawPass(100 + index, false, false, PassAccess{});
+                recorder.PrepareSamplePass();
+                auto* visibility = recorder.SampleVisibilityBuffer();
+                if (visibility == nullptr) throw std::runtime_error("no visibility buffer before pass " + std::to_string(index));
+                MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
+                pass.colorAttachments[0].texture = texture;
+                pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                pass.visibilityResultBuffer = (__bridge id<MTLBuffer>)visibility;
+                pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+                id<MTL4RenderCommandEncoder> render = Metal::Stream(start.commands).BeginRender(pass);
+                [render setRenderPipelineState:pipeline];
+                recorder.NoteSampledDraw(start.commands);
+                [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                recorder.LeaveRenderPassOpen(100 + index, Recorder::NoTiming, false, PassAccess{});
+            }
+            recorder.Sync();
+            total = recorder.SamplesTotal() - before;
+        } catch (const std::exception& thrown) {
+            failure = thrown.what();
+        }
+    }
+    [device.queue removeResidencySet:residency];
+    Expect(failure.empty(), "sampled passes threw: " + failure);
+    Expect(total == std::uint64_t{Passes} * 16u * 16u, "SamplesTotal over " + std::to_string(Passes) + " passes is " + std::to_string(total) + ", expected " + std::to_string(Passes * 256u));
+}
+
 // A one-shot command batch alongside the recorder: recorded work goes first in queue order.
 void CommandBatchAfterRecorded(const Context& context) {
     Buffer target(context, 4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -504,6 +566,16 @@ void Timing(const Context& context) {
     if (!completed.empty()) Expect(completed.front().gpuStartNs > 0 && completed.front().gpuEndNs >= completed.front().gpuStartNs, "the batch stamps are " + std::to_string(completed.front().gpuStartNs) + " .. " + std::to_string(completed.front().gpuEndNs));
 }
 
+// A timestamp the GPU never wrote resolves to MTLCounterErrorValue (all ones); such a pair, a zero
+// stamp or a pair out of order measures nothing (before, the [gputime] line summed their unsigned
+// differences, ~1.8e19 ticks each).
+void TimestampPairs() {
+    constexpr std::uint64_t unwritten = ~std::uint64_t{0};
+    Expect(Metal::TimestampPairValid(100u, 100u) && Metal::TimestampPairValid(100u, 250u), "an ordered pair of written stamps is refused");
+    Expect(!Metal::TimestampPairValid(100u, unwritten) && !Metal::TimestampPairValid(unwritten, 100u) && !Metal::TimestampPairValid(unwritten, unwritten), "an unwritten stamp is accepted");
+    Expect(!Metal::TimestampPairValid(250u, 100u) && !Metal::TimestampPairValid(0u, 100u), "a reversed pair or a zero stamp is accepted");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -511,6 +583,7 @@ int main(int argc, char** argv) {
         MetalTest::Device device;
         const bool timing = argc == 2 && std::string_view(argv[1]) == "--timing";
         try {
+            TimestampPairs();
             if (timing) {
                 Timing(device.context);
             } else {
@@ -523,6 +596,7 @@ int main(int argc, char** argv) {
                 Fills(device.context);
                 MeshArguments(device.context);
                 OcclusionSamples(device);
+                OcclusionPasses(device);
                 CommandBatchAfterRecorded(device.context);
                 FlushHookWaitsForGpuWrites(device.context);
                 ManyBatches(device.context);

@@ -11,6 +11,7 @@ namespace {
 
 void PatchBranchTarget(std::uint32_t* cmd, std::uint32_t field, const volatile std::uint32_t* target, std::uint32_t sizeInDwords, const char* function) {
     Agc::Command::ValidatePacket(cmd, 0x3fu, 14, function);
+    cmd = Agc::Command::Host(cmd);
     const auto address = reinterpret_cast<std::uintptr_t>(target);
     Agc::Command::CheckAddress(address, 4, function);
     Agc::Command::CheckBits(sizeInDwords, 0xfffffu, function);
@@ -22,6 +23,7 @@ void PatchBranchTarget(std::uint32_t* cmd, std::uint32_t field, const volatile s
 void PatchBranchTarget(std::uint32_t* cmd, std::uint32_t field, std::uint8_t cachePolicy, const volatile std::uint32_t* target, std::uint32_t sizeInDwords, const char* function) {
     Agc::Command::CheckBits(cachePolicy, 3, function);
     PatchBranchTarget(cmd, field, target, sizeInDwords, function);
+    cmd = Agc::Command::Host(cmd);
     cmd[field + 2u] = (cmd[field + 2u] & ~(3u << 28u)) | (static_cast<std::uint32_t>(cachePolicy) << 28u);
 }
 
@@ -31,6 +33,7 @@ extern "C" {
 
 int APS5_VABI sceAgcBranchPatchSetCompareAddress(std::uint32_t* cmd, const volatile std::uint64_t* compareAddress) {
     Agc::Command::ValidatePacket(cmd, 0x3fu, 14, __func__);
+    cmd = Agc::Command::Host(cmd);
     const auto address = reinterpret_cast<std::uintptr_t>(compareAddress);
     Agc::Command::CheckAddress(address, 8, __func__);
     cmd[2] = static_cast<std::uint32_t>(address);

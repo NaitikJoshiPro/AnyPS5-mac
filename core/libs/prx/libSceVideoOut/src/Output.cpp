@@ -6,10 +6,14 @@
 #include <mutex>
 #include <stdexcept>
 #include <cmath>
+#include <cstdio>
 
 #include "SceTypes.hpp"
 #include "prx/libSceVideoOut/include/Output.hpp"
+#include "prx/libSceVideoOut/include/DisplayMode.hpp"
+#include "prx/libc/include/ConsoleSettings.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
@@ -123,6 +127,7 @@ int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) t
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    status = GuestArena::HostPointer(status); // may be displaced guest memory (D31, D33)
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -139,6 +144,7 @@ int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* statu
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    status = GuestArena::HostPointer(status); // may be displaced guest memory (D31, D33)
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -155,19 +161,26 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    status = GuestArena::HostPointer(status); // may be displaced guest memory (D31, D33)
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    status->resolution = (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
-    status->dynamicRange = 1;
+    // The output resolution is the console display mode's (the TV's), not the registered buffers' (D61).
+    const auto& mode = VideoOutCurrentDisplayMode_nid_no_patch();
+    status->resolution = mode.height >= 2160u ? 2u : 1u;
+    // Dynamic range 1 is SDR, 2 HDR, with flag bit 0 set for HDR (SharpProspero VideoOutTypes.cs); the TV's
+    // (APS5_HDR, default SDR), the same for every title (D68).
+    const bool hdr = ConsoleHdrOutput();
+    status->dynamicRange = hdr ? 2u : 1u;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
-    status->flags = 0;
+    status->flags = hdr ? 1u : 0u;
     status->reserved[0] = 0;
     status->reserved[1] = 0;
     status->reserved[2] = 0;
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] GetOutputStatus(handle %d): resolution class %u (display mode %s), dynamic range %u, refresh %llu, buffers %ux%u\n", handle, status->resolution, mode.name, status->dynamicRange, static_cast<unsigned long long>(status->refreshRate), cfg->width, cfg->height);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -177,6 +190,7 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    status = GuestArena::HostPointer(status); // may be displaced guest memory (D31, D33)
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -184,11 +198,15 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     *status = VideoOutResolutionStatus{};
-    status->fullWidth = cfg->width;
-    status->fullHeight = cfg->height;
-    status->paneWidth = cfg->width;
-    status->paneHeight = cfg->height;
+    // A console reports its output (the TV's resolution), whatever size the title's buffers have: the
+    // display engine scales them (D61).
+    const auto& mode = VideoOutCurrentDisplayMode_nid_no_patch();
+    status->fullWidth = mode.width;
+    status->fullHeight = mode.height;
+    status->paneWidth = mode.width;
+    status->paneHeight = mode.height;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] GetResolutionStatus(handle %d): %ux%u (display mode %s), buffers %ux%u\n", handle, mode.width, mode.height, mode.name, cfg->width, cfg->height);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -230,6 +248,7 @@ int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options)
 
 int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
     const int result = validateOutputConfig(handle, mode, options, reservedPtr, reserved);
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] IsOutputSupported(handle %d, mode 0x%llx): %d\n", handle, static_cast<unsigned long long>(mode), result != 0 ? result : 1);
     if (result != 0) {
         return result;
     }

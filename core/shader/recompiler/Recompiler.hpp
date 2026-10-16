@@ -272,6 +272,11 @@ struct SpirvTarget {
     ShaderBackend backend = ShaderBackend::Spirv;
     bool vertexSubgroups = true;
     bool float16DenormPreserve = false;
+    // The device's f32 arithmetic flushes denormal operands and results to signed zeros, as RDNA's
+    // FLOAT_MODE f32 flush does (Apple GPUs; DECISIONS D54): with FLOAT_MODE flush and round to
+    // nearest even, v_add/v_sub/v_subrev/v_mul_f32 and the f32 compares skip the front end's explicit
+    // operand and result flushes (MslTargetOptions, FPMulNativeFlushFlag). Never set for Vulkan.
+    bool float32DenormFlushNative = false;
 };
 
 struct BindingLayout {

@@ -8,6 +8,7 @@
 
 #include "SceShaders.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderUtils.hpp"
 
 namespace {
 
@@ -60,7 +61,7 @@ GsOccupancyLimits getGsOccupancyLimits(const Shader* gs, std::uint32_t vertexCap
 
 extern "C" {
 
-int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, std::uint32_t budget, float factor) {
+int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* guestGs, std::uint32_t budget, float factor) {
     if (regs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": regs is null");
     }
@@ -72,7 +73,12 @@ int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs
         pcAlloc.value = GE_PC_ALLOC_FULL;
         rsrc4.value = LATE_ALLOC_GS_FULL;
     } else if (budget != 0) {
-        if (gs == nullptr || gs->specials == nullptr) {
+        if (guestGs == nullptr) {
+            throw std::runtime_error(std::string(__func__) + ": gs or its special registers are null");
+        }
+        const Shader view = HostShader(guestGs); // displaced memory (D31, D33)
+        const Shader* gs = &view;
+        if (gs->specials == nullptr) {
             throw std::runtime_error(std::string(__func__) + ": gs or its special registers are null");
         }
         const GsOccupancyLimits base = getGsOccupancyLimits(gs, 1024u, 128u);
@@ -103,8 +109,9 @@ int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs
         }
     }
 
-    regs[0] = pcAlloc;
-    regs[1] = rsrc4;
+    auto* out = GuestArena::HostPointer(regs);
+    out[0] = pcAlloc;
+    out[1] = rsrc4;
     return 0;
 }
 

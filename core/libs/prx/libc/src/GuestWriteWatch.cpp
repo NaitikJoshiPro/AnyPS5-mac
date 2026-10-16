@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -32,6 +33,7 @@
 #include <mach/mach_vm.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -319,6 +321,21 @@ private:
 
 const bool g_opened = (Watch::Get(), true);
 #elif defined(__APPLE__)
+// macOS raises an alignment fault (an ordered access or an atomic crossing 16 bytes, which FEX and the displaced
+// stubs emulate further down the chain) as SIGBUS/BUS_ADRALN, the same signal and code as a protection fault on a
+// watched page. Only the ESR tells them apart: a data abort (EC 0x24/0x25) with fault status 0b100001 is an
+// alignment fault, never a write to a watched page. Claiming one would retry the access forever.
+bool IsAlignmentFault(const void* context) {
+#if defined(__aarch64__)
+    const std::uint64_t esr = static_cast<const ucontext_t*>(context)->uc_mcontext->__es.__esr;
+    const std::uint64_t exceptionClass = esr >> 26;
+    return (exceptionClass == 0x24 || exceptionClass == 0x25) && (esr & 0x3f) == 0x21;
+#else
+    (void)context;
+    return false;
+#endif
+}
+
 class Watch {
 public:
     static Watch& Get() {
@@ -499,7 +516,7 @@ private:
 
     static void fault(int signal, siginfo_t* info, void* context) {
         auto& watch = Get();
-        if (watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
+        if (!IsAlignmentFault(context) && watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
         const auto& previous = signal == SIGBUS ? watch._previousBus : watch._previousSegv;
         if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
             previous.sa_sigaction(signal, info, context);
@@ -643,7 +660,18 @@ void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes)
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
-    return Watch::Get().Unregister(begin, begin + bytes);
+    // Debug aid: APS5_TRACE_LEAVING_WATCH names every unregistration that removed watched pages and
+    // its caller (image + offset).
+    static const bool trace = std::getenv("APS5_TRACE_LEAVING_WATCH") != nullptr;
+    const bool removed = Watch::Get().Unregister(begin, begin + bytes);
+    if (trace && removed) {
+        Dl_info info{};
+        const void* caller = __builtin_return_address(0);
+        const bool named = dladdr(caller, &info) != 0 && info.dli_fname != nullptr;
+        std::fprintf(stderr, "[leaving-watch] write watch unregistered 0x%llx+0x%llx (caller %s+0x%llx %s)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), named ? info.dli_fname : "?",
+            static_cast<unsigned long long>(named ? reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0), named && info.dli_sname != nullptr ? info.dli_sname : "");
+    }
+    return removed;
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);

@@ -343,6 +343,39 @@ def load_ok(load1, limit):
     return load1 < limit
 
 
+class LibsLinkError(RuntimeError):
+    pass
+
+
+def ensure_libs_link(run_dir, build, out=sys.stdout):
+    """Makes run_dir/libs point at build's libraries (the runner loads the PS5 libraries from there).
+
+    `prepare` sets the link; a later `run --build X` must not silently use another build's libraries, so the link is
+    re-pointed at X's when it points elsewhere (or dangles). Refuses (LibsLinkError) when X has no libraries or the
+    run dir holds a real `libs` directory instead of a link. Returns the previous target, or None when unchanged."""
+    run_dir, build = Path(run_dir), Path(build).resolve()
+    wanted = build / "core/libs/libs"
+    if not wanted.is_dir():
+        raise LibsLinkError(f"{wanted} does not exist: build the libraries of {build} first")
+    link = run_dir / "libs"
+    if link.is_symlink():
+        current = Path(os.readlink(link))
+        if not current.is_absolute():
+            current = run_dir / current
+        if current.exists() and current.resolve() == wanted.resolve():
+            return None
+        link.unlink()
+        link.symlink_to(wanted)
+        print(f"libs: {link} pointed at {current}; re-pointed at {wanted}", file=out, flush=True)
+        return current
+    if link.exists():
+        raise LibsLinkError(f"{link} is not a symlink: cannot tell which build's libraries it holds; "
+                            f"run `title_run.py prepare {run_dir.name} --build {build}`")
+    link.symlink_to(wanted)
+    print(f"libs: {link} was missing; pointed at {wanted}", file=out, flush=True)
+    return None
+
+
 def cmd_prepare(args):
     work = work_dir()
     build = Path(args.build).resolve()
@@ -373,7 +406,11 @@ def cmd_prepare(args):
 
 
 def cmd_run(args):
-    """One title run; the whole run holds the machine-wide GPU lock (taken before the per-build lock)."""
+    """One title run; the whole run holds the machine-wide GPU lock.
+
+    Lock order (see buildlock.py): wait for the build's gpu_suite lease first, WITHOUT the GPU lock, then take the
+    GPU lock; the buildlock child does not wait for the lease again (the suite may be queued on the GPU lock)."""
+    buildlock.wait_for_lease(Path(args.build).resolve(), out=sys.stdout)
     with buildlock.gpu_lock(label=f"title_run {args.id} --tag {args.tag}", out=sys.stdout):
         return run_locked(args)
 
@@ -384,6 +421,11 @@ def run_locked(args):
     run_dir = work / "runs" / "m3" / args.id
     if not (run_dir / "app.elf").exists():
         print(f"{run_dir}/app.elf missing: run `title_run.py prepare {args.id}` first", file=sys.stderr)
+        return 2
+    try:
+        ensure_libs_link(run_dir, build)
+    except LibsLinkError as error:
+        print(f"refusing to run: {error}", file=sys.stderr)
         return 2
     logs = Path(args.log_dir)
     logs.mkdir(parents=True, exist_ok=True)

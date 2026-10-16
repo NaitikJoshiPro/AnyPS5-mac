@@ -162,12 +162,67 @@ class EnvAndAudioTests(unittest.TestCase):
         self.assertAlmostEqual(title_run.pcm_windows(f32, "f32", 2, 1, 1.0)[0], 0.25)
 
 
+class LibsLinkTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.run_dir = root / "runs" / "m3" / "T"
+        self.run_dir.mkdir(parents=True)
+        self.builds = {}
+        for name in ("build-a", "build-b"):
+            (root / name / "core/libs/libs").mkdir(parents=True)
+            self.builds[name] = root / name
+        self.out = open(os.devnull, "w")
+
+    def tearDown(self):
+        self.out.close()
+        self.tmp.cleanup()
+
+    def target(self):
+        return Path(os.readlink(self.run_dir / "libs"))
+
+    def test_matching_link_is_kept(self):
+        (self.run_dir / "libs").symlink_to(self.builds["build-a"] / "core/libs/libs")
+        self.assertIsNone(title_run.ensure_libs_link(self.run_dir, self.builds["build-a"], out=self.out))
+        self.assertEqual(self.target(), self.builds["build-a"] / "core/libs/libs")
+
+    def test_stale_link_is_repointed_at_the_run_build(self):
+        (self.run_dir / "libs").symlink_to(self.builds["build-a"] / "core/libs/libs")
+        previous = title_run.ensure_libs_link(self.run_dir, self.builds["build-b"], out=self.out)
+        self.assertEqual(previous, self.builds["build-a"] / "core/libs/libs")
+        self.assertEqual(self.target(), self.builds["build-b"].resolve() / "core/libs/libs")
+
+    def test_dangling_or_missing_link_points_at_the_run_build(self):
+        (self.run_dir / "libs").symlink_to(Path(self.tmp.name) / "gone/core/libs/libs")
+        title_run.ensure_libs_link(self.run_dir, self.builds["build-b"], out=self.out)
+        self.assertEqual(self.target(), self.builds["build-b"].resolve() / "core/libs/libs")
+        (self.run_dir / "libs").unlink()
+        title_run.ensure_libs_link(self.run_dir, self.builds["build-a"], out=self.out)
+        self.assertEqual(self.target(), self.builds["build-a"].resolve() / "core/libs/libs")
+
+    def test_refuses_a_build_without_libraries_or_a_real_directory(self):
+        with self.assertRaises(title_run.LibsLinkError):
+            title_run.ensure_libs_link(self.run_dir, Path(self.tmp.name) / "build-none", out=self.out)
+        (self.run_dir / "libs").mkdir()
+        with self.assertRaises(title_run.LibsLinkError):
+            title_run.ensure_libs_link(self.run_dir, self.builds["build-a"], out=self.out)
+
+    def test_run_refuses_before_starting_the_runner(self):
+        (self.run_dir / "app.elf").write_bytes(b"")
+        (self.run_dir / "libs").mkdir()
+        args = mock.Mock(id="T", build=str(self.builds["build-a"]), log_dir=str(Path(self.tmp.name) / "logs"))
+        with mock.patch.object(title_run, "work_dir", return_value=Path(self.tmp.name)), \
+                mock.patch.object(title_run.subprocess, "Popen") as popen, mock.patch("sys.stderr", self.out):
+            self.assertEqual(title_run.run_locked(args), 2)
+            popen.assert_not_called()
+
+
 class GpuLockTests(unittest.TestCase):
     def test_cmd_run_holds_the_gpu_lock_for_the_whole_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "locks", "gpu.lock")
             seen = []
-            args = mock.Mock(id="T1", tag="x")
+            args = mock.Mock(id="T1", tag="x", build=tmp)
             with mock.patch.dict(os.environ, {buildlock.GPU_LOCK_ENV: path}), \
                     mock.patch.object(title_run, "run_locked", lambda a: seen.append(buildlock.read_gpu_holder(path)) or 7):
                 os.environ.pop(buildlock.GPU_HELD_ENV, None)
@@ -175,6 +230,52 @@ class GpuLockTests(unittest.TestCase):
                 self.assertIsNone(buildlock.read_gpu_holder(path))
             self.assertEqual(seen[0]["pid"], os.getpid())
             self.assertIn("title_run T1", seen[0]["command"])
+
+    def test_lock_order_has_no_deadlock_between_a_suite_and_a_title_run(self):
+        """A suite-like process holds the lease and takes the GPU lock per test; a title-run-like one waits for the
+        lease, takes the GPU lock and runs buildlock.py as a child. Before the fix each waited on the other forever."""
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        suite = (
+            "import sys, time\nsys.path.insert(0, %r)\nimport buildlock\nbuild = sys.argv[1]\n"
+            "buildlock.take_lease(build, 60, run='t')\ntry:\n print('leased', flush=True)\n"
+            " time.sleep(1.0)\n for i in range(3):\n  with buildlock.gpu_lock(label='suite test', poll=0.05):\n   time.sleep(0.3)\n"
+            "finally:\n buildlock.release_lease(build)\n" % here)
+        title = (
+            "import sys, subprocess\nsys.path.insert(0, %r)\nimport buildlock\nbuild = sys.argv[1]\n"
+            "buildlock.wait_for_lease(build, poll=0.05)\nwith buildlock.gpu_lock(label='title run', poll=0.05):\n"
+            " import time; time.sleep(0.5)\n"
+            " sys.exit(subprocess.call([sys.executable, %r, build, '--', 'true']))\n" % (here, os.path.join(here, "buildlock.py")))
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, **{buildlock.GPU_LOCK_ENV: os.path.join(tmp, "locks", "gpu.lock")})
+            env.pop(buildlock.GPU_HELD_ENV, None)
+            build = os.path.join(tmp, "build")
+            suite_proc = subprocess.Popen([sys.executable, "-c", suite, build], env=env, stdout=subprocess.PIPE, text=True)
+            self.assertEqual(suite_proc.stdout.readline().strip(), "leased")
+            # Title run starts while the lease exists; it waits for it, then races the suite for the GPU lock. Force the
+            # bad interleaving too: the title run holds the GPU lock while the suite (lease holder) is queued.
+            title_proc = subprocess.Popen([sys.executable, "-c", title, build], env=env)
+            try:
+                self.assertEqual(title_proc.wait(timeout=30), 0)
+                self.assertEqual(suite_proc.wait(timeout=30), 0)
+            finally:
+                for proc in (suite_proc, title_proc):
+                    if proc.poll() is None:
+                        proc.kill()
+
+    def test_buildlock_under_the_gpu_lock_does_not_wait_for_the_lease(self):
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as tmp:
+            build = os.path.join(tmp, "build")
+            os.makedirs(build)
+            with open(os.path.join(build, buildlock.LEASE_NAME), "w") as stream:
+                import json, time
+                json.dump({"pid": os.getppid(), "started": time.time(), "max_seconds": 600, "run": "x"}, stream)
+            env = dict(os.environ, **{buildlock.GPU_HELD_ENV: "1"})
+            code = subprocess.run([sys.executable, os.path.join(here, "buildlock.py"), build, "--", "true"],
+                                  env=env, timeout=20).returncode
+            self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

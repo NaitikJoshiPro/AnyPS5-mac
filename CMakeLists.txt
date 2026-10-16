@@ -154,7 +154,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_title_run.py)
         add_test(NAME mac_progress_tool COMMAND ${Python3_EXECUTABLE} -I
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_mac_progress.py)
-        set_tests_properties(check_skips_macos gpu_suite_tool port_ledger_tool title_run_tool mac_progress_tool PROPERTIES TIMEOUT 120)
+        add_test(NAME profile_title_tool COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/mac/test_profile_title.py)
+        set_tests_properties(check_skips_macos gpu_suite_tool port_ledger_tool title_run_tool mac_progress_tool
+            profile_title_tool PROPERTIES TIMEOUT 120)
         add_test(NAME unself COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_unself.py)
         add_test(NAME pad_input COMMAND ${Python3_EXECUTABLE}

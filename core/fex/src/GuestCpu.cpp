@@ -6,7 +6,9 @@
 #include "CodeCache.hpp"
 #include "CodePool.hpp"
 #include "ConsoleSyscalls.hpp"
+#include "GuestGuards.hpp"
 #include "GuestProgram.hpp"
+#include "GuestSampler.hpp"
 #include "Options.hpp"
 
 #include <FEXCore/Config/Config.h>
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mach/mach.h>
+#include <unistd.h>
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
@@ -72,6 +75,9 @@ bool HasFeature(const char* name) {
     return sysctlbyname((std::string("hw.optional.arm.") + name).c_str(), &value, &size, nullptr, 0) == 0 && value != 0;
 }
 
+// MIDR_EL1 with Apple's implementer code (0x61) and part number 0.
+constexpr std::uint32_t AppleSiliconMidr = 0x61000000;
+
 FEXCore::HostFeatures HostFeatures() {
     FEXCore::HostFeatures features {};
     features.DCacheLineLog2 = 4; // 64-byte lines: DCacheSize() is 4 << DCacheLineLog2
@@ -97,6 +103,14 @@ FEXCore::HostFeatures HostFeatures() {
     features.SupportsDotProd = HasFeature("FEAT_DotProd");
     features.SupportsAVX = true;
     features.SupportsAES256 = features.SupportsAES;
+    // FEX sizes its per-CPU CPUID data (the brand string of leaves 0x80000002-0x80000004, big/little flags) from
+    // CPUMIDRs, which only Linux fills (sysfs midr_el1); left empty, those leaves read past an empty vector and the
+    // guest crashes on a null product name. macOS does not expose MIDR_EL1 to user code, so every core gets Apple's
+    // implementer code with part 0, which FEX's table names "Apple Silicon" (one kind of core: not hybrid).
+    int cores = 0;
+    std::size_t coresSize = sizeof(cores);
+    if (sysctlbyname("hw.logicalcpu", &cores, &coresSize, nullptr, 0) != 0 || cores < 1) cores = 1;
+    features.CPUMIDRs.assign(static_cast<std::size_t>(cores), AppleSiliconMidr);
     return features;
 }
 
@@ -222,6 +236,7 @@ public:
             std::lock_guard lock(threadsMutex);
             thread = guestCode.context->CreateThread();
         }
+        GuestSampler::Register(thread);
         thread->CurrentFrame->State.rip = rip;
         thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = rsp;
         callRet = mmap(nullptr, ThreadState::CALLRET_STACK_SIZE + 2 * Page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -249,6 +264,7 @@ public:
     GuestThread& operator=(const GuestThread&) = delete;
 
     ~GuestThread() {
+        GuestSampler::Unregister(thread);
         {
             std::lock_guard lock(threadsMutex);
             guestCode.context->DestroyThread(thread);
@@ -391,16 +407,31 @@ FEXCore::ArchHelpers::Arm64::UnalignedHandlerType unalignedHandler = FEXCore::Ar
 // The M3 raises SIGBUS (BUS_ADRALN) when an ordered access (LDAPR/LDAPUR/STLR/STLUR) or an atomic crosses a
 // 16-byte boundary. FEX emulates the access or backpatches it to a plain access plus barrier; the backpatch writes
 // through the code pool's writable alias (FEX Arm64.cpp).
+void ReportUnaligned(const char* what, std::uint64_t pc, const siginfo_t* info) {
+    char message[200];
+    const int length = std::snprintf(message, sizeof(message), "[aps5-fex] unaligned access %s: pc 0x%llx instruction 0x%08x address 0x%llx\n", what,
+        static_cast<unsigned long long>(pc), *reinterpret_cast<const std::uint32_t*>(pc), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
+    if (length > 0) (void)!write(STDERR_FILENO, message, std::min(static_cast<std::size_t>(length), sizeof(message) - 1));
+}
+
 bool HandleUnaligned(int signal, siginfo_t* info, __darwin_mcontext64* machine) {
     if (signal != SIGBUS || info->si_code != BUS_ADRALN || currentThread == nullptr) return false;
     const std::uint64_t pc = arm_thread_state64_get_pc(machine->__ss);
-    if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) return false;
+    if (!currentThread->CTX->IsAddressInCodeBuffer(currentThread, pc)) {
+        // Pool memory outside FEX's code buffers holds the displaced-access stubs (GuestDisplaced.cpp). FEX's
+        // backpatch would rewrite the stub's neighbouring words, so the fault goes down the chain to libc's
+        // displaced handler, which rewrites the stub's own copy the same way (and names what it cannot handle).
+        return false;
+    }
     // __x[0..28], __fp, __lr, __sp and __pc are contiguous: FEX indexes the GPRs as x0..x31.
     static_assert(offsetof(__darwin_arm_thread_state64, __x) + 29 * 8 == offsetof(__darwin_arm_thread_state64, __fp));
     static_assert(offsetof(__darwin_arm_thread_state64, __fp) + 8 == offsetof(__darwin_arm_thread_state64, __lr));
     static_assert(offsetof(__darwin_arm_thread_state64, __lr) + 8 == offsetof(__darwin_arm_thread_state64, __sp));
     const auto result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(currentThread, unalignedHandler, pc, machine->__ss.__x);
-    if (!result) return false;
+    if (!result) {
+        ReportUnaligned("that FEX cannot emulate", pc, info);
+        return false;
+    }
     arm_thread_state64_set_pc_fptr(machine->__ss, reinterpret_cast<void*>(pc + *result));
     return true;
 }
@@ -559,13 +590,17 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     state->context->EnableExitOnHLT();
     if (!state->context->InitCore()) throw std::runtime_error("FEXCore failed to initialise");
     if (const std::uint64_t gadget = CreateConsoleSyscallGadget(bridge)) state->context->AddThunkTrampolineIRHandler(ConsoleSyscallGadget, gadget);
+    RedirectGuestGuards(bridge, program, *state->context);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
+    GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping,
+                        [&bridge](std::uint64_t rip) { return bridge.StubName(rip); });
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;
     exitFlush = ExitFlush {state->context.get(), state->modules.get(), state->coverage};
 }
 
 GuestCpu::~GuestCpu() {
+    GuestSampler::Stop(state->context.get());
     if (exitFlush && exitFlush->context == state->context.get()) exitFlush.reset();
     state->context->FlushDiskCache();
     guestCode = {};

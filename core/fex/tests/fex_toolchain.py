@@ -124,6 +124,28 @@ def clear_static_tls_flag(path):
     pathlib.Path(path).write_bytes(data)
 
 
+def export_symbols(path):
+    """Gives the executable a PS5 eboot's DT_SCE_SYMTABSZ (0x6100003f), the size of .dynsym, in place of
+    DT_FLAGS_1 (unused by the relinker): the relinker copies the executable's defined symbols into the
+    output only when that tag is present."""
+    data = bytearray(pathlib.Path(path).read_bytes())
+    phoff, = struct.unpack_from("<Q", data, 32)
+    phnum, = struct.unpack_from("<H", data, 56)
+    for index in range(phnum):
+        kind, _, offset, _, _, size = struct.unpack_from("<IIQQQQ", data, phoff + index * 56)
+        if kind != 2:
+            continue
+        entries = {}
+        for entry in range(offset, offset + size, 16):
+            tag, value = struct.unpack_from("<qQ", data, entry)
+            entries.setdefault(tag, (entry, value))
+        symtab, strtab = entries[6][1], entries[5][1]
+        if strtab <= symtab:
+            raise RuntimeError(f"{path}: .dynstr does not follow .dynsym")
+        struct.pack_into("<qQ", data, entries[0x6ffffffb][0], 0x6100003f, strtab - symtab)
+    pathlib.Path(path).write_bytes(data)
+
+
 def link_executable(objs, libs, out):
     link(["-pie", "-z", "now", "--hash-style=sysv", "--eh-frame-hdr", "--no-dynamic-linker", "-e", "_start",
           *map(str, objs), *map(str, libs), "-o", str(out)])

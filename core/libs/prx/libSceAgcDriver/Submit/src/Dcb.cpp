@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <algorithm>
 #include <iterator>
 
@@ -15,8 +16,10 @@ int AgcDriver::SubmitMany(std::uint32_t* const* addresses, const std::uint32_t* 
     if (!addresses || !sizes) throw std::runtime_error("AGC driver: null multi-submit arrays");
     AgcDriver::GuestMemory::CheckRange(addresses, count * sizeof(*addresses), alignof(std::uint32_t*));
     AgcDriver::GuestMemory::CheckRange(sizes, count * sizeof(*sizes), alignof(std::uint32_t));
+    const auto* addressesHost = GuestArena::HostRange(addresses, count * sizeof(*addresses)); // alias if displaced (D31, D33)
+    const auto* sizesHost = GuestArena::HostRange(sizes, count * sizeof(*sizes));
     for (std::uint32_t i = 0; i < count; ++i) {
-        const Packet packet{addresses[i], sizes[i], 0, {}};
+        const Packet packet{addressesHost[i], sizesHost[i], 0, {}};
         AgcDriver::Submit(&packet, queue);
     }
     return 0;
@@ -33,10 +36,11 @@ std::uint32_t APS5_VABI sceAgcDriverWaitUntilSafeForRendering(std::uint32_t** co
     if (!command || capacity < AgcDriver::RenderingWaitPacketWords || mode != 0 || index < 0)
         throw std::invalid_argument("AGC driver: invalid rendering wait arguments");
     AgcDriver::GuestMemory::CheckRange(command, sizeof(*command), alignof(std::uint32_t*), true);
-    AgcDriver::GuestMemory::CheckRange(*command, AgcDriver::RenderingWaitPacketWords * sizeof(std::uint32_t), alignof(std::uint32_t), true);
+    auto* const commandHost = GuestArena::HostPointer(command); // the slot and the packet may be displaced (D31, D33)
+    AgcDriver::GuestMemory::CheckRange(*commandHost, AgcDriver::RenderingWaitPacketWords * sizeof(std::uint32_t), alignof(std::uint32_t), true);
     const std::uint32_t words[] = {AgcDriver::RenderingWaitPacketHeader, handle, static_cast<std::uint32_t>(index), mode};
-    std::copy(std::begin(words), std::end(words), *command);
-    *command += AgcDriver::RenderingWaitPacketWords;
+    std::copy(std::begin(words), std::end(words), GuestArena::HostRange(*commandHost, sizeof(words)));
+    *commandHost += AgcDriver::RenderingWaitPacketWords; // still the guest pointer
     return 0;
 }
 

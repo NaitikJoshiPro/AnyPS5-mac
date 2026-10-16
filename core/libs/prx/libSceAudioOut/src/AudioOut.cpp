@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <prx/libc/include/General.hpp>
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include "SDL.h"
 #include "SceTypes.hpp"
@@ -215,6 +216,8 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
         return;
     }
 
+    // The guest's PCM buffer is read (and may be queued to SDL) natively: a displaced one (D31, D33) by its alias.
+    data = GuestArena::HostRange(data, static_cast<std::size_t>(port.samplesNum) * static_cast<std::uint32_t>(port.channels) * bytesPerSample(port.format));
     std::vector<std::uint8_t> prepareBuf;
     const void* prepared = prepareBuffer(port, data, prepareBuf);
     const std::uint32_t preparedSize = port.samplesNum *
@@ -392,6 +395,7 @@ int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) 
     if (param == nullptr || num == 0) {
         return -2144993276;
     }
+    param = GuestArena::HostRange(param, num * sizeof(*param)); // may be displaced guest memory (D31, D33); ptr stays a guest pointer
 
     std::lock_guard<std::mutex> outputLock(g_outputMutex);
     std::unique_lock<std::mutex> lock(g_mutex);
@@ -424,6 +428,7 @@ int APS5_VABI sceAudioOutSetVolume(int handle, std::uint32_t flag, int* vol) {
     if (vol == nullptr) {
         return -2144993276;
     }
+    vol = GuestArena::HostPointer(vol);
     std::lock_guard<std::mutex> lock(g_mutex);
     Port* port = getPort(handle);
     if (port == nullptr) {
@@ -455,7 +460,7 @@ int APS5_VABI sceAudioOutGetLastOutputTime(int handle, std::uint64_t* outputTime
     if (port == nullptr) {
         return -2144993277;
     }
-    *outputTime = port->lastDataOutputTime;
+    *GuestArena::HostPointer(outputTime) = port->lastDataOutputTime;
     return 0;
 }
 
@@ -463,6 +468,7 @@ int APS5_VABI sceAudioOutGetPortState(int handle, AudioOutPortState* state) {
     if (state == nullptr) {
         return -2144993276;
     }
+    state = GuestArena::HostPointer(state); // may be displaced guest memory (D31, D33)
     std::lock_guard<std::mutex> lock(g_mutex);
     Port* port = getPort(handle);
     if (port == nullptr) {

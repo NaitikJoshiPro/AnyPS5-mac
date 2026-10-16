@@ -25,6 +25,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 namespace AgcDriver::Graphics {
 class StorageTexture;
@@ -36,6 +37,13 @@ class CommandStream;
 class PipelineCache;
 class ImageCache;
 class ImageBindings;
+// Readies guest memory [address, address + bytes) for GPU work this thread records into the open
+// batch next (Recorder.mm, D66): queued labels and storage image stores over it are recorded, and
+// no CPU wait is made, since recorded GPU writes precede the reader in queue order. Returns false
+// when a pending CPU write-back made it wait as a CPU read does (the read is still ordered).
+bool FlushForGpuRead(std::uint64_t address, std::size_t bytes);
+// {reads ordered by the queue alone, reads that waited} since start (tests, [metal] trace).
+std::pair<std::uint64_t, std::uint64_t> GpuReadCounts();
 }
 
 namespace AgcDriver {
@@ -55,6 +63,11 @@ struct PresentedFrame {
     std::uint64_t frames = 0;
 };
 PresentedFrame LastPresentedFrame();
+// Presents the MetalFX spatial scaler upscaled (D61).
+std::uint64_t MetalFxPresents();
+// Display buffers decoded on the GPU from their host import (D66), and those decoded on the CPU.
+std::uint64_t GpuDecodedPresents();
+std::uint64_t CpuDecodedPresents();
 
 [[noreturn]] inline void Unimplemented(const char* what, const char* package) {
     throw std::runtime_error(std::string("Metal device: ") + what + " is not implemented yet (" + package + ", docs/mac/M2_DESIGN.md)");
@@ -183,6 +196,8 @@ struct VulkanDevice::State {
         // The writable ranges (a dispatch binding the table may store anywhere in them).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
+        // Bytes of long allocations the host-import budget left out (D52).
+        std::uint64_t refusedBytes = 0;
     } addressTable;
 
     // D5's shader library and pipeline cache (MTL4Compiler + MTL4Archive, background builds); it

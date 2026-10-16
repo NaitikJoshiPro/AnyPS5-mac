@@ -11,6 +11,7 @@ extern "C" {
 
 int APS5_VABI sceAgcQueueEndOfPipeActionPatchAddress(std::uint32_t* cmd, const volatile Label* address) {
     Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(cmd), 4, __func__);
+    cmd = Agc::Command::Host(cmd);
     const auto guestAddress = reinterpret_cast<std::uintptr_t>(address);
     const auto opcode = (cmd[0] >> 8u) & 0xffu;
     if (opcode == 0x49u) {
@@ -32,6 +33,7 @@ int APS5_VABI sceAgcQueueEndOfPipeActionPatchAddress(std::uint32_t* cmd, const v
 
 int APS5_VABI sceAgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
     Agc::Command::ValidatePacket(cmd, 0x49u, 8, __func__);
+    cmd = Agc::Command::Host(cmd);
     if ((cmd[2] >> 29u) == 1u) Agc::Command::CheckBits(data, 0xffffffffu, __func__);
     cmd[5] = static_cast<std::uint32_t>(data);
     cmd[6] = static_cast<std::uint32_t>(data >> 32u);
@@ -40,6 +42,7 @@ int APS5_VABI sceAgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) 
 
 int APS5_VABI sceAgcQueueEndOfPipeActionPatchGcrCntl(std::uint32_t* cmd, std::uint16_t gcrControl) {
     Agc::Command::ValidatePacket(cmd, 0x49u, 8, __func__);
+    cmd = Agc::Command::Host(cmd);
     Agc::Command::CheckBits(gcrControl, 0xfffu, __func__);
     std::uint32_t control = gcrControl;
     if ((control & 0x300u) == 0x100u) {
@@ -51,6 +54,7 @@ int APS5_VABI sceAgcQueueEndOfPipeActionPatchGcrCntl(std::uint32_t* cmd, std::ui
 
 int APS5_VABI sceAgcQueueEndOfPipeActionPatchType(std::uint32_t* cmd, std::uint8_t action) {
     Agc::Command::ValidatePacket(cmd, 0x49u, 8, __func__);
+    cmd = Agc::Command::Host(cmd);
     Agc::Command::CheckBits(action, 0x3fu, __func__);
     const std::uint32_t eventIndex = action >= 0x2fu ? 6u : 5u;
     cmd[1] = (cmd[1] & ~0xf3fu) | action | (eventIndex << 8u);

@@ -124,7 +124,12 @@ def release_lease(build_dir) -> None:
 # One flock on a fixed path outside every worktree (<repo>/.mac-work/locks/gpu.lock, shared by all worktrees), so GPU
 # workloads from different build directories never overlap. A sidecar file (gpu.lock.info) says who holds it. The
 # kernel drops the flock when the holder dies, so a dead holder never blocks; a stale sidecar is just overwritten.
-# Lock order is always GPU lock first, then the per-build lock (never the reverse) so the two cannot deadlock.
+# Global lock order: suite lease (wait only, never held while blocking on others) -> GPU lock -> per-build flock.
+# gpu_suite holds its lease for the whole run and takes the GPU lock per test, so anything that takes the GPU lock
+# must first wait for the build's lease WITHOUT holding the GPU lock (wait_for_lease), and must not wait for the
+# lease again once it holds the GPU lock (a lease holder may be queued on the GPU lock; waiting would deadlock).
+# That skip is safe for run-only commands: while we hold the GPU lock the lease holder cannot run a test, so
+# the binaries are stable unless this command itself rebuilds them (then the suite notices changed mtimes and fails).
 
 GPU_LOCK_ENV = "APS5_GPU_LOCK"            # overrides the lock path (tests)
 GPU_HELD_ENV = "APS5_GPU_LOCK_HELD"       # set in the environment of children of a holder: they must not re-take it
@@ -229,6 +234,7 @@ def main() -> int:
                          "  --gpu also takes the machine-wide GPU lock (for ad-hoc GPU commands)\n")
         return 2
     if use_gpu:
+        wait_for_lease(sys.argv[1], int(os.environ["APS5_SUITE_LEASE_OWNER"]) if os.environ.get("APS5_SUITE_LEASE_OWNER", "").isdigit() else None)
         with gpu_lock(label=" ".join(sys.argv[3:])):
             return build_locked()
     return build_locked()
@@ -242,7 +248,9 @@ def build_locked() -> int:
     owner_pid = int(owner) if owner and owner.isdigit() else None
     lock_path = os.path.join(build_dir, ".aps5-build.lock")
     # Wait for a suite lease without holding the lock, so the suite's own tests can still take it.
-    wait_for_lease(build_dir, owner_pid)
+    # Under the GPU lock the lease was already waited for before taking it (see the lock order above): do not wait again.
+    if not os.environ.get(GPU_HELD_ENV):
+        wait_for_lease(build_dir, owner_pid)
     with open(lock_path, "a+") as lock:
         start = time.monotonic()
         try:

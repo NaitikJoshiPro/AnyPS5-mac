@@ -19,11 +19,14 @@
 #include "BdaAbi.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "MetalResidency.h"
+
 #include <spirv/unified1/spirv.hpp>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -63,6 +66,13 @@ namespace Bda = ShaderRecompiler::BdaAbi;
 using Graphics::Recorder;
 
 constexpr std::uint64_t HostPage = 16384u;
+
+// The host-import join window (SetHostImportWindow): 8 MiB as upstream's Vulkan device, or
+// APS5_HOST_IMPORT_WINDOW_MIB (0 = unbounded spans, the behaviour before D44).
+std::uint64_t HostImportWindowBytes() {
+    const char* value = std::getenv("APS5_HOST_IMPORT_WINDOW_MIB");
+    return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 8ull) << 20u;
+}
 constexpr std::uint64_t ArenaGranule = 1u << 20u;
 // Workgroups per grid dimension the device reports (WorkGroupCountLimit). Metal ran 2^24
 // threadgroups in x and 2^20 in y and z on the M3 (no limit is documented); dispatches beyond this
@@ -92,6 +102,16 @@ std::uint32_t LoopGuardLimit() {
         return parsed == 0u ? 0xffffffffu : parsed;
     }();
     return limit;
+}
+
+// The guest memory the BDA page table may add through new page wrappers (D52): wrappers are no-copy
+// buffers Metal wires in full when a command buffer uses them, outside the live-import budget.
+std::uint64_t BdaWrapperBudget() {
+    static const std::uint64_t bytes = [] {
+        if (const char* value = std::getenv("APS5_BDA_WRAP_MIB"); value != nullptr && *value != '\0') return std::strtoull(value, nullptr, 10) << 20u;
+        return std::uint64_t{1024} << 20u;
+    }();
+    return bytes;
 }
 
 // Debug aid (APS5_NO_OPPORTUNISTIC_REAP=1), as upstream: no reap of finished batches before a
@@ -126,9 +146,11 @@ GuestBufferRange DecodeBuffer(std::span<const std::uint32_t> words) {
     return {base, stride == 0u ? records : records * stride};
 }
 
-// Whether every page of [pageBegin, pageEnd) is mapped readable (executable pages included).
+// Whether every page of guest [pageBegin, pageEnd) is mapped readable (executable pages included). A displaced range
+// (GuestDisplaced.hpp, D31/D33) is queried at its alias; its guest address is a guard.
 bool Readable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
-    mach_vm_address_t cursor = pageBegin;
+    mach_vm_address_t cursor = GuestArena::HostAddress(pageBegin);
+    pageEnd = cursor + (pageEnd - pageBegin);
     while (cursor < pageEnd) {
         mach_vm_address_t region = cursor;
         mach_vm_size_t size = 0;
@@ -145,7 +167,8 @@ bool Readable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
 // Why [pageBegin, pageEnd) cannot be wrapped in place, empty when it can: every page must be
 // mapped, readable and not executable (code-signed pages fault when wrapped).
 std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
-    mach_vm_address_t cursor = pageBegin;
+    mach_vm_address_t cursor = GuestArena::HostAddress(pageBegin);
+    pageEnd = cursor + (pageEnd - pageBegin);
     while (cursor < pageEnd) {
         mach_vm_address_t region = cursor;
         mach_vm_size_t size = 0;
@@ -153,10 +176,10 @@ std::string Unwrappable(std::uint64_t pageBegin, std::uint64_t pageEnd) {
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t object = MACH_PORT_NULL;
         if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || region > cursor) {
-            return "guest memory at " + Hex(cursor) + " is not mapped";
+            return "guest memory at " + Hex(GuestArena::GuestAddress(cursor)) + " is not mapped";
         }
         if ((info.protection & VM_PROT_EXECUTE) != 0 || (info.protection & VM_PROT_READ) == 0) {
-            return "guest memory at " + Hex(cursor) + " is executable or unreadable and cannot be wrapped (ranges a command only reads are copied instead)";
+            return "guest memory at " + Hex(GuestArena::GuestAddress(cursor)) + " is executable or unreadable and cannot be wrapped (ranges a command only reads are copied instead)";
         }
         cursor = region + size;
     }
@@ -181,6 +204,30 @@ id<MTLDevice> SelectDevice() {
         if (lower(name).find(request) != std::string::npos) return candidate;
     }
     throw std::runtime_error(std::string("Metal device: no usable device whose name contains ANYPS5_GPU=\"") + requested + "\"; devices: " + names);
+}
+
+// One Metal 4 command queue per MTLDevice, shared by every VulkanDevice made on it. The driver
+// replaces its windowless device with a windowed one when VideoOut attaches a window
+// (Driver::AttachWindow), and state keyed by the MTLDevice outlives the replacement: the host
+// imports (GuestBufferMemory.mm) and the objects the first device made attach their residency sets
+// to the queue that was current when they were made. With a queue per device, the replacement's
+// command buffers ran without those sets: its label stores and every other access through such an
+// import went to non-resident memory (reads 0, writes lost; PPSA99005's completion markers never
+// reached the CPU). Upstream's VkDevice differs per VulkanDevice, which resets that state instead.
+// Never destroyed: the exit handler tears down devices still alive at exit() after static destructors ran.
+id<MTL4CommandQueue> SharedQueue(id<MTLDevice> device) {
+    struct Queues {
+        std::mutex mutex;
+        std::vector<std::pair<id<MTLDevice>, id<MTL4CommandQueue>>> queues;
+    };
+    static Queues* const shared = new Queues;
+    std::lock_guard lock(shared->mutex);
+    for (const auto& [owner, queue] : shared->queues) {
+        if (owner == device) return queue;
+    }
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    if (queue != nil) shared->queues.emplace_back(device, queue);
+    return queue;
 }
 
 std::uint32_t WorkgroupStride(const ShaderRecompiler::RecompileResult& shader) {
@@ -220,8 +267,8 @@ std::uint64_t VulkanDevice::State::TryWrap(std::uint64_t address, std::uint64_t 
     }
     id<MTLBuffer> buffer = Metal::NewNoCopyBuffer(device, pageBegin, pageEnd - pageBegin, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (buffer == nil) return 0;
-    [residency addAllocation:buffer];
-    [residency commit];
+    ::AgcDriver::Metal::Residency::Add(residency, buffer);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     wrappers.push_back({pageBegin, pageEnd, buffer});
     return buffer.gpuAddress + (address - pageBegin);
 }
@@ -258,7 +305,7 @@ std::uint64_t VulkanDevice::State::WrapOrCopy(std::uint64_t address, std::uint64
         const auto reason = Unwrappable(pageBegin, pageEnd);
         throw std::runtime_error("Metal device: " + (reason.empty() ? "newBufferWithBytesNoCopy refused guest memory at " + Hex(pageBegin) : reason) + (written ? " (the command writes it: a copy would lose the stores)" : bytes > MaxCopiedBytes ? " (too large to copy: " + std::to_string(bytes) + " bytes)" : ""));
     }
-    return stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(address), bytes), 16u).address;
+    return stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostAddress(address)), bytes), 16u).address;
 }
 
 id<MTLBuffer> VulkanDevice::State::WrapperOf(std::uint64_t address, std::uint64_t bytes, std::uint64_t* offset) const {
@@ -283,8 +330,8 @@ void VulkanDevice::State::KeepWrapped(std::uint64_t address, std::uint64_t bytes
 
 void VulkanDevice::State::DropWrappersIfIdle() {
     if (recorder == nullptr || !recorder->Idle() || wrappers.empty()) return;
-    for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
-    [residency commit];
+    for (const auto& wrapper : wrappers) ::AgcDriver::Metal::Residency::Remove(residency, wrapper.buffer);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     wrappers.clear();
     ++wrapperEpoch;
     // The cached BDA table points into the dropped wrappers and its lease pins the registry.
@@ -306,9 +353,9 @@ id<MTLBuffer> VulkanDevice::State::WorkgroupArena(std::uint64_t groups, std::uin
     if (arena == nil) throw std::runtime_error("Metal device: cannot allocate " + std::to_string(size) + " bytes of device-memory LDS");
     // The LDS lock dword of every workgroup slot starts unlocked.
     std::memset(arena.contents, 0, arena.length);
-    if (workgroupArena != nil) [residency removeAllocation:workgroupArena];
-    [residency addAllocation:arena];
-    [residency commit];
+    if (workgroupArena != nil) ::AgcDriver::Metal::Residency::Remove(residency, workgroupArena);
+    ::AgcDriver::Metal::Residency::Add(residency, arena);
+    ::AgcDriver::Metal::Residency::Commit(residency);
     workgroupArena = arena;
     return arena;
 }
@@ -323,21 +370,86 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         ranges.reserve(acquired->size());
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         std::size_t skipped = 0;
+        static const bool traceTable = std::getenv("APS5_TRACE_GPU") != nullptr;
+        std::uint64_t importedBytes = 0;
+        std::uint64_t wrappedBytes = 0;
+        std::uint64_t refusedBytes = 0;
+        // Every page wrapper the device holds counts (the V# wrappers of earlier dispatches too):
+        // they live until the recorder is idle (DropWrappersIfIdle).
+        std::uint64_t heldWrapperBytes = 0;
+        for (const auto& wrapper : wrappers) heldWrapperBytes += wrapper.end - wrapper.begin;
+        const auto add = [&](const GuestAllocations::Range& range, std::uint64_t begin, std::uint64_t end, std::uint64_t gpu) {
+            const auto permissions = Bda::Read | (range.writable ? Bda::Write : 0u);
+            if ((permissions & Bda::Write) != 0u) {
+                if (end > Bda::WrittenAddressLimit) throw std::runtime_error("Metal device: a writable BDA range ends past the addresses the written-page record can hold");
+                writable.push_back({begin, end});
+            }
+            ranges.push_back({begin, end, gpu, permissions, 0u});
+        };
         for (const auto& range : *acquired) {
+            const auto end = range->address + range->bytes;
+            if (context.hostImportAlignment != 0u && range->bytes > Graphics::HostImportPieceBytes) {
+                // A long allocation is served piece by piece through host imports (D42 windows,
+                // within the live-import budget), never by one page wrapper: Metal wires a no-copy
+                // buffer in full when a command buffer uses it, and a table holding ASTRO BOT's
+                // 3.1 + 4.6 GiB direct memory as wrappers beside the imports made the GPU fail the
+                // first BDA dispatch with kIOGPUCommandBufferCallbackErrorOutOfMemory (reported as
+                // MTL4CommandQueueErrorTimeout, D52). A piece the budget refuses is left out of the
+                // table: an access there records an Unmapped fault instead.
+                for (auto begin = range->address; begin < end;) {
+                    const auto pieceEnd = std::min(end, (begin / Graphics::HostImportPieceBytes + 1u) * Graphics::HostImportPieceBytes);
+                    std::uint64_t offset = 0;
+                    if (id<MTLBuffer> import = ImportOf(begin, pieceEnd - begin, &offset)) {
+                        add(*range, begin, pieceEnd, import.gpuAddress + offset);
+                        importedBytes += pieceEnd - begin;
+                    } else {
+                        refusedBytes += pieceEnd - begin;
+                    }
+                    begin = pieceEnd;
+                }
+                continue;
+            }
+            std::uint64_t offset = 0;
+            if (context.hostImportAlignment != 0u) {
+                if (id<MTLBuffer> import = ImportOf(range->address, range->bytes, &offset)) {
+                    add(*range, range->address, end, import.gpuAddress + offset);
+                    importedBytes += range->bytes;
+                    continue;
+                }
+            }
+            // Not imported (the budget, or memory imports cannot hold): a page wrapper, which the
+            // import budget does not see, so the wrappers the table adds are bounded on their own
+            // (BdaWrapperBudget, over all the device's wrappers); one that already holds the range
+            // costs nothing more.
+            if (WrapperOf(range->address, range->bytes, &offset) == nil) {
+                if (heldWrapperBytes + range->bytes > BdaWrapperBudget()) {
+                    refusedBytes += range->bytes;
+                    continue;
+                }
+                wrappedBytes += range->bytes;
+                heldWrapperBytes += range->bytes;
+            }
             const auto gpu = TryWrap(range->address, range->bytes);
             if (gpu == 0) {
                 ++skipped;
                 continue;
             }
-            const auto permissions = Bda::Read | (range->writable ? Bda::Write : 0u);
-            if ((permissions & Bda::Write) != 0u) {
-                if (range->address + range->bytes > Bda::WrittenAddressLimit) throw std::runtime_error("Metal device: a writable BDA range ends past the addresses the written-page record can hold");
-                writable.push_back({range->address, range->address + range->bytes});
-            }
-            ranges.push_back({range->address, range->address + range->bytes, gpu, permissions, 0u});
+            add(*range, range->address, end, gpu);
+        }
+        if (refusedBytes != 0u && addressTable.refusedBytes != refusedBytes) {
+            std::fprintf(stderr, "[metal] BDA page table: %.0f MiB of guest allocations left out (live-import budget APS5_HOST_IMPORT_MIB, page-wrapper budget APS5_BDA_WRAP_MIB; an access there records an Unmapped fault)\n", refusedBytes / 1048576.0);
         }
         if (skipped != 0u && addressTable.skipped != skipped) {
             std::fprintf(stderr, "[metal] BDA page table: %zu of %zu guest allocations cannot be wrapped in place and are left out (mirrors: work package D3)\n", skipped, acquired->size());
+        }
+        if (traceTable) {
+            std::uint64_t wrapperBytes = 0;
+            std::uint64_t largest = 0;
+            for (const auto& wrapper : wrappers) {
+                wrapperBytes += wrapper.end - wrapper.begin;
+                largest = std::max(largest, wrapper.end - wrapper.begin);
+            }
+            std::fprintf(stderr, "[gpu] BDA page table: %zu ranges, %.1f MiB of them in host imports, %.1f MiB in new page wrappers, %.1f MiB left out; %zu page wrappers hold %.1f MiB (largest %.1f MiB)\n", ranges.size(), importedBytes / 1048576.0, wrappedBytes / 1048576.0, refusedBytes / 1048576.0, wrappers.size(), wrapperBytes / 1048576.0, largest / 1048576.0);
         }
         // TryWrap may have created wrappers but never drops any, so the epoch is still current.
         const Bda::Header header {Bda::Version, static_cast<std::uint32_t>(ranges.size()), static_cast<std::uint32_t>(sizeof(Bda::Range)), 0u};
@@ -352,6 +464,7 @@ const std::vector<std::byte>& VulkanDevice::State::AddressTableBytes(std::shared
         addressTable.ranges = std::move(ranges);
         addressTable.writable = std::move(writable);
         addressTable.skipped = skipped;
+        addressTable.refusedBytes = refusedBytes;
     }
     *lease = addressTable.lease.lock();
     // Nothing in flight held it: the registry is unchanged (same generation), so a new lease pins
@@ -549,16 +662,16 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         //    the cached BDA table holding their addresses.
         report.wrappersDropped = std::max(heldWrappers, wrappers.size());
         if (residency != nil) {
-            for (const auto& wrapper : wrappers) [residency removeAllocation:wrapper.buffer];
+            for (const auto& wrapper : wrappers) ::AgcDriver::Metal::Residency::Remove(residency, wrapper.buffer);
         }
         wrappers.clear();
         ++wrapperEpoch;
         addressTable = {};
         // 4. The device's own residency set leaves the queue before it is released.
         if (queue != nil && residency != nil) {
-            [queue removeResidencySet:residency];
-            [residency removeAllAllocations];
-            [residency commit];
+            ::AgcDriver::Metal::Residency::Detach(queue, residency);
+            ::AgcDriver::Metal::Residency::RemoveAll(residency);
+            ::AgcDriver::Metal::Residency::Commit(residency);
             report.residencyRemoved = true;
         }
         // The image cache's residency set leaves the queue (D4/D5, MetalImages.h).
@@ -568,6 +681,9 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         presenter.reset();
         if (images != nullptr) images->Teardown();
         images.reset();
+        // Allocations removed from residency sets since the last queue commit (MetalResidency.h):
+        // the queue is idle and its sets are gone, so they go now.
+        ::AgcDriver::Metal::Residency::Drain();
         // The pipeline cache after the recorder: joins its background workers, saves the archive.
         pipelines.reset();
         compiler = nil;
@@ -606,7 +722,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
             state->compiler = state->pipelines->Compiler();
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
-            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT, spv::CapabilityStencilExportEXT, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod}) {
+            // ImageGatherExtended + nonConstantImageOffsets (Target()): MSL's sample/gather take a
+            // run-time int2 offset (MslImage.cpp PackedOffset), as Vulkan's maintenance8 does.
+            for (const auto capability : {spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT, spv::CapabilityStencilExportEXT, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt16, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilitySignedZeroInfNanPreserve, spv::CapabilityImageQuery, spv::CapabilityMinLod, spv::CapabilityImageGatherExtended}) {
                 state->capabilities.push_back(static_cast<std::uint32_t>(capability));
             }
             // Multisampled storage images are emulated as 2D arrays of layers * samples slices (DECISIONS D22, MslAbi v6).
@@ -625,7 +743,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
-            state->queue = [state->device newMTL4CommandQueue];
+            state->queue = SharedQueue(state->device);
             MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
             residency.initialCapacity = 64;
             state->residency = [state->device newResidencySetWithDescriptor:residency error:&error];
@@ -633,14 +751,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->faults = [state->device newBufferWithLength:Bda::FaultBufferBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
             if (state->faults == nil) throw std::runtime_error("Metal device: cannot allocate the fault buffer");
             std::memset(state->faults.contents, 0, state->faults.length);
-            [state->residency addAllocation:state->faults];
+            ::AgcDriver::Metal::Residency::Add(state->residency, state->faults);
             state->atomicLocks = [state->device newBufferWithLength:Abi::AtomicLockAllocationBytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
             if (state->atomicLocks == nil) throw std::runtime_error("Metal device: cannot allocate the 64-bit atomic lock table");
             // Every lock word starts released; only the GPU touches the table after this.
             std::memset(state->atomicLocks.contents, 0, state->atomicLocks.length);
-            [state->residency addAllocation:state->atomicLocks];
-            [state->residency commit];
-            [state->queue addResidencySet:state->residency];
+            ::AgcDriver::Metal::Residency::Add(state->residency, state->atomicLocks);
+            ::AgcDriver::Metal::Residency::Commit(state->residency);
+            ::AgcDriver::Metal::Residency::Attach(state->queue, state->residency);
             MTL4ArgumentTableDescriptor* table = [MTL4ArgumentTableDescriptor new];
             table.maxBufferBindCount = Abi::Index(Abi::BufferIndex::Count);
             state->images = std::make_unique<Graphics::Metal::ImageCache>(state->device, state->queue);
@@ -654,6 +772,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.bufferDeviceAddress = true;
             // Host imports (D3): no-copy buffers over whole 16 KiB pages of guest allocations.
             context.hostImportAlignment = HostPage;
+            // Adjacent allocations join one import only over whole aligned 8 MiB windows, as on
+            // upstream's Vulkan device (a94730373): a heap growing 16 KiB at a time otherwise re-imports
+            // the whole chain at every growth, and the retired no-copy buffers stay in the import
+            // residency set until their batch completes (SuperTuxKart: ~20 GiB of them in one batch,
+            // which Metal refused at commit with MTL4CommandQueueErrorTimeout; DECISIONS D44).
+            Graphics::SetHostImportWindow(HostImportWindowBytes());
             const auto bufferLength = static_cast<std::uint64_t>(state->device.maxBufferLength);
             context.limits.maxStorageBufferRange = static_cast<std::uint32_t>(std::min<std::uint64_t>(bufferLength, 0xffffffffu));
             context.limits.maxUniformBufferRange = context.limits.maxStorageBufferRange;
@@ -776,6 +900,20 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     // "f16->f32 (native)" op matched the exact decode for 20000 halves, a quarter of them denormal
     // (gpu-suite 20261013T140350Z).
     target.float16DenormPreserve = true;
+    // Texel offsets computed at run time (ASTRO BOT: "normalized guest sampler is used with a texel
+    // offset that is not a constant"): MSL sample/gather/sample_compare take a run-time int2 offset,
+    // the equivalent of Vulkan's maintenance8 + shaderImageGatherExtended. Metal is reported to clamp offsets to
+    // [-8, 7] where RDNA2 takes 6-bit fields ([-32, 31]); TechnicalDebt metal-texel-offset-range.
+    target.nonConstantImageOffsets = true;
+    // DECISIONS D54: Apple GPUs flush f32 denormal operands and results of add, subtract, multiply
+    // and compares to signed zeros, as RDNA's FLOAT_MODE f32 flush does (agc_metal_native_f32_flush
+    // compares both translations bit for bit), so the front end drops its explicit flushes there.
+    // APS5_MSL_NATIVE_F32_FLUSH=0 keeps them (debug aid).
+    static const bool nativeF32Flush = [] {
+        const char* value = std::getenv("APS5_MSL_NATIVE_F32_FLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    target.float32DenormFlushNative = nativeF32Flush;
     return target;
 }
 
@@ -1036,7 +1174,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     };
     outcome.reason = refusal();
     if (outcome.reason == CopyOutcome::None) {
-        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
+        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memmove(reinterpret_cast<void*>(GuestArena::HostAddress(destination)), reinterpret_cast<const void*>(GuestArena::HostAddress(source)), bytes); });
         outcome.path = 0;
         outcome.sourceSettledBySignal = settledBySignal;
         return outcome;
@@ -1507,8 +1645,8 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         auto* last = reinterpret_cast<volatile std::uint32_t*>(Pm4::GdsAddress() + Pm4::GdsBytes - 4u);
         *last = 0xc0ffee00u;
         if (mapping != nil && probe != nil) {
-            [residency addAllocation:probe];
-            [residency commit];
+            ::AgcDriver::Metal::Residency::Add(residency, probe);
+            ::AgcDriver::Metal::Residency::Commit(residency);
             stream.Barrier();
             [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + 16u toBuffer:probe destinationOffset:0 size:16];
             [stream.Compute() copyFromBuffer:mapping sourceOffset:offset + Pm4::GdsBytes - 4u toBuffer:probe destinationOffset:16 size:4];

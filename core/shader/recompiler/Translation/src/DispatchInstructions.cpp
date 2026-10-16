@@ -25,6 +25,10 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
         throw std::runtime_error(instruction.unsupportedReason.empty() ? "unsupported decoded instruction at pc " + std::to_string(instruction.programCounter) : std::string(instruction.unsupportedReason));
     }
     f32DenormalFlush = f32DenormalFlushFor(instruction);
+    nativeF32FlushOp = f32DenormalFlush != 0u ? nativeF32FlushFor(instruction) : NativeF32Flush::None;
+    // The device flushes the operands and the result itself (the compare keeps its constant-operand
+    // path, which reads the flush bits).
+    if (nativeF32FlushOp == NativeF32Flush::Arithmetic || nativeF32FlushOp == NativeF32Flush::Product) f32DenormalFlush = 0u;
     bool translated = false;
     switch (instruction.family) {
         case RdnaInstructionFamily::SOP1:

@@ -11,6 +11,7 @@
 // the GPU mapping already holds the CPU's pages (agc_metal_noncopy_import checks both).
 
 #import <Metal/Metal.h>
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -26,11 +27,18 @@ namespace AgcDriver::Metal {
 // a time; nullptr clears it. GuestBufferMemory.mm defines it.
 using ImportReleaseProbe = void (*)(const void* buffer);
 void SetImportReleaseProbe(ImportReleaseProbe probe);
+// Test seam (tests/ReplacedDeviceQueue.mm): the command queue the host-import residency set of `device`
+// (an MTLDevice) is attached to, null when it has none. GuestBufferMemory.mm defines it.
+const void* HostImportResidencyQueue(const void* device);
 
-inline id<MTLBuffer> NewNoCopyBuffer(id<MTLDevice> device, std::uint64_t begin, std::uint64_t bytes, MTLResourceOptions options) {
+// guestBegin is a guest address: the write watch keys pages by guest address, while the region scan, the temporary
+// mprotect and the wrap itself use the host address, the alias for a displaced range (GuestDisplaced.hpp, D31/D33;
+// offsets into the buffer are the same).
+inline id<MTLBuffer> NewNoCopyBuffer(id<MTLDevice> device, std::uint64_t guestBegin, std::uint64_t bytes, MTLResourceOptions options) {
+    const bool watched = GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(guestBegin, bytes);
+    if (watched) GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(reinterpret_cast<const void*>(guestBegin), bytes);
+    const std::uint64_t begin = GuestArena::HostAddress(guestBegin);
     const auto end = begin + bytes;
-    const bool watched = GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(begin, bytes);
-    if (watched) GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(reinterpret_cast<const void*>(begin), bytes);
     // Readable pages without write access that may be given it (guest read-only mappings).
     std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, int>> restore;
     for (std::uint64_t cursor = begin; cursor < end;) {
@@ -48,7 +56,7 @@ inline id<MTLBuffer> NewNoCopyBuffer(id<MTLDevice> device, std::uint64_t begin, 
     }
     id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:reinterpret_cast<void*>(begin) length:bytes options:options deallocator:nil];
     for (const auto& [range, protection] : restore) ::mprotect(reinterpret_cast<void*>(range.first), range.second - range.first, protection);
-    if (watched) GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(reinterpret_cast<const void*>(begin), bytes);
+    if (watched) GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(reinterpret_cast<const void*>(guestBegin), bytes);
     return buffer;
 }
 

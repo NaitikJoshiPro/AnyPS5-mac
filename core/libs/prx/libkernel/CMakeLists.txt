@@ -34,6 +34,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/GuestTlsMacOs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/TlsGetAddr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/MainThreadMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
@@ -1222,6 +1223,16 @@ if(BUILD_TESTING)
     target_link_libraries(guest_displaced_memory_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_displaced_memory_tests)
     add_test(NAME guest_displaced_memory COMMAND guest_displaced_memory_tests)
+    add_test_executable(guest_displaced_paths_tests ${LIBS_INCLUDE_DIR}/tests/GuestDisplacedPaths.cpp)
+    target_include_directories(guest_displaced_paths_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_displaced_paths_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_displaced_paths_tests)
+    add_test(NAME guest_displaced_paths COMMAND guest_displaced_paths_tests)
+    add_test_executable(guest_displaced_status_tests ${LIBS_INCLUDE_DIR}/tests/GuestDisplacedStatus.cpp)
+    target_include_directories(guest_displaced_status_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_displaced_status_tests PRIVATE libSceVideoOut libScePad libSceAudioOut libSceUserService libkernel libc)
+    configure_windows_unwind(guest_displaced_status_tests)
+    add_test(NAME guest_displaced_status COMMAND guest_displaced_status_tests)
     add_test_executable(guest_fcntl_duplicate_tests ${LIBS_INCLUDE_DIR}/tests/GuestFcntlDuplicate.cpp)
     target_include_directories(guest_fcntl_duplicate_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_fcntl_duplicate_tests PRIVATE libkernel libc)

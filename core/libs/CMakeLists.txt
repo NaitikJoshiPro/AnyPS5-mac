@@ -71,6 +71,22 @@ if(MINGW)
     endforeach()
 endif()
 
+# D35: hidden definitions of read, write, recv, ... that translate displaced guest buffers before libSystem sees them.
+# Always built (its test runs); linked into libc and every prx with APS5_HOST_SYSCALL_SHIM (ON by default since D35's
+# verification; OFF only to bisect).
+option(APS5_HOST_SYSCALL_SHIM "Link the displaced-buffer host system call shim into every prx library (macOS arm64)" ON)
+if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+    add_library(aps5_host_syscall_shim STATIC ${CMAKE_CURRENT_SOURCE_DIR}/hostsys/HostSyscallShim.cpp)
+    target_include_directories(aps5_host_syscall_shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(aps5_host_syscall_shim PRIVATE cxx_std_20)
+    set_target_properties(aps5_host_syscall_shim PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
+endif()
+function(link_host_syscall_shim target)
+    if(APS5_HOST_SYSCALL_SHIM AND TARGET aps5_host_syscall_shim)
+        target_link_libraries(${target} PRIVATE aps5_host_syscall_shim)
+    endif()
+endfunction()
+
 set(LIBC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/prx/libc)
 add_library(libc SHARED EXCLUDE_FROM_ALL)
 set(LIBS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
@@ -78,6 +94,7 @@ add_subdirectory(${LIBC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/prx/libc)
 target_include_directories(libc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 configure_windows_unwind(libc)
 configure_prx_rpath(libc)
+link_host_syscall_shim(libc)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libc PRIVATE LINKER:-z,now)
     target_link_options(libc INTERFACE LINKER:--no-as-needed)
@@ -137,6 +154,7 @@ foreach(LIB_DIR ${LIBS_DIRS})
         endif()
 
         configure_prx_rpath(${LIB_NAME})
+        link_host_syscall_shim(${LIB_NAME})
         if(LIB_NAME STREQUAL "libkernel")
             target_link_libraries(${LIB_NAME} PUBLIC libc)
         else()
@@ -426,6 +444,12 @@ if(BUILD_TESTING)
     configure_windows_unwind(savedata_replace_file_failure_tests)
     add_test(NAME savedata_replace_file_failure COMMAND savedata_replace_file_failure_tests)
 
+    add_test_executable(guest_displaced_fiber_media_tests tests/GuestDisplacedFiberMedia.cpp)
+    target_include_directories(guest_displaced_fiber_media_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_displaced_fiber_media_tests PRIVATE libSceFiber libSceSaveData.native libkernel libc)
+    configure_windows_unwind(guest_displaced_fiber_media_tests)
+    add_test(NAME guest_displaced_fiber_media COMMAND guest_displaced_fiber_media_tests)
+
     add_test_executable(guest_crt_tests tests/GuestCrt.cpp)
     target_include_directories(guest_crt_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_crt_tests PRIVATE libSceAmpr libc)
@@ -466,6 +490,46 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_posix_random PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePosixForWebKit>")
+    endif()
+
+    # libSceAgc's shader functions on displaced guest memory read through host views: zero faults, same results
+    # (D31, D33). The sources are compiled in with stub driver entry points, so no GPU is touched.
+    add_test_executable(guest_displaced_shaders_tests
+            tests/GuestDisplacedShaders.cpp
+            prx/libSceAgc/Shader/src/CreateShader.cpp
+            prx/libSceAgc/Shader/src/ShaderUtils.cpp
+            prx/libSceAgc/Shader/src/InterpolantMapping.cpp
+            prx/libSceAgc/Shader/src/PrimState.cpp
+            prx/libSceAgc/Shader/src/LinkShaders.cpp
+            prx/libSceAgc/Shader/src/GsPrimPayload.cpp
+            prx/libSceAgc/Shader/src/GsOversubscription.cpp
+            prx/libSceAgc/Misc/src/ShaderFusion.cpp
+    )
+    target_include_directories(guest_displaced_shaders_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_displaced_shaders_tests PRIVATE libSceAgcDriver libkernel libc)
+    configure_windows_unwind(guest_displaced_shaders_tests)
+    add_test(NAME guest_displaced_shaders COMMAND guest_displaced_shaders_tests)
+
+    if(TARGET aps5_host_syscall_shim)
+        add_test_executable(host_syscall_shim_tests tests/HostSyscallShim.cpp)
+        target_include_directories(host_syscall_shim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(host_syscall_shim_tests PRIVATE aps5_host_syscall_shim libkernel libc)
+        add_test(NAME host_syscall_shim COMMAND host_syscall_shim_tests)
+        # D35: every libSystem symbol a prx imports is classified in hostsys/host_imports.tsv; shimmed ones are defined
+        # by the archive and, with the shim on, no longer imported. The negative twin drops a row and must fail.
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            set(HOST_IMPORTS_CHECK ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mac/check_host_imports.py
+                --inventory ${CMAKE_CURRENT_SOURCE_DIR}/hostsys/host_imports.tsv --libraries ${PATCHED_DIR}
+                --archive $<TARGET_FILE:aps5_host_syscall_shim>)
+            if(APS5_HOST_SYSCALL_SHIM)
+                list(APPEND HOST_IMPORTS_CHECK --shim-on)
+            endif()
+            add_test(NAME host_import_inventory COMMAND ${HOST_IMPORTS_CHECK})
+            add_test(NAME host_import_inventory_unclassified COMMAND ${HOST_IMPORTS_CHECK} --drop malloc)
+            set_tests_properties(host_import_inventory host_import_inventory_unclassified PROPERTIES TIMEOUT 120)
+            set_tests_properties(host_import_inventory_unclassified PROPERTIES PASS_REGULAR_EXPRESSION "error: malloc [(]imported by")
+        endif()
     endif()
 
     add_test_executable(guest_acm_tests tests/GuestAcm.cpp)

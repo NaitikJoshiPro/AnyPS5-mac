@@ -6,6 +6,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
@@ -276,18 +277,27 @@ static int NativeFutimes(int descriptor, const KernelTimeval* times) {
 static int NativeFlock(int descriptor, int operation) {
     return ::flock(descriptor, operation);
 }
+// Host system calls get the host address of a guest buffer: a displaced one (D31, D33) is a guard page at its guest
+// address, where the kernel returns EFAULT instead of raising the signal the fault handler redirects.
 static std::int64_t NativePread(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset) {
-    return static_cast<std::int64_t>(::pread(descriptor, buf, nbytes, static_cast<off_t>(offset)));
+    return static_cast<std::int64_t>(::pread(descriptor, GuestArena::HostRange(buf, nbytes), nbytes, static_cast<off_t>(offset)));
 }
 static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nbytes, std::int64_t offset) {
+    buf = GuestArena::HostRange(buf, nbytes);
     const auto result = File::PwriteSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset);
     return result == -2 ? static_cast<std::int64_t>(::pwrite(descriptor, buf, nbytes, static_cast<off_t>(offset))) : result;
 }
 static_assert(sizeof(KernelIovec) == sizeof(struct iovec));
 static_assert(offsetof(KernelIovec, base) == offsetof(struct iovec, iov_base));
 static_assert(offsetof(KernelIovec, length) == offsetof(struct iovec, iov_len));
-static const struct iovec* NativeIovecs(const KernelIovec* iov) {
-    return reinterpret_cast<const struct iovec*>(iov);
+// A host copy of the guest's iovecs with every base at its host address (displaced bases at their alias).
+static std::vector<struct iovec> NativeIovecs(const KernelIovec* iov, int iovcnt) {
+    std::vector<struct iovec> host(static_cast<std::size_t>(std::max(iovcnt, 0)));
+    for (std::size_t i = 0; i < host.size(); ++i) {
+        std::memcpy(&host[i], &iov[i], sizeof(host[i]));
+        host[i].iov_base = GuestArena::HostRange(host[i].iov_base, host[i].iov_len);
+    }
+    return host;
 }
 #endif
 
@@ -1156,7 +1166,7 @@ int64_t APS5_VABI sceKernelReadv(int d, const KernelIovec* iov, int iovcnt) {
         return result < 0 ? SceKernelError(*__error_nid_postfix()) : result;
     }
     if (File::IsRandomDevice(d)) return ReadRandomIovecs(d, iov, iovcnt);
-    const auto result = static_cast<std::int64_t>(::readv(d, NativeIovecs(iov), iovcnt));
+    const auto result = static_cast<std::int64_t>(::readv(d, NativeIovecs(iov, iovcnt).data(), iovcnt));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1169,9 +1179,9 @@ int64_t APS5_VABI sceKernelWritev(int d, const KernelIovec* iov, int iovcnt) {
 #ifdef __APPLE__
     if (iovcnt == 0) return EmptyIovecs(d);
 #endif
-    const auto sharedResult = File::WritevSharedMemory_nid_no_patch(d, NativeIovecs(iov), iovcnt);
+    const auto sharedResult = File::WritevSharedMemory_nid_no_patch(d, NativeIovecs(iov, iovcnt).data(), iovcnt);
     if (sharedResult != -2) return sharedResult < 0 ? SceErrorFromErrno(errno) : sharedResult;
-    const auto result = static_cast<std::int64_t>(::writev(d, NativeIovecs(iov), iovcnt));
+    const auto result = static_cast<std::int64_t>(::writev(d, NativeIovecs(iov, iovcnt).data(), iovcnt));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1185,7 +1195,7 @@ int64_t APS5_VABI sceKernelPreadv(int d, const KernelIovec* iov, int iovcnt, int
     std::deque<GuestArena::HostWrite> destinations;
     if (!OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::IsRandomDevice(d)) return ReadRandomIovecs(d, iov, iovcnt);
-    const auto result = static_cast<std::int64_t>(::preadv(d, NativeIovecs(iov), iovcnt, static_cast<off_t>(offset)));
+    const auto result = static_cast<std::int64_t>(::preadv(d, NativeIovecs(iov, iovcnt).data(), iovcnt, static_cast<off_t>(offset)));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1196,9 +1206,9 @@ int64_t APS5_VABI sceKernelPwritev(int d, const KernelIovec* iov, int iovcnt, in
 #ifdef __APPLE__
     if (iovcnt == 0) return EmptyIovecs(d);
 #endif
-    const auto sharedResult = File::PwritevSharedMemory_nid_no_patch(d, NativeIovecs(iov), iovcnt, offset);
+    const auto sharedResult = File::PwritevSharedMemory_nid_no_patch(d, NativeIovecs(iov, iovcnt).data(), iovcnt, offset);
     if (sharedResult != -2) return sharedResult < 0 ? SceErrorFromErrno(errno) : sharedResult;
-    const auto result = static_cast<std::int64_t>(::pwritev(d, NativeIovecs(iov), iovcnt, static_cast<off_t>(offset)));
+    const auto result = static_cast<std::int64_t>(::pwritev(d, NativeIovecs(iov, iovcnt).data(), iovcnt, static_cast<off_t>(offset)));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 

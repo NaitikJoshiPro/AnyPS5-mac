@@ -56,7 +56,24 @@ void zero(const Registers& registers, std::uint32_t offset, std::uint32_t mask, 
 
 std::string vteMessage(std::uint32_t viewportControl) {
     std::ostringstream message;
-    message << "AGC graphics: PA_CL_VTE_CNTL=0x" << std::hex << viewportControl << ": expected 0x43f for homogeneous positions and all viewport transforms; pre-divided coordinates, reciprocal W or disabled transforms are unsupported";
+    message << "AGC graphics: PA_CL_VTE_CNTL=0x" << std::hex << viewportControl << ": expected 0x43f for homogeneous positions and all viewport transforms or 0x300 for window-space positions; other pre-divided coordinates, reciprocal W or partial transforms are unsupported";
+    return message.str();
+}
+
+// PA_SU_VTX_CNTL: PIX_CENTER (bit 0, 1 = pixel centers at +0.5), ROUND_MODE (bits 1-2, 2 = round to
+// even), QUANT_MODE (bits 3-5: 5 = 16.8 fixed point 1/256, 6 = 14.10 1/1024, 7 = 12.12 1/4096). radeonsi
+// picks the quantization by viewport size (si_state_viewport.c: 1/4096 or 1/1024 for small viewports,
+// 1/256 otherwise). The host rasterizer snaps with its own fixed sub-pixel precision whatever the guest
+// asks, so the finer modes are accepted as 1/256 is (D45); D3D pixel centers, other rounding and the
+// coarser modes are refused.
+bool StandardVertexControl(std::uint32_t control) {
+    const auto quantization = (control >> 3u) & 7u;
+    return (control & ~0x3fu) == 0 && (control & 7u) == 5u && quantization >= 5u;
+}
+
+std::string vertexControlMessage(std::uint32_t control) {
+    std::ostringstream message;
+    message << "AGC graphics: nonstandard pixel center or vertex quantization is unsupported (PA_SU_VTX_CNTL=0x" << std::hex << control << "; supported: OpenGL pixel centers, round to even, 1/256 or finer sub-pixel quantization: 0x2d, 0x35, 0x3d)";
     return message.str();
 }
 
@@ -113,6 +130,12 @@ constexpr std::uint32_t ScanControlMask = ~0x76023fffu;
 constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 // Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
 constexpr std::uint32_t ClipControlMask = ~(0x80000u | 0x01000000u | 0x0c000000u);
+// PA_CL_VTE_CNTL: W0 holds W and every viewport scale/offset is enabled (homogeneous positions), or
+// VTX_XY_FMT and VTX_Z_FMT with no transform (window-space positions: radeonsi's
+// window_space_position vertex shaders, Mesa si_state_shaders.cpp).
+constexpr std::uint32_t HomogeneousViewportControl = 0x43fu;
+constexpr std::uint32_t WindowSpaceViewportControl = 0x300u;
+constexpr std::uint32_t ClipDisable = 1u << 16u;
 
 bool zFormatSupported(std::uint32_t format) {
     return format == 0u || format == 1u || format == 2u || format == 3u || format == 9u;
@@ -650,12 +673,21 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, c
         const auto primitives = group & 0x1ffu;
         const auto maxVertices = read(queue.context, 0x1ff);
         const auto verticesPerPrimitive = vertexWorkgroup ? 3u : read(queue.context, 0x2ce);
-        validate((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3, "unsupported geometry input or output assembly");
+        // DECISIONS D41: a rect list (17) through an NGG vertex program outputs RECTLIST (GS_OUT_PRIM_TYPE
+        // 3); the MSL mesh function adds each rect's fourth vertex. A geometry program's rect output
+        // and the other output types stay refused.
+        const bool rectList = primitive == 17 && vertexWorkgroup && read(queue.context, 0x29b) == 3;
+        if (!rectList && !((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3)) {
+            const std::string assembly = "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE " + std::to_string(primitive) + ", VGT_GS_OUT_PRIM_TYPE " + std::to_string(read(queue.context, 0x29b)) + ", " + std::to_string(verticesPerPrimitive) + " vertices per output primitive)";
+            validate(false, assembly.c_str());
+        }
         const auto inputSize = primitive == 1 ? 1u : primitive == 2 ? 2u : 3u;
         validate(vertices >= inputSize && maxVertices != 0 && (!vertexWorkgroup || maxVertices >= inputSize) && maxVertices <= 256 && verticesPerPrimitive <= 256, "invalid geometry subgroup output");
         const auto inputStep = primitive == 5 || primitive == 6 ? 1u : inputSize;
         const auto outputLimit = vertexWorkgroup ? (maxVertices - inputSize) / inputStep + 1u : maxVertices / verticesPerPrimitive;
-        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit});
+        // The host mesh holds a rect group's 3 vertices per rect plus the synthesized one: at most 64
+        // rects keep it within Metal's 256 vertices per mesh.
+        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit, rectList ? 64u : primitives});
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
         validate(vertexWorkgroup || (((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3), "unsupported geometry VGPR allocation");
@@ -705,7 +737,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
         case 3: result.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
         case 7:
         case 17:
-            Require(result.stages.path == ShaderPath::Vertex, "rect-list requires vertex routing");
+            // DECISIONS D41: the mesh path takes rect lists that DecodeShaderStages accepted.
+            Require(result.stages.path == ShaderPath::Vertex || (primitive == 17 && result.stages.mesh.has_value() && result.stages.mesh->inputPrimitive == 17), "rect-list requires vertex routing");
             result.rectList = true;
             result.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
             break;
@@ -763,13 +796,17 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
     zero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits");
     Require(read(cx, 0x83) == 0xffffu, "clip rectangles are unsupported");
     Require((read(cx, 0x8c) & 0xfu) == 0xau, "nonstandard triangle edge rules are unsupported");
-    Require(read(cx, 0x2f9) == 0x2du, "nonstandard pixel center or vertex quantization is unsupported");
+    if (const auto vertexControl = read(cx, 0x2f9); !StandardVertexControl(vertexControl)) throw std::runtime_error(vertexControlMessage(vertexControl));
     Require(read(cx, 0x30e) == 0xffffffffu && read(cx, 0x30f) == 0xffffffffu, "sample masks are unsupported");
     const auto viewportControl = read(cx, 0x206);
-    if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
-    zero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags");
-    result.depthClamp = (read(cx, 0x204) & 0x0c000000u) != 0;
-    result.negativeOneToOne = (read(cx, 0x204) & 0x80000u) == 0;
+    if (viewportControl != HomogeneousViewportControl && viewportControl != WindowSpaceViewportControl) throw std::runtime_error(vteMessage(viewportControl));
+    result.windowSpacePosition = viewportControl == WindowSpaceViewportControl;
+    // radeonsi disables clipping exactly for window-space positions (si_emit_clip_regs). Without clipping
+    // the hardware clamps depth to the viewport's range instead of clipping it.
+    zero(cx, 0x204, ClipControlMask & ~(result.windowSpacePosition ? ClipDisable : 0u), "unsupported PA_CL_CLIP_CNTL flags");
+    result.depthClamp = (read(cx, 0x204) & (0x0c000000u | ClipDisable)) != 0;
+    // Window-space depth is not a clip-space value: no [-w, w] remap.
+    result.negativeOneToOne = !result.windowSpacePosition && (read(cx, 0x204) & 0x80000u) == 0;
     const auto raster = read(cx, 0x205);
     // Bits 5-10 give the front/back polygon type (2 = filled triangles), which POLY_MODE (bit 3) turns on
     // explicitly; KEEP_TOGETHER_ENABLE (bit 24) only affects primitive distribution across the chip.
@@ -858,12 +895,15 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, const ShaderRec
             std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
-    const auto xs = readFloat(cx, 0x10f);
-    const auto xo = readFloat(cx, 0x110);
-    const auto ys = readFloat(cx, 0x111);
-    const auto yo = readFloat(cx, 0x112);
-    const auto zs = readFloat(cx, 0x113);
-    const auto zo = readFloat(cx, 0x114);
+    // Window-space positions skip the viewport transform: x and y are pixels and z is depth. The host
+    // pipeline maps them back through a viewport over the render area and the vertex function's
+    // window-space epilogue (Metal: MslAbi WindowSpace macros).
+    const auto xs = result.windowSpacePosition ? 0.5f * static_cast<float>(result.renderExtent.width) : readFloat(cx, 0x10f);
+    const auto xo = result.windowSpacePosition ? xs : readFloat(cx, 0x110);
+    const auto ys = result.windowSpacePosition ? 0.5f * static_cast<float>(result.renderExtent.height) : readFloat(cx, 0x111);
+    const auto yo = result.windowSpacePosition ? ys : readFloat(cx, 0x112);
+    const auto zs = result.windowSpacePosition ? 1.0f : readFloat(cx, 0x113);
+    const auto zo = result.windowSpacePosition ? 0.0f : readFloat(cx, 0x114);
     const auto minDepth = result.negativeOneToOne ? zo - zs : zo;
     const auto maxDepth = zo + zs;
     APS5_LOG_OUT_DEBUG("Viewport transform scale=(%f,%f,%f) offset=(%f,%f,%f) depth=(%f,%f)", xs, ys, zs, xo, yo, zo, minDepth, maxDepth);
@@ -1307,12 +1347,13 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (auto reason = nonzero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits"); !reason.empty()) return reason;
     if (value(cx, 0x83, word) && word != 0xffffu) return require(false, "clip rectangles are unsupported");
     if (value(cx, 0x8c, word) && (word & 0xfu) != 0xau) return require(false, "nonstandard triangle edge rules are unsupported");
-    if (value(cx, 0x2f9, word) && word != 0x2du) return require(false, "nonstandard pixel center or vertex quantization is unsupported");
+    if (value(cx, 0x2f9, word) && !StandardVertexControl(word)) return vertexControlMessage(word);
     if (value(cx, 0x313, word) && (word & ~0x001f6000u) != 0 && word != 0x6001u) return conservativeMessage(word);
     std::uint32_t other = 0;
     if (value(cx, 0x30e, word) && value(cx, 0x30f, other) && (word != 0xffffffffu || other != 0xffffffffu)) return require(false, "sample masks are unsupported");
-    if (value(cx, 0x206, word) && word != 0x43fu) return vteMessage(word);
-    if (auto reason = nonzero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
+    const bool windowSpace = value(cx, 0x206, word) && word == WindowSpaceViewportControl;
+    if (value(cx, 0x206, word) && word != HomogeneousViewportControl && !windowSpace) return vteMessage(word);
+    if (auto reason = nonzero(cx, 0x204, ClipControlMask & ~(windowSpace ? ClipDisable : 0u), "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;
     if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word) && !colorControlSupported(word, ColorWriteMask(cx) != 0)) return colorControlMessage(word);
     if (auto reason = nonzero(cx, 0x1c4, zFormatSupported(zFormat) ? 0u : ~0u, "depth or sample-mask export"); !reason.empty()) return reason;

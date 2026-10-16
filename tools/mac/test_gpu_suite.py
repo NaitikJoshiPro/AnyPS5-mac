@@ -397,6 +397,15 @@ class GuardTests(unittest.TestCase):
         self.assertRefused(result, log, "uncommitted changes")
         self.assertIn("core/a.cpp", json.loads(files["summary.json"])["meta"]["guards"]["dirty"])
 
+    def test_busy_wait_waits_for_a_dirty_tree_to_become_clean(self):
+        tree = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tree, ignore_errors=True))
+        states = iter([["core/a.cpp"], ["core/a.cpp"], []])
+        with mock.patch.object(gpu_suite, "dirty_paths", lambda source: next(states)), mock.patch.object(gpu_suite.time, "sleep"):
+            self.assertEqual(gpu_suite.wait_until_clean(tree, 60, poll=0.01), [])
+        with mock.patch.object(gpu_suite, "dirty_paths", lambda source: ["core/a.cpp"]):
+            self.assertEqual(gpu_suite.wait_until_clean(tree, 0), ["core/a.cpp"])
+
     def test_refuses_untracked_files_under_specifics(self):
         def add(root, source, build):
             (source / "specifics").mkdir()

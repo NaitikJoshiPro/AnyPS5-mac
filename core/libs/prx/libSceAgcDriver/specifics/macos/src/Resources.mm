@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "MetalResidency.h"
 #include <algorithm>
 #include <cstdio>
 #include <exception>
@@ -200,8 +201,10 @@ void CommandBatch::Submit() {
         *failure = Metal::Describe(feedback.error);
     }];
     id<MTL4CommandBuffer> commandBuffers[1] = {commandBuffer};
-    [metal->queue commit:commandBuffers count:1 options:options];
-    [metal->queue signalEvent:metal->event value:1];
+    ::AgcDriver::Metal::Residency::CommitQueue([&] {
+        [metal->queue commit:commandBuffers count:1 options:options];
+        [metal->queue signalEvent:metal->event value:1];
+    });
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;

@@ -9,8 +9,10 @@
 // heap timestamps; occlusion samples are visibility-result counters of the render passes, folded
 // by the MSL twins of the SampleCounter/SampleDumps kernels (RecorderKernels.h).
 #include "MetalCommandStream.h"
+#include "MetalVmTrace.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -38,6 +40,7 @@
 #include <thread>
 #include <tuple>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#include "MetalResidency.h"
 
 namespace AgcDriver::Graphics {
 
@@ -218,8 +221,8 @@ struct SamplePoolCache {
             free.push_back(pool);
             return;
         }
-        [residency removeAllocation:pool];
-        [residency commit];
+        ::AgcDriver::Metal::Residency::Remove(residency, pool);
+        ::AgcDriver::Metal::Residency::Commit(residency);
     }
     id<MTLBuffer> take() {
         std::lock_guard lock(mutex);
@@ -231,8 +234,8 @@ struct SamplePoolCache {
     void close() {
         std::lock_guard lock(mutex);
         closed = true;
-        for (id<MTLBuffer> pool : free) [residency removeAllocation:pool];
-        if (!free.empty()) [residency commit];
+        for (id<MTLBuffer> pool : free) ::AgcDriver::Metal::Residency::Remove(residency, pool);
+        if (!free.empty()) ::AgcDriver::Metal::Residency::Commit(residency);
         free.clear();
     }
 };
@@ -320,7 +323,7 @@ struct RecorderObjects {
     // Two-entry timestamp heaps of the batch stamps, reused when only those are taken.
     std::vector<id<MTL4CounterHeap>> spareHeaps;
     ~RecorderObjects() {
-        if (queue != nil && residency != nil) [queue removeResidencySet:residency];
+        if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
     }
 };
 
@@ -1111,7 +1114,11 @@ private:
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
-void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+// `gpuReader`: the access is GPU work this thread records into the open batch next (the Metal
+// present's display decode, D66). Every recorded GPU write over the range precedes it in queue
+// order, so the hook records what must land first (queued labels, storage image stores) and skips
+// both CPU waits; FlushForGpuRead only asks for that while no batch holds a CPU write-back.
+void FlushForAccessImpl(std::uint64_t address, std::size_t bytes, bool gpuReader) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -1128,7 +1135,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             record();
         }
     }
-    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
+    if (!gpuReader && (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes))) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1163,7 +1170,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     } else {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
     }
-    if (stored || published) {
+    if ((stored || published) && !gpuReader) {
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
         // mutex released when this acquisition is the outermost; a nested hook waits locked through
@@ -1180,6 +1187,13 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         }
     }
 }
+
+void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    FlushForAccessImpl(address, bytes, false);
+}
+
+std::atomic<std::uint64_t> gpuReadsOrdered{0};
+std::atomic<std::uint64_t> gpuReadsWaited{0};
 
 }
 
@@ -1200,7 +1214,7 @@ Recorder::Recorder(const Context& context, bool) : context(context), id(nextReco
     NSError* error = nil;
     objects->residency = [objects->device newResidencySetWithDescriptor:residency error:&error];
     if (objects->residency == nil) Metal::Fail("the recorder's residency set: " + Metal::Describe(error));
-    [objects->queue addResidencySet:objects->residency];
+    ::AgcDriver::Metal::Residency::Attach(objects->queue, objects->residency);
     objects->arena = std::make_shared<Metal::UploadArena>(objects->device, objects->queue);
     const auto frequency = [objects->device queryTimestampFrequency];
     objects->nanosecondsPerTick = frequency != 0 ? 1e9 / static_cast<double>(frequency) : 1.0;
@@ -1617,6 +1631,7 @@ void Recorder::ensureOpen() {
             throw;
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
+        batch->openedAt = std::chrono::steady_clock::now();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
@@ -1716,6 +1731,52 @@ void Recorder::flushPendingStore() {
     run.bytes.clear();
 }
 
+std::string DebugImportResidency(void* buffer);
+
+namespace {
+
+// APS5_TRACE_LABEL_LANDING: the label copies a batch recorded, reported when the GPU finishes it.
+struct LandingCopy {
+    id<MTLBuffer> source;
+    NSUInteger sourceOffset;
+    id<MTLBuffer> destination;
+    NSUInteger destinationOffset;
+    std::size_t bytes;
+    std::uint64_t address;
+    id<MTLBuffer> readback;
+    NSUInteger readbackOffset;
+};
+std::mutex landingMutex;
+std::multimap<std::uint64_t, LandingCopy> landingCopies;
+
+void NoteLandingCopy(std::uint64_t serial, LandingCopy copy) {
+    std::lock_guard lock(landingMutex);
+    landingCopies.emplace(serial, std::move(copy));
+}
+
+void ReportLandingCopies(std::uint64_t serial) {
+    std::vector<LandingCopy> copies;
+    {
+        std::lock_guard lock(landingMutex);
+        const auto [first, last] = landingCopies.equal_range(serial);
+        for (auto it = first; it != last; ++it) copies.push_back(it->second);
+        landingCopies.erase(first, last);
+    }
+    for (const auto& copy : copies) {
+        std::uint64_t source = 0, destination = 0, guest = 0, gpuSees = 0;
+        std::memcpy(&gpuSees, static_cast<const std::byte*>(copy.readback.contents) + copy.readbackOffset, copy.bytes);
+        std::uint64_t gpuPage = 0, cpuPage = 0;
+        std::memcpy(&gpuPage, static_cast<const std::byte*>(copy.readback.contents) + copy.readbackOffset + 8, 8);
+        std::memcpy(&cpuPage, reinterpret_cast<const void*>(::GuestArena::HostAddress(copy.address & ~std::uint64_t{0x3fff})), 8);
+        std::memcpy(&source, static_cast<const std::byte*>(copy.source.contents) + copy.sourceOffset, copy.bytes);
+        std::memcpy(&destination, static_cast<const std::byte*>(copy.destination.contents) + copy.destinationOffset, copy.bytes);
+        std::memcpy(&guest, reinterpret_cast<const void*>(::GuestArena::HostAddress(copy.address)), copy.bytes);
+        std::fprintf(stderr, "[landing] batch %llu done: copy of 0x%llx: upload holds 0x%llx, destination buffer %p holds 0x%llx, guest memory holds 0x%llx, the GPU read back 0x%llx through the destination; page start: GPU 0x%llx CPU 0x%llx\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(copy.address), static_cast<unsigned long long>(source), (__bridge void*)copy.destination, static_cast<unsigned long long>(destination), static_cast<unsigned long long>(guest), static_cast<unsigned long long>(gpuSees), static_cast<unsigned long long>(gpuPage), static_cast<unsigned long long>(cpuPage));
+    }
+}
+
+}
+
 bool Recorder::closeStoreRun(bool atSubmit) {
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
@@ -1763,7 +1824,37 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                     ++barriers;
                     storeWawBarriers.fetch_add(1, std::memory_order_relaxed);
                 }
-                stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
+                static const bool traceLanding = std::getenv("APS5_TRACE_LABEL_LANDING") != nullptr;
+                if (traceLanding && store.address != 0) {
+                    auto target = Metal::BufferOf(store.buffer);
+                    const auto host = reinterpret_cast<std::uint64_t>(target.contents) + store.offset;
+                    std::fprintf(stderr, "[landing] store run: guest 0x%llx+0x%zx into buffer %p (contents %p, length 0x%llx) offset 0x%llx = host 0x%llx%s\n", static_cast<unsigned long long>(store.address), store.bytes.size(), (__bridge void*)target, target.contents, static_cast<unsigned long long>(target.length), static_cast<unsigned long long>(store.offset), static_cast<unsigned long long>(host), host == ::GuestArena::HostAddress(store.address) ? "" : " (NOT the guest's host address)");
+                    std::fprintf(stderr, "[landing]   page now: %s\n", ::AgcDriver::Metal::VmWiredInfo(host).c_str());
+                    // APS5_TRACE_LABEL_LANDING_WATCH=1: backtrace of the first CPU store to the page after it.
+                    static const bool watchPage = std::getenv("APS5_TRACE_LABEL_LANDING_WATCH") != nullptr;
+                    static bool watched = false;
+                    if (watchPage && !watched) {
+                        watched = true;
+                        ::AgcDriver::Metal::WatchWrites(host);
+                    }
+                }
+                if (traceLanding && store.address != 0 && store.bytes.size() <= 8) {
+                    // The same copy UpdateBuffer records, with its source kept so the batch's completion
+                    // can report what the GPU copied from and what the destination holds afterwards.
+                    const auto upload = stream.Write(store.bytes, 4);
+                    [stream.Compute() copyFromBuffer:upload.buffer sourceOffset:upload.offset toBuffer:Metal::BufferOf(store.buffer) destinationOffset:store.offset size:store.bytes.size()];
+                    // Read the stored bytes back through the same buffer on the GPU, into upload memory.
+                    const auto readback = stream.Allocate(16, 8);
+                    std::memset(readback.host, 0xee, 16);
+                    [stream.Compute() barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+                    [stream.Compute() copyFromBuffer:Metal::BufferOf(store.buffer) sourceOffset:store.offset toBuffer:readback.buffer destinationOffset:readback.offset size:store.bytes.size()];
+                    // Also the first 8 bytes of the store's 16 KiB page, which the CPU wrote (a command buffer header).
+                    [stream.Compute() copyFromBuffer:Metal::BufferOf(store.buffer) sourceOffset:(store.offset & ~VkDeviceSize{0x3fff}) toBuffer:readback.buffer destinationOffset:readback.offset + 8 size:8];
+                    std::fprintf(stderr, "[landing]   residency: %s; recorder queue %p\n", DebugImportResidency((__bridge void*)Metal::BufferOf(store.buffer)).c_str(), (__bridge void*)metal->queue);
+                    NoteLandingCopy(submissions + 1, LandingCopy{upload.buffer, upload.offset, Metal::BufferOf(store.buffer), store.offset, store.bytes.size(), store.address, readback.buffer, readback.offset});
+                } else {
+                    stream.UpdateBuffer(Metal::BufferOf(store.buffer), store.offset, store.bytes);
+                }
                 run.recorded.emplace_back(store.buffer, store.offset, storeEnd);
                 storedBytes += store.bytes.size();
             }
@@ -1845,6 +1936,7 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
+std::atomic<std::uint64_t> timingInvalid{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
@@ -2142,6 +2234,14 @@ void Recorder::PrepareSampleSlot() {
     if (!segmentSlotReady(*open)) takeSegmentPool(*open);
 }
 
+void Recorder::PrepareSamplePass() {
+    GuestMemory::AssertGpuLockHeld("Recorder::PrepareSamplePass");
+    if (!countingSamples || !segmentMode()) return;
+    ensureOpen();
+    if (open->segmentActive) endSegment(*open);
+    if (!segmentSlotReady(*open)) takeSegmentPool(*open);
+}
+
 void Recorder::EndPassSamples() {
     if (open != nullptr && open->segmentActive) endSegment(*open);
 }
@@ -2163,8 +2263,8 @@ void Recorder::takeSegmentPool(Batch& batch) {
         pool = [metal->device newBufferWithLength:8u * SegmentSlots options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         if (pool == nil) Metal::Fail("cannot allocate an occlusion visibility buffer");
         // Kept resident for the recorder's life: the cache bounds how many there are.
-        [metal->residency addAllocation:pool];
-        [metal->residency commit];
+        ::AgcDriver::Metal::Residency::Add(metal->residency, pool);
+        ::AgcDriver::Metal::Residency::Commit(metal->residency);
     }
     std::memset(pool.contents, 0, pool.length);
     try {
@@ -2375,7 +2475,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     for (std::size_t i = 0; i < stamps.size(); ++i) stamps[i] = static_cast<const MTL4TimestampHeapEntry*>(resolved.bytes)[i].timestamp;
     const auto period = metal->nanosecondsPerTick;
     if (!GpuTimingEnabled()) {
-        if (batch.batchTiming == 0 && stamps[1] >= stamps[0]) {
+        if (batch.batchTiming == 0 && Metal::TimestampPairValid(stamps[0], stamps[1])) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs);
@@ -2389,6 +2489,12 @@ void Recorder::readGpuTiming(Batch& batch) {
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+        // A stamp the GPU never wrote (MTLCounterErrorValue) or a pair out of order is left out and
+        // counted, instead of an unsigned difference of ~1.8e19 ticks.
+        if (!Metal::TimestampPairValid(stamps[i * 2], stamps[i * 2 + 1])) {
+            timingInvalid.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         const auto ns = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period;
         if (i == batch.batchTiming) {
             // The whole batch: apart from the per-program totals it contains.
@@ -2434,7 +2540,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap, %llu with an unwritten or reversed stamp); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges, static_cast<unsigned long long>(timingInvalid.exchange(0, std::memory_order_relaxed)));
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
@@ -2478,13 +2584,13 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
-void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
+void Recorder::KeepThroughHold(std::shared_ptr<void> object, std::size_t bytes) {
     GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
     if (const auto hold = GuestMemory::GpuHoldSerial(); hold != holdKeptSerial) {
         holdKept.clear();
         holdKeptSerial = hold;
     }
-    Keep(object);
+    Keep(object, bytes);
     holdKept.push_back(std::move(object));
 }
 
@@ -2570,7 +2676,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         const auto from = std::max(address, aligned + k * block);
         const auto to = std::min(end, aligned + (k + 1) * block);
         const auto offset = static_cast<std::size_t>(from - address);
-        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(GuestArena::HostRange(from, static_cast<std::size_t>(to - from))), static_cast<std::size_t>(to - from)}); // alias if displaced (D31, D33)
     }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
@@ -2582,7 +2688,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(GuestArena::HostRange(address + offset, length)), length);
     return true;
 }
 
@@ -2756,6 +2862,19 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     if (open != nullptr && overlaps(*open, address, end)) return true;
     for (const auto& batch : inFlight) {
         if (overlaps(*batch, address, end)) return true;
+    }
+    return false;
+}
+
+bool Recorder::CompletionWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    if (open != nullptr && open->writeBackCompletionCount != 0 && overlaps(*open, address, end)) return true;
+    for (const auto& batch : inFlight) {
+        if (batch->writeBackCompletionCount != 0 && overlaps(*batch, address, end)) return true;
+    }
+    for (const auto* batch : finishing) {
+        if (batch->writeBackCompletionCount != 0 && overlaps(*batch, address, end)) return true;
     }
     return false;
 }
@@ -3194,7 +3313,15 @@ void Recorder::Submit() {
     MTL4CommitOptions* options = [MTL4CommitOptions new];
     std::shared_ptr<BatchFeedback> feedback = batch->metal->feedback;
     std::shared_ptr<FeedbackSink> sink = metal->sink;
+    static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
+    const auto committedAt = std::chrono::steady_clock::now();
+    if (traceGpu) std::fprintf(stderr, "[gpu] recorder commits batch %llu (open %.1f ms)\n", static_cast<unsigned long long>(serial), std::chrono::duration<double, std::milli>(committedAt - batch->openedAt).count());
     [options addFeedbackHandler:^(MetalFeedback commitFeedback) {
+        static const bool traceLandingCopies = std::getenv("APS5_TRACE_LABEL_LANDING") != nullptr;
+        if (traceLandingCopies) ReportLandingCopies(serial);
+        if (traceGpu) std::fprintf(stderr, "[gpu] recorder batch %llu completed on the GPU (%.2f ms; feedback %.1f ms after the commit)%s%s\n", static_cast<unsigned long long>(serial), (commitFeedback.GPUEndTime - commitFeedback.GPUStartTime) * 1e3,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committedAt).count(), commitFeedback.error != nil ? ": " : "", commitFeedback.error != nil ? Metal::Describe(commitFeedback.error).c_str() : "");
+        if (traceGpu && commitFeedback.error != nil) std::fprintf(stderr, "[gpu] recorder batch %llu error domain %s code %ld user info %s\n", static_cast<unsigned long long>(serial), commitFeedback.error.domain.UTF8String, static_cast<long>(commitFeedback.error.code), commitFeedback.error.userInfo.description.UTF8String);
         feedback->gpuStartSeconds = commitFeedback.GPUStartTime;
         feedback->gpuEndSeconds = commitFeedback.GPUEndTime;
         if (commitFeedback.error != nil) {
@@ -3205,8 +3332,12 @@ void Recorder::Submit() {
     }];
     const auto submitStart = std::chrono::steady_clock::now();
     MetalCommandBuffer commandBuffers[1] = {commandBuffer};
-    [metal->queue commit:commandBuffers count:1 options:options];
-    [metal->queue signalEvent:metal->timeline value:serial];
+    // Under the residency lock: the commit walks the queue's residency sets, which the release
+    // thread changes (MetalResidency.h, D44).
+    ::AgcDriver::Metal::Residency::CommitQueue([&] {
+        [metal->queue commit:commandBuffers count:1 options:options];
+        [metal->queue signalEvent:metal->timeline value:serial];
+    });
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3787,6 +3918,34 @@ void Recorder::release(Batch& batch) noexcept {
     } catch (...) {
     }
     batch.metal.reset();
+}
+
+}
+
+namespace AgcDriver::Graphics::Metal {
+
+bool FlushForGpuRead(std::uint64_t address, std::size_t bytes) {
+    // A completion action may write guest memory on the CPU when its batch finishes (a write-back):
+    // queue order does not cover that, so the access waits as a CPU read would.
+    bool writeBack = false;
+    if (Recorder::PendingWriteBackCompletions() != 0) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        writeBack = recorder != nullptr && recorder->CompletionWriteOverlaps(address, bytes);
+    }
+    if (writeBack) {
+        FlushForAccessImpl(address, bytes, false);
+        gpuReadsWaited.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    FlushForAccessImpl(address, bytes, true);
+    gpuReadsOrdered.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::pair<std::uint64_t, std::uint64_t> GpuReadCounts() {
+    return {gpuReadsOrdered.load(std::memory_order_relaxed), gpuReadsWaited.load(std::memory_order_relaxed)};
 }
 
 }

@@ -91,6 +91,24 @@ std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInput
     return {(threads + 63u) / 64u * 32u, 1u, 1u};
 }
 
+MslMeshOutput MslMeshOutputOf(const ShaderMeshInputInfo& mesh) {
+    MslMeshOutput output;
+    output.rectList = mesh.inputPrimitive == 17u;
+    if (!output.rectList) {
+        output.guestVertices = output.vertices = mesh.maxVertices;
+        output.guestPrimitives = output.primitives = mesh.maxPrimitives;
+        return output;
+    }
+    // A rect-list NGG vertex program allocates at most its group's vertices and rects (the
+    // translator's s2 counts), so the host mesh holds those, one synthesized vertex per rect after
+    // them and two triangles per rect.
+    output.guestVertices = std::min(mesh.maxVertices, mesh.verticesPerGroup);
+    output.guestPrimitives = std::min(mesh.maxPrimitives, mesh.primitivesPerGroup);
+    output.vertices = output.guestVertices + output.guestPrimitives;
+    output.primitives = output.guestPrimitives * 2u;
+    return output;
+}
+
 namespace {
 
 // Mesh functions (NGG primitive shaders, mirroring EmitMeshEntryPoint on the SPIR-V path): the guest
@@ -98,9 +116,161 @@ namespace {
 // GS_ALLOC_REQ counts in threadgroup memory; after a threadgroup barrier invocation i writes vertex
 // i and primitive i (indices: three 9-bit fields at bits 0, 10 and 20, clamped to the last vertex;
 // bit 31 culls). Threadgroup variables live in the mesh function and reach aps5_body as pointers.
+// Rect lists (VGT_PRIMITIVE_TYPE 17, GS_OUT_PRIM_TYPE RECTLIST; DECISIONS D41): the guest exports
+// one primitive of three vertices per rect and the primitive assembler adds the fourth corner. As
+// the vertex function's APS5_RECT_LIST (and the SPIR-V rect-list TCS), the right-angle vertex c is
+// the one whose neighbours share its x and y; the fourth vertex is the other two minus c, for the
+// position and every parameter alike (one plane over the rect, as the hardware interpolates it);
+// the rect draws as (c, n, p) and (p, n, v3), both in the guest's winding. A rect without exactly
+// one right angle, a w that differs between its vertices or is not positive, or a non-finite fourth
+// position is culled. Vertices are staged raw in threadgroup memory (another invocation's export
+// feeds each rect), then the window-space / depth epilogue runs on every written vertex.
+std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& output, bool layer, std::uint32_t ldsBytes) {
+    const auto& mesh = state.inputInfo.vertex->mesh;
+    std::uint32_t parameters = 0u;
+    for (const auto& stageOutput : state.program.Info().outputs) parameters += stageOutput.kind == StageOutputKind::Parameter ? 1u : 0u;
+    const auto staging = output.guestVertices * 16u * (1u + parameters);
+    const auto total = staging + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u);
+    if (total > state.target.maxThreadgroupMemoryBytes) state.Fail("a rect-list mesh function stages " + std::to_string(output.guestVertices) + " vertices of " + std::to_string(16u * (1u + parameters)) + " bytes in threadgroup memory: " + std::to_string(total) + " bytes with LDS exceed the " + std::to_string(state.target.maxThreadgroupMemoryBytes) + "-byte limit");
+    const auto local = state.Builtin(MslBuiltin::ThreadIndexInThreadgroup);
+    const auto guestVertices = std::to_string(output.guestVertices) + "u";
+    std::string text = "    threadgroup Aps5MeshVertex aps5_rv[" + std::to_string(output.guestVertices) + "];\n";
+    text += "    const uint aps5_vertices = min(aps5_malloc[0], " + guestVertices + ");\n";
+    text += "    const uint aps5_rects = min(aps5_malloc[1], " + std::to_string(output.guestPrimitives) + "u);\n";
+    text += "    if (" + local + " == 0u) aps5_mesh.set_primitive_count(aps5_rects * 2u);\n";
+    text += "    const uint aps5_last = max(aps5_vertices, 1u) - 1u;\n";
+    for (std::uint32_t half = 0; half < state.laneCount; ++half) {
+        state.half = half;
+        text += "    {\n        const uint aps5_i = " + state.GuestInvocationIndex() + ";\n";
+        text += "        if (aps5_i < aps5_vertices) aps5_rv[aps5_i] = aps5_mv[" + std::to_string(half) + "];\n    }\n";
+    }
+    text += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    const auto finish = [](const std::string& name, const std::string& indent) {
+        return WindowSpaceEpilogue(name + ".aps5_position", indent) +
+               "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n" + indent + name + ".aps5_position.z = (" + name + ".aps5_position.z + " + name + ".aps5_position.w) * 0.5f;\n#endif\n";
+    };
+    for (std::uint32_t half = 0; half < state.laneCount; ++half) {
+        state.half = half;
+        const auto h = std::to_string(half);
+        text += "    {\n        const uint aps5_i = " + state.GuestInvocationIndex() + ";\n";
+        text += "        if (aps5_i < aps5_vertices) {\n            Aps5MeshVertex aps5_v = aps5_rv[aps5_i];\n" + finish("aps5_v", "            ");
+        text += "            aps5_mesh.set_vertex(aps5_i, aps5_v);\n        }\n";
+        text += "        if (aps5_i < aps5_rects) {\n            const uint aps5_packed = aps5_mprim[" + h + "];\n";
+        text += "            uint aps5_k[3];\n            Aps5MeshVertex aps5_r[3];\n";
+        text += "            for (uint c = 0u; c < 3u; ++c) {\n                aps5_k[c] = min(extract_bits(aps5_packed, c * 10u, 9u), aps5_last);\n                aps5_r[c] = aps5_rv[aps5_k[c]];\n            }\n";
+        text += "            bool aps5_edge[3];\n            float aps5_weight[3];\n            uint aps5_edges = 0u;\n";
+        text += "            for (uint c = 0u; c < 3u; ++c) {\n";
+        text += "                const uint next = (c + 1u) % 3u, previous = (c + 2u) % 3u;\n";
+        text += "                const bool xy = aps5_r[c].aps5_position.x == aps5_r[next].aps5_position.x && aps5_r[c].aps5_position.y == aps5_r[previous].aps5_position.y;\n";
+        text += "                const bool yx = aps5_r[c].aps5_position.y == aps5_r[next].aps5_position.y && aps5_r[c].aps5_position.x == aps5_r[previous].aps5_position.x;\n";
+        text += "                aps5_edge[c] = xy || yx;\n                aps5_weight[c] = aps5_edge[c] ? -1.0f : 1.0f;\n                aps5_edges += aps5_edge[c] ? 1u : 0u;\n            }\n";
+        text += "            const uint aps5_first = aps5_edge[1] ? 1u : (aps5_edge[2] ? 2u : 0u);\n";
+        text += "            Aps5MeshVertex aps5_v3 = aps5_r[aps5_first];\n";
+        text += "            aps5_v3.aps5_position = aps5_r[0].aps5_position * aps5_weight[0] + aps5_r[1].aps5_position * aps5_weight[1] + aps5_r[2].aps5_position * aps5_weight[2];\n";
+        for (const auto& stageOutput : state.program.Info().outputs) {
+            if (stageOutput.kind != StageOutputKind::Parameter) continue;
+            const auto field = "p" + std::to_string(stageOutput.location);
+            text += "            aps5_v3." + field + " = aps5_r[0]." + field + " * aps5_weight[0] + aps5_r[1]." + field + " * aps5_weight[1] + aps5_r[2]." + field + " * aps5_weight[2];\n";
+        }
+        text += "            const float aps5_w = aps5_r[0].aps5_position.w;\n";
+        text += "            const bool aps5_valid_rect = aps5_edges == 1u && aps5_w > 0.0f && aps5_r[1].aps5_position.w == aps5_w && aps5_r[2].aps5_position.w == aps5_w && all(isfinite(aps5_v3.aps5_position));\n";
+        text += finish("aps5_v3", "            ");
+        text += "            const uint aps5_extra = " + guestVertices + " + aps5_i;\n";
+        text += "            aps5_mesh.set_vertex(aps5_extra, aps5_v3);\n";
+        text += "            const uint aps5_c = aps5_k[aps5_first], aps5_n = aps5_k[(aps5_first + 1u) % 3u], aps5_p = aps5_k[(aps5_first + 2u) % 3u];\n";
+        text += "            const uint aps5_corners[6] = {aps5_c, aps5_n, aps5_p, aps5_p, aps5_n, aps5_extra};\n";
+        text += "            for (uint c = 0u; c < 6u; ++c) aps5_mesh.set_index(aps5_i * 6u + c, uchar(aps5_corners[c]));\n";
+        text += "            Aps5MeshPrimitive aps5_prim = {};\n";
+        text += "            aps5_prim.aps5_culled = (aps5_packed & 0x80000000u) != 0u || !aps5_valid_rect;\n";
+        if (layer) text += "            aps5_prim.aps5_layer = aps5_mlayer[aps5_k[" + std::to_string(std::min(mesh.provokingVertex, 2u)) + "]];\n";
+        text += "            aps5_mesh.set_primitive(aps5_i * 2u, aps5_prim);\n            aps5_mesh.set_primitive(aps5_i * 2u + 1u, aps5_prim);\n        }\n    }\n";
+    }
+    state.half = 0u;
+    return text;
+}
+
+// The triangle-vertices mode of mesh functions (APS5_TRIANGLE_VERTICES, MslAbi Version 13; DECISIONS
+// D46), the mesh counterpart of the vertex function's D20
+// emulation: per-vertex fragment values need each triangle's three corners, and the emulated
+// barycentrics need one-hot corner weights, which a vertex shared between triangles cannot carry.
+// So every output triangle gets three unshared vertices (weights (1,0,0), (0,1,0), (0,0,1)) and the
+// corners' values of the per-vertex locations in its primitive record. A mesh<> holds 256 vertices,
+// so the subgroup's primitives are split over the grid's z dimension in equal parts of at most 85
+// (MslAbi::MeshTriangleVerticesPrimitives); every split threadgroup runs the guest program in full
+// and writes its part. The guest's vertices and primitive words are staged in threadgroup memory
+// (any invocation's export feeds any triangle). Corner 0 is the provoking vertex, then the guest
+// primitive's order (rotated for last-vertex provoking, which keeps the winding), as the vertex
+// function's TriangleVerticesHeader order, so P0/P10/P20 and the weights agree between the paths.
+std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std::uint32_t ldsBytes) {
+    const auto& mesh = state.inputInfo.vertex->mesh;
+    const auto split = MslAbi::MeshTriangleVerticesPrimitives(mesh.maxPrimitives);
+    const auto threadCounts = MslThreadsPerThreadgroup(mesh, state.laneCount);
+    const auto threads = threadCounts[0] * threadCounts[1] * threadCounts[2];
+    std::uint32_t parameters = 0u;
+    for (const auto& stageOutput : state.program.Info().outputs) parameters += stageOutput.kind == StageOutputKind::Parameter ? 1u : 0u;
+    // Aps5MeshVertex: position and parameters, plus at most two float3 weight sets (16 bytes each).
+    const auto vertexBytes = 16u * (1u + parameters) + 32u;
+    const auto total = mesh.maxVertices * vertexBytes + mesh.maxPrimitives * 4u + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u);
+    if (total > state.target.maxThreadgroupMemoryBytes) {
+        return "#error \"the triangle-vertices mesh function (per-vertex fragment inputs of a mesh draw) stages " + std::to_string(mesh.maxVertices) + " vertices of " + std::to_string(vertexBytes) + " bytes in threadgroup memory: " + std::to_string(total) + " bytes with LDS exceed the " + std::to_string(state.target.maxThreadgroupMemoryBytes) + "-byte limit\"\n";
+    }
+    const auto local = state.Builtin(MslBuiltin::ThreadIndexInThreadgroup);
+    const auto group = state.Builtin(MslBuiltin::ThreadgroupPositionInGrid);
+    const auto provoking = std::to_string(std::min(mesh.provokingVertex, 2u));
+    // The provoking corner: the draw's last-vertex convention (APS5_PROVOKING_LAST, PA_SU_SC_MODE_CNTL
+    // PROVOKING_VTX_LAST; State.cpp leaves the mesh configuration's provokingVertex at 0), else the
+    // configuration's.
+    std::string text = "#if defined(" + std::string(MslAbi::ProvokingLastMacro) + ") && " + std::string(MslAbi::ProvokingLastMacro) + "\n    constexpr uint aps5_provoking = 2u;\n#else\n    constexpr uint aps5_provoking = " + provoking + "u;\n#endif\n";
+    text += "    threadgroup Aps5MeshVertex aps5_tv_v[" + std::to_string(mesh.maxVertices) + "];\n";
+    text += "    threadgroup uint aps5_tv_p[" + std::to_string(mesh.maxPrimitives) + "];\n";
+    text += "    const uint aps5_vertices = min(aps5_malloc[0], " + std::to_string(mesh.maxVertices) + "u);\n";
+    text += "    const uint aps5_primitives = min(aps5_malloc[1], " + std::to_string(mesh.maxPrimitives) + "u);\n";
+    text += "    const uint aps5_last = max(aps5_vertices, 1u) - 1u;\n";
+    text += "    const uint aps5_first = " + group + ".z * " + std::to_string(split) + "u;\n";
+    text += "    const uint aps5_count = aps5_primitives > aps5_first ? min(aps5_primitives - aps5_first, " + std::to_string(split) + "u) : 0u;\n";
+    text += "    if (" + local + " == 0u) aps5_mesh.set_primitive_count(aps5_count);\n";
+    for (std::uint32_t half = 0; half < state.laneCount; ++half) {
+        state.half = half;
+        const auto h = std::to_string(half);
+        text += "    {\n        const uint aps5_i = " + state.GuestInvocationIndex() + ";\n";
+        text += "        if (aps5_i < aps5_vertices) {\n            Aps5MeshVertex aps5_v = aps5_mv[" + h + "];\n";
+        text += WindowSpaceEpilogue("aps5_v.aps5_position", "            ");
+        text += "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n";
+        text += "            aps5_v.aps5_position.z = (aps5_v.aps5_position.z + aps5_v.aps5_position.w) * 0.5f;\n#endif\n";
+        text += "            aps5_tv_v[aps5_i] = aps5_v;\n        }\n";
+        text += "        if (aps5_i < aps5_primitives) aps5_tv_p[aps5_i] = aps5_mprim[" + h + "];\n    }\n";
+    }
+    state.half = 0u;
+    text += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    text += "    for (uint aps5_t = " + local + "; aps5_t < aps5_count; aps5_t += " + std::to_string(threads) + "u) {\n";
+    text += "        const uint aps5_packed = aps5_tv_p[aps5_first + aps5_t];\n";
+    text += "        uint aps5_k[3];\n";
+    text += "        for (uint c = 0u; c < 3u; ++c) aps5_k[c] = min(extract_bits(aps5_packed, ((c + aps5_provoking) % 3u) * 10u, 9u), aps5_last);\n";
+    text += "        Aps5MeshPrimitive aps5_p = {};\n        aps5_p.aps5_culled = (aps5_packed & 0x80000000u) != 0u;\n";
+    if (layer) text += "        aps5_p.aps5_layer = aps5_mlayer[aps5_k[0]];\n";
+    for (std::uint32_t corner = 0; corner < 3u; ++corner) {
+        const auto c = std::to_string(corner);
+        const auto weights = std::string("float3(") + (corner == 0u ? "1.0f" : "0.0f") + ", " + (corner == 1u ? "1.0f" : "0.0f") + ", " + (corner == 2u ? "1.0f" : "0.0f") + ")";
+        text += "        {\n            Aps5MeshVertex aps5_v = aps5_tv_v[aps5_k[" + c + "]];\n";
+        text += "#if (APS5_BARYCENTRICS & 1)\n            aps5_v.aps5_bw = " + weights + ";\n#endif\n";
+        text += "#if (APS5_BARYCENTRICS & 2)\n            aps5_v.aps5_bwl = " + weights + ";\n#endif\n";
+        for (const auto& stageOutput : state.program.Info().outputs) {
+            if (stageOutput.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(stageOutput.location) + "\n";
+            text += "            aps5_p." + PerVertexField(stageOutput.location, corner) + " = aps5_v.p" + std::to_string(stageOutput.location) + ";\n#endif\n";
+        }
+        text += "            aps5_mesh.set_vertex(aps5_t * 3u + " + c + "u, aps5_v);\n";
+        text += "            aps5_mesh.set_index(aps5_t * 3u + " + c + "u, uchar(aps5_t * 3u + " + c + "u));\n        }\n";
+    }
+    text += "        aps5_mesh.set_primitive(aps5_t, aps5_p);\n    }\n";
+    return text;
+}
+
 std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> parameters) {
     const auto graphics = MslGraphicsInterfaceOf(state);
     const auto& mesh = state.inputInfo.vertex->mesh;
+    const auto output = MslMeshOutputOf(mesh);
+    std::uint32_t lds = 0u;
     if (state.LdsInDeviceMemory()) state.Fail("mesh functions keep LDS in threadgroup memory; device-memory LDS is not implemented for them");
     const bool layer = std::any_of(state.program.Info().outputs.begin(), state.program.Info().outputs.end(), [](const StageOutput& output) { return output.kind == StageOutputKind::Layer; });
     std::string text = graphics.declarations;
@@ -124,6 +294,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         if (first != std::string::npos && line.compare(first, 12u, "threadgroup ") == 0) {
             if (line.compare(first, 26u, "threadgroup uint aps5_lds[") != 0) state.Fail("threadgroup declaration in a mesh program's prologue: " + line);
             hoisted += line;
+            lds = static_cast<std::uint32_t>(std::stoul(line.substr(first + 26u))) * 4u;
             helperParameters.push_back("threadgroup uint* aps5_lds");
             arguments.push_back("aps5_lds");
             continue;
@@ -141,7 +312,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
     }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
-    text += ")\n{\n" + state.locals + prologue + state.body + "}\n\n";
+    text += ")\n{\n" + MslFunctionStatements(state, prologue) + "}\n\n";
     text += "[[mesh]] void " + std::string(MslAbi::EntryPoint) + "(\n    Aps5Mesh aps5_mesh";
     for (const auto& parameter : parameters) text += ",\n    " + parameter;
     text += ")\n{\n" + hoisted;
@@ -156,6 +327,8 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
     for (std::size_t index = 0; index < arguments.size(); ++index) call += (index == 0u ? "" : ", ") + arguments[index];
     text += call + ");\n";
     text += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    if (output.rectList) return text + MeshRectListEpilogue(state, output, layer, lds) + "}\n";
+    text += "#if " + TriangleVerticesCondition() + "\n" + MeshTriangleVerticesEpilogue(state, layer, lds) + "#else\n";
     text += "    const uint aps5_vertices = min(aps5_malloc[0], " + std::to_string(mesh.maxVertices) + "u);\n";
     text += "    const uint aps5_primitives = min(aps5_malloc[1], " + std::to_string(mesh.maxPrimitives) + "u);\n";
     text += "    if (" + local + " == 0u) aps5_mesh.set_primitive_count(aps5_primitives);\n";
@@ -166,6 +339,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         text += "    {\n        const uint aps5_i = " + state.GuestInvocationIndex() + ";\n";
         text += "        if (aps5_i < aps5_vertices) {\n            Aps5MeshVertex aps5_v = aps5_mv[" + h + "];\n";
         // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w].
+        text += WindowSpaceEpilogue("aps5_v.aps5_position", "            ");
         text += "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n";
         text += "            aps5_v.aps5_position.z = (aps5_v.aps5_position.z + aps5_v.aps5_position.w) * 0.5f;\n#endif\n";
         text += "            aps5_mesh.set_vertex(aps5_i, aps5_v);\n        }\n";
@@ -178,7 +352,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         text += "            aps5_mesh.set_primitive(aps5_i, aps5_p);\n        }\n    }\n";
     }
     state.half = 0u;
-    text += "}\n";
+    text += "#endif\n}\n";
     return text;
 }
 
@@ -186,7 +360,11 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
 
 std::string EmitMslEntryPoint(MslEmitterState& state) {
     // The mesh function's epilogue needs the invocation index whether or not the guest reads it.
-    if (state.reflection.stage == MslAbi::Stage::Mesh) static_cast<void>(state.Builtin(MslBuiltin::ThreadIndexInThreadgroup));
+    // (and the grid position: the triangle-vertices mode's split index is its z, MslAbi Version 13).
+    if (state.reflection.stage == MslAbi::Stage::Mesh) {
+        static_cast<void>(state.Builtin(MslBuiltin::ThreadIndexInThreadgroup));
+        static_cast<void>(state.Builtin(MslBuiltin::ThreadgroupPositionInGrid));
+    }
     std::vector<MslAbi::TableBinding> tableBindings;
     for (const auto& descriptor : state.program.Metadata().bindings.descriptors) {
         if (!state.usedKinds.contains(descriptor.kind)) continue;
@@ -237,7 +415,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         for (std::size_t index = 0; index < parameters.size(); ++index) {
             text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];
         }
-        text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n";
+        text += ")\n{\n" + MslFunctionStatements(state, state.prologue) + "}\n";
         return text;
     }
     if (state.reflection.stage == MslAbi::Stage::Mesh) return text + EmitMeshFunction(state, std::move(parameters));
@@ -298,7 +476,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
-    text += ")\n{\n" + state.locals + state.prologue + state.body + "}\n\n";
+    text += ")\n{\n" + MslFunctionStatements(state, state.prologue) + "}\n\n";
     const auto returnType = graphics.outputType.empty() ? std::string("void") : graphics.outputType;
     text += graphics.attributes + (fragment ? "fragment " : "vertex ") + returnType + " " + std::string(MslAbi::EntryPoint) + "(";
     for (std::size_t index = 0; index < parameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + parameters[index];
@@ -356,11 +534,21 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "#elif " + TriangleVerticesCondition() + "\n";
         text += "    device const Aps5TriangleVertices& aps5_tv = *reinterpret_cast<device const Aps5TriangleVertices*>(aps5_triangles);\n";
         text += "    device const uint* aps5_tv_ids = aps5_triangles + 8u;\n";
-        text += "    const uint aps5_triangle = aps5_vertex_id / 3u;\n";
-        text += "    const uint aps5_corner = aps5_vertex_id % 3u;\n";
+        // MslAbi Version 14: points and lines draw in the same mode with PrimitiveVerticesMacro guest
+        // vertices per primitive (1 or 2, default 3); the corners past them repeat the last vertex.
+        const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
+        text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
+        text += "    const uint aps5_triangle = aps5_vertex_id / " + primitiveVertices + ";\n";
+        text += "    const uint aps5_corner = aps5_vertex_id % " + primitiveVertices + ";\n";
         text += "    Aps5VertexOut aps5_v[3] = {};\n";
         for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
-            text += "    " + call("aps5_tv_ids[aps5_triangle * 3u + " + std::to_string(vertex) + "u]", "aps5_v[" + std::to_string(vertex) + "]", vertex) + "\n";
+            const auto slot = "aps5_v[" + std::to_string(vertex) + "]";
+            const auto guest = call("aps5_tv_ids[aps5_triangle * " + primitiveVertices + " + " + std::to_string(vertex) + "u]", slot, vertex);
+            if (vertex == 0u) {
+                text += "    " + guest + "\n";
+                continue;
+            }
+            text += "#if " + primitiveVertices + " > " + std::to_string(vertex) + "u\n    " + guest + "\n#else\n    " + slot + " = aps5_v[" + std::to_string(vertex - 1u) + "];\n#endif\n";
         }
         text += "    aps5_out = aps5_v[aps5_corner];\n";
         for (const auto& output : state.program.Info().outputs) {

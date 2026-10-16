@@ -57,6 +57,8 @@ public:
     std::uint64_t StubBase() const { return reinterpret_cast<std::uint64_t>(stubs); }
     std::size_t StubSize() const { return StubCapacity * StubBytes; }
     bool OwnsStub(std::uint64_t address) const { return address >= StubBase() && address < StubBase() + StubSize(); }
+    // The import whose stub holds `address` (a guest RIP inside the stub area), or "" (diagnostics).
+    std::string StubName(std::uint64_t address);
 
     std::uint64_t Call(FEXCore::Core::CPUState& state, std::uint64_t number, std::uint64_t block);
 

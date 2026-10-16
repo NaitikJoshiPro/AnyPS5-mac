@@ -358,7 +358,12 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
     IrValue& lhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*lhs), ir.Constant(0x7fffffffu));
     IrValue& rhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*rhs), ir.Constant(0x7fffffffu));
-    const auto infZero = [&](IrValue& inf, IrValue& zero) -> IrValue& { return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), ir.IEqual(zero, ir.Constant(0u))); };
+    // With the device's own flush (NativeF32Flush::Product) the factors arrive unflushed: a
+    // denormal factor is the zero RDNA multiplies by.
+    const bool denormalIsZero = nativeF32FlushOp == NativeF32Flush::Product;
+    const auto infZero = [&](IrValue& inf, IrValue& zero) -> IrValue& {
+        return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), denormalIsZero ? ir.ULessThan(zero, ir.Constant(0x00800000u)) : ir.IEqual(zero, ir.Constant(0u)));
+    };
     return ir.LogicalOr(infZero(lhsMagnitude, rhsMagnitude), infZero(rhsMagnitude, lhsMagnitude));
 }
 

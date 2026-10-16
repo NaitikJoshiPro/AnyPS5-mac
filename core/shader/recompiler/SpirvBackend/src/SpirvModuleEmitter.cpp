@@ -680,6 +680,9 @@ void DefineMeshOutputs(SpirvEmitterState& state) {
 }
 
 void EmitMeshEntryPoint(SpirvEmitterState& state) {
+    // Rect lists (VGT_PRIMITIVE_TYPE 17) need a fourth vertex per primitive; only the MSL mesh
+    // function synthesizes it (DECISIONS D41).
+    if (state.inputInfo.vertex->mesh.inputPrimitive == 17u) throw std::runtime_error("SPIR-V mesh shaders do not expand rect lists (VGT_PRIMITIVE_TYPE 17); only the MSL backend implements them");
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
     for (std::uint32_t half = 0; half < state.laneCount; half++) {

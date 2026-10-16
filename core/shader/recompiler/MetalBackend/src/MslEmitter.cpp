@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -171,6 +174,200 @@ void MslEmitterState::DeclareLocal(std::string_view type, std::string_view name,
     locals.append(";\n");
 }
 
+namespace {
+
+bool IdentifierStart(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool IdentifierChar(char c) {
+    return IdentifierStart(c) || (c >= '0' && c <= '9');
+}
+
+// `vN` or `vN_h`: the names HalfName gives SSA values.
+bool SsaName(std::string_view name) {
+    if (name.size() < 2u || name[0] != 'v') return false;
+    std::size_t index = 1u;
+    while (index < name.size() && name[index] >= '0' && name[index] <= '9') ++index;
+    if (index == 1u) return false;
+    return index == name.size() || name.substr(index) == "_h";
+}
+
+}
+
+std::size_t MslSinkDeclarations(std::string& locals, const std::string& prologue, std::string& body) {
+    struct Candidate {
+        std::string type;
+        std::size_t localBegin = 0;
+        std::size_t localEnd = 0;
+        std::int64_t scope = -1;
+        std::size_t definition = std::string::npos;
+        bool eligible = false;
+    };
+    std::unordered_map<std::string, Candidate> candidates;
+    // Locals of the exact form "    T vN = T(0);".
+    for (std::size_t begin = 0; begin < locals.size();) {
+        std::size_t end = locals.find('\n', begin);
+        end = end == std::string::npos ? locals.size() : end + 1u;
+        const std::string_view line(locals.data() + begin, end - begin);
+        if (line.starts_with("    ") && line.ends_with(";\n")) {
+            const std::string_view rest = line.substr(4u, line.size() - 6u);
+            const auto space = rest.find(' ');
+            const auto equals = rest.find(" = ");
+            if (space != std::string_view::npos && equals != std::string_view::npos && space < equals) {
+                const std::string_view type = rest.substr(0, space);
+                const std::string_view name = rest.substr(space + 1u, equals - space - 1u);
+                const std::string_view initializer = rest.substr(equals + 3u);
+                if (SsaName(name) && initializer.size() == type.size() + 3u && initializer.starts_with(type) && initializer.ends_with("(0)")) {
+                    Candidate candidate;
+                    candidate.type = type;
+                    candidate.localBegin = begin;
+                    candidate.localEnd = end;
+                    candidates.emplace(std::string(name), std::move(candidate));
+                }
+            }
+        }
+        begin = end;
+    }
+    if (candidates.empty()) return 0u;
+
+    // Block structure: every '{' opens a scope, '}' closes it; a scope with a case label is a switch
+    // body (a declaration there could be jumped over).
+    std::vector<std::int64_t> stack{0};
+    std::vector<bool> active{true};
+    std::vector<bool> switchScope{false};
+    bool failed = false;
+    auto scan = [&](const std::string& text, bool isBody) {
+        char previousEnd = ';';
+        for (std::size_t begin = 0; begin < text.size() && !failed;) {
+            std::size_t end = text.find('\n', begin);
+            if (end == std::string::npos) end = text.size();
+            std::size_t first = begin;
+            while (first < end && (text[first] == ' ' || text[first] == '\t')) ++first;
+            if (first < end && text[first] == '#') {
+                failed = true;
+                return;
+            }
+            const std::string_view trimmed(text.data() + first, end - first);
+            if (trimmed.starts_with("case ") || trimmed.starts_with("default:")) switchScope[static_cast<std::size_t>(stack.back())] = true;
+            // A definition statement: "vN = expression;" on a line of its own, after a complete statement.
+            const bool statement = isBody && trimmed.ends_with(";") && (previousEnd == ';' || previousEnd == '{' || previousEnd == '}');
+            bool firstToken = true;
+            std::size_t codeEnd = end;
+            for (std::size_t index = first; index < end;) {
+                const char c = text[index];
+                if (c == '/' && index + 1u < end && text[index + 1u] == '/') {
+                    codeEnd = index;
+                    break;
+                }
+                if (c == '{') {
+                    stack.push_back(static_cast<std::int64_t>(active.size()));
+                    active.push_back(true);
+                    switchScope.push_back(false);
+                    ++index;
+                    firstToken = false;
+                    continue;
+                }
+                if (c == '}') {
+                    if (stack.size() <= 1u) {
+                        failed = true;
+                        return;
+                    }
+                    active[static_cast<std::size_t>(stack.back())] = false;
+                    stack.pop_back();
+                    ++index;
+                    firstToken = false;
+                    continue;
+                }
+                if (IdentifierChar(c)) {
+                    std::size_t tokenEnd = index;
+                    while (tokenEnd < end && IdentifierChar(text[tokenEnd])) ++tokenEnd;
+                    if (IdentifierStart(c)) {
+                        const std::string_view token(text.data() + index, tokenEnd - index);
+                        if (const auto found = token[0] == 'v' ? candidates.find(std::string(token)) : candidates.end(); found != candidates.end()) {
+                            auto& candidate = found->second;
+                            if (candidate.scope < 0) {
+                                candidate.scope = stack.back();
+                                const std::string_view after(text.data() + tokenEnd, end - tokenEnd);
+                                candidate.eligible = statement && firstToken && after.starts_with(" = ");
+                                if (candidate.eligible) {
+                                    // The expression must not read the value it defines.
+                                    const std::string_view expression = after.substr(3u);
+                                    for (std::size_t at = expression.find(token); at != std::string_view::npos; at = expression.find(token, at + 1u)) {
+                                        const bool before = at == 0u || !IdentifierChar(expression[at - 1u]);
+                                        const bool behind = at + token.size() >= expression.size() || !IdentifierChar(expression[at + token.size()]);
+                                        if (before && behind) candidate.eligible = false;
+                                    }
+                                }
+                                candidate.definition = index;
+                            } else if (!active[static_cast<std::size_t>(candidate.scope)]) {
+                                candidate.eligible = false;
+                            }
+                        }
+                    }
+                    index = tokenEnd;
+                    firstToken = false;
+                    continue;
+                }
+                if (c != ' ' && c != '\t') firstToken = false;
+                ++index;
+            }
+            // The last code character of the line (comments and blank lines leave it unchanged).
+            std::size_t last = codeEnd;
+            while (last > first && (text[last - 1u] == ' ' || text[last - 1u] == '\t')) --last;
+            if (last > first) previousEnd = text[last - 1u];
+            begin = end + 1u;
+        }
+    };
+    scan(prologue, false);
+    scan(body, true);
+    if (failed) return 0u;
+
+    std::vector<std::pair<std::size_t, const Candidate*>> sunk;
+    for (const auto& [name, candidate] : candidates) {
+        if (candidate.eligible && candidate.scope >= 0 && !switchScope[static_cast<std::size_t>(candidate.scope)]) sunk.emplace_back(candidate.definition, &candidate);
+    }
+    if (sunk.empty()) return 0u;
+    std::sort(sunk.begin(), sunk.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+    std::string rewritten;
+    rewritten.reserve(body.size() + sunk.size() * 8u);
+    std::size_t copied = 0;
+    for (const auto& [offset, candidate] : sunk) {
+        rewritten.append(body, copied, offset - copied);
+        rewritten.append(candidate->type);
+        rewritten.push_back(' ');
+        copied = offset;
+    }
+    rewritten.append(body, copied, std::string::npos);
+    body = std::move(rewritten);
+    std::vector<std::pair<std::size_t, std::size_t>> removed;
+    removed.reserve(sunk.size());
+    for (const auto& entry : sunk) removed.emplace_back(entry.second->localBegin, entry.second->localEnd);
+    std::sort(removed.begin(), removed.end());
+    std::string kept;
+    kept.reserve(locals.size());
+    std::size_t from = 0;
+    for (const auto& [begin, end] : removed) {
+        kept.append(locals, from, begin - from);
+        from = end;
+    }
+    kept.append(locals, from, std::string::npos);
+    locals = std::move(kept);
+    return sunk.size();
+}
+
+std::string MslFunctionStatements(const MslEmitterState& state, const std::string& prologue) {
+    static const bool hoistAll = [] {
+        const char* value = std::getenv("APS5_MSL_HOIST_ALL");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (hoistAll) return state.locals + prologue + state.body;
+    std::string locals = state.locals;
+    std::string body = state.body;
+    static_cast<void>(MslSinkDeclarations(locals, prologue, body));
+    return locals + prologue + body;
+}
+
 std::string MslEmitterState::Temporary(std::string_view prefix) {
     return std::string(prefix) + std::to_string(nextTemporary++);
 }
@@ -313,8 +510,9 @@ std::string MslEmitterState::GuestGlobalInvocationId(std::uint32_t component) {
 }
 
 std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
-    // Mesh draws are never split: the grid is (mesh groups, instances, 1), as gl_WorkGroupID.
-    if (program.Resources().stage == IrShaderStage::Mesh) return Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component);
+    // Mesh draws: the grid is (mesh groups, instances, splits), gl_WorkGroupID is (x, y, 0). The z
+    // dimension splits a group's primitives in the triangle-vertices mode (MslAbi Version 13).
+    if (program.Resources().stage == IrShaderStage::Mesh) return component == 2u ? std::string("0u") : Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component);
     usesDriverData = true;
     return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "])";
 }

@@ -4,6 +4,7 @@
 # --pipeline-cache-only mode (agc_pipeline_cache) through RecorderTwins.h.
 list(APPEND agcMetalTwins
         "Graphics/src/PipelineCache.cpp=specifics/macos/src/PipelineCache.mm"
+        "Graphics/src/PipelineCache.cpp=specifics/macos/src/MetalLibraryStore.mm"
         "tests/Recorder.cpp=specifics/macos/tests/D5RecorderModes.mm"
         "Graphics/src/Sampler.cpp=specifics/macos/src/Sampler.mm"
         "Graphics/src/PlaceholderImages.cpp=specifics/macos/src/PlaceholderImages.mm"

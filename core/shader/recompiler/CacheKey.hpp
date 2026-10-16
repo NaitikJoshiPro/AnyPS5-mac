@@ -249,6 +249,7 @@ private:
         append(key, static_cast<std::uint32_t>(value.backend));
         append(key, value.vertexSubgroups);
         append(key, value.float16DenormPreserve);
+        append(key, value.float32DenormFlushNative);
     }
 };
 

@@ -5,6 +5,7 @@
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 
@@ -173,6 +174,7 @@ int APS5_VABI sceVideoOutGetEventId(const KernelEvent* ev) {
     if (ev == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    ev = GuestArena::HostPointer(ev); // events may sit in displaced guest memory (D31, D33)
     if (ev->filter != EVFILT_VIDEO_OUT) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_EVENT");
     }
@@ -187,6 +189,8 @@ int APS5_VABI sceVideoOutGetEventData(const KernelEvent* ev, int64_t* data) {
     if (ev == nullptr || data == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    ev = GuestArena::HostPointer(ev); // displaced guest memory (D31, D33)
+    data = GuestArena::HostPointer(data);
     if (ev->filter != EVFILT_VIDEO_OUT) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_EVENT");
     }
@@ -202,6 +206,7 @@ int APS5_VABI sceVideoOutGetEventCount(const KernelEvent* ev) {
     if (ev == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
+    ev = GuestArena::HostPointer(ev); // displaced guest memory (D31, D33)
     if (ev->filter != EVFILT_VIDEO_OUT) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_EVENT");
     }

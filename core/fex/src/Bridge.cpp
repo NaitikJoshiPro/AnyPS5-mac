@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 
 struct Aps5NativeArguments {
     std::uint64_t gpr[8];
@@ -170,6 +171,29 @@ void GetMachineState(MachineState* machine) {
     throw MachineFrame {*machine};
 }
 
+// FEXCore keeps the SSE rounding mode, flush-to-zero and denormals-are-zero in the host FPCR, which only its
+// LDMXCSR/FXRSTOR code writes (OpDispatchBuilder::RestoreMXCSRState, SetRoundingMode in JIT/MiscOps.cpp).
+// A resumed state with another MXCSR sets them here the same way: RC (bits 13-14) bit-swapped into RMode
+// (22-23), FTZ (15) into FZ (24), DAZ (6) into FIZ (0) where the host has FEAT_AFP.
+bool HostHasAfp() {
+    static const bool afp = [] {
+        int value = 0;
+        std::size_t size = sizeof(value);
+        return sysctlbyname("hw.optional.arm.FEAT_AFP", &value, &size, nullptr, 0) == 0 && value != 0;
+    }();
+    return afp;
+}
+
+void ApplyMxcsrToHost(std::uint32_t mxcsr) {
+    const std::uint64_t rc = (mxcsr >> 13) & 3u;
+    const std::uint64_t mode = ((rc & 1u) << 1) | (rc >> 1);
+    std::uint64_t fpcr = __builtin_arm_rsr64("fpcr");
+    fpcr = (fpcr & ~(std::uint64_t {3} << 22)) | (mode << 22);
+    fpcr = (fpcr & ~(std::uint64_t {1} << 24)) | (std::uint64_t {(mxcsr >> 15) & 1u} << 24);
+    if (HostHasAfp()) fpcr = (fpcr & ~std::uint64_t {1}) | ((mxcsr >> 6) & 1u);
+    __builtin_arm_wsr64("fpcr", fpcr);
+}
+
 void ApplyMachineState(FEXCore::Core::CPUState& state, const MachineState& machine) {
     for (std::size_t i = 0; i < 16; ++i) state.gregs[DwarfRegisters[i]] = machine.gregs[i];
     state.rip = machine.rip;
@@ -182,6 +206,8 @@ void ApplyMachineState(FEXCore::Core::CPUState& state, const MachineState& machi
     for (const auto& [flag, bit] : X87ConditionBits) state.flags[flag] = static_cast<std::uint8_t>((status >> bit) & 1u);
     state.AbridgedFTW = image[FxsaveTags];
     std::memcpy(&state.mxcsr, image + FxsaveMxcsr, sizeof(state.mxcsr));
+    state.mxcsr &= 0xffc0u;
+    ApplyMxcsrToHost(state.mxcsr);
     for (unsigned index = 0; index < 8; ++index) {
         std::memset(state.mm[(top + index) & 7u], 0, sizeof(state.mm[0]));
         std::memcpy(state.mm[(top + index) & 7u], image + FxsaveX87 + 16 * index, 10);
@@ -215,7 +241,8 @@ static_assert(MakecontextEntryCode[MakecontextFinishCall] == 0xe8);
 std::vector<std::uint64_t> tlsOffsets;
 
 void* TlsGetAddr(const std::uint64_t* index) {
-    if (currentCall == nullptr || index[0] >= tlsOffsets.size()) {
+    // Module ids start at 1 (GuestProgram numbers image i as i + 1); 0 is no module.
+    if (currentCall == nullptr || index[0] == 0 || index[0] >= tlsOffsets.size()) {
         std::fprintf(stderr, "[aps5-fex] __tls_get_addr for TLS module %llu\n", static_cast<unsigned long long>(index[0]));
         std::abort();
     }
@@ -478,6 +505,9 @@ void Bridge::Connect() {
         reinterpret_cast<void (*)(void (*)(std::uint32_t*, std::uint16_t*))>(setControl)(GuestControl);
     if (void* setCall = HostSymbol("Aps5SetBridgeGuestCall_nid_no_patch"))
         reinterpret_cast<void (*)(std::uint64_t (*)(std::uint64_t, const std::uint64_t*))>(setCall)(CallGuestFunction);
+    // libkernel's __tls_get_addr export (NID vNe1w4diLCs) resolves through the same module numbering.
+    if (void* setTls = HostSymbol("Aps5SetGuestTlsResolver_nid_no_patch"))
+        reinterpret_cast<void (*)(void* (*)(const std::uint64_t*))>(setTls)(TlsGetAddr);
     if (void* setFiber = HostSymbol("Aps5SetFiberBridge_nid_no_patch")) {
         using SetFiberBridge = void (*)(void (*)(std::uintptr_t*), void (*)(const std::uintptr_t*), void (*)(std::uint32_t*, std::uint16_t*),
                                         std::uint64_t);
@@ -488,6 +518,9 @@ void Bridge::Connect() {
     if (void* setWriter = HostSymbol("GuestDisplacedSetCodeWriter_nid_no_patch"))
         reinterpret_cast<void (*)(bool (*)(std::uintptr_t, std::uint32_t), std::uintptr_t (*)(std::uintptr_t, std::size_t, std::uintptr_t*))>(setWriter)(
             &CodePool::WriteInstruction, &CodePool::AllocateBeside);
+    // ... and forgotten, with their stubs, when FEX frees the code buffer that holds them.
+    if (void* codeFreed = HostSymbol("GuestDisplacedCodeFreed_nid_no_patch"))
+        CodePool::SetFreeListener(reinterpret_cast<CodePool::FreeListener>(codeFreed));
     if (void* setMachine = HostSymbol("Aps5SetBridgeMachineState_nid_no_patch")) {
         std::uint64_t entry = 0;
         if (void* finish = HostSymbol("Aps5MakecontextFinish_nid_no_patch")) {
@@ -521,6 +554,13 @@ void Bridge::SetTlsOffsets(std::vector<std::uint64_t> offsets) {
 std::uint64_t Bridge::TlsGetAddrStub() {
     if (tlsGetAddrStub == 0) tlsGetAddrStub = AddStub(reinterpret_cast<void*>(&TlsGetAddr), "__tls_get_addr");
     return tlsGetAddrStub;
+}
+
+std::string Bridge::StubName(std::uint64_t address) {
+    if (!OwnsStub(address) || address < StubBase() + FirstStubOffset) return {};
+    std::lock_guard lock(stubMutex);
+    const std::size_t index = (address - StubBase() - FirstStubOffset) / StubBytes;
+    return index < functions.size() ? functions[index].name : std::string {};
 }
 
 std::uint64_t Bridge::AddStub(void* address, const std::string& name, Variadic variadic, std::uint8_t fixed, bool x87Result,

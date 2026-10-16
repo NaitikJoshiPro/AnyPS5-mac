@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -315,7 +316,8 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
 bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    // Key scans read guest metadata in bulk: displaced metadata (D31, D33) at its alias, not through the fault path.
+    const auto* keys = reinterpret_cast<const std::uint8_t*>(GuestArena::HostRange(metaAddress, count));
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool uncompressed = AllKeysEqual(keys, count, 0xff);
     if (ScanProfileEnabled()) CountScan(count, start);
@@ -457,7 +459,7 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             recorder->Sync();
         }
     }
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    const auto* keys = reinterpret_cast<const std::uint8_t*>(GuestArena::HostRange(metaAddress, count));
     const auto first = keys[0];
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool uniform = AllKeysEqual(keys + 1, count - 1, first);
@@ -722,7 +724,7 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
     }
     for (const auto& [from, to] : unwritten) {
         if (mixed) break;
-        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        const auto* keys = reinterpret_cast<const std::uint8_t*>(GuestArena::HostRange(from, static_cast<std::size_t>(to - from)));
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else mixed = true;
     }

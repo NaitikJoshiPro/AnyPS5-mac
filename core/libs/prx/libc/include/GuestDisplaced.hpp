@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 // Guest addresses the host cannot map at their own value live at a fixed alias instead: host = guest | DisplacedFlip
 // (D31, D33). On macOS arm64 these are a table of host-reserved ranges, found at startup (GuestDisplaced.cpp):
@@ -74,6 +75,27 @@ inline T* HostPointer(T* guest) {
     return reinterpret_cast<T*>(HostAddress(reinterpret_cast<std::uintptr_t>(guest)));
 }
 
+// The host address of guest [guest, guest + bytes) for native bulk access (memcpy, memcmp, scans, host system calls),
+// translated once up front instead of faulting per load/store; a host system call cannot be rescued by the fault
+// handler at all (the kernel returns EFAULT). A range crossing the window's edge has no single backing and throws
+// (the arena never maps one: the shared cache lies below the window, malloc's regions above it). Host addresses,
+// aliases included, pass through unchanged. Costs one compare for memory above the window.
+inline std::uintptr_t HostRange(std::uintptr_t guest, std::size_t bytes) {
+    if (!MayBeDisplaced(guest)) return guest;
+    const auto start = DisplacedStart();
+    if (guest >= start) {
+        if (bytes > DisplacedEnd - guest) throw std::runtime_error("native access to guest memory straddles the upper edge of the displaced window");
+        return guest | DisplacedFlip;
+    }
+    if (bytes > start - guest) throw std::runtime_error("native access to guest memory straddles the lower edge of the displaced window");
+    return guest;
+}
+
+template <typename T>
+inline T* HostRange(T* guest, std::size_t bytes) {
+    return reinterpret_cast<T*>(HostRange(reinterpret_cast<std::uintptr_t>(guest), bytes));
+}
+
 extern "C" {
 // Reserves the alias window and installs the fault handler (once). False when the host has no displaced window
 // or the alias could not be reserved; fixed guest mappings in the window then fail as host regions.
@@ -86,8 +108,29 @@ void GuestDisplacedSetCodeWriter_nid_no_patch(bool (*writer)(std::uintptr_t pc, 
     std::uintptr_t (*allocator)(std::uintptr_t pc, std::size_t bytes, std::uintptr_t* writable));
 // Faults redirected to the alias, and the JIT sites patched so far.
 void GuestDisplacedStats_nid_no_patch(std::uint64_t* faults, std::uint64_t* patches);
+// Faults at sites that cannot be patched (native code, signed or out of branch range), and how many of their stubs
+// returned through BRK (a second signal: a far stub whose return could not be made a branch), and the far stubs
+// built with a branch return instead.
+void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint64_t* trapReturns, std::uint64_t* branchSites);
+// Tests: native code in [start, end) gets far stubs and is treated as immutable like the dyld shared cache (0, 0 ends it).
+void GuestDisplacedTestFarCode_nid_no_patch(std::uintptr_t start, std::uintptr_t end);
 // The active displaced ranges in ascending order (empty when inactive).
 void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count);
+// Code in [start, end) is about to be freed (the CPU backend's code buffer, a module's code): forget every patched
+// site in it and free their stubs (and the sites inside those stubs) for reuse. The caller guarantees that no thread
+// runs the code any more (FEX frees a code buffer only once every thread has left it), so none runs their stubs
+// either: a stub is entered only from its site and returns into its site's code. Safe against concurrent faults on
+// other threads (one lock, signals blocked while it is held). Returns the number of sites forgotten.
+std::size_t GuestDisplacedCodeFreed_nid_no_patch(std::uintptr_t start, std::uintptr_t end);
+// Site table and stub memory occupancy: live sites, sites forgotten so far, stub slots in use, stub slots on free
+// lists, stub chunks reserved, and sites whose pc lies inside a stub (a stub's own access that faulted).
+struct DisplacedSiteStats {
+    std::uint64_t liveSites = 0, forgottenSites = 0, slotsInUse = 0, slotsFree = 0, chunks = 0, stubSites = 0;
+};
+void GuestDisplacedSiteStats_nid_no_patch(DisplacedSiteStats* stats);
+// Tests: cap the live sites and the stub chunks below their built-in limits (0 restores the default), so churn
+// beyond the cap shows whether sites and stubs are reclaimed.
+void GuestDisplacedTestLimits_nid_no_patch(std::size_t maxSites, std::size_t maxChunks);
 }
 
 }

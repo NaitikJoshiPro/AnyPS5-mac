@@ -1,5 +1,6 @@
 // Work package D4: see MetalVulkanImages.h.
 #include "MetalVulkanImages.h"
+#import <objc/runtime.h>
 #include "MetalCommandStream.h"
 #include "MetalImages.h"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <span>
 #include <mutex>
@@ -250,6 +252,33 @@ void NoteImageCopy(VkImage image, bool toBuffer) {
 
 namespace Vk {
 
+std::uint32_t HostLevelLimit(VkImageType type, VkExtent3D extent) {
+    std::uint32_t largest = std::max(extent.width, std::max(extent.height, 1u));
+    if (type == VK_IMAGE_TYPE_3D) largest = std::max(largest, extent.depth);
+    return static_cast<std::uint32_t>(std::bit_width(std::max(largest, 1u)));
+}
+
+// The guest's levels past the host image's (D64): one 1x1 texture each (AMD keeps every level past
+// 1x1 as another 1x1 level with its own storage), associated with the image's texture.
+const char ExtraLevelsKey = 0;
+
+NSArray<id<MTLTexture>>* ExtraLevels(id<MTLTexture> texture) {
+    return texture != nil ? objc_getAssociatedObject(texture, &ExtraLevelsKey) : nil;
+}
+
+// The texture and host level holding guest level `level` of an image.
+id<MTLTexture> LevelSource(id<MTLTexture> texture, std::uint32_t level, std::uint32_t* hostLevel) {
+    if (level < texture.mipmapLevelCount) {
+        *hostLevel = level;
+        return texture;
+    }
+    NSArray<id<MTLTexture>>* extra = ExtraLevels(texture);
+    const auto index = level - static_cast<std::uint32_t>(texture.mipmapLevelCount);
+    if (extra == nil || index >= extra.count) FailImages("mip level " + std::to_string(level) + " is outside the image (" + std::to_string(texture.mipmapLevelCount) + " host levels)");
+    *hostLevel = 0;
+    return extra[index];
+}
+
 VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
     id<MTLDevice> device = DeviceOf(deviceHandle);
     if (device == nil) FailImages("CreateImage needs a Metal device");
@@ -282,7 +311,12 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
     descriptor.height = std::max(info->extent.height, 1u);
     descriptor.depth = std::max(info->extent.depth, 1u);
     descriptor.arrayLength = std::max(info->arrayLayers, 1u);
-    descriptor.mipmapLevelCount = std::max(info->mipLevels, 1u);
+    // A guest T# may declare more levels than its dimensions have (DECISIONS D64: radeonsi's block
+    // views of a compressed texture keep its level count, e.g. 128x128 blocks of a 512x512 BC
+    // texture with 10 levels); AMD keeps every level past 1x1 as another 1x1 level, Metal refuses
+    // the descriptor. The host image holds the levels the dimensions allow; copies of the others are
+    // skipped (their guest bytes stay as they are) and a view of one throws.
+    descriptor.mipmapLevelCount = std::min(std::max(info->mipLevels, 1u), HostLevelLimit(info->imageType, info->extent));
     descriptor.sampleCount = static_cast<NSUInteger>(info->samples);
     descriptor.storageMode = MTLStorageModePrivate;
     MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
@@ -309,6 +343,25 @@ VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     if (auto* cache = ImageCache::For(device)) cache->Track(texture);
+    if (const auto declared = std::max(info->mipLevels, 1u); declared > texture.mipmapLevelCount) {
+        NSMutableArray<id<MTLTexture>>* extra = [NSMutableArray arrayWithCapacity:declared - texture.mipmapLevelCount];
+        MTLTextureDescriptor* single = [descriptor copy];
+        single.width = 1;
+        single.height = 1;
+        single.depth = 1;
+        single.mipmapLevelCount = 1;
+        single.usage = texture.usage;
+        for (auto level = static_cast<std::uint32_t>(texture.mipmapLevelCount); level < declared; ++level) {
+            id<MTLTexture> one = [device newTextureWithDescriptor:single];
+            if (one == nil) {
+                *image = VK_NULL_HANDLE;
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+            if (auto* cache = ImageCache::For(device)) cache->Track(one);
+            [extra addObject:one];
+        }
+        objc_setAssociatedObject(texture, &ExtraLevelsKey, extra, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
     *image = RetainImage(texture);
     if (auto* probe = imageProbe.load(std::memory_order_acquire)) probe->Created(*image);
     return VK_SUCCESS;
@@ -318,7 +371,10 @@ void DestroyImage(VkDevice deviceHandle, VkImage image, const VkAllocationCallba
     if (image == VK_NULL_HANDLE) return;
     if (auto* probe = imageProbe.load(std::memory_order_acquire); probe != nullptr && probe->Destroying(image)) return;
     id<MTLTexture> texture = CFBridgingRelease(reinterpret_cast<CFTypeRef>(image));
-    if (auto* cache = ImageCache::For(DeviceOf(deviceHandle))) cache->Untrack(texture);
+    if (auto* cache = ImageCache::For(DeviceOf(deviceHandle))) {
+        for (id<MTLTexture> one in ExtraLevels(texture)) cache->Untrack(one);
+        cache->Untrack(texture);
+    }
 }
 
 void GetImageMemoryRequirements(VkDevice, VkImage image, VkMemoryRequirements* requirements) {
@@ -360,7 +416,11 @@ VkResult CreateImageView(VkDevice, const VkImageViewCreateInfo* info, const VkAl
     default: FailImages("unknown image view type");
     }
     const auto& range = info->subresourceRange;
-    const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
+    // A view from a guest level past the host image's is a view of that level's 1x1 texture (D64);
+    // a view from a host level stops at the host's last level.
+    std::uint32_t baseLevel = range.baseMipLevel;
+    if (baseLevel >= texture.mipmapLevelCount) texture = LevelSource(texture, baseLevel, &baseLevel);
+    const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS || baseLevel + range.levelCount > texture.mipmapLevelCount ? static_cast<std::uint32_t>(texture.mipmapLevelCount) - baseLevel : range.levelCount;
     const auto layerTotal = texture.textureType == MTLTextureType3D ? 1u : texture.arrayLength;
     const auto layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS ? layerTotal - range.baseArrayLayer : range.layerCount;
     auto swizzle = MTLTextureSwizzleChannelsMake(SwizzleOf(info->components.r, MTLTextureSwizzleRed), SwizzleOf(info->components.g, MTLTextureSwizzleGreen), SwizzleOf(info->components.b, MTLTextureSwizzleBlue), SwizzleOf(info->components.a, MTLTextureSwizzleAlpha));
@@ -372,7 +432,7 @@ VkResult CreateImageView(VkDevice, const VkImageViewCreateInfo* info, const VkAl
     auto viewFormat = Required(info->format);
     if (type == MTLTextureType3D && viewFormat == MTLPixelFormatDepth16Unorm) viewFormat = MTLPixelFormatR16Unorm;
     if (type == MTLTextureType3D && viewFormat == MTLPixelFormatDepth32Float) viewFormat = MTLPixelFormatR32Float;
-    id<MTLTexture> result = [texture newTextureViewWithPixelFormat:viewFormat textureType:type levels:NSMakeRange(range.baseMipLevel, levels) slices:NSMakeRange(type == MTLTextureType3D ? 0u : range.baseArrayLayer, type == MTLTextureType3D ? 1u : layers) swizzle:swizzle];
+    id<MTLTexture> result = [texture newTextureViewWithPixelFormat:viewFormat textureType:type levels:NSMakeRange(baseLevel, levels) slices:NSMakeRange(type == MTLTextureType3D ? 0u : range.baseArrayLayer, type == MTLTextureType3D ? 1u : layers) swizzle:swizzle];
     if (result == nil) {
         *view = VK_NULL_HANDLE;
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -548,11 +608,13 @@ void CmdCopyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage des
     NoteImageCopy(destination, false);
     auto& stream = Stream(commands);
     id<MTLBuffer> buffer = BufferOf(source);
-    id<MTLTexture> texture = TextureOfImage(destination);
+    id<MTLTexture> image = TextureOfImage(destination);
     auto encoder = stream.Compute();
     for (std::uint32_t index = 0; index < count; ++index) {
         const auto& region = regions[index];
-        const auto level = region.imageSubresource.mipLevel;
+        // A guest level past the host image's is its 1x1 texture (CreateImage, D64).
+        std::uint32_t level = 0;
+        id<MTLTexture> texture = LevelSource(image, region.imageSubresource.mipLevel, &level);
         const auto size = RegionSize(texture, level, region.imageExtent);
         std::uint32_t blockHeight = 1;
         const auto rowTexels = region.bufferRowLength != 0u ? region.bufferRowLength : static_cast<std::uint32_t>(size.width);
@@ -570,11 +632,13 @@ void CmdCopyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayou
     NoteImageCopy(source, true);
     auto& stream = Stream(commands);
     id<MTLBuffer> buffer = BufferOf(destination);
-    id<MTLTexture> texture = TextureOfImage(source);
+    id<MTLTexture> image = TextureOfImage(source);
     auto encoder = stream.Compute();
     for (std::uint32_t index = 0; index < count; ++index) {
         const auto& region = regions[index];
-        const auto level = region.imageSubresource.mipLevel;
+        // A guest level past the host image's is its 1x1 texture (CreateImage, D64).
+        std::uint32_t level = 0;
+        id<MTLTexture> texture = LevelSource(image, region.imageSubresource.mipLevel, &level);
         const auto size = RegionSize(texture, level, region.imageExtent);
         std::uint32_t blockHeight = 1;
         const auto rowTexels = region.bufferRowLength != 0u ? region.bufferRowLength : static_cast<std::uint32_t>(size.width);
@@ -590,14 +654,18 @@ void CmdCopyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayou
 
 void CmdCopyImage(VkCommandBuffer commands, VkImage source, VkImageLayout, VkImage destination, VkImageLayout, std::uint32_t count, const VkImageCopy* regions) {
     auto& stream = Stream(commands);
-    id<MTLTexture> from = TextureOfImage(source);
-    id<MTLTexture> to = TextureOfImage(destination);
+    id<MTLTexture> fromImage = TextureOfImage(source);
+    id<MTLTexture> toImage = TextureOfImage(destination);
     auto encoder = stream.Compute();
     for (std::uint32_t index = 0; index < count; ++index) {
         const auto& region = regions[index];
-        const auto size = RegionSize(from, region.srcSubresource.mipLevel, region.extent);
+        std::uint32_t sourceLevel = 0;
+        std::uint32_t destinationLevel = 0;
+        id<MTLTexture> from = LevelSource(fromImage, region.srcSubresource.mipLevel, &sourceLevel);
+        id<MTLTexture> to = LevelSource(toImage, region.dstSubresource.mipLevel, &destinationLevel);
+        const auto size = RegionSize(from, sourceLevel, region.extent);
         for (std::uint32_t layer = 0; layer < std::max(region.srcSubresource.layerCount, 1u); ++layer) {
-            [encoder copyFromTexture:from sourceSlice:region.srcSubresource.baseArrayLayer + layer sourceLevel:region.srcSubresource.mipLevel sourceOrigin:MTLOriginMake(region.srcOffset.x, region.srcOffset.y, region.srcOffset.z) sourceSize:size toTexture:to destinationSlice:region.dstSubresource.baseArrayLayer + layer destinationLevel:region.dstSubresource.mipLevel destinationOrigin:MTLOriginMake(region.dstOffset.x, region.dstOffset.y, region.dstOffset.z)];
+            [encoder copyFromTexture:from sourceSlice:region.srcSubresource.baseArrayLayer + layer sourceLevel:sourceLevel sourceOrigin:MTLOriginMake(region.srcOffset.x, region.srcOffset.y, region.srcOffset.z) sourceSize:size toTexture:to destinationSlice:region.dstSubresource.baseArrayLayer + layer destinationLevel:destinationLevel destinationOrigin:MTLOriginMake(region.dstOffset.x, region.dstOffset.y, region.dstOffset.z)];
         }
     }
     stream.CountCommand();
@@ -639,7 +707,8 @@ void CmdClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout, 
     };
     for (std::uint32_t index = 0; index < rangeCount; ++index) {
         const auto& range = ranges[index];
-        const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
+        if (range.baseMipLevel >= texture.mipmapLevelCount) continue;
+        const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS || range.baseMipLevel + range.levelCount > texture.mipmapLevelCount ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
         const auto layers = volume ? 1u : (range.layerCount == VK_REMAINING_ARRAY_LAYERS ? texture.arrayLength - range.baseArrayLayer : range.layerCount);
         for (std::uint32_t level = range.baseMipLevel; level < range.baseMipLevel + levels; ++level) {
             id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:(volume ? MTLTextureType3D : MTLTextureType2DArray) levels:NSMakeRange(level, 1) slices:NSMakeRange(volume ? 0u : range.baseArrayLayer, volume ? 1u : layers)];
@@ -670,7 +739,8 @@ void ClearByRenderPass(VkCommandBuffer commands, id<MTLTexture> texture, const V
     auto& stream = Stream(commands);
     for (std::uint32_t index = 0; index < rangeCount; ++index) {
         const auto& range = ranges[index];
-        const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
+        if (range.baseMipLevel >= texture.mipmapLevelCount) continue;
+        const auto levels = range.levelCount == VK_REMAINING_MIP_LEVELS || range.baseMipLevel + range.levelCount > texture.mipmapLevelCount ? texture.mipmapLevelCount - range.baseMipLevel : range.levelCount;
         const bool volume = texture.textureType == MTLTextureType3D;
         const auto layers = volume ? 1u : (range.layerCount == VK_REMAINING_ARRAY_LAYERS ? texture.arrayLength - range.baseArrayLayer : range.layerCount);
         for (std::uint32_t level = range.baseMipLevel; level < range.baseMipLevel + levels; ++level) {

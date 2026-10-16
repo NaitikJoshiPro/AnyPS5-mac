@@ -59,6 +59,14 @@ SDL_AudioDeviceID openDevice(std::uint32_t freq, std::uint32_t samples, const Fo
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return 0;
         g_sdlAudio = true;
     }
+#if defined(__APPLE__)
+    // Opening a Core Audio capture device asks the user for microphone access and then records them
+    // without their asking. The port opens without a device instead, as when the console has no microphone:
+    // silence at the port's pace, sceAudioInGetSilentState reporting SILENT_STATE_DEVICE_NONE. Only SDL's
+    // file-backed "disk" driver (tests, explicit SDL_AUDIODRIVER=disk) captures. Real input is future work.
+    const char* driver = SDL_GetCurrentAudioDriver();
+    if (driver == nullptr || std::strcmp(driver, "disk") != 0) return 0;
+#endif
     SDL_AudioSpec desired{};
     desired.freq = static_cast<int>(freq);
     desired.format = format.format;
@@ -198,10 +206,12 @@ int32_t APS5_VABI sceAudioInAsyncOpen(int32_t user_id, uint32_t type, uint32_t i
     return openPort(len, freq, param, __func__);
 }
 
+// Whether the port captures from a controller's built-in microphone. No port ever captures from a
+// controller here (ports capture from SDL's default capture device, or from nothing), so an open port
+// answers 0 (false); an unknown handle answers INVALID_HANDLE as the other per-port calls do.
 int32_t APS5_VABI sceAudioInIsPadEmbeddedMic(int32_t handle) {
- (void)handle;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+    std::lock_guard lock(g_mutex);
+    return find(handle) != nullptr ? 0 : AUDIO_IN_ERROR_INVALID_HANDLE;
 }
 
 }

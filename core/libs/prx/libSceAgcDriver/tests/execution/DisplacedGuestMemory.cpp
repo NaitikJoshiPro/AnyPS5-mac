@@ -1,6 +1,7 @@
 // Guest memory in the displaced window (D31, D33: the macOS arm64 GPU carveout at 64-448 GiB and the dyld shared
 // region's unused tail, backed at guest | DisplacedFlip) reaches the GPU, at 0x4000000000 and at 0x400000000: the driver wraps the alias, a GPU fill lands in the pages the CPU sees at both the
 // guest address (through the fault handler) and the alias, and the driver's own guest reads and writes translate.
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -8,6 +9,8 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <cstddef>
@@ -19,6 +22,11 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 namespace {
 
@@ -31,6 +39,32 @@ constexpr std::uint32_t ReadWrite = 0x04; // PAGE_READWRITE, as GuestArenaCommit
 
 std::uint32_t HostWord(std::uint64_t guest, std::size_t index) {
     return reinterpret_cast<const volatile std::uint32_t*>(GuestArena::HostAddress(guest))[index];
+}
+
+std::uint64_t Faults() {
+    std::uint64_t faults = 0, patches = 0;
+    GuestArena::GuestDisplacedStats_nid_no_patch(&faults, &patches);
+    return faults;
+}
+
+#if defined(__APPLE__)
+int HostProtection(std::uint64_t address) {
+    mach_vm_address_t region = address;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || region > address) return -1;
+    return info.protection;
+}
+#endif
+
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> CollectWritten(std::uint64_t guest, std::size_t bytes) {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(guest, bytes, [](void* context, std::uintptr_t begin, std::uintptr_t end) {
+        static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(context)->emplace_back(begin, end);
+    }, &runs);
+    return runs;
 }
 
 std::uint32_t GuestWord(std::uint64_t guest, std::size_t index) {
@@ -54,6 +88,17 @@ int main() {
             GuestArena::GuestArenaCommit_nid_postfix(guest, Bytes, ReadWrite, 0x4000);
             GuestAllocations::Mutation().Add(guest, Bytes, true, true, true);
 
+            // The write watch keys pages by guest address and arms them at the alias. Wrapping the range for the GPU
+            // (MetalNoCopy.h) brackets the guest range as a host write, so the armed alias pages are left writable
+            // under the GPU mapping (the driver consumes the written marks itself). Looked up by the alias, the watch
+            // would miss them and the wrap would re-protect them read-only behind the GPU mapping.
+            const bool watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
+            if (watched) {
+                GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(guest, Bytes);
+                static_cast<void>(CollectWritten(Base, Bytes)); // arms every page
+                Require(HostProtection(GuestArena::HostAddress(Base)) == VM_PROT_READ, "displaced guest memory: the write watch did not arm the alias");
+            }
+
             // A GPU fill through the import of the alias.
             {
                 std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -67,6 +112,22 @@ int main() {
                 Require(GuestWord(Base, index) == expected, "displaced guest memory: the GPU fill is not visible at the guest address");
             }
             Require(HostWord(Base, Bytes / 8) == 0, "displaced guest memory: the fill ran past its range");
+            if (watched) {
+                Require((HostProtection(GuestArena::HostAddress(Base)) & VM_PROT_WRITE) != 0, "displaced guest memory: the wrapped alias pages were left armed read-only");
+                GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(guest, Bytes);
+            }
+
+            // DCC key scans read guest metadata in bulk at the alias, not through the fault handler.
+            {
+                constexpr std::uint64_t Surface = 0x100000;
+                const auto Keys = AgcDriver::Graphics::DccKeyBytes(Surface);
+                Require(Keys != 0 && Keys <= Bytes / 4, "displaced guest memory: unexpected DCC key size");
+                std::memset(reinterpret_cast<void*>(GuestArena::HostAddress(Base + Bytes - Keys)), 0xff, Keys);
+                const auto faults = Faults();
+                Require(AgcDriver::Graphics::ReadDccKeys(Base + Bytes - Keys, Surface) == AgcDriver::Graphics::DccKeys::Uncompressed, "displaced guest memory: DCC keys misread");
+                Require(Faults() == faults, "displaced guest memory: the DCC key scan faulted on the guest address");
+                std::memset(reinterpret_cast<void*>(GuestArena::HostAddress(Base + Bytes - Keys)), 0, Keys);
+            }
 
             // The CPU writes through the guest address; the driver reads it back and writes it.
             reinterpret_cast<volatile std::uint32_t*>(Base + Bytes / 2)[0] = 0xcafef00du;
@@ -102,6 +163,22 @@ int main() {
                 const auto expected = AgcDriver::DecodeDisplayBuffer(display, {reinterpret_cast<const std::byte*>(GuestArena::HostAddress(Base)), size});
                 Require(pixels == expected, "displaced guest memory: the display buffer decode differs from the alias");
                 Require(faultsAfter == faultsBefore, "displaced guest memory: the display buffer decode faulted on the guest address");
+            }
+
+            // WAIT_REG_MEM label polls read the alias: a label in the window (STK's fences at 0x400000000) does not
+            // fault on every poll, 32- and 64-bit alike.
+            {
+                const std::uint64_t label = Base + 0x40;
+                reinterpret_cast<volatile std::uint64_t*>(GuestArena::HostAddress(label))[0] = 0xbeefcafe00000007ull;
+                const auto wait32 = std::array<std::uint32_t, 7>{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 7u, 0xffffffffu, 4u};
+                const auto miss32 = std::array<std::uint32_t, 7>{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 8u, 0xffffffffu, 4u};
+                const auto wait64 = std::array<std::uint32_t, 9>{0xc0079300u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 7u, 0xbeefcafeu, 0xffffffffu, 0xffffffffu, 4u};
+                const auto faults = Faults();
+                for (int poll = 0; poll < 1000; ++poll) {
+                    Require(AgcDriver::Pm4::WaitSatisfiedUnchecked(wait32) && !AgcDriver::Pm4::WaitSatisfiedUnchecked(miss32), "displaced guest memory: a 32-bit label poll misread the label");
+                    Require(AgcDriver::Pm4::WaitSatisfiedUnchecked(wait64), "displaced guest memory: a 64-bit label poll misread the label");
+                }
+                Require(Faults() == faults, "displaced guest memory: label polls faulted on the guest address (" + std::to_string(Faults() - faults) + " faults)");
             }
 
             GuestAllocations::Mutation().Remove(guest);

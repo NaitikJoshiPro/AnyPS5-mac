@@ -146,9 +146,17 @@ public:
     std::string Builtin(MslBuiltin builtin);
     std::bitset<static_cast<std::size_t>(MslBuiltin::Count)> builtins;
     bool usesTable = false;
-    // Graphics stages (MslStageIo.cpp, B6): fragment inputs read (Vulkan location -> interpolation
-    // qualifier, e.g. ", flat"), and whether the pixel valid mask (kill) is used.
-    std::map<std::uint32_t, std::string> fragmentInputs;
+    // Graphics stages (MslStageIo.cpp, B6): fragment inputs read (Vulkan location -> how: flat,
+    // perspective or linear, and the interpolation locations read, one bit per
+    // InterpolationLocation: one location takes its qualifier, several make the input an
+    // interpolant<> read with interpolate_at_*, DECISIONS D38), the emulated barycentrics' locations
+    // (perspective, linear), and whether the pixel valid mask (kill) is used.
+    struct FragmentInput {
+        enum class Mode : std::uint32_t { Flat, Perspective, Linear } mode = Mode::Flat;
+        std::uint32_t locations = 0;
+    };
+    std::map<std::uint32_t, FragmentInput> fragmentInputs;
+    std::array<std::uint32_t, 2> barycentricLocations {};
     bool usesValidMask = false;
     // Images (MslImage.cpp): the direct runtime-mode switch case being emitted, {selector function
     // constant id, mode index}, for Reflection::samplerModeUses; {0, ~0u} outside one.
@@ -259,6 +267,16 @@ bool EmitMslTessellationInstruction(MslEmitterState& state, const IrValue& instr
 [[nodiscard]] std::string MslTessellationInvocation(MslEmitterState& state);
 void PrepareMslTessellationStage(MslEmitterState& state);
 [[nodiscard]] std::string EmitMslTessellationStage(MslEmitterState& state, std::vector<std::string> parameters, bool hasTable);
+// Mesh output of an NGG rect list (VGT_PRIMITIVE_TYPE 17, DECISIONS D41): the guest's vertices
+// (at most its group's), then one synthesized fourth vertex per rect, and two triangles per rect.
+struct MslMeshOutput {
+    bool rectList = false;
+    std::uint32_t guestVertices = 0u;
+    std::uint32_t guestPrimitives = 0u;
+    std::uint32_t vertices = 0u;
+    std::uint32_t primitives = 0u;
+};
+[[nodiscard]] MslMeshOutput MslMeshOutputOf(const ShaderMeshInputInfo& mesh);
 // The stage function's signature and module-scope declarations (MslEntryPoint.cpp).
 [[nodiscard]] std::string EmitMslEntryPoint(MslEmitterState& state);
 // Graphics stages (MslStageIo.cpp, B6): the stage-function output/input struct declarations and the
@@ -274,6 +292,8 @@ struct MslGraphicsInterface {
 // preprocessor condition of the mode, of one per-vertex location, and corner fields (pv<L>_<vertex>).
 [[nodiscard]] std::string TriangleVertexMacroDefaults();
 [[nodiscard]] std::string TriangleVerticesCondition();
+// The window-space position remap (MslAbi::WindowSpaceMacro) of `position`, a float4 lvalue.
+[[nodiscard]] std::string WindowSpaceEpilogue(const std::string& position, const std::string& indent);
 [[nodiscard]] std::string PerVertexLocationCondition(std::uint32_t location);
 // The guest cull distances a vertex program writes (highest index + 1; MslAbi Version 10).
 [[nodiscard]] std::uint32_t MslCullDistanceCount(const MslEmitterState& state);
@@ -286,6 +306,15 @@ struct MslGraphicsInterface {
 [[nodiscard]] std::array<std::uint32_t, 3> MslThreadsPerThreadgroup(const ShaderWorkgroupInputInfo& workgroup, std::uint32_t laneCount);
 // The stage function's body (MslFlowEmitter.cpp): structured control flow over the IR blocks.
 void EmitMslFunctionBody(MslEmitterState& state);
+// The statements of a function: the locals, `prologue` and the body (MslEmitter.cpp). An SSA local
+// whose first occurrence is its definition statement, with every other occurrence inside that
+// statement's block, is declared at the definition instead of zero-initialized at function scope
+// (MslSinkDeclarations; APS5_MSL_HOIST_ALL=1 keeps every one hoisted).
+[[nodiscard]] std::string MslFunctionStatements(const MslEmitterState& state, const std::string& prologue);
+// The declaration sinking on its own: `locals` lines `    T vN = T(0);` (and `vN_h`) whose value
+// qualifies lose their declaration, and their definition line `vN = e;` in `body` becomes
+// `T vN = e;`. Nothing changes when the text has a preprocessor line. Returns the number sunk.
+std::size_t MslSinkDeclarations(std::string& locals, const std::string& prologue, std::string& body);
 // The wave-LDS barrier scope of a program (MslFlowEmitter.cpp, the SPIR-V path's WaveLdsScope).
 [[nodiscard]] MslBarrierScope MslWaveLdsScope(const MslEmitterState& state);
 

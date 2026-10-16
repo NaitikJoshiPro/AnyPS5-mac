@@ -7,7 +7,7 @@ set_target_properties(agc_metal_msaa_tests PROPERTIES CXX_EXTENSIONS OFF OBJCXX_
 if(CMAKE_CXX_COMPILER_LAUNCHER)
     set_property(TARGET agc_metal_msaa_tests PROPERTY OBJCXX_COMPILER_LAUNCHER ${CMAKE_CXX_COMPILER_LAUNCHER})
 endif()
-foreach(agcMetalMsaaMode IN ITEMS edges masks depth integer sampled emulated sampled8 interp a2c storage ranges)
+foreach(agcMetalMsaaMode IN ITEMS edges masks depth integer sampled emulated sampled8 interp interp_locations a2c storage ranges)
     add_test(NAME agc_metal_msaa_${agcMetalMsaaMode} COMMAND agc_metal_msaa_tests ${agcMetalMsaaMode})
     set_tests_properties(agc_metal_msaa_${agcMetalMsaaMode} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)
 endforeach()

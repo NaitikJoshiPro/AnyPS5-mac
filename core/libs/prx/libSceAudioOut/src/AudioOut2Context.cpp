@@ -12,6 +12,7 @@
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "AudioOut2Internal.hpp"
 
@@ -303,8 +304,8 @@ int APS5_VABI sceAudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint3
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     std::lock_guard lock(context->lock);
     const auto level = QueueLevel(*context, Clock::now());
-    if (queue_level) *queue_level = level;
-    if (available_queue) *available_queue = context->queueDepth - level;
+    if (queue_level) *GuestArena::HostPointer(queue_level) = level; // may be displaced guest memory (D31, D33)
+    if (available_queue) *GuestArena::HostPointer(available_queue) = context->queueDepth - level;
     context->queueLevelPolls++;
     context->summaryPolls++;
     if (context->queueLevelPolls <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f GetQueueLevel ctx %p -> level %u, available %u\n", AudioOut2TraceSeconds(), static_cast<void*>(context), level, context->queueDepth - level);

@@ -3,6 +3,7 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <algorithm>
@@ -369,6 +370,7 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
     if (tp == nullptr) {
         APS5_INVALID_ARG_EX;
     }
+    tp = GuestArena::HostPointer(tp); // the timespec may be displaced guest memory (D31, D33)
     if (IsCpuClock(clockId)) {
         std::uint64_t nanos = 0;
         if (!GuestThreadCpuNanos(static_cast<int>(static_cast<std::uint32_t>(clockId) & CPU_CLOCK_ID_MASK), &nanos)) {
@@ -473,7 +475,8 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
 
 int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz) {
     KernelTimeval ignoredTime{};
-    if (tv == nullptr) tv = &ignoredTime;
+    tv = tv == nullptr ? &ignoredTime : GuestArena::HostPointer(tv); // may be displaced guest memory (D31, D33)
+    if (tz != nullptr) tz = GuestArena::HostPointer(tz);
 #ifdef _WIN32
     FILETIME ft{};
     GetSystemTimePreciseAsFileTime(&ft);

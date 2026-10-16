@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -141,8 +142,9 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         return false;
     }
     std::uint32_t count = 0, period = 0;
-    std::memcpy(&count, reinterpret_cast<const void*>(record), 4);
-    std::memcpy(&period, reinterpret_cast<const void*>(record + 4), 4);
+    const auto recordHost = GuestArena::HostRange(static_cast<std::uintptr_t>(record), 8); // alias if displaced (D31, D33)
+    std::memcpy(&count, reinterpret_cast<const void*>(recordHost), 4);
+    std::memcpy(&period, reinterpret_cast<const void*>(recordHost + 4), 4);
     const auto bytes = static_cast<std::size_t>(count) * 4u;
 
     if (count == 0 || period < count || groups[0] != (count + 63u) / 64u || count > userData[2] || count > userData[6] || bytes > (16u << 20u) || source % 4 != 0 || destination % 4 != 0 || (record < destination + bytes && destination < record + 8)) {

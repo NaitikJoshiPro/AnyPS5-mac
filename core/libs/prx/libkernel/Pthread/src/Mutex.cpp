@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "../include/Pthread.hpp"
 #include "../include/Mutex.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -32,7 +33,7 @@ bool isInitializedMutex(PthreadMutex mutex) {
 PthreadMutex resolveMutex(PthreadMutex* mutex, bool initialize) {
     if (!mutex)
         throw std::invalid_argument("Mutex pointer is null");
-    std::atomic_ref<PthreadMutex> slot(*mutex);
+    std::atomic_ref<PthreadMutex> slot(*GuestArena::HostPointer(mutex));
     if (const auto current = slot.load(std::memory_order_acquire); isInitializedMutex(current))
         return current;
     std::lock_guard lock(initializationMutex);
@@ -147,24 +148,25 @@ int APS5_VABI scePthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* a
     if (attr && *attr)
         replacement->_type = (*attr)->type;
     std::lock_guard lock(initializationMutex);
-    std::atomic_ref<PthreadMutex>(*mutex).store(replacement.release(), std::memory_order_release);
+    std::atomic_ref<PthreadMutex>(*GuestArena::HostPointer(mutex)).store(replacement.release(), std::memory_order_release);
     return 0;
 }
 
 int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
     if (!mutex)
         throw std::invalid_argument("Mutex pointer is null");
+    mutex = GuestArena::HostPointer(mutex); // the slot's host view (displaced memory, D31, D33)
     std::lock_guard lock(initializationMutex);
     if (*mutex == destroyedMutex())
         return SCE_KERNEL_ERROR_EINVAL;
     if (*mutex == adaptiveInitializer()) {
-        std::atomic_ref<PthreadMutex>(*mutex).store(destroyedMutex(), std::memory_order_release);
+        std::atomic_ref<PthreadMutex>(*GuestArena::HostPointer(mutex)).store(destroyedMutex(), std::memory_order_release);
         return 0;
     }
     if (*mutex && (*mutex)->_owner.load(std::memory_order_acquire) != std::thread::id{})
         return SCE_KERNEL_ERROR_EBUSY;
     delete *mutex;
-    std::atomic_ref<PthreadMutex>(*mutex).store(destroyedMutex(), std::memory_order_release);
+    std::atomic_ref<PthreadMutex>(*GuestArena::HostPointer(mutex)).store(destroyedMutex(), std::memory_order_release);
     return 0;
 }
 

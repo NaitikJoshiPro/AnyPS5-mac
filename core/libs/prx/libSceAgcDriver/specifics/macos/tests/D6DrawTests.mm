@@ -5,14 +5,24 @@
 //                                   continued pass, tiled RenderTarget-mode targets loaded and
 //                                   written back, cull mode and front-face winding as Vulkan)
 //   agc_metal_draw_tests primitives (agc_metal_draw_primitives: depth surfaces and the depth test,
-//                                   indexed triangle fans, CPU-read indirect draws, instancing)
+//                                   indexed triangle fans, a triangle list with primitive restart,
+//                                   CPU-read indirect draws, instancing)
 //   agc_metal_draw_tests offscreen  (agc_metal_offscreen_frames: headless presentation, a window
 //                                   without a Metal layer: pixels scaled aspect-fit over black,
-//                                   clears, slots retired; read back via APS5_METAL_PRESENT_READBACK)
+//                                   clears, slots retired; read back via APS5_METAL_PRESENT_READBACK;
+//                                   APS5_METALFX=0: the bilinear scaler, exact pixels)
+//   agc_metal_draw_tests metalfx    (agc_metal_metalfx_present: D61's MetalFX spatial upscale in the
+//                                   present: upscales through MetalFX, downscales and clears do not)
+//   agc_metal_draw_tests decode     (agc_metal_present_gpu_decode: D66's display decode on the GPU:
+//                                   linear/pitched and 64 KiB R_X tiled, BGRA/RGBA 8-bit, 10-bit, both
+//                                   16-bit float orders against DecodeDisplayBuffer; a recorded GPU
+//                                   fill is decoded without a CPU wait; unimported memory decodes on
+//                                   the CPU)
 #include "../src/MetalDeviceState.h"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
@@ -21,6 +31,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <sys/mman.h>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -303,6 +314,31 @@ void CheckPrimitives(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     Require(PixelRgba8(target, Extent - 2u, 2u) == 0xff0000ffu && PixelRgba8(target, Extent - 2u, Extent - 2u) == 0xff0000ffu && PixelRgba8(target, 2u, 2u) == 0u, "the indexed triangle fan did not cover exactly the right half");
 
+    // Indexed triangle list with primitive restart (VK_EXT_primitive_topology_list_restart
+    // semantics, the guest's VGT reset index): the restart index ends the current triangle and drops
+    // its incomplete vertices. {0 1 2, 4 5, R, 0 2 3} draws the right-half quad only; ignoring the
+    // restart would add triangle (4 5 0) on the left, and Metal's own assembly (restart for strips
+    // only) would take R as a vertex.
+    std::memset(target.Data(), 0, target.Size());
+    constexpr std::array<std::array<float, 4>, 6> listQuad {{{0.0f, -1.0f, 0.5f, 0.0f}, {1.0f, -1.0f, 0.5f, 0.0f}, {1.0f, 1.0f, 0.5f, 0.0f}, {0.0f, 1.0f, 0.5f, 0.0f}, {-1.0f, -1.0f, 0.5f, 0.0f}, {-1.0f, 1.0f, 0.5f, 0.0f}}};
+    WriteVertices(vertices, listQuad);
+    const std::array<std::uint16_t, 9> listIndices {0u, 1u, 2u, 4u, 5u, 0xffffu, 0u, 2u, 3u};
+    std::memcpy(indices.Data(), listIndices.data(), sizeof(listIndices));
+    auto list = BaseState();
+    SetTarget(list, target.Address(), VK_FORMAT_R8G8B8A8_UNORM, ColorTileMode::Linear, 4u);
+    list.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    list.primitiveRestart = true;
+    Draw(device, list, MakeShaders(vertices.Address(), 6u, 0xff0000ffu), {indices.Address(), static_cast<std::uint32_t>(listIndices.size()), 2u, 1u, 0u, true});
+    device.WaitIdle();
+    for (const auto y : {2u, Extent / 4u, Extent / 2u, Extent - 3u}) {
+        for (const auto x : {Extent / 2u + 1u, Extent * 3u / 4u, Extent - 2u}) {
+            Require(PixelRgba8(target, x, y) == 0xff0000ffu, "the restarted triangle list left right-half pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") uncovered");
+        }
+        for (const auto x : {1u, Extent / 8u, Extent / 4u}) {
+            Require(PixelRgba8(target, x, y) == 0u, "the restarted triangle list drew left-half pixel (" + std::to_string(x) + ", " + std::to_string(y) + "): the restart did not drop the incomplete triangle");
+        }
+    }
+
     // CPU-read indirect draw (two records, the first empty) plus instancing: the instance at w
     // = 1 shifts the half-width quad's triangles by one unit.
     std::memset(target.Data(), 0, target.Size());
@@ -327,7 +363,7 @@ void CheckPrimitives(AgcDriver::VulkanDevice& device) {
     Draw(device, plain, shifted, indirect);
     device.WaitIdle();
     Require(PixelRgba8(target, 2u, 2u) == 0xff00ff00u && PixelRgba8(target, Extent - 2u, 2u) == 0xff00ff00u, "the indirect draw's second instance did not reach the right half");
-    std::puts("primitives: depth test, indexed fan, CPU indirect, instancing passed");
+    std::puts("primitives: depth test, indexed fan, restarted triangle list, CPU indirect, instancing passed");
 }
 
 // Headless presentation: a 32x16 source with four colored quadrants presented into a 64x48
@@ -365,6 +401,210 @@ void CheckOffscreen(AgcDriver::VulkanDevice& device) {
     std::puts("offscreen: aspect-fit scaling, letterbox, clear, slot retirement passed");
 }
 
+// MetalFX present (D61): an upscale goes through the MetalFX spatial scaler into the aspect-fit
+// rectangle (flat regions keep their color, letterbox rows stay black); a downscale and a clear do not.
+void CheckMetalFx(AgcDriver::VulkanDevice& device) {
+    Require(device.Presentable(), "the headless window is not presentable");
+    const auto before = AgcDriver::Metal::MetalFxPresents();
+    const auto quadrantImage = [](std::uint32_t width, std::uint32_t height, const std::array<std::uint32_t, 4>& colors) {
+        std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4u);
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) {
+                const auto color = colors[(y >= height / 2u ? 2u : 0u) + (x >= width / 2u ? 1u : 0u)];
+                std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4u, &color, 4u);
+            }
+        }
+        return pixels;
+    };
+    const auto near = [](std::uint32_t a, std::uint32_t b, int tolerance) {
+        for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
+            const int difference = static_cast<int>((a >> shift) & 0xffu) - static_cast<int>((b >> shift) & 0xffu);
+            if (difference > tolerance || difference < -tolerance) return false;
+        }
+        return true;
+    };
+    // 32x18 (16:9) into 64x48: the rectangle is 64x36 at y 6, a 2x upscale.
+    constexpr std::array<std::uint32_t, 4> colors {0xffc03020u, 0xff20c030u, 0xff3020c0u, 0xffa0a0a0u};
+    device.PresentPixels(32u, 18u, quadrantImage(32u, 18u, colors));
+    device.WaitIdle();
+    auto frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(frame.width == 64u && frame.height == 48u, "the MetalFX present read back " + std::to_string(frame.width) + "x" + std::to_string(frame.height));
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 1u, "the 2x upscale did not go through MetalFX");
+    const auto at = [&](std::uint32_t x, std::uint32_t y) {
+        std::uint32_t value;
+        std::memcpy(&value, frame.pixels.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4u, 4u);
+        return value;
+    };
+    Require(at(32u, 2u) == 0xff000000u && at(5u, 5u) == 0xff000000u && at(32u, 45u) == 0xff000000u && at(60u, 42u) == 0xff000000u, "the letterbox rows are not opaque black");
+    for (const auto& [x, y, quadrant] : std::array<std::array<std::uint32_t, 3>, 4> {{{10u, 13u, 0u}, {54u, 13u, 1u}, {10u, 35u, 2u}, {54u, 35u, 3u}}}) {
+        Require(near(at(x, y), colors[quadrant], 3), "MetalFX changed a flat region at " + std::to_string(x) + "," + std::to_string(y) + ": " + std::to_string(at(x, y)));
+    }
+    // The sharp vertical edge (red 0xc0 | 0x20) is reconstructed: the row falls from the left side's
+    // red to the right side's within the 4 pixels around the edge (MetalFX sharpens, so a small
+    // overshoot either side is allowed).
+    std::string row;
+    for (std::uint32_t x = 26u; x < 38u; ++x) row += std::to_string((at(x, 13u) >> 16u) & 0xffu) + " ";
+    const auto red = [&](std::uint32_t x) { return static_cast<int>((at(x, 13u) >> 16u) & 0xffu); };
+    Require(red(29u) >= 0xc0 - 48 && red(34u) <= 0x20 + 48 && red(26u) >= 0xc0 - 3 && red(37u) <= 0x20 + 3, "the upscaled edge is wrong: " + row);
+    for (std::uint32_t x = 26u; x < 38u; ++x) Require(red(x) >= 0x20 - 48 && red(x) <= 0xc0 + 48, "the upscaled edge overshoots: " + row);
+    std::printf("metalfx edge row (red): %s\n", row.c_str());
+    // A new source size makes a new scaler: 48x27 into the same target (rectangle 64x36).
+    device.PresentPixels(48u, 27u, quadrantImage(48u, 27u, colors));
+    device.WaitIdle();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 2u, "the 48x27 upscale did not go through MetalFX");
+    Require(near(at(10u, 13u), colors[0], 3) && near(at(54u, 35u), colors[3], 3), "the second MetalFX scaler's flat regions are wrong");
+    // A downscale (128x96 into 64x48) keeps the bilinear scaler.
+    device.PresentPixels(128u, 96u, quadrantImage(128u, 96u, colors));
+    device.WaitIdle();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 2u, "a downscale went through MetalFX");
+    Require(at(10u, 10u) == colors[0] && at(54u, 40u) == colors[3], "the bilinear downscale is wrong");
+    // A clear-only present.
+    Require(device.PresentClear(32u, 18u, true), "a headless clear was not presented");
+    device.FinishPresent();
+    device.QueuePresent();
+    frame = AgcDriver::Metal::LastPresentedFrame();
+    Require(AgcDriver::Metal::MetalFxPresents() == before + 2u && at(10u, 13u) == 0xff000000u, "the clear-only present is wrong");
+    std::puts("metalfx: 2x upscale through MetalFX, letterbox, flat regions, new scaler size, bilinear downscale, clear passed");
+}
+
+// A display buffer in mapped guest memory (64 KiB aligned, registered), as the guest's direct memory is.
+class DisplayBlock {
+public:
+    explicit DisplayBlock(std::size_t bytes) : size((bytes + 65535u) & ~std::size_t{65535u}) {
+        mapped = mmap(nullptr, size + 65536u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        Require(mapped != MAP_FAILED, "cannot map a display block");
+        block = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(mapped) + 65535u) & ~std::uintptr_t{65535u});
+        GuestAllocations::Mutation().Add(block, size, true, true, true);
+    }
+    ~DisplayBlock() {
+        GuestAllocations::Mutation().Remove(block);
+        munmap(mapped, size + 65536u);
+    }
+    DisplayBlock(const DisplayBlock&) = delete;
+    DisplayBlock& operator=(const DisplayBlock&) = delete;
+    std::byte* Data() const { return block; }
+    std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(block); }
+
+private:
+    std::size_t size;
+    void* mapped = nullptr;
+    std::byte* block = nullptr;
+};
+
+// D66: display buffers decoded on the GPU from their host import. Runs with APS5_PRESENT_SIZE=300x260
+// (the target is the display buffer's size: the scaler copies 1:1) and APS5_METALFX=0.
+void CheckGpuDecode(AgcDriver::VulkanDevice& device) {
+    Require(device.Presentable(), "the headless window is not presentable");
+    constexpr std::uint32_t Width = 300u;
+    constexpr std::uint32_t Height = 260u;
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    const auto next = [&] {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return seed;
+    };
+    const auto present = [&](const AgcDriver::DisplayBuffer& buffer) {
+        Require(device.PresentDisplayBuffer(buffer), "the display buffer was not presented");
+        device.FinishPresent();
+        device.QueuePresent();
+        const auto frame = AgcDriver::Metal::LastPresentedFrame();
+        Require(frame.width == Width && frame.height == Height, "the decode test target is " + std::to_string(frame.width) + "x" + std::to_string(frame.height) + ", not 300x260 (APS5_PRESENT_SIZE)");
+        return frame;
+    };
+    const auto compare = [&](const char* name, const AgcDriver::DisplayBuffer& buffer, const AgcDriver::Metal::PresentedFrame& frame) {
+        const auto size = AgcDriver::DisplayBufferSize(buffer);
+        const auto expected = AgcDriver::DecodeDisplayBuffer(buffer, {reinterpret_cast<const std::byte*>(buffer.address), size});
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                std::uint32_t want = 0;
+                std::uint32_t got = 0;
+                std::memcpy(&want, expected.data() + (static_cast<std::size_t>(y) * Width + x) * 4u, 4u);
+                std::memcpy(&got, frame.pixels.data() + (static_cast<std::size_t>(y) * Width + x) * 4u, 4u);
+                // The scaler presents opaque: alpha is not compared.
+                if ((want & 0x00ffffffu) != (got & 0x00ffffffu)) {
+                    char message[160];
+                    std::snprintf(message, sizeof(message), "%s: pixel %u,%u is 0x%08x, the CPU decode gives 0x%08x", name, x, y, got, want);
+                    throw std::runtime_error(message);
+                }
+            }
+        }
+    };
+    struct Case {
+        const char* name;
+        std::uint64_t format;
+        std::uint32_t tiling;
+        std::uint32_t pitch;
+    };
+    const std::array<Case, 6> cases {{
+        {"B8G8R8A8 linear, pitch 320", 0x8000000000000000ull, 1u, 320u},
+        {"R8G8B8A8 tiled", 0x8000000022000000ull, 0u, 0u},
+        {"B8G8R8A8 10-bit tiled", 0x8100000000000000ull, 0u, 0u},
+        {"R8G8B8A8 10-bit linear", 0x8100000022000000ull, 1u, 0u},
+        {"R16G16B16A16 float tiled", 0xc001000622000000ull, 0u, 0u},
+        {"B16G16R16A16 float linear", 0xc001000600000000ull, 1u, 0u},
+    }};
+    const auto gpuBefore = AgcDriver::Metal::GpuDecodedPresents();
+    for (const auto& item : cases) {
+        const AgcDriver::DisplayBuffer probe{0x10000u, item.format, Width, Height, item.tiling, item.pitch};
+        const auto size = AgcDriver::DisplayBufferSize(probe);
+        DisplayBlock block(size);
+        for (std::size_t offset = 0; offset < size; offset += 8u) {
+            const auto value = next();
+            std::memcpy(block.Data() + offset, &value, std::min<std::size_t>(8u, size - offset));
+        }
+        const AgcDriver::DisplayBuffer buffer{block.Address(), item.format, Width, Height, item.tiling, item.pitch};
+        const auto decodedBefore = AgcDriver::Metal::GpuDecodedPresents();
+        const auto frame = present(buffer);
+        Require(AgcDriver::Metal::GpuDecodedPresents() == decodedBefore + 1u, std::string(item.name) + ": not decoded on the GPU");
+        compare(item.name, buffer, frame);
+        std::printf("decode: %s matches the CPU decode\n", item.name);
+    }
+    // A GPU fill recorded over the display buffer right before the flip: the decode follows it in
+    // queue order, with no CPU wait in between.
+    {
+        const AgcDriver::DisplayBuffer probe{0x10000u, 0x8000000000000000ull, Width, Height, 0u, 0u};
+        const auto size = AgcDriver::DisplayBufferSize(probe);
+        DisplayBlock block(size);
+        std::memset(block.Data(), 0x11, size);
+        const AgcDriver::DisplayBuffer buffer{block.Address(), probe.pixelFormat, Width, Height, 0u, 0u};
+        constexpr std::array<std::uint32_t, 4> pattern {0xff3366ccu, 0xff3366ccu, 0xff3366ccu, 0xff3366ccu};
+        Require(device.FillBuffer(buffer.address, size, pattern), "the display buffer fill was not recorded on the GPU (no host import)");
+        const auto ordered = AgcDriver::Graphics::Metal::GpuReadCounts().first;
+        const auto frame = present(buffer);
+        Require(AgcDriver::Graphics::Metal::GpuReadCounts().first == ordered + 1u, "the decode after a recorded fill waited on the CPU");
+        std::uint32_t corner = 0;
+        std::uint32_t center = 0;
+        std::memcpy(&corner, frame.pixels.data(), 4u);
+        std::memcpy(&center, frame.pixels.data() + (static_cast<std::size_t>(Height / 2u) * Width + Width / 2u) * 4u, 4u);
+        Require((corner & 0x00ffffffu) == 0x3366ccu && (center & 0x00ffffffu) == 0x3366ccu, "the decode read the display buffer before the recorded fill: " + std::to_string(corner) + " " + std::to_string(center));
+        compare("after a recorded fill", buffer, frame);
+        std::puts("decode: a recorded GPU fill is decoded in queue order");
+    }
+    // Memory outside every host import keeps the CPU decode.
+    {
+        const AgcDriver::DisplayBuffer probe{0x10000u, 0x8000000000000000ull, Width, Height, 1u, 0u};
+        const auto size = AgcDriver::DisplayBufferSize(probe);
+        auto* bytes = static_cast<std::byte*>(std::aligned_alloc(65536u, (size + 65535u) & ~std::size_t{65535u}));
+        Require(bytes != nullptr, "cannot allocate the unregistered display buffer");
+        std::unique_ptr<std::byte, decltype(&std::free)> owner(bytes, &std::free);
+        for (std::size_t offset = 0; offset < size; offset += 4u) {
+            const auto value = static_cast<std::uint32_t>(next());
+            std::memcpy(bytes + offset, &value, 4u);
+        }
+        const AgcDriver::DisplayBuffer buffer{reinterpret_cast<std::uint64_t>(bytes), probe.pixelFormat, Width, Height, 1u, 0u};
+        const auto cpuBefore = AgcDriver::Metal::CpuDecodedPresents();
+        const auto frame = present(buffer);
+        Require(AgcDriver::Metal::CpuDecodedPresents() == cpuBefore + 1u, "unimported memory was not decoded on the CPU");
+        compare("unimported (CPU decode)", buffer, frame);
+        std::puts("decode: unimported memory keeps the CPU decode");
+    }
+    Require(AgcDriver::Metal::GpuDecodedPresents() == gpuBefore + cases.size() + 1u, "GPU decodes were not counted");
+    std::puts("decode: GPU display decode passed");
+}
+
 void NoDrawableSize(void*, std::uint32_t* width, std::uint32_t* height) {
     *width = 64u;
     *height = 48u;
@@ -378,7 +618,7 @@ int main(int argc, char** argv) {
     static int windowToken = 0;
     AgcDriver::PresentationWindow window {&windowToken, {}, nullptr, &NoDrawableSize, 64u, 48u, nullptr};
     try {
-        device = mode == "offscreen" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
+        device = mode == "offscreen" || mode == "metalfx" || mode == "decode" ? std::make_unique<AgcDriver::VulkanDevice>(&window) : std::make_unique<AgcDriver::VulkanDevice>();
     } catch (const std::exception& error) {
         std::printf("skipped, no usable Metal device: %s\n", error.what());
         return Skipped;
@@ -390,6 +630,10 @@ int main(int argc, char** argv) {
             CheckPrimitives(*device);
         } else if (mode == "offscreen") {
             CheckOffscreen(*device);
+        } else if (mode == "metalfx") {
+            CheckMetalFx(*device);
+        } else if (mode == "decode") {
+            CheckGpuDecode(*device);
         } else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;

@@ -16,8 +16,8 @@
 
 namespace AgcDriver::Graphics::Metal {
 
-id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRequest& request) {
-    @autoreleasepool {
+MTL4PipelineDescriptor* PipelineCache::meshDescriptor(const RenderPipelineRequest& request) {
+    {
         if (request.depthFormat != MTLPixelFormatInvalid && request.stencilFormat != MTLPixelFormatInvalid && request.stencilFormat != request.depthFormat) {
             throw std::runtime_error("Metal pipeline cache (work package D5): separate depth and stencil formats are not supported");
         }
@@ -52,15 +52,12 @@ id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRe
         if (request.meshThreads != 0u) descriptor.maxTotalThreadsPerMeshThreadgroup = request.meshThreads;
         // An object stage launches at most meshGroups mesh threadgroups per object threadgroup.
         descriptor.maxTotalThreadgroupsPerMeshGrid = request.object ? request.meshGroups : MaxMeshThreadgroupsPerGrid;
-        NSError* error = nil;
-        id<MTLRenderPipelineState> pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
-        if (pipeline == nil) throw std::runtime_error("Metal device: mesh render pipeline creation failed: " + std::string(error != nil ? error.localizedDescription.UTF8String : "unknown error"));
-        {
-            std::lock_guard lock(mutex);
-            ++statistics.pipelinesCompiled;
-        }
-        return pipeline;
+        return descriptor;
     }
+}
+
+id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRequest& request) {
+    return obtainRender([this, request] { return meshDescriptor(request); }, "a mesh render pipeline");
 }
 
 }

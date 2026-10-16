@@ -127,7 +127,7 @@ static int CreateRack(Ngs2Handle systemHandle, std::uint32_t rackId, const RackO
     }
     if (rackId == SCE_NGS2_RACK_ID_CUSTOM_SUBMIXER) Ngs2SetupUserFx(*rack, options.customSubmixer.custom_rack_option);
     system->racks.push_back(rack);
-    *handle = reinterpret_cast<Ngs2Handle>(rack);
+    *Ngs2Host(handle, sizeof(*handle)) = Ngs2GuestHandle(rack);
     return SCE_NGS2_OK;
 }
 
@@ -165,7 +165,7 @@ int APS5_VABI sceNgs2RackCreate(uintptr_t system_handle, uint32_t rack_id, const
     const auto options = CheckedRackOption(rack_id, option);
     if (buffer_info == nullptr) APS5_INVALID_ARG_EX;
     std::lock_guard lock(Ngs2Mutex());
-    return CreateRack(system_handle, rack_id, options, *buffer_info, {}, handle);
+    return CreateRack(system_handle, rack_id, options, *Ngs2Host(buffer_info, sizeof(*buffer_info)), {}, handle);
 }
 
 int APS5_VABI sceNgs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t rack_id, const Ngs2RackOption* option, const Ngs2BufferAllocator* allocator, uintptr_t* handle) {
@@ -196,7 +196,7 @@ int APS5_VABI sceNgs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_id
     auto* rack = Ngs2FindRack(rack_handle);
     if (rack == nullptr) return SCE_NGS2_ERROR_INVALID_RACK_HANDLE;
     if (voice_id >= rack->voices.size()) APS5_INVALID_ARG_EX;
-    *handle = reinterpret_cast<Ngs2Handle>(&rack->voices[voice_id]);
+    *Ngs2Host(handle, sizeof(*handle)) = reinterpret_cast<Ngs2Handle>(&rack->voices[voice_id]);
     return SCE_NGS2_OK;
 }
 
@@ -210,7 +210,7 @@ int APS5_VABI sceNgs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, size
     std::memcpy(info->name, rack->name, sizeof(info->name));
     info->rack_handle = rack_handle;
     info->buffer_info = rack->bufferInfo;
-    info->owner_system_handle = reinterpret_cast<Ngs2Handle>(rack->system);
+    info->owner_system_handle = Ngs2GuestHandle(rack->system);
     info->type = rack->rackId >> 12;
     info->rack_id = rack->rackId;
     info->uid = rack->uid;

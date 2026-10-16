@@ -12,6 +12,7 @@
 #include <string>
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
 #include "prx/libc/include/X87Extended.hpp"
 
@@ -103,29 +104,37 @@ TFloat ParseFloat(const char* text, char** end, TFloat (*parse)(const char*, cha
 
 extern "C" {
 
+// The bulk string and memory exports run host code over guest pointers: a displaced guest range (D31, D33) is
+// translated to its alias up front (GuestArena::HostRange), never left to the per-access fault path. They return the
+// guest's own pointers.
 void* APS5_VABI memset_nid_postfix(void* s, int c, size_t n) {
     // APS5_LOG_OUT("s=%p c=%d n=%zu", s, c, n);
-    return std::memset(s, c, n);
+    std::memset(GuestArena::HostRange(s, n), c, n);
+    return s;
 }
 
 void APS5_VABI bzero_nid_postfix(void* destination, size_t count) {
-    std::memset(destination, 0, count);
+    std::memset(GuestArena::HostRange(destination, count), 0, count);
 }
 
 void* APS5_VABI memcpy_nid_postfix(void* dest, const void* src, size_t n) {
-    return std::memcpy(dest, src, n);
+    std::memcpy(GuestArena::HostRange(dest, n), GuestArena::HostRange(src, n), n);
+    return dest;
 }
 
 void* APS5_VABI memmove_nid_postfix(void* dest, const void* src, size_t n) {
-    return std::memmove(dest, src, n);
+    std::memmove(GuestArena::HostRange(dest, n), GuestArena::HostRange(src, n), n);
+    return dest;
 }
 
 int APS5_VABI memcmp_nid_postfix(const void* s1, const void* s2, size_t n) {
-    return std::memcmp(s1, s2, n);
+    return std::memcmp(GuestArena::HostRange(s1, n), GuestArena::HostRange(s2, n), n);
 }
 
 const void* APS5_VABI memchr_nid_postfix(const void* s, int c, size_t n) {
-    return std::memchr(s, c, n);
+    const auto* host = static_cast<const unsigned char*>(GuestArena::HostPointer(s)); // n may overstate the buffer (stops at c)
+    const void* found = std::memchr(host, c, n);
+    return found == nullptr ? nullptr : static_cast<const unsigned char*>(s) + (static_cast<const unsigned char*>(found) - host);
 }
 
 void* APS5_VABI memrchr_nid_postfix(const void* s, int c, size_t n) {
@@ -139,23 +148,25 @@ void* APS5_VABI memrchr_nid_postfix(const void* s, int c, size_t n) {
 }
 
 int APS5_VABI strcmp_nid_postfix(const char* s1, const char* s2) {
-    return std::strcmp(s1, s2);
+    return std::strcmp(GuestArena::HostPointer(s1), GuestArena::HostPointer(s2));
 }
 
 int APS5_VABI strncmp_nid_postfix(const char* s1, const char* s2, size_t n) {
-    return std::strncmp(s1, s2, n);
+    return std::strncmp(GuestArena::HostPointer(s1), GuestArena::HostPointer(s2), n);
 }
 
 size_t APS5_VABI strlen_nid_postfix(const char* s) {
-    return std::strlen(s);
+    return std::strlen(GuestArena::HostPointer(s));
 }
 
 char* APS5_VABI strcpy_nid_postfix(char* dest, const char* src) {
-    return std::strcpy(dest, src);
+    std::strcpy(GuestArena::HostPointer(dest), GuestArena::HostPointer(src));
+    return dest;
 }
 
 char* APS5_VABI strncpy_nid_postfix(char* dest, const char* src, size_t count) {
-    return std::strncpy(dest, src, count);
+    std::strncpy(GuestArena::HostRange(dest, count), GuestArena::HostPointer(src), count);
+    return dest;
 }
 
 char* APS5_VABI strcat_nid_postfix(char* dest, const char* src) {
@@ -277,12 +288,12 @@ int APS5_VABI wmemcmp_nid_postfix(const char16_t* s1, const char16_t* s2, size_t
 }
 
 char16_t* APS5_VABI wmemcpy_nid_postfix(char16_t* dest, const char16_t* src, size_t n) {
-    if (n != 0) std::memcpy(dest, src, n * sizeof(char16_t));
+    if (n != 0) std::memcpy(GuestArena::HostRange(dest, n * sizeof(char16_t)), GuestArena::HostRange(src, n * sizeof(char16_t)), n * sizeof(char16_t));
     return dest;
 }
 
 char16_t* APS5_VABI wmemmove_nid_postfix(char16_t* dest, const char16_t* src, size_t n) {
-    if (n != 0) std::memmove(dest, src, n * sizeof(char16_t));
+    if (n != 0) std::memmove(GuestArena::HostRange(dest, n * sizeof(char16_t)), GuestArena::HostRange(src, n * sizeof(char16_t)), n * sizeof(char16_t));
     return dest;
 }
 
@@ -310,7 +321,7 @@ int APS5_VABI strncasecmp_nid_postfix(const char* s1, const char* s2, size_t n) 
 }
 
 int APS5_VABI bcmp_nid_postfix(const void* s1, const void* s2, size_t n) {
-    return std::memcmp(s1, s2, n);
+    return std::memcmp(GuestArena::HostRange(s1, n), GuestArena::HostRange(s2, n), n);
 }
 
 size_t APS5_VABI strspn_nid_postfix(const char* s, const char* accept) {
@@ -318,7 +329,7 @@ size_t APS5_VABI strspn_nid_postfix(const char* s, const char* accept) {
 }
 
 int APS5_VABI strcoll_nid_postfix(const char* s1, const char* s2) {
-    return std::strcmp(s1, s2);
+    return std::strcmp(GuestArena::HostPointer(s1), GuestArena::HostPointer(s2));
 }
 
 int APS5_VABI strncpy_s_nid_postfix(char* dest, size_t destsz, const char* src, size_t count) {

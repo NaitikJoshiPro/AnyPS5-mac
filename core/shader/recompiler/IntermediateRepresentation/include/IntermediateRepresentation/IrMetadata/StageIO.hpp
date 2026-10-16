@@ -48,6 +48,22 @@ enum class StageInputKind {
     LayerExported,
 };
 
+// The I/J pair (SPI_PS_INPUT_ADDR PERSP/LINEAR_CENTER, _CENTROID, _SAMPLE) one interpolated pixel
+// read uses, carried per instruction (DECISIONS D38) in the IrValue flags of pixel GetAttribute
+// values (host interpolation) and of BaryCoordSmooth/BaryCoordNoPerspective GetBuiltin values
+// (emulated barycentrics) as InterpolationLocationFlag | location. Flags without the bit: the pixel
+// center for barycentrics, the program's per-input metadata for attributes.
+enum class InterpolationLocation : std::uint32_t {
+    Center = 0,
+    Centroid = 1,
+    Sample = 2,
+};
+inline constexpr std::uint32_t InterpolationLocationFlag = 0x100u;
+
+inline constexpr std::uint32_t InterpolationLocationFlags(InterpolationLocation location) {
+    return InterpolationLocationFlag | static_cast<std::uint32_t>(location);
+}
+
 enum class StageOutputKind {
     Position,
     Parameter,

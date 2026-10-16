@@ -8,6 +8,8 @@
 // APS5_PER_VERTEX_LOCATIONS, APS5_BARYCENTRICS from the fragment reflection, APS5_CONSERVATIVE off
 // and on) into a render pipeline, which checks that the user() outputs and inputs match. The
 // rendering itself is checked by agc_driver_pixel_barycentric_emulation and agc_driver_interpolation_f16.
+// MslAbi Version 14 (DECISIONS D69): the vertex function also links for points and lines
+// (APS5_PRIMITIVE_VERTICES 1 and 2).
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -63,6 +65,15 @@ alignas(256) constexpr std::array<std::uint32_t, 6> VertexValuePixelCode{
 alignas(256) constexpr std::array<std::uint32_t, 5> InterpolatedPixelCode{
     0xc8080000, 0xc8090001, 0xf800180f, 0x02020202, 0xbf810000,
 };
+// DECISIONS D38, one input at several locations (llvm-mc -arch=amdgcn -mcpu=gfx1030): v_interp_p1/p2
+// of input 0 over the sample, center and centroid pairs (v[0:1], v[2:3], v[4:5]), exported.
+alignas(256) constexpr std::array<std::uint32_t, 9> ThreeLocationsPixelCode{
+    0xc8180000u, 0xc8190001u, 0xc81c0002u, 0xc81d0003u, 0xc8200004u, 0xc8210005u, 0xf800180fu, 0x07080706u, 0xbf810000u,
+};
+// Exports two I/J pairs (exact barycentrics at the first two enabled locations): exp mrt0 v0, v1, v2, v3.
+alignas(256) constexpr std::array<std::uint32_t, 3> TwoPairsPixelCode{
+    0xf800180fu, 0x03020100u, 0xbf810000u,
+};
 // tests/execution/InterpolationF16.cpp: 16-bit interpolation (v_interp_p1ll/p1lv/p2_f16) of an
 // FP16_INTERP_MODE input, results stored to a buffer.
 alignas(256) constexpr std::array<std::uint32_t, 47> F16PixelCode{
@@ -111,6 +122,9 @@ struct PixelCase {
     // MslAbi Version 9 (DECISIONS D28): the qualifier of host-interpolated input 0, by the I/J pair
     // the program's v_interp_p2 reads (empty: not checked).
     const char* qualifier = "";
+    // DECISIONS D38: the input (host) or the weights (emulated) are read at several locations,
+    // through interpolant<> (pull-model interpolation) instead of a qualifier.
+    bool pullModel = false;
 };
 
 ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTarget& target, const PixelCase& test, std::uint32_t vertexPush) {
@@ -176,17 +190,20 @@ NSString* Decimal(std::uint64_t value) {
     return [NSString stringWithFormat:@"%llu", static_cast<unsigned long long>(value)];
 }
 
-void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, std::uint32_t conservative, MTLPixelFormat format) {
+void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, std::uint32_t conservative, MTLPixelFormat format, std::uint32_t primitiveVertices = 3u) {
     const auto& fragment = pixel.msl.Reflection();
     const auto& vertexReflection = vertex.msl.Reflection();
-    const auto what = name + (conservative != 0u ? " (conservative)" : "");
-    id<MTLFunction> vertexFunction = Compile(device, what + " vertex", vertex, @{
+    const auto what = name + (conservative != 0u ? " (conservative)" : "") + (primitiveVertices == 1u ? " (points)" : primitiveVertices == 2u ? " (lines)" : "");
+    NSMutableDictionary<NSString*, NSObject*>* vertexMacros = [@{
         @(Abi::TriangleVerticesMacro): @"1",
         @(Abi::PerVertexLocationsMacro): Decimal(fragment.perVertexLocations & 0xffffffffu),
         @(Abi::PerVertexLocationsHighMacro): Decimal(fragment.perVertexLocations >> 32u),
         @(Abi::BarycentricsMacro): Decimal(fragment.emulatedBarycentrics),
         @(Abi::ConservativeMacro): Decimal(conservative),
-    });
+    } mutableCopy];
+    // MslAbi Version 14 (DECISIONS D69): points and lines take one or two guest vertices per primitive.
+    if (primitiveVertices != 3u) vertexMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
+    id<MTLFunction> vertexFunction = Compile(device, what + " vertex", vertex, vertexMacros);
     id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, @{
         @(Abi::VertexOutputsMacro): Decimal(vertexReflection.outputLocations & 0xffffffffu),
         @(Abi::VertexOutputsHighMacro): Decimal(vertexReflection.outputLocations >> 32u),
@@ -218,8 +235,18 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
             Require(Has(source, "float4 " + field + " [[user(aps5_" + field + "), flat]]"), name + ": no flat fragment input " + field);
         }
     }
-    Require(Has(source, "aps5_bw [[user(aps5_bw), center_perspective]]") == ((test.barycentrics & 1u) != 0u), name + ": perspective weights input does not match the reflection");
-    Require(Has(source, "aps5_bwl [[user(aps5_bwl), center_no_perspective]]") == ((test.barycentrics & 2u) != 0u), name + ": linear weights input does not match the reflection");
+    if (test.pullModel && test.barycentrics != 0u) {
+        Require(Has(source, "interpolant<float3, interpolation::perspective> aps5_bw [[user(aps5_bw)]]") == ((test.barycentrics & 1u) != 0u), name + ": perspective weights are not an interpolant");
+        Require(Has(source, "aps5_in.aps5_bw.interpolate_at_sample(aps5_sample_id)") && Has(source, "aps5_in.aps5_bw.interpolate_at_center()"), name + ": the weights are not read at the sample and the center");
+    } else {
+        Require(Has(source, "aps5_bw [[user(aps5_bw), center_perspective]]") == ((test.barycentrics & 1u) != 0u), name + ": perspective weights input does not match the reflection");
+        Require(Has(source, "aps5_bwl [[user(aps5_bwl), center_no_perspective]]") == ((test.barycentrics & 2u) != 0u), name + ": linear weights input does not match the reflection");
+    }
+    if (test.pullModel && test.barycentrics == 0u) {
+        Require(Has(source, "interpolant<float4, interpolation::perspective> p0 [[user(locn0)]]"), name + ": input 0 is not an interpolant");
+        for (const char* read : {".interpolate_at_sample(aps5_sample_id)", ".interpolate_at_center()", ".interpolate_at_centroid()"}) Require(Has(source, std::string("aps5_in.p0") + read), name + ": input 0 has no " + read + " read");
+    }
+    if (test.pullModel) Require(reflection.perSample && Has(source, "[[sample_id]]"), name + ": a read at the sample does not run per sample");
     if (test.alphaToCoverage) {
         // Alpha to coverage starts from full coverage (SPIR-V: StoreCoverage(-1)); only a float MRT0
         // export lowers it, so a uint export must keep every sample.
@@ -233,6 +260,8 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     const auto format = test.outputMode == 7u ? MTLPixelFormatRGBA32Uint : MTLPixelFormatRGBA32Float;
     Link(device, name, vertex, pixel, 0u, format);
     Link(device, name, vertex, pixel, 1u, format);
+    Link(device, name, vertex, pixel, 0u, format, 1u);
+    Link(device, name, vertex, pixel, 0u, format, 2u);
     std::printf("%s: per-vertex locations 0x%llx, barycentrics %u, linked in the triangle-vertices mode\n", test.name, static_cast<unsigned long long>(reflection.perVertexLocations), reflection.emulatedBarycentrics);
 }
 
@@ -252,10 +281,12 @@ int main() {
             const auto vertex = RecompileVertex(target);
             const auto& vertexSource = vertex.msl.Source();
             Require(Has(std::string(vertexSource), "#elif defined(APS5_TRIANGLE_VERTICES) && APS5_TRIANGLE_VERTICES") && Has(std::string(vertexSource), "[[buffer(" + std::to_string(Abi::Index(Abi::BufferIndex::TriangleVertices)) + ")]]"), "the vertex function has no triangle-vertices mode");
+            Require(Has(std::string(vertexSource), std::string("#ifndef ") + Abi::PrimitiveVerticesMacro) && Has(std::string(vertexSource), std::string("aps5_vertex_id / ") + Abi::PrimitiveVerticesMacro), "the triangle-vertices mode does not take the primitive's vertex count (points and lines)");
             const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
             const auto linear = PixelInputBit(PixelInput::LinearCenter);
             const auto position = PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY);
-            const std::array<PixelCase, 13> cases{{
+            const auto threeLocations = PixelInputBit(PixelInput::PerspectiveSample) | perspective | PixelInputBit(PixelInput::PerspectiveCentroid);
+            const std::array<PixelCase, 15> cases{{
                 {"perspective I/J", BarycentricPixelCode, perspective, false, 64u, 0u, 1u},
                 {"linear I/J", BarycentricPixelCode, linear, false, 64u, 0u, 2u},
                 {"v_interp_mov P10/P20/P0", VertexValuePixelCode, perspective, false, 64u, 1u, 0u},
@@ -271,6 +302,10 @@ int main() {
                 {"host v_interp at the sample (LINEAR_SAMPLE)", InterpolatedPixelCode, PixelInputBit(PixelInput::LinearSample), false, 64u, 0u, 0u, false, 9u, "sample_no_perspective"},
                 {"host v_interp at the centroid (PERSP_CENTROID)", InterpolatedPixelCode, PixelInputBit(PixelInput::PerspectiveCentroid), false, 64u, 0u, 0u, false, 9u, "centroid_perspective"},
                 {"host v_interp at the centroid (LINEAR_CENTROID)", InterpolatedPixelCode, PixelInputBit(PixelInput::LinearCentroid), false, 64u, 0u, 0u, false, 9u, "centroid_no_perspective"},
+                // DECISIONS D38: input 0 at the sample, center and centroid (interpolant<>), and the
+                // exact sample and center I/J (emulated weights as an interpolant<>).
+                {"host v_interp at sample, center and centroid", ThreeLocationsPixelCode, threeLocations, false, 64u, 0u, 0u, false, 9u, "", true},
+                {"exact I/J at the sample and the center", TwoPairsPixelCode, PixelInputBit(PixelInput::PerspectiveSample) | perspective, false, 64u, 0u, 1u, false, 9u, "", true},
             }};
             for (const auto& test : cases) Check(metal, target, vertex, test);
         }

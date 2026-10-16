@@ -152,6 +152,53 @@ void DontNeedZeroes() {
 
 }
 
+// Displaced-access stub chunks must be within branch range of the JIT site: AllocateNear takes the free range nearest
+// the pc (not the first one), splits it around the allocation and refuses beyond the reach.
+void Nearest() {
+    CodePool pool(64 * CodePool::Granule);
+    const auto granule = CodePool::Granule;
+    void* low = pool.Allocate(8 * granule); // [0, 8): the first free range is now [8, 64)
+    const auto pc = reinterpret_cast<std::uintptr_t>(pool.Code()) + 40 * granule + 12;
+    void* near = pool.AllocateNear(pc, granule, 64 * granule);
+    Require(At(near) == pool.Code() + 40 * granule); // inside the free range, at pc's granule
+    Require(pool.FreeRanges() == 2);                  // [8, 40) and [41, 64)
+    Require(pool.Used() == 9 * granule);
+    void* after = pool.AllocateNear(pc, granule, 64 * granule);
+    Require(At(after) == pool.Code() + 41 * granule || At(after) == pool.Code() + 39 * granule);
+    Require(pool.AllocateNear(pc, 60 * granule, 64 * granule) == nullptr);             // no free range that large
+    Require(pool.AllocateNear(reinterpret_cast<std::uintptr_t>(pool.Code()), granule, granule) == nullptr); // free space beyond the reach
+    Require(pool.AllocateNear(0x1000, granule, 64 * granule) == nullptr);               // pc outside the pool
+    Require(pool.Free(near, granule) && pool.Free(after, granule) && pool.Free(low, 8 * granule));
+    Require(pool.FreeRanges() == 1 && pool.Used() == 0);
+}
+
+// Displaced-access sites (libc GuestDisplaced) are released with the code that holds them: Free reports every range
+// to the listener, with the rounded length, before the range can be allocated again.
+std::uintptr_t listenedStart = 0, listenedEnd = 0;
+std::size_t listened = 0;
+std::size_t Listener(std::uintptr_t start, std::uintptr_t end) {
+    listenedStart = start;
+    listenedEnd = end;
+    ++listened;
+    return 0;
+}
+
+void FreeListener() {
+    CodePool pool(16 * CodePool::Granule);
+    CodePool::SetFreeListener(&Listener);
+    void* buffer = pool.Allocate(3 * CodePool::Granule - 100);
+    Require(listened == 0);
+    Require(pool.Free(buffer, 3 * CodePool::Granule - 100));
+    Require(listened == 1 && listenedStart == reinterpret_cast<std::uintptr_t>(buffer) &&
+            listenedEnd == reinterpret_cast<std::uintptr_t>(buffer) + 3 * CodePool::Granule);
+    int outside = 0;
+    Require(!pool.Free(&outside, 4)); // not pool memory: not reported
+    Require(listened == 1);
+    CodePool::SetFreeListener(nullptr);
+    void* again = pool.Allocate(CodePool::Granule);
+    Require(pool.Free(again, CodePool::Granule) && listened == 1);
+}
+
 int main() {
     Granularity();
     DualMapping();
@@ -161,6 +208,8 @@ int main() {
     Exhaustion();
     Threads();
     DontNeedZeroes();
+    Nearest();
+    FreeListener();
     std::puts("code pool: all checks passed");
     return 0;
 }

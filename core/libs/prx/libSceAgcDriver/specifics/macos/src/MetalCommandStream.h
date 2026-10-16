@@ -34,6 +34,13 @@
 
 namespace AgcDriver::Graphics::Metal {
 
+// Whether a pair of resolved MTL4 timestamps measures a range: both written (an entry the GPU never
+// wrote reads MTLCounterErrorValue, all ones; a zero is no time either) and in order (D59).
+inline bool TimestampPairValid(std::uint64_t begin, std::uint64_t end) {
+    constexpr std::uint64_t unwritten = ~std::uint64_t{0};
+    return begin != 0u && begin != unwritten && end != unwritten && end >= begin;
+}
+
 [[noreturn]] inline void Fail(const std::string& what) {
     throw std::runtime_error("Metal recorder (work package D2): " + what);
 }

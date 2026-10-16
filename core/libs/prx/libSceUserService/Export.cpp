@@ -2,9 +2,11 @@
 #include <cstdint>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <atomic>
 #include <cstring>
 #include "prx/libSceUserService/UserService.hpp"
+#include "prx/libc/include/ConsoleSettings.hpp"
 
 static int ReportAccessibilitySetting(int user_id, int32_t* setting, int32_t value) {
  if (user_id != USER_SERVICE_INITIAL_USER_ID) {
@@ -13,7 +15,7 @@ static int ReportAccessibilitySetting(int user_id, int32_t* setting, int32_t val
  if (setting == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- *setting = value;
+ *GuestArena::HostPointer(setting) = value;
  return USER_SERVICE_OK;
 }
 
@@ -51,7 +53,7 @@ int APS5_VABI sceUserServiceGetAgeLevel(int user_id, uint32_t* age_level) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
  constexpr std::uint32_t Unrestricted = 0xFFFFFFFFu;
- *age_level = Unrestricted;
+ *GuestArena::HostPointer(age_level) = Unrestricted;
  return USER_SERVICE_OK;
 }
 
@@ -65,26 +67,42 @@ int APS5_VABI sceUserServiceGetEvent(SceUserServiceEvent* event) {
   return USER_SERVICE_ERROR_NO_EVENT;
  }
  constexpr std::uint32_t EventTypeLogin = 0;
- event->event_type = EventTypeLogin;
- event->user_id = USER_SERVICE_INITIAL_USER_ID;
+ GuestArena::HostPointer(event)->event_type = EventTypeLogin;
+ GuestArena::HostPointer(event)->user_id = USER_SERVICE_INITIAL_USER_ID;
  return USER_SERVICE_OK;
 }
 
 int APS5_VABI sceUserServiceGetGamePresets(int user_id, UserServiceGamePresets* presets) {
- // System-wide game presets (difficulty, view inversion, subtitles, audio language) of the user's
- // profile. A fresh console has none set: every field is 0, "not specified", and the title falls
- // back to its own defaults. this_size is the caller's.
+ // System-wide game presets of the user's profile (Settings > Saved Data and Game/App Settings > Game Presets).
+ // Difficulty, view inversion, subtitles and audio language are "not specified" (0): the title keeps its own
+ // defaults. priority is the "Performance Mode or Resolution Mode" preset, APS5_GAME_PRESET (performance by
+ // default, D68). this_size is the caller's: only the fields inside it are written (Ghost of Yotei passes 48).
  if (presets == nullptr || user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- presets->difficulty = 0;
- presets->priority = 0;
- presets->invert_vertical_view_for_1st_person_view = 0;
- presets->invert_horizontal_view_for_1st_person_view = 0;
- presets->invert_vertical_view_for_3rd_person_view = 0;
- presets->invert_horizontal_view_for_3rd_person_view = 0;
- presets->display_sub_titles = 0;
- presets->audio_language = 0;
+ auto* host = GuestArena::HostPointer(presets);
+ const std::size_t extent = host->this_size;
+ if (extent < offsetof(UserServiceGamePresets, difficulty)) {
+  return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+ }
+ const std::uint32_t priority = ConsoleGamePresetPriority();
+ const struct {
+  std::size_t offset;
+  std::uint32_t value;
+ } fields[] = {
+  {offsetof(UserServiceGamePresets, difficulty), 0},
+  {offsetof(UserServiceGamePresets, priority), priority},
+  {offsetof(UserServiceGamePresets, invert_vertical_view_for_1st_person_view), 0},
+  {offsetof(UserServiceGamePresets, invert_horizontal_view_for_1st_person_view), 0},
+  {offsetof(UserServiceGamePresets, invert_vertical_view_for_3rd_person_view), 0},
+  {offsetof(UserServiceGamePresets, invert_horizontal_view_for_3rd_person_view), 0},
+  {offsetof(UserServiceGamePresets, display_sub_titles), 0},
+  {offsetof(UserServiceGamePresets, audio_language), 0},
+ };
+ for (const auto& field : fields) {
+  if (field.offset + sizeof(std::uint32_t) <= extent) std::memcpy(reinterpret_cast<std::byte*>(host) + field.offset, &field.value, sizeof(field.value));
+ }
+ SystemQueryTrace("userservice", "GetGamePresets(user %d, this_size %zu): priority %u (%s)", user_id, extent, priority, priority == ConsoleGamePresetPriorityPerformance ? "performance" : "game default");
  return USER_SERVICE_OK;
 }
 
@@ -92,7 +110,7 @@ int APS5_VABI sceUserServiceGetInitialUser(int* user_id) {
  if (user_id == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- *user_id = USER_SERVICE_INITIAL_USER_ID;
+ *GuestArena::HostPointer(user_id) = USER_SERVICE_INITIAL_USER_ID;
  return USER_SERVICE_OK;
 }
 
@@ -100,10 +118,10 @@ int APS5_VABI sceUserServiceGetLoginUserIdList(UserServiceLoginUserIdList* user_
  if (user_id_list == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- user_id_list->user_id[0] = USER_SERVICE_INITIAL_USER_ID;
- user_id_list->user_id[1] = USER_SERVICE_USER_ID_INVALID;
- user_id_list->user_id[2] = USER_SERVICE_USER_ID_INVALID;
- user_id_list->user_id[3] = USER_SERVICE_USER_ID_INVALID;
+ GuestArena::HostPointer(user_id_list)->user_id[0] = USER_SERVICE_INITIAL_USER_ID;
+ GuestArena::HostPointer(user_id_list)->user_id[1] = USER_SERVICE_USER_ID_INVALID;
+ GuestArena::HostPointer(user_id_list)->user_id[2] = USER_SERVICE_USER_ID_INVALID;
+ GuestArena::HostPointer(user_id_list)->user_id[3] = USER_SERVICE_USER_ID_INVALID;
  return USER_SERVICE_OK;
 }
 
@@ -115,10 +133,10 @@ int APS5_VABI sceUserServiceGetUserName(int user_id, char* name, size_t size) {
   return USER_SERVICE_ERROR_UNKNOWN_USER;
  }
  if (size < USER_SERVICE_MAX_USER_NAME_LENGTH + 1) {
-  std::memset(name, 0, size);
+  std::memset(GuestArena::HostRange(name, size), 0, size); // may be displaced guest memory (D31, D33)
   return USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
  }
- std::strncpy(name, USER_SERVICE_INITIAL_USER_NAME, size);
+ std::strncpy(GuestArena::HostRange(name, size), USER_SERVICE_INITIAL_USER_NAME, size);
  return USER_SERVICE_OK;
 }
 
@@ -126,7 +144,7 @@ int APS5_VABI sceUserServiceGetUserNumber(int user_id, int32_t* number) {
  if (number == nullptr || user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- *number = 1;
+ *GuestArena::HostPointer(number) = 1;
  return USER_SERVICE_OK;
 }
 
@@ -147,7 +165,7 @@ int APS5_VABI sceUserServiceTerminate(void) {
 int APS5_VABI sceUserServiceGetPlatformPrivacyWs1(int32_t user_id, int32_t* value) {
     (void)user_id;
     if (!value) return USER_SERVICE_ERROR_INVALID_ARGUMENT;
-    *value = 0;
+    *GuestArena::HostPointer(value) = 0;
     return 0;
 }
 
@@ -155,7 +173,7 @@ int APS5_VABI sceUserServiceGetForegroundUser(int* user_id) {
  if (user_id == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- *user_id = USER_SERVICE_INITIAL_USER_ID;
+ *GuestArena::HostPointer(user_id) = USER_SERVICE_INITIAL_USER_ID;
  return USER_SERVICE_OK;
 }
 
@@ -163,9 +181,9 @@ int APS5_VABI sceUserServiceGetRegisteredUserIdList(UserServiceRegisteredUserIdL
  if (user_id_list == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- user_id_list->user_id[0] = USER_SERVICE_INITIAL_USER_ID;
+ GuestArena::HostPointer(user_id_list)->user_id[0] = USER_SERVICE_INITIAL_USER_ID;
  for (int i = 1; i < 16; ++i) {
-  user_id_list->user_id[i] = USER_SERVICE_USER_ID_INVALID;
+  GuestArena::HostPointer(user_id_list)->user_id[i] = USER_SERVICE_USER_ID_INVALID;
  }
  return USER_SERVICE_OK;
 }
@@ -174,7 +192,7 @@ int APS5_VABI sceUserServiceGetUserColor(int user_id, int* color) {
  if (color == nullptr || user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- *color = 0;
+ *GuestArena::HostPointer(color) = 0;
  return USER_SERVICE_OK;
 }
 
@@ -182,7 +200,7 @@ int APS5_VABI sceUserServiceGetNpAccountId(int user_id, uint64_t* account_id) {
  if (account_id == nullptr || user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- *account_id = 0;
+ *GuestArena::HostPointer(account_id) = 0;
  return USER_SERVICE_OK;
 }
 

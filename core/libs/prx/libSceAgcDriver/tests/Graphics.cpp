@@ -703,6 +703,28 @@ void NggVertexWorkgroupTests() {
     queue.userConfig[0x242] = 6;
     mesh = *AgcDriver::Graphics::DecodeState(queue, true).stages.mesh;
     Require(mesh.primitivesPerGroup == 126 && mesh.verticesPerGroup == 128 && mesh.maxPrimitives == 128, "the NGG vertex subgroup of a triangle strip is not bounded by its vertex budget");
+    // DECISIONS D41: radeonsi's u_blitter rect list through an NGG vertex program (SuperTuxKart,
+    // VGT_SHADER_STAGES_EN 0x412010, GS_OUT_PRIM_TYPE RECTLIST) takes the mesh path as a rect list.
+    queue.userConfig[0x242] = 17;
+    queue.context[0x29b] = 3;
+    queue.context[0x2d5] = 0x412010;
+    state = AgcDriver::Graphics::DecodeState(queue, true);
+    Require(state.stages.mesh && state.stages.mesh->inputPrimitive == 17 && state.rectList && state.cullMode == VK_CULL_MODE_NONE && !state.primitiveRestart, "an NGG rect list did not decode as a mesh rect list");
+    Require(state.stages.mesh->primitivesPerGroup == 42 && state.stages.mesh->verticesPerGroup == 126, "the NGG rect-list subgroup changed");
+    queue.userConfig[0x25b] = (256u << 9u) | 128u;
+    queue.context[0x1ff] = 256;
+    mesh = *AgcDriver::Graphics::DecodeState(queue, true).stages.mesh;
+    Require(mesh.primitivesPerGroup == 64 && mesh.verticesPerGroup == 192, "a rect-list subgroup is not capped at 64 rects (Metal's 256 mesh vertices with one more per rect)");
+    queue.userConfig[0x25b] = 0x10080;
+    queue.context[0x1ff] = 0x80;
+    queue.context[0x29b] = 2;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE 17, VGT_GS_OUT_PRIM_TYPE 2");
+    queue.userConfig[0x242] = 4;
+    queue.context[0x29b] = 3;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE 4, VGT_GS_OUT_PRIM_TYPE 3");
+    queue.userConfig[0x242] = 6;
+    queue.context[0x29b] = 2;
+    queue.context[0x2d5] = 0x12010;
     queue.shader[0x8a] = 0x222c0005;
     queue.shader[0x8b] = 0x400030;
     Require(AgcDriver::Graphics::DecodeState(queue, true).stages.mesh.has_value(), "an NGG vertex program that loads only its vertex ID was rejected");
@@ -2491,7 +2513,43 @@ void InitialContextTests() {
         queue.context[0x206] = control;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
     }
+    // Window-space positions (radeonsi window_space_position shaders): VTX_XY_FMT | VTX_Z_FMT, no
+    // viewport transform; the viewport becomes the render area with depth [0, 1] and clipping may be off.
+    queue.context[0x206] = 0x300;
+    const std::uint32_t clipControl = queue.context.at(0x204);
+    for (const std::uint32_t clip : {clipControl, clipControl | 0x10000u}) {
+        queue.context[0x204] = clip;
+        const auto window = AgcDriver::Graphics::DecodeState(queue);
+        Require(window.windowSpacePosition && !window.negativeOneToOne, "window-space positions were not decoded");
+        Require(window.viewport.x == 0.0f && window.viewport.y == 0.0f && window.viewport.width == static_cast<float>(window.renderExtent.width) && window.viewport.height == static_cast<float>(window.renderExtent.height), "window-space viewport does not cover the render area");
+        Require(window.viewport.minDepth == 0.0f && window.viewport.maxDepth == 1.0f, "window-space depth range is not [0, 1]");
+        Require(window.depthClamp == ((clip & 0x10000u) != 0 || (clip & 0x0c000000u) != 0), "disabled clipping must clamp depth");
+    }
+    queue.context[0x204] = clipControl;
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_CL_VTE_CNTL") == std::string::npos, "the draw pre-check refused window-space positions");
     queue.context[0x206] = 0x43f;
+    Require(!AgcDriver::Graphics::DecodeState(queue).windowSpacePosition, "homogeneous positions decoded as window space");
+    queue.context[0x204] = clipControl | 0x10000u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_CLIP_CNTL");
+    queue.context[0x204] = clipControl;
+    for (const auto control : {0x100u, 0x200u, 0x700u, 0x301u, 0x33fu}) {
+        queue.context[0x206] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
+    }
+    queue.context[0x206] = 0x43f;
+    // PA_SU_VTX_CNTL (D45): radeonsi's finer sub-pixel quantization for small viewports (1/1024, 1/4096)
+    // is accepted beside 1/256; D3D pixel centers, other rounding modes and coarser quantization are not.
+    for (const std::uint32_t control : {0x35u, 0x3du}) {
+        queue.context[0x2f9] = control;
+        static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_SU_VTX_CNTL") == std::string::npos, "the draw pre-check refused a finer vertex quantization");
+    }
+    for (const std::uint32_t control : {0x2cu, 0x29u, 0x2bu, 0x25u, 0x05u, 0x6du}) {
+        queue.context[0x2f9] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_SU_VTX_CNTL=0x");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_SU_VTX_CNTL=0x") != std::string::npos, "the draw pre-check accepted an unsupported PA_SU_VTX_CNTL");
+    }
+    queue.context[0x2f9] = 0x2d;
     queue.context[0x2dc] |= 1;
     Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "undithered alpha-to-coverage was not decoded");
     queue.context.erase(0x2dc);

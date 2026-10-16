@@ -65,6 +65,10 @@ inline MeshDrawPlan PlanMeshDraw(const Graphics::State& graphics, const Pm4::Dra
         // As upstream (Draw.cpp prepareDrawInputs): fans cannot restart; strips use a restart table.
         if (restarts && mesh.inputPrimitive == 5) throw std::runtime_error("AGC graphics: primitive restart in a triangle fan geometry draw is unsupported");
         if (restarts && mesh.inputPrimitive == 6) restartTable = MeshRestartTable(indices, draw.indexSize);
+        // Lists pass the draw precheck with restart enabled (PrimitiveListRestart: the vertex path
+        // expands them on the CPU); the mesh function has no list restart, so a list that holds a
+        // restart index throws here instead of fetching vertex 0xffff(ffff).
+        if (restarts && step != 1u) throw std::runtime_error("AGC graphics: a restart index inside an indexed list geometry (mesh) draw is unsupported");
     }
     MeshArguments resolved{};
     bool needsArguments = !restartTable.empty();

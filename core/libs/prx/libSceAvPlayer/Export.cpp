@@ -8,6 +8,7 @@
 #include <string_view>
 #include "SceTypes.hpp"
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 using namespace AvPlayer;
 
@@ -68,27 +69,27 @@ int APS5_VABI sceAvPlayerEnableStream(AvPlayerInternal* h, uint32_t stream_id) {
 
 Bool APS5_VABI sceAvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* audio_info) {
     if (!h || !audio_info) return false;
-    return ToPlayer(h)->GetAudioData(*audio_info);
+    return ToPlayer(h)->GetAudioData(*GuestArena::HostPointer(audio_info)); // guest structs may be displaced (D31, D33)
 }
 
 int APS5_VABI sceAvPlayerGetStreamInfo(AvPlayerInternal* h, uint32_t stream_id, AvPlayerStreamInfo* info) {
     if (!h || !info) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    return ToPlayer(h)->GetStreamInfo(stream_id, *info);
+    return ToPlayer(h)->GetStreamInfo(stream_id, *GuestArena::HostPointer(info));
 }
 
 int APS5_VABI sceAvPlayerGetStreamInfoEx(AvPlayerInternal* h, uint32_t stream_id, AvPlayerStreamInfoEx* info) {
     if (!h || !info) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
-    return ToPlayer(h)->GetStreamInfoEx(stream_id, *info);
+    return ToPlayer(h)->GetStreamInfoEx(stream_id, *GuestArena::HostPointer(info));
 }
 
 Bool APS5_VABI sceAvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* video_info) {
     if (!h || !video_info) return false;
-    return ToPlayer(h)->GetVideoData(*video_info);
+    return ToPlayer(h)->GetVideoData(*GuestArena::HostPointer(video_info));
 }
 
 Bool APS5_VABI sceAvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfoEx* video_info) {
     if (!h || !video_info) return false;
-    return ToPlayer(h)->GetVideoData(*video_info);
+    return ToPlayer(h)->GetVideoData(*GuestArena::HostPointer(video_info));
 }
 
 AvPlayerInternal* APS5_VABI sceAvPlayerInit(AvPlayerInitData* init) {

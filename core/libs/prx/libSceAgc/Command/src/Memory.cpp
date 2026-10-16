@@ -63,15 +63,16 @@ std::uint32_t* WriteData(CommandBuffer* buffer, bool compute, std::uint8_t dst, 
     Require(compute || (address & 3u) == 0, function, "misaligned write address");
     Require(dst != 0 || writeConfirm == 0, function, "register writes do not support write confirmation");
     std::vector<std::uint32_t> snapshot(count);
-    std::memcpy(snapshot.data(), data, count * sizeof(std::uint32_t));
+    std::memcpy(snapshot.data(), GuestArena::HostRange(data, count * sizeof(std::uint32_t)), count * sizeof(std::uint32_t));
     const auto destination = compute ? static_cast<std::uint32_t>(dst) << 8u : ((dst & 1u) << 30u) | ((dst & 0x1eu) << 7u);
-    auto* packet = Allocate(buffer, count + 4u, function);
+    auto* const guestPacket = Allocate(buffer, count + 4u, function);
+    auto* packet = Host(guestPacket);
     packet[0] = Header(0x37u, count + 4u);
     packet[1] = destination | (static_cast<std::uint32_t>(increment) << 16u) | (static_cast<std::uint32_t>(writeConfirm) << 20u) | (static_cast<std::uint32_t>(cachePolicy) << 25u);
     packet[2] = static_cast<std::uint32_t>(address);
     packet[3] = static_cast<std::uint32_t>(address >> 32u);
     std::copy(snapshot.begin(), snapshot.end(), packet + 4);
-    return packet;
+    return guestPacket;
 }
 
 std::uint32_t* WriteWait(CommandBuffer* buffer, std::uint8_t size, std::uint8_t compareFunction, std::uint8_t operation, std::uint8_t cachePolicy, const volatile void* address, std::uint64_t reference, std::uint64_t mask, std::uint32_t pollCycles, const char* function) {
@@ -90,7 +91,8 @@ std::uint32_t* WriteWait(CommandBuffer* buffer, std::uint8_t size, std::uint8_t 
     if (guestAddress != 0) CheckAddress(guestAddress, size == 0 ? 4 : 8, function);
     CheckBits(guestAddress, 0xffffffffffffull, function);
     const auto waitSize = size == 0 ? 7u : 9u;
-    auto* packet = Allocate(buffer, waitSize + 7u, function);
+    auto* const guestPacket = Allocate(buffer, waitSize + 7u, function);
+    auto* packet = Host(guestPacket);
     packet[0] = Header(0x79u, 4, 1);
     packet[1] = 0x342u;
     packet[2] = (size == 0 ? 0xc8010000u : 0xc8020000u) | static_cast<std::uint32_t>(guestAddress >> 32u);
@@ -113,11 +115,12 @@ std::uint32_t* WriteWait(CommandBuffer* buffer, std::uint8_t size, std::uint8_t 
     wait[waitSize] = Header(0x79u, 3, 1);
     wait[waitSize + 1u] = 0x342u;
     wait[waitSize + 2u] = 0xc8000000u;
-    return packet;
+    return guestPacket;
 }
 
 std::uint32_t* ValidateWait(std::uint32_t* packet, const char* function) {
     CheckAddress(reinterpret_cast<std::uintptr_t>(packet), 4, function);
+    packet = Host(packet); // the wrapper returned is a host view too: callers patch through it
     Require(packet[0] == Header(0x79u, 4, 1) && packet[1] == 0x342u, function, "invalid wait wrapper");
     const auto tag = packet[2] & 0xffff0000u;
     Require(tag == 0xc8010000u || tag == 0xc8020000u, function, "invalid wait tag");

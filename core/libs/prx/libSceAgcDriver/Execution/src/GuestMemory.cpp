@@ -15,6 +15,7 @@
 #include <bit>
 #include <functional>
 #include <cstdio>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -781,7 +782,7 @@ struct WindowCopy {
     std::span<const std::byte> bytes;
 
     bool Holds(std::uintptr_t page) const {
-        return std::memcmp(reinterpret_cast<const void*>(page), bytes.data() + (page - first), WritePageBytes) == 0;
+        return std::memcmp(reinterpret_cast<const void*>(GuestArena::HostRange(page, WritePageBytes)), bytes.data() + (page - first), WritePageBytes) == 0;
     }
 };
 
@@ -997,6 +998,9 @@ struct WriteTracker {
     }
 
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
+        // Debug aid: APS5_TRACE_STAMP=<hex address> reports every stamp of that address's 64 KiB block.
+        static const std::uint64_t traced = [] { const char* value = std::getenv("APS5_TRACE_STAMP"); return value != nullptr ? std::strtoull(value, nullptr, 16) : ~std::uint64_t{0}; }();
+        if (traced != ~std::uint64_t{0} && block == blockOf(traced)) std::fprintf(stderr, "[stamp] block of 0x%llx stamped %s at generation %u\n", static_cast<unsigned long long>(traced), kind == StampKind::Cpu ? "cpu" : kind == StampKind::Driver ? "driver" : kind == StampKind::ImportWindow ? "import-window" : "fresh", stampGeneration);
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
 #ifdef _WIN32
@@ -1262,7 +1266,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     std::vector<std::byte> saved;
     if (covered && staysWatched) {
         CheckRange(reinterpret_cast<const void*>(first), static_cast<std::size_t>(stop - first), 1, false);
-        const auto* source = reinterpret_cast<const std::byte*>(first);
+        const auto* source = reinterpret_cast<const std::byte*>(GuestArena::HostRange(first, static_cast<std::size_t>(stop - first)));
         saved.assign(source, source + (stop - first));
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
@@ -1362,6 +1366,15 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    {
+        static const std::uint64_t traced = [] { const char* value = std::getenv("APS5_TRACE_STAMP"); return value != nullptr ? std::strtoull(value, nullptr, 16) : ~std::uint64_t{0}; }();
+        if (traced >= address && traced - address < bytes) {
+            Dl_info info{};
+            const void* caller = __builtin_return_address(0);
+            const bool named = dladdr(caller, &info) != 0 && info.dli_sname != nullptr;
+            std::fprintf(stderr, "[stamp] MarkWritten 0x%llx+0x%zx over 0x%llx from %s\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(traced), named ? info.dli_sname : "?");
+        }
+    }
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();

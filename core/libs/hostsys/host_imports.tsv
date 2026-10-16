@@ -1,0 +1,429 @@
+# Host system call shim inventory (D35). Every libSystem symbol imported by a built prx library (libc included).
+# Columns: symbol, class, handling, note. Checked by tools/mac/check_host_imports.py (test host_import_inventory).
+# class: buffer (kernel reads or writes a user buffer), path (kernel reads a path string), stdio, address (guest
+#   address identity), retaining (a buffer pointer is stored or returned), scalar (kernel call, no pointer),
+#   userspace (no kernel access to a guest pointer: slow at worst, never EFAULT), data.
+# handling: shim (HostSyscallShim.cpp defines it), hand (translated by its callers), none.
+__assert_rtn	userspace	none	
+__chkstk_darwin	userspace	none	
+__cxa_atexit	userspace	none	context pointer retained and handed back: identity, never translated
+__cxa_thread_atexit	userspace	none	context pointer retained and handed back: identity, never translated
+__darwin_check_fd_set_overflow	userspace	none	
+__divti3	userspace	none	
+__error	userspace	none	
+__exp10	userspace	none	
+__exp10f	userspace	none	
+__fpclassifyd	userspace	none	
+__fpclassifyf	userspace	none	
+__gcc_personality_v0	userspace	none	
+__maskrune	userspace	none	
+__memcpy_chk	userspace	none	
+__memset_chk	userspace	none	
+__shared_region_check_np	buffer	none	host-internal: only GuestDisplaced calls it, on a host stack variable while it builds the window
+__sincos_stret	userspace	none	
+__sincosf_stret	userspace	none	
+__srget	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+__stack_chk_fail	userspace	none	
+__stack_chk_guard	data	none	data symbol
+__stderrp	data	none	data symbol
+__stdinp	data	none	data symbol
+__stdoutp	data	none	data symbol
+__strcpy_chk	userspace	none	
+__swbuf	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+__tolower	userspace	none	
+__toupper	userspace	none	
+__udivti3	userspace	none	
+_availability_version_check	userspace	none	
+_Block_object_assign	userspace	none	
+_Block_object_dispose	userspace	none	
+_DefaultRuneLocale	data	none	data symbol
+_dispatch_main_q	data	none	data symbol
+_dispatch_source_type_memorypressure	data	none	data symbol
+_dyld_get_image_header	userspace	none	
+_dyld_get_image_name	userspace	none	
+_dyld_get_image_vmaddr_slide	userspace	none	
+_dyld_image_count	userspace	none	
+_dyld_register_func_for_add_image	userspace	none	
+_dyld_register_func_for_remove_image	userspace	none	
+_Exit	scalar	none	kernel call without a pointer argument
+_NSConcreteGlobalBlock	data	none	data symbol
+_NSConcreteStackBlock	data	none	data symbol
+_NSGetArgc	userspace	none	
+_NSGetArgv	userspace	none	
+_NSGetExecutablePath	userspace	none	
+_tlv_atexit	userspace	none	context pointer retained and handed back: identity, never translated
+_tlv_bootstrap	userspace	none	
+_Unwind_Resume	userspace	none	
+abort	scalar	none	kernel call without a pointer argument
+accept	buffer	shim	socket address out-struct and its length
+access	path	shim	path string
+acos	userspace	none	
+acosf	userspace	none	
+acosh	userspace	none	
+acoshf	userspace	none	
+arc4random_buf	userspace	none	
+asin	userspace	none	
+asinf	userspace	none	
+asinh	userspace	none	
+asinhf	userspace	none	
+atan	userspace	none	
+atan2	userspace	none	
+atan2f	userspace	none	
+atanf	userspace	none	
+atanh	userspace	none	
+atexit	userspace	none	context pointer retained and handed back: identity, never translated
+atof	userspace	none	
+atoi	userspace	none	
+backtrace	userspace	none	
+backtrace_symbols_fd	userspace	none	
+bind	buffer	shim	socket address in-struct
+bsearch	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+bzero	userspace	none	
+calloc	userspace	none	
+cbrt	userspace	none	
+cbrtf	userspace	none	
+chmod	path	shim	path string
+clearerr	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+clock	userspace	none	
+clock_getres	buffer	shim	timespec out
+clock_gettime	buffer	shim	timespec out
+clock_gettime_nsec_np	scalar	none	clock id in, nanoseconds returned: no pointer
+close	scalar	none	kernel call without a pointer argument
+closedir	userspace	none	
+connect	buffer	shim	socket address in-struct
+cos	userspace	none	
+cosf	userspace	none	
+cosh	userspace	none	
+coshf	userspace	none	
+dispatch_after	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_async_f	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_get_global_queue	userspace	none	
+dispatch_once_f	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_resume	userspace	none	
+dispatch_semaphore_create	userspace	none	
+dispatch_semaphore_signal	userspace	none	
+dispatch_semaphore_wait	userspace	none	
+dispatch_source_create	userspace	none	
+dispatch_source_get_data	userspace	none	
+dispatch_source_set_event_handler	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_sync	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_sync_f	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_time	userspace	none	
+div	userspace	none	
+dladdr	userspace	none	
+dlclose	userspace	none	
+dlerror	userspace	none	
+dlopen	path	shim	path string
+dlsym	userspace	none	
+dup	scalar	none	kernel call without a pointer argument
+dup2	scalar	none	kernel call without a pointer argument
+environ	data	none	data symbol
+erff	userspace	none	
+execv	path	shim	path and argv strings (argv array copied when any entry is displaced)
+exit	scalar	none	kernel call without a pointer argument
+exp	userspace	none	
+exp2	userspace	none	
+exp2f	userspace	none	
+expf	userspace	none	
+expm1	userspace	none	
+expm1f	userspace	none	
+fabs	userspace	none	
+faccessat	path	shim	directory-relative path string
+fchmod	scalar	none	kernel call without a pointer argument
+fclose	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fcntl	buffer	shim	F_GETPATH/F_GETPATH_NOFIRMLINK, F_GETLK/F_SETLK/F_SETLKW, F_PREALLOCATE, F_PUNCHHOLE, F_LOG2PHYS(_EXT), F_RDADVISE, F_SETSIZE; other commands pass through
+fdopen	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fdopendir	scalar	none	kernel call without a pointer argument
+fegetround	userspace	none	
+feof	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+feraiseexcept	userspace	none	
+ferror	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fflush	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fgetc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fgets	retaining	shim	buffer translated, returned pointer mapped back to the guest's
+fileno	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+flock	scalar	none	kernel call without a pointer argument
+flockfile	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fmod	userspace	none	
+fmodf	userspace	none	
+fopen	path	shim	path and mode strings
+fprintf	stdio	shim	formatted into a host buffer, then written: a long %s argument would otherwise reach write(2) from guest memory
+fputc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fputs	stdio	shim	string; a long string or an unbuffered stream is written from it directly
+fread	stdio	shim	buffer; large transfers reach read/write(2) inside libsystem_c directly from it
+free	userspace	none	
+freeaddrinfo	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+freeifaddrs	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+freopen	path	shim	path and mode strings; the stream is host
+frexp	userspace	none	
+frexpf	userspace	none	
+fseek	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fseeko	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+fsgetpath	buffer	shim	path out-buffer and fsid
+fstat	buffer	shim	stat out-struct
+fstatat	path	shim	directory-relative path string and stat out-struct
+fstatfs	buffer	shim	statfs out-struct
+fstatvfs	buffer	shim	statvfs out-struct (libc fills it from a local statfs; translated anyway, cost nil)
+fsync	scalar	none	kernel call without a pointer argument
+ftell	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+ftello	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+ftruncate	scalar	none	kernel call without a pointer argument
+ftrylockfile	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+funlockfile	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+futimes	buffer	shim	timeval[2]
+fwrite	stdio	shim	buffer; large transfers reach read/write(2) inside libsystem_c directly from it
+getaddrinfo	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+getc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+getentropy	buffer	shim	buffer, length given
+getenv	userspace	none	
+geteuid	scalar	none	kernel call without a pointer argument
+gethostbyname	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+getifaddrs	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+getnameinfo	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+getpagesize	scalar	none	kernel call without a pointer argument
+getpeername	buffer	shim	socket address out-struct and its length
+getpid	scalar	none	kernel call without a pointer argument
+getppid	scalar	none	kernel call without a pointer argument
+getpwuid_r	userspace	none	name lookup over IPC; arguments and results are copied in userspace
+getrlimit	buffer	shim	rlimit struct
+getrusage	buffer	shim	rusage out-struct
+getsectiondata	userspace	none	
+getsegmentdata	userspace	none	
+getsockname	buffer	shim	socket address out-struct and its length
+getsockopt	buffer	shim	option value out-struct and its length
+gettimeofday	buffer	shim	timeval out (commpage on arm64, system call fallback)
+gmtime_r	userspace	none	
+h_errno	data	none	data symbol
+host_statistics64	userspace	none	MIG: arguments are copied into a message in userspace
+hypot	userspace	none	
+inet_ntop	userspace	none	
+inet_pton	userspace	none	
+ioctl	buffer	shim	IOCPARM_LEN(request) bytes when IOC_IN/IOC_OUT is set; IOC_VOID and size 0 pass the argument through (documented gap: a request that takes a pointer without encoding its size)
+isatty	scalar	none	kernel call without a pointer argument
+kevent	retaining	shim	change and event arrays and the timeout; udata is opaque and never translated, so events hand back what the guest stored
+kOSThermalNotificationPressureLevelName	data	none	data symbol
+kqueue	scalar	none	kernel call without a pointer argument
+ldexp	userspace	none	
+ldexpf	userspace	none	
+lgamma	userspace	none	
+listen	scalar	none	kernel call without a pointer argument
+lldiv	userspace	none	
+localtime_r	userspace	none	
+log	userspace	none	
+log10	userspace	none	
+log10f	userspace	none	
+log1p	userspace	none	
+log1pf	userspace	none	
+log2	userspace	none	
+log2f	userspace	none	
+logb	userspace	none	
+logbf	userspace	none	
+logf	userspace	none	
+longjmp	userspace	none	jmp_buf on a host stack; the signal mask is saved by a libc-internal sigprocmask
+lseek	scalar	none	kernel call without a pointer argument
+lstat	path	shim	path string and stat out-struct
+lutimes	path	shim	path string and timeval[2]
+mach_absolute_time	scalar	none	kernel call without a pointer argument
+mach_error_string	userspace	none	
+mach_host_self	scalar	none	kernel call without a pointer argument
+mach_msg	buffer	shim	message buffer of max(send, receive) size; out-of-line descriptors are not translated
+mach_port_deallocate	scalar	none	kernel call without a pointer argument
+mach_task_self_	data	none	data symbol
+mach_thread_self	scalar	none	kernel call without a pointer argument
+mach_timebase_info	buffer	shim	timebase out-struct
+mach_vm_allocate	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_deallocate	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_map	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_protect	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_region	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_region_recurse	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_remap	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_wait_until	scalar	none	kernel call without a pointer argument
+malloc	userspace	none	
+mbrtowc	userspace	none	
+memchr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+memcmp	userspace	none	
+memcpy	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+memmove	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+memset	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+memset_pattern16	userspace	none	
+mkdir	path	shim	path string
+mkstemp	path	shim	template modified in place, then opened
+mktime	userspace	none	
+mlock	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mmap	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+modf	userspace	none	
+modff	userspace	none	
+mprotect	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+munlock	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+munmap	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+nanosleep	buffer	shim	timespec in and out (libc computes them in userspace on arm64; translated anyway)
+nextafterf	userspace	none	
+notify_cancel	userspace	none	
+notify_get_state	userspace	none	
+notify_register_check	userspace	none	
+open	path	shim	path string
+openat	path	shim	directory-relative path string
+opendir	path	shim	path string
+pipe	buffer	shim	int[2] out-array
+pipe2	buffer	shim	int[2] out-array
+poll	buffer	shim	pollfd array
+posix_memalign	userspace	none	
+pow	userspace	none	
+powf	userspace	none	
+pread	buffer	shim	buffer, length given
+preadv	buffer	shim	iovec array and its bases (copied when a base needs translating)
+pthread_attr_destroy	userspace	none	
+pthread_attr_init	userspace	none	
+pthread_attr_setdetachstate	userspace	none	
+pthread_attr_setstacksize	userspace	none	
+pthread_cond_broadcast	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_cond_destroy	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_cond_init	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_cond_signal	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_cond_timedwait	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_cond_wait	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_cpu_number_np	userspace	none	
+pthread_create	userspace	none	context pointer retained and handed back: identity, never translated
+pthread_detach	userspace	none	
+pthread_exit	userspace	none	
+pthread_get_stackaddr_np	userspace	none	
+pthread_get_stacksize_np	userspace	none	
+pthread_getschedparam	userspace	none	
+pthread_getspecific	userspace	none	context pointer retained and handed back: identity, never translated
+pthread_join	userspace	none	
+pthread_key_create	userspace	none	context pointer retained and handed back: identity, never translated
+pthread_key_delete	userspace	none	
+pthread_mach_thread_np	userspace	none	
+pthread_main_np	userspace	none	
+pthread_mutex_destroy	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_mutex_init	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_mutex_lock	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_mutex_trylock	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_mutex_unlock	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_mutexattr_init	userspace	none	
+pthread_mutexattr_settype	userspace	none	
+pthread_once	userspace	none	context pointer retained and handed back: identity, never translated
+pthread_self	userspace	none	
+pthread_set_qos_class_self_np	userspace	none	
+pthread_setcanceltype	userspace	none	
+pthread_setname_np	buffer	shim	thread name string handed to the kernel by __proc_info
+pthread_setschedparam	userspace	none	
+pthread_setspecific	userspace	none	context pointer retained and handed back: identity, never translated
+pthread_sigmask	buffer	shim	sigset in and out
+pthread_threadid_np	userspace	none	
+putc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+puts	stdio	shim	string; a long string or an unbuffered stream is written from it directly
+pwrite	buffer	shim	buffer, length given
+pwritev	buffer	shim	iovec array and its bases (copied when a base needs translating)
+qsort	userspace	none	
+raise	scalar	none	kernel call without a pointer argument
+read	buffer	shim	buffer, length given
+readdir	userspace	none	
+readv	buffer	shim	iovec array and its bases (copied when a base needs translating)
+realloc	userspace	none	
+recv	buffer	shim	buffer, length given
+recvfrom	buffer	shim	buffer and socket address out-struct
+remainder	userspace	none	
+remainderf	userspace	none	
+remove	path	shim	path string
+rename	path	shim	two path strings
+rewind	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+rewinddir	userspace	none	
+rmdir	path	shim	path string
+scalbn	userspace	none	
+scalbnf	userspace	none	
+sched_get_priority_max	scalar	none	kernel call without a pointer argument
+sched_get_priority_min	scalar	none	kernel call without a pointer argument
+sched_yield	scalar	none	kernel call without a pointer argument
+select	buffer	shim	fd_set words for nfds and the timeval
+send	buffer	shim	buffer, length given
+sendto	buffer	shim	buffer and socket address
+setenv	userspace	none	
+setjmp	userspace	none	jmp_buf on a host stack; the signal mask is saved by a libc-internal sigprocmask
+setrlimit	buffer	shim	rlimit struct
+setsockopt	buffer	shim	option value in-struct
+setvbuf	retaining	shim	stream buffer retained by the FILE: translated, the FILE never hands it back
+shm_open	path	shim	path string
+shm_unlink	path	shim	path string
+shutdown	scalar	none	kernel call without a pointer argument
+sigaction	buffer	shim	sigaction in and out structs (the handler is code, not translated)
+signal	scalar	none	kernel call without a pointer argument
+sin	userspace	none	
+sinf	userspace	none	
+sinh	userspace	none	
+sinhf	userspace	none	
+snprintf	userspace	none	
+socket	scalar	none	kernel call without a pointer argument
+socketpair	buffer	shim	int[2] out-array
+sscanf	userspace	none	
+stat	path	shim	path string and stat out-struct
+strcasecmp	userspace	none	
+strcasestr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strcat	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strchr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strcmp	userspace	none	
+strcpy	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strcspn	userspace	none	
+strdup	userspace	none	
+strerror	userspace	none	
+strerror_r	userspace	none	
+strftime	userspace	none	
+strlcat	userspace	none	
+strlcpy	userspace	none	
+strlen	userspace	none	
+strncasecmp	userspace	none	
+strncat	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strncmp	userspace	none	
+strncpy	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strnlen	userspace	none	
+strpbrk	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strrchr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strspn	userspace	none	
+strstr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strtod	userspace	none	
+strtof	userspace	none	
+strtoimax	userspace	none	
+strtok_r	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+strtol	userspace	none	
+strtoll	userspace	none	
+strtoul	userspace	none	
+strtoull	userspace	none	
+strtoumax	userspace	none	
+sys_icache_invalidate	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+sysconf	scalar	none	kernel call without a pointer argument
+sysctl	buffer	shim	MIB array, old buffer, old length, new buffer
+sysctlbyname	buffer	shim	name string, old buffer, old length, new buffer
+tan	userspace	none	
+tanf	userspace	none	
+tanh	userspace	none	
+tanhf	userspace	none	
+thread_info	userspace	none	MIG: arguments are copied into a message in userspace
+thread_policy_set	userspace	none	MIG: arguments are copied into a message in userspace
+time	userspace	none	
+times	userspace	none	
+truncate	path	shim	path string
+tzname	data	none	data symbol
+tzset	userspace	none	
+uname	buffer	shim	utsname out-struct (libc fills it with sysctl calls on the caller's buffer)
+ungetc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+unlink	path	shim	path string
+utimes	path	shim	path string and timeval[2]
+vfprintf	stdio	shim	formatted into a host buffer, then written: a long %s argument would otherwise reach write(2) from guest memory
+vfscanf	stdio	none	reads through the FILE's host buffer, parses in userspace
+vm_kernel_page_size	data	none	data symbol
+vsnprintf	userspace	none	
+vsscanf	userspace	none	
+wcrtomb	userspace	none	
+wcscasecmp	userspace	none	
+wcscmp	userspace	none	
+wcscpy	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+wcslcat	userspace	none	
+wcslcpy	userspace	none	
+wcslen	userspace	none	
+wcsncasecmp	userspace	none	
+wcsncmp	userspace	none	
+wcsstr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+wmemchr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
+write	buffer	shim	buffer, length given
+writev	buffer	shim	iovec array and its bases (copied when a base needs translating)

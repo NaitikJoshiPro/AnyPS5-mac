@@ -2234,9 +2234,12 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     if (outcome.reason == CopyOutcome::None) {
         // A plain CPU store, stamped for the write watch, with no pending write to note (nothing is
         // outstanding on the range) and nothing recorded.
+        // Host views: either side may be displaced memory (D31, D33), where a native memcpy takes two signals per access.
+        const auto* sourceHost = reinterpret_cast<const std::byte*>(GuestArena::HostRange(static_cast<std::uintptr_t>(source), bytes));
+        auto* destinationHost = reinterpret_cast<std::byte*>(GuestArena::HostRange(static_cast<std::uintptr_t>(destination), bytes));
         std::vector<std::byte> expected;
-        if (verify) expected.assign(reinterpret_cast<const std::byte*>(source), reinterpret_cast<const std::byte*>(source) + bytes);
-        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memcpy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
+        if (verify) expected.assign(sourceHost, sourceHost + bytes);
+        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memcpy(destinationHost, sourceHost, bytes); });
         outcome.path = 0;
         outcome.sourceSettledBySignal = settledBySignal;
         if (verify) {
@@ -2246,8 +2249,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
             Graphics::Recorder::CountSync(4);
             recorder.Sync();
             copiesVerified.fetch_add(1, std::memory_order_relaxed);
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes) && std::memcmp(expected.data(), reinterpret_cast<const void*>(source), bytes) != 0) copySourceChanged.fetch_add(1, std::memory_order_relaxed);
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes) && std::memcmp(expected.data(), reinterpret_cast<const void*>(destination), bytes) != 0) copyDestinationChanged.fetch_add(1, std::memory_order_relaxed);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes) && std::memcmp(expected.data(), sourceHost, bytes) != 0) copySourceChanged.fetch_add(1, std::memory_order_relaxed);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes) && std::memcmp(expected.data(), destinationHost, bytes) != 0) copyDestinationChanged.fetch_add(1, std::memory_order_relaxed);
         }
         return outcome;
     }

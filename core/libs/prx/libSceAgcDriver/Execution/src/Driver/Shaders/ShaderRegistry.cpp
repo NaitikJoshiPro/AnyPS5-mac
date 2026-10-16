@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -21,7 +22,10 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <list>
+#include <map>
+#include <mutex>
 #include <atomic>
 #include <pthread.h>
 #include <sstream>
@@ -121,21 +125,52 @@ std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
 }
 
 std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shaders, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
+    // A program outside every registered shader's code is read raw, as compute dispatches do (a title
+    // can register its own shaders and also draw unregistered ones: the oops-sdk registers its display
+    // shaders through sceAgcCreateShader while radeonsi submits raw programs). An address inside a
+    // registered shader of another type throws in RegisteredProgram.
     if (auto registered = RegisteredProgram(shaders, address, types)) return registered;
-    require(shaders.empty(), "graphics program does not belong to a compatible registered shader");
     return ReadRawShader(address);
 }
 
 namespace {
 std::atomic<bool> rawGraphicsDrawn{false};
+std::mutex rawGraphicsMutex;
+std::map<std::uint64_t, std::uint64_t> rawGraphicsRanges;
 }
 
-void NoteRawGraphicsDraw() {
+void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot) {
+    if (snapshot.rawGraphicsNoted->load(std::memory_order_acquire)) return;
+    auto begin = snapshot.codeAddress;
+    auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);
+    {
+        std::lock_guard lock(rawGraphicsMutex);
+        auto next = rawGraphicsRanges.upper_bound(begin);
+        if (next != rawGraphicsRanges.begin() && std::prev(next)->second >= begin) {
+            const auto previous = std::prev(next);
+            begin = previous->first;
+            end = std::max(end, previous->second);
+            rawGraphicsRanges.erase(previous);
+        }
+        while (next != rawGraphicsRanges.end() && next->first <= end) {
+            end = std::max(end, next->second);
+            next = rawGraphicsRanges.erase(next);
+        }
+        rawGraphicsRanges.emplace(begin, end);
+    }
+    snapshot.rawGraphicsNoted->store(true, std::memory_order_release);
     rawGraphicsDrawn.store(true, std::memory_order_relaxed);
 }
 
 bool RawGraphicsDrawn() {
     return rawGraphicsDrawn.load(std::memory_order_relaxed);
+}
+
+bool RawGraphicsDrawnIn(std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return false;
+    std::lock_guard lock(rawGraphicsMutex);
+    const auto next = rawGraphicsRanges.lower_bound(end);
+    return next != rawGraphicsRanges.begin() && std::prev(next)->second > begin;
 }
 
 namespace {
@@ -306,10 +341,11 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
     const std::size_t bytes = registered.num_sh_registers * sizeof(ShaderRegister);
     if (bytes == 0 || bound == nullptr || address < snapshot.headerAddress || address - snapshot.headerAddress > snapshot.header.size() || snapshot.header.size() - (address - snapshot.headerAddress) < bytes) return false;
     GuestMemory::CheckRange(bound, bytes, alignof(ShaderRegister));
+    const auto* hostBound = GuestArena::HostRange(bound, bytes);
     for (std::size_t index = 0; index < registered.num_sh_registers; ++index) {
         ShaderRegister expected;
         std::memcpy(&expected, snapshot.header.data() + (address - snapshot.headerAddress) + index * sizeof(ShaderRegister), sizeof(ShaderRegister));
-        const auto reg = bound[index];
+        const auto reg = hostBound[index];
         if (reg.offset != expected.offset) return false;
         const bool fused = reg.offset == 0x100u || reg.offset == 0x10au || reg.offset == 0x10bu || reg.offset == 0x148u || reg.offset == 0x149u;
         if (!fused && reg.value != expected.value) return false;
@@ -320,7 +356,7 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
 static Shader GuestShaderFields(const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
-    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&fields, GuestArena::HostRange(static_cast<const void*>(shader), sizeof(Shader)), sizeof(Shader));
     return fields;
 }
 
@@ -330,7 +366,7 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader used;
     Shader registered;
-    std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&used, GuestArena::HostRange(static_cast<const void*>(shader), sizeof(Shader)), sizeof(Shader));
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
     used.user_data = registered.user_data;
     return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || FusedHullHeader(snapshot, used, registered);
@@ -1034,7 +1070,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             if (fields.type != snapshot.type) {
                 const std::size_t count = fields.num_sh_registers;
                 GuestMemory::CheckRange(fields.sh_registers, count * sizeof(ShaderRegister), alignof(ShaderRegister));
-                for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(fields.sh_registers[index].offset, fields.sh_registers[index].value);
+                const auto* registers = GuestArena::HostRange(fields.sh_registers, count * sizeof(ShaderRegister));
+                for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(registers[index].offset, registers[index].value);
             }
         }
     }
@@ -1266,21 +1303,25 @@ void Driver::RegisterShader(const Shader* shader) {
     PerformanceTimer timing("Shader.Register");
     ShaderPreparationTransaction transaction;
     CheckFailure();
-    require(!RawGraphicsDrawn(), "a shader was registered after graphics programs were drawn without registration");
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
-    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&fields, GuestArena::HostRange(static_cast<const void*>(shader), sizeof(Shader)), sizeof(Shader));
     require(fields.file_header == 0x34333231u && fields.version == 0x18u, "invalid shader header");
     require(fields.header_size >= sizeof(Shader), "shader header is smaller than its fixed fields");
     require(fields.shader_size != 0 && (fields.shader_size & 3u) == 0, "invalid shader size");
     GuestMemory::CheckRange(shader, fields.header_size, 1);
     const auto* code = const_cast<const void*>(fields.code);
     GuestMemory::CheckRange(code, fields.shader_size, 256);
+    // Draws keep raw snapshots of unregistered programs (revalidated by reading them raw again), so a
+    // registration over code that was drawn raw would give one program two identities.
+    require(!RawGraphicsDrawnIn(reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(code) + fields.shader_size), "a shader was registered over a graphics program that was drawn without registration");
     ShaderSnapshot snapshot{reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(shader), fields.type, {}, {}};
     snapshot.code.resize(fields.shader_size / sizeof(std::uint32_t));
-    std::memcpy(snapshot.code.data(), code, fields.shader_size);
+    // Bulk snapshots read the host view once (displaced memory, D31, D33: ASTRO BOT's shaders are at 0x5xxxxxxxx,
+    // where a native memcpy through the guest address faults on every 32 bytes).
+    std::memcpy(snapshot.code.data(), GuestArena::HostRange(code, fields.shader_size), fields.shader_size);
     snapshot.header.resize(fields.header_size);
-    std::memcpy(snapshot.header.data(), static_cast<const void*>(shader), fields.header_size);
+    std::memcpy(snapshot.header.data(), GuestArena::HostRange(static_cast<const void*>(shader), fields.header_size), fields.header_size);
 
     transaction.Hold();
     {
@@ -1331,7 +1372,7 @@ void Driver::RegisterShader(const Shader* shader) {
         const auto print = [](const ShaderRegister* registers, std::uint32_t count) {
             for (std::uint32_t i = 0; i < count && registers != nullptr; ++i) {
                 ShaderRegister value;
-                std::memcpy(&value, static_cast<const void*>(registers + i), sizeof(value));
+                std::memcpy(&value, static_cast<const void*>(GuestArena::HostPointer(registers + i)), sizeof(value));
                 std::fprintf(stderr, " %x=%08x", value.offset, value.value);
             }
         };

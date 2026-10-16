@@ -1,5 +1,6 @@
 #include "CodePool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <iterator>
 #include <libkern/OSCacheControl.h>
@@ -20,7 +21,12 @@ std::size_t RoundUp(std::size_t value) {
 // Live pools, read from fault handlers (no locks).
 constexpr std::size_t MaxPools = 8;
 std::atomic<CodePool*> pools[MaxPools];
+std::atomic<CodePool::FreeListener> freeListener{nullptr};
 
+}
+
+void CodePool::SetFreeListener(FreeListener listener) {
+    freeListener.store(listener, std::memory_order_release);
 }
 
 CodePool::CodePool(std::size_t size) : size(RoundUp(size)) {
@@ -80,6 +86,33 @@ void* CodePool::Allocate(std::size_t length) {
                              std::to_string(free.size()) + " free ranges)");
 }
 
+void* CodePool::AllocateNear(std::uintptr_t pc, std::size_t length, std::size_t reach) {
+    const std::size_t aligned = RoundUp(length);
+    if (aligned == 0 || !Contains(reinterpret_cast<const void*>(pc))) return nullptr;
+    const std::size_t target = (pc - reinterpret_cast<std::uintptr_t>(code)) & ~(Granule - 1);
+    std::lock_guard lock(mutex);
+    auto best = free.end();
+    std::size_t bestStart = 0, bestDistance = ~std::size_t{0};
+    for (auto range = free.begin(); range != free.end(); ++range) {
+        if (range->second < aligned) continue;
+        const std::size_t start = std::min(std::max(target, range->first), range->first + range->second - aligned);
+        const std::size_t distance = start >= target ? start + aligned - target : target - start;
+        if (distance < bestDistance) {
+            best = range;
+            bestStart = start;
+            bestDistance = distance;
+        }
+    }
+    if (best == free.end() || bestDistance > reach) return nullptr;
+    const std::size_t offset = best->first, rangeLength = best->second;
+    free.erase(best);
+    if (bestStart > offset) free.emplace(offset, bestStart - offset);
+    if (bestStart + aligned < offset + rangeLength) free.emplace(bestStart + aligned, offset + rangeLength - bestStart - aligned);
+    used += aligned;
+    madvise(writable + bestStart, aligned, MADV_FREE_REUSE);
+    return code + bestStart;
+}
+
 bool CodePool::Free(void* address, std::size_t length) {
     auto* byte = static_cast<std::uint8_t*>(address);
     if (!Contains(byte)) return false;
@@ -87,6 +120,10 @@ bool CodePool::Free(void* address, std::size_t length) {
     const std::size_t aligned = RoundUp(length);
     if (offset % Granule != 0 || aligned == 0 || offset + aligned > size)
         throw std::runtime_error("JIT pool: bad free of " + std::to_string(length) + " bytes at offset " + std::to_string(offset));
+    // Before the pool lock: the listener takes libc's displaced-site lock, which a fault handler holds while it
+    // allocates stub memory from this pool (AllocateBeside), so the order is always site lock -> pool lock.
+    if (const auto listener = freeListener.load(std::memory_order_acquire))
+        listener(reinterpret_cast<std::uintptr_t>(byte), reinterpret_cast<std::uintptr_t>(byte) + aligned);
     std::lock_guard lock(mutex);
     auto next = free.lower_bound(offset);
     if (next != free.end() && next->first < offset + aligned) throw std::runtime_error("JIT pool: range freed twice");
@@ -141,13 +178,12 @@ std::uintptr_t CodePool::AllocateBeside(std::uintptr_t pc, std::size_t bytes, st
     for (auto& slot : pools) {
         auto* pool = slot.load(std::memory_order_acquire);
         if (pool == nullptr || !pool->Contains(reinterpret_cast<const void*>(pc))) continue;
-        try {
-            const auto rx = reinterpret_cast<std::uintptr_t>(pool->Allocate(bytes));
-            *writable = rx + pool->writeOffset;
-            return rx;
-        } catch (const std::runtime_error&) {
-            return 0;
-        }
+        // Nearest free range: the stubs must be within branch range (+-128 MiB) of pc, and first fit in a 1 GiB pool
+        // often is not (ASTRO BOT: JIT sites ~240 MiB into the pool got far stubs, one SIGTRAP per access).
+        const auto rx = reinterpret_cast<std::uintptr_t>(pool->AllocateNear(pc, bytes, NearReach));
+        if (rx == 0) return 0;
+        *writable = rx + pool->writeOffset;
+        return rx;
     }
     return 0;
 }

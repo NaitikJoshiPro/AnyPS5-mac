@@ -15,6 +15,10 @@
 #if defined(__x86_64__)
 #include <xmmintrin.h>
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "prx/libc/include/GuestMachineState.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -257,14 +261,16 @@ asm(".text\n"
     ud2
 )" APS5_ASM_FUNCTION_END("Aps5FiberTrampoline_nid_no_patch"));
 #else
+// Host stack switching exists for x86-64 hosts only. On arm64 macOS fibers switch guest state through the
+// FEXCore bridge instead (Enter/Continue below), so these are never reached there.
 extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void* load) {
     (void)save;
     (void)load;
-    NotImplemented_nid_no_patch(__func__);
+    throw std::runtime_error("sceFiber: host stack switching needs an x86-64 host");
 }
 
 extern "C" void Aps5FiberTrampoline_nid_no_patch() {
-    NotImplemented_nid_no_patch(__func__);
+    throw std::runtime_error("sceFiber: host stack switching needs an x86-64 host");
 }
 #endif
 
@@ -374,8 +380,15 @@ static StackBounds FiberBounds(const Fiber* fiber) {
 
 #endif
 
+// The fiber object lives in guest memory, which may be displaced (D31, D33): every native access goes through its
+// host view, read and written in place (same pages, so the state atomic stays atomic). ThreadState().current holds
+// that host view; the guest only ever sees the object's guest address (sceFiberGetSelf).
+static Fiber* HostFiber(FiberObject* object) {
+    return GuestArena::HostRange(reinterpret_cast<Fiber*>(object), FIBER_OBJECT_SIZE);
+}
+
 static Fiber* AsFiber(FiberObject* object) {
-    auto* fiber = reinterpret_cast<Fiber*>(object);
+    auto* fiber = HostFiber(object);
     return fiber && fiber->magic == FIBER_MAGIC ? fiber : nullptr;
 }
 
@@ -461,12 +474,34 @@ void Save(GuestContext& context, std::uint64_t* transfer) {
     bridgeControl(&context.mxcsr, &context.fcw);
 }
 
+// Resumes context with its own MXCSR and x87 control word, as the x86-64 stack switch does (ldmxcsr/fldcw):
+// both are callee-saved in the SysV ABI, so each fiber and the thread keep theirs across switches. The
+// register-only resume cannot set them, so this goes through the runner's whole-state hooks.
+[[noreturn]] void ContinueWithControl(const GuestContext& context) {
+    if (!LibcHasMachineState_nid_no_patch())
+        throw std::runtime_error("sceFiber: resuming a context with a different MXCSR or x87 control word needs the runner's machine-state hooks");
+    GuestMachineState state {};
+    LibcGetMachineState_nid_no_patch(&state);
+    state.gregs[GuestMachine::Rax] = SCE_OK;
+    state.gregs[GuestMachine::Rbx] = context.rbx;
+    state.gregs[GuestMachine::Rbp] = context.rbp;
+    state.gregs[GuestMachine::Rsp] = context.rsp;
+    state.gregs[GuestMachine::R12] = context.r12;
+    state.gregs[GuestMachine::R13] = context.r13;
+    state.gregs[GuestMachine::R14] = context.r14;
+    state.gregs[GuestMachine::R15] = context.r15;
+    state.rip = context.rip;
+    std::memcpy(state.fxsave, &context.fcw, sizeof(context.fcw));
+    std::memcpy(state.fxsave + GuestMachine::FxsaveMxcsr, &context.mxcsr, sizeof(context.mxcsr));
+    LibcSetMachineState_nid_no_patch(&state);
+}
+
 [[noreturn]] void Continue(const GuestContext& context, std::uint64_t transfer) {
     std::uint32_t mxcsr = 0;
     std::uint16_t fcw = 0;
     bridgeControl(&mxcsr, &fcw);
-    if (mxcsr != context.mxcsr || fcw != context.fcw) NotImplemented_nid_no_patch("sceFiber switching to a different MXCSR or x87 control word");
-    if (context.transfer) *context.transfer = transfer;
+    if (context.transfer) *GuestArena::HostPointer(context.transfer) = transfer;
+    if (mxcsr != context.mxcsr || fcw != context.fcw) ContinueWithControl(context);
     std::uintptr_t registers[GuestRegisters];
     bridgeCapture(registers);
     registers[Rax] = SCE_OK;
@@ -490,7 +525,7 @@ void Save(GuestContext& context, std::uint64_t* transfer) {
     bridgeCapture(registers);
     const auto top = reinterpret_cast<std::uintptr_t>(target->context + target->contextSize) & ~static_cast<std::uintptr_t>(15);
     const auto stack = top - 16;
-    std::memcpy(reinterpret_cast<void*>(stack), &entryReturned, sizeof(entryReturned));
+    std::memcpy(reinterpret_cast<void*>(GuestArena::HostRange(stack, sizeof(entryReturned))), &entryReturned, sizeof(entryReturned));
     registers[Rsp] = stack;
     registers[Rip] = reinterpret_cast<std::uintptr_t>(target->entry);
     registers[Rdi] = target->argOnInitialize;
@@ -521,19 +556,19 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     if ((reinterpret_cast<std::uintptr_t>(addr_context) & 15) != 0 || (size_context & 15) != 0) return SCE_FIBER_ERROR_ALIGNMENT;
     if (addr_context == nullptr) return SCE_FIBER_ERROR_INVALID;
     if (size_context < FIBER_MIN_CONTEXT_SIZE) return SCE_FIBER_ERROR_RANGE;
-    auto* fiber = reinterpret_cast<Fiber*>(object);
+    auto* fiber = HostFiber(object);
     if (fiber->magic == FIBER_MAGIC) {
         UnpinStack(fiber->context, fiber->contextSize);
         ReleaseHostStack(fiber);
     }
-    std::memset(object, 0, FIBER_OBJECT_SIZE);
+    std::memset(fiber, 0, FIBER_OBJECT_SIZE);
     fiber->magic = FIBER_MAGIC;
     fiber->state.store(FiberState::Idle, std::memory_order_relaxed);
     fiber->entry = entry;
     fiber->argOnInitialize = arg_on_initialize;
     fiber->context = static_cast<std::uint8_t*>(addr_context);
     fiber->contextSize = size_context;
-    std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
+    std::strncpy(fiber->name, GuestArena::HostPointer(name), FIBER_MAX_NAME_LENGTH);
     AllocateHostStack(fiber);
     fiber->contextSizeCheck = g_contextSizeCheck.load(std::memory_order_relaxed);
     if (fiber->contextSizeCheck) {
@@ -571,7 +606,7 @@ int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_r
     Resume(fiber, &ThreadState().threadStack, arg_on_run);
     CompletePendingSuspend();
     SetBounds(ThreadState().threadBounds);
-    if (arg_on_return) *arg_on_return = ThreadState().transfer;
+    if (arg_on_return) *GuestArena::HostPointer(arg_on_return) = ThreadState().transfer;
     return SCE_OK;
 }
 
@@ -600,7 +635,7 @@ int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint6
     ThreadState().pendingSuspend = self;
     Resume(target, &self->savedStack, arg_on_run);
     CompletePendingSuspend();
-    if (arg_on_run_out) *arg_on_run_out = ThreadState().transfer;
+    if (arg_on_run_out) *GuestArena::HostPointer(arg_on_run_out) = ThreadState().transfer;
     return SCE_OK;
 }
 
@@ -622,20 +657,21 @@ int32_t APS5_VABI sceFiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_o
     SetBounds(ThreadState().threadBounds);
     Aps5FiberSwitchStack_nid_no_patch(&self->savedStack, ThreadState().threadStack);
     CompletePendingSuspend();
-    if (arg_on_run) *arg_on_run = ThreadState().transfer;
+    if (arg_on_run) *GuestArena::HostPointer(arg_on_run) = ThreadState().transfer;
     return SCE_OK;
 }
 
 int32_t APS5_VABI sceFiberGetSelf(FiberObject** fiber) {
     if (!fiber) return SCE_FIBER_ERROR_NULL;
     if (!ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
-    *fiber = reinterpret_cast<FiberObject*>(ThreadState().current);
+    *GuestArena::HostPointer(fiber) = reinterpret_cast<FiberObject*>(GuestArena::GuestAddress(reinterpret_cast<std::uintptr_t>(ThreadState().current)));
     return SCE_OK;
 }
 
 int32_t APS5_VABI sceFiberGetInfo(FiberObject* object, FiberInfo* fiber_info) {
     auto* fiber = AsFiber(object);
     if (!fiber || !fiber_info) return object && fiber_info ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
+    fiber_info = GuestArena::HostRange(fiber_info, sizeof(FiberInfo));
     if (fiber_info->size != sizeof(FiberInfo)) return SCE_FIBER_ERROR_INVALID;
     fiber_info->entry = reinterpret_cast<FiberEntry>(fiber->entry);
     fiber_info->arg_on_initialize = fiber->argOnInitialize;
@@ -655,20 +691,20 @@ int32_t APS5_VABI sceFiberRename(FiberObject* object, const char* name) {
     auto* fiber = AsFiber(object);
     if (!fiber || !name) return object && name ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     std::memset(fiber->name, 0, sizeof(fiber->name));
-    std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
+    std::strncpy(fiber->name, GuestArena::HostPointer(name), FIBER_MAX_NAME_LENGTH);
     return SCE_OK;
 }
 
 int32_t APS5_VABI sceFiberOptParamInitialize(FiberOptParam* opt_param) {
     if (!opt_param) return SCE_FIBER_ERROR_NULL;
-    std::memset(opt_param, 0, FIBER_OPT_PARAM_SIZE);
+    std::memset(GuestArena::HostRange(opt_param, FIBER_OPT_PARAM_SIZE), 0, FIBER_OPT_PARAM_SIZE);
     return SCE_OK;
 }
 
 int32_t APS5_VABI sceFiberGetThreadFramePointerAddress(uint64_t* addr_frame_pointer) {
     if (!addr_frame_pointer) return SCE_FIBER_ERROR_NULL;
     if (!ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
-    *addr_frame_pointer = ThreadState().threadFramePointer;
+    *GuestArena::HostPointer(addr_frame_pointer) = ThreadState().threadFramePointer;
     return SCE_OK;
 }
 

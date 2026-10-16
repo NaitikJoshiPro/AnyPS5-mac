@@ -6,6 +6,7 @@
 #include <bit>
 #include <array>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +33,20 @@ std::string TriangleVertexMacroDefaults() {
 
 std::string TriangleVerticesCondition() {
     return "defined(APS5_TRIANGLE_VERTICES) && APS5_TRIANGLE_VERTICES";
+}
+
+std::string WindowSpaceEpilogue(const std::string& position, const std::string& indent) {
+    // PA_CL_VTE_CNTL 0x300: x and y are pixels, z is depth, nothing divides them by w, and w is only
+    // the perspective term of attribute interpolation. Multiplying the NDC of a (0, 0, width, height,
+    // 0, 1) viewport by w lands on the same pixel and depth after the host's divide and keeps w.
+    const std::string condition = std::string("defined(") + MslAbi::WindowSpaceMacro + ") && " + MslAbi::WindowSpaceMacro;
+    std::string text = "#if " + condition + "\n";
+    text += indent + "{\n";
+    text += indent + "    const float4 aps5_ws = " + position + ";\n";
+    text += indent + "    " + position + " = float4((2.0f * aps5_ws.x / float(" + MslAbi::WindowSpaceWidthMacro + ") - 1.0f) * aps5_ws.w, (2.0f * aps5_ws.y / float(" + MslAbi::WindowSpaceHeightMacro + ") - 1.0f) * aps5_ws.w, aps5_ws.z * aps5_ws.w, aps5_ws.w);\n";
+    text += indent + "}\n";
+    text += "#endif\n";
+    return text;
 }
 
 std::string PerVertexLocationCondition(std::uint32_t location) {
@@ -111,11 +126,48 @@ std::string InstanceId(MslEmitterState& state) {
     return "aps5_instance_id";
 }
 
+const char* LocationName(InterpolationLocation location) {
+    switch (location) {
+    case InterpolationLocation::Centroid: return "centroid";
+    case InterpolationLocation::Sample: return "sample";
+    default: return "center";
+    }
+}
+
+// A read at the sample's location runs the fragment function per sample (MSL specification 5.5:
+// sample_* inputs and [[sample_id]]); interpolate_at_sample takes the sample's (host) index.
+void ReadAtSample(MslEmitterState& state) {
+    state.AddParameter("uint aps5_sample_id [[sample_id]]");
+    state.reflection.perSample = true;
+}
+
+// The interpolation location of one read (DECISIONS D38): the IrValue flags the front end set
+// (InterpolationLocationFlags), else the center for barycentrics, and for attributes the only
+// location the program's metadata names for the input.
+InterpolationLocation ReadLocation(MslEmitterState& state, const IrValue& instruction, std::optional<std::uint32_t> attribute) {
+    const auto flags = instruction.Flags<std::uint32_t>();
+    if ((flags & InterpolationLocationFlag) != 0u) {
+        const auto location = flags & ~InterpolationLocationFlag;
+        if (location > static_cast<std::uint32_t>(InterpolationLocation::Sample)) state.Fail(instruction, "invalid interpolation location " + std::to_string(location));
+        return static_cast<InterpolationLocation>(location);
+    }
+    if (!attribute.has_value()) return InterpolationLocation::Center;
+    const auto& metadata = state.program.Metadata();
+    const auto bit = 1u << *attribute;
+    const bool atSample = (metadata.pixelSampleInputs & bit) != 0u;
+    const bool atCentroid = (metadata.pixelCentroidInputs & bit) != 0u;
+    if (static_cast<unsigned>(atSample) + static_cast<unsigned>(atCentroid) + static_cast<unsigned>((metadata.pixelCenterInputs & bit) != 0u) > 1u) state.Fail(instruction, "reads pixel input " + std::to_string(*attribute) + ", interpolated at more than one of center, centroid and sample, without naming the location of this read");
+    return atSample ? InterpolationLocation::Sample : atCentroid ? InterpolationLocation::Centroid : InterpolationLocation::Center;
+}
+
 // Emulated per-vertex values (MslAbi Version 5, the triangle-vertices expansion): the corner weights
-// interpolated perspective-correct (bit 0) or linearly (bit 1), as gl_BaryCoordKHR / NoPerspKHR.
-std::string EmulatedBarycentric(MslEmitterState& state, bool linear) {
+// interpolated perspective-correct (bit 0) or linearly (bit 1), as gl_BaryCoordKHR / NoPerspKHR, at
+// the read's location (DECISIONS D38: aps5_bw_<location>, defined by MslGraphicsInterfaceOf).
+std::string EmulatedBarycentric(MslEmitterState& state, bool linear, InterpolationLocation location) {
     state.reflection.emulatedBarycentrics |= linear ? 2u : 1u;
-    return linear ? "aps5_in.aps5_bwl" : "aps5_in.aps5_bw";
+    state.barycentricLocations[linear ? 1u : 0u] |= 1u << static_cast<std::uint32_t>(location);
+    if (location == InterpolationLocation::Sample) ReadAtSample(state);
+    return std::string(linear ? "aps5_bwl_" : "aps5_bw_") + LocationName(location);
 }
 
 // One channel of corner `vertex`'s value of a per-vertex pixel parameter at Vulkan location
@@ -212,7 +264,7 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             // function emits one-hot corner weights, interpolated as the hardware interpolates the
             // guest's I/J (EmulatedBarycentric).
             if (component > 1u) state.Fail(instruction, "barycentric component is out of range");
-            return "as_type<uint>(" + EmulatedBarycentric(state, kind == StageInputKind::BaryCoordNoPerspective) + "[" + std::to_string(component + 1u) + "])";
+            return "as_type<uint>(" + EmulatedBarycentric(state, kind == StageInputKind::BaryCoordNoPerspective, ReadLocation(state, instruction, std::nullopt)) + "[" + std::to_string(component + 1u) + "])";
         default:
             break;
         }
@@ -245,24 +297,28 @@ std::string PixelAttribute(MslEmitterState& state, const IrValue& instruction, s
     const bool linear = pixel.InputIsLinear(attribute, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs);
     if (InputIsPerVertex(state, attribute)) {
         // A slot read per vertex is interpolated from its corner values, as the SPIR-V path's
-        // EmitAttributeValue: corner 0 when flat, else the barycentric-weighted sum.
+        // EmitAttributeValue: corner 0 when flat, else the barycentric-weighted sum (weights at the
+        // read's location).
         if (flat) return "as_type<uint>(" + PerVertexValue(state, location, 0u, channel) + ")";
-        const auto weights = EmulatedBarycentric(state, linear);
+        const auto weights = EmulatedBarycentric(state, linear, ReadLocation(state, instruction, attribute));
         std::string sum = PerVertexValue(state, location, 0u, channel) + " * " + weights + "[0]";
         for (std::uint32_t vertex = 1u; vertex < 3u; ++vertex) sum = "(" + sum + " + " + PerVertexValue(state, location, vertex, channel) + " * " + weights + "[" + std::to_string(vertex) + "])";
         return "as_type<uint>(" + sum + ")";
     }
-    // The interpolation location is the I/J pair the guest's v_interp_p2 reads (SPI_PS_INPUT_ENA
-    // PERSP/LINEAR_CENTER, _CENTROID, _SAMPLE; DECISIONS D28): sample_* inputs make Metal run the
-    // fragment function per sample, at that sample's position.
-    const auto bit = 1u << attribute;
-    const bool atSample = (metadata.pixelSampleInputs & bit) != 0u;
-    const bool atCentroid = (metadata.pixelCentroidInputs & bit) != 0u;
-    if (!flat && static_cast<unsigned>(atSample) + static_cast<unsigned>(atCentroid) + static_cast<unsigned>((metadata.pixelCenterInputs & bit) != 0u) > 1u) state.Fail(instruction, "interpolates pixel input " + std::to_string(attribute) + " at more than one of center, centroid and sample");
-    const std::string at = atSample ? "sample" : atCentroid ? "centroid" : "center";
-    if (!flat && atSample) state.reflection.perSample = true;
-    state.fragmentInputs.emplace(location, flat ? ", flat" : linear ? ", " + at + "_no_perspective" : ", " + at + "_perspective");
-    return "aps5_input_" + std::to_string(location) + "(" + std::to_string(channel & 3u) + ")";
+    // The interpolation location is the I/J pair this read's v_interp_p2 reads (SPI_PS_INPUT_ENA
+    // PERSP/LINEAR_CENTER, _CENTROID, _SAMPLE; DECISIONS D28, D38): an input read at one location
+    // takes that location's qualifier (sample_* inputs make Metal run the fragment function per
+    // sample, at that sample's position), an input read at several is an interpolant<> read with
+    // interpolate_at_<location> (MslGraphicsInterfaceOf defines aps5_input_<L>_<location>).
+    using Mode = MslEmitterState::FragmentInput::Mode;
+    const auto mode = flat ? Mode::Flat : linear ? Mode::Linear : Mode::Perspective;
+    const auto input = state.fragmentInputs.try_emplace(location, MslEmitterState::FragmentInput {mode, 0u}).first;
+    if (input->second.mode != mode) state.Fail(instruction, "pixel input location " + std::to_string(location) + " is read both flat and interpolated, or both perspective-correct and linearly");
+    if (flat) return "aps5_input_" + std::to_string(location) + "(" + std::to_string(channel & 3u) + ")";
+    const auto at = ReadLocation(state, instruction, attribute);
+    input->second.locations |= 1u << static_cast<std::uint32_t>(at);
+    if (at == InterpolationLocation::Sample) ReadAtSample(state);
+    return "aps5_input_" + std::to_string(location) + "_" + LocationName(at) + "(" + std::to_string(channel & 3u) + ")";
 }
 
 void GetAttribute(MslEmitterState& state, const IrValue& instruction) {
@@ -730,7 +786,8 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         // Metal has no depth clip control: a [-w, w] guest depth range is remapped to [0, w]. The y
         // flip between Vulkan and Metal lives in the driver's viewport (MetalDraw.mm); APS5_FLIP_Y is
         // a debug aid the driver never defines.
-        result.epilogue = "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n"
+        result.epilogue = WindowSpaceEpilogue("aps5_out.aps5_position", "    ") +
+                          "#if defined(APS5_DEPTH_NEGATIVE_ONE_TO_ONE) && APS5_DEPTH_NEGATIVE_ONE_TO_ONE\n"
                           "    aps5_out.aps5_position.z = (aps5_out.aps5_position.z + aps5_out.aps5_position.w) * 0.5f;\n"
                           "#endif\n"
                           "#if defined(APS5_FLIP_Y) && APS5_FLIP_Y\n"
@@ -741,9 +798,10 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     if (stage == IrShaderStage::Mesh) {
         // Mesh functions (NGG primitive shaders, as DefineMeshOutputs): the vertex record carries the
         // position and the parameters, the primitive record the cull flag and the layer.
-        const auto& mesh = VertexInfo(state).mesh;
-        if (mesh.maxVertices == 0u || mesh.maxVertices > 256u) state.Fail("mesh functions output 1 to 256 vertices (Metal mesh<> limit), the subgroup has " + std::to_string(mesh.maxVertices));
-        if (mesh.maxPrimitives == 0u || mesh.maxPrimitives > 512u) state.Fail("mesh functions output 1 to 512 primitives (Metal mesh<> limit), the subgroup has " + std::to_string(mesh.maxPrimitives));
+        const auto meshOutput = MslMeshOutputOf(VertexInfo(state).mesh);
+        const auto subgroup = meshOutput.rectList ? std::string(" (rect list: guest vertices plus one per rect)") : std::string();
+        if (meshOutput.vertices == 0u || meshOutput.vertices > 256u) state.Fail("mesh functions output 1 to 256 vertices (Metal mesh<> limit), the subgroup has " + std::to_string(meshOutput.vertices) + subgroup);
+        if (meshOutput.primitives == 0u || meshOutput.primitives > 512u) state.Fail("mesh functions output 1 to 512 primitives (Metal mesh<> limit), the subgroup has " + std::to_string(meshOutput.primitives) + subgroup);
         text += "struct Aps5MeshVertex {\n    float4 aps5_position [[position]];\n";
         std::uint32_t scalars = 4u;
         bool layer = false;
@@ -757,14 +815,41 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                 scalars += 4u;
                 break;
             case StageOutputKind::Layer: layer = true; break;
-            default: state.Fail("unsupported mesh output kind");
+            default: state.Fail("mesh functions output the position, parameters and layer only: clip and cull distances, point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
             }
         }
         if (scalars > 124u) state.Fail("the mesh function exceeds 124 scalar varyings");
+        // MslAbi Version 13, the triangle-vertices mode (APS5_TRIANGLE_VERTICES, as the vertex
+        // function's D20 emulation): every output triangle has its own three vertices, which carry
+        // one-hot corner weights as the barycentrics; the corners' values of the per-vertex locations
+        // go in the primitive record (flat by definition, read by the fragment function's flat
+        // user(aps5_pv<L>_<j>) inputs), so each is stored once per triangle, not per vertex.
+        text += TriangleVertexMacroDefaults();
+        text += "#if " + TriangleVerticesCondition() + "\n";
+        text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
+        text += "#if (APS5_BARYCENTRICS & 2)\n    float3 aps5_bwl [[user(aps5_bwl)]];\n#endif\n";
+        text += "#endif\n";
         text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
         if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
+        text += "#if " + TriangleVerticesCondition() + "\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            text += "#endif\n";
+        }
+        text += "#endif\n";
         text += "};\n\n";
-        text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(mesh.maxVertices) + ", " + std::to_string(mesh.maxPrimitives) + ", metal::topology::triangle>;\n\n";
+        if (meshOutput.rectList) {
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n\n";
+        } else {
+            const auto split = MslAbi::MeshTriangleVerticesPrimitives(meshOutput.primitives);
+            text += "#if " + TriangleVerticesCondition() + "\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(3u * split) + ", " + std::to_string(split) + ", metal::topology::triangle>;\n";
+            text += "#else\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n";
+            text += "#endif\n\n";
+        }
         result.outputType = "Aps5MeshVertex";
         return result;
     }
@@ -774,11 +859,34 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     text += "#ifndef APS5_SAMPLE_BASE\n#define APS5_SAMPLE_BASE 0\n#endif\n";
     text += "struct Aps5FragmentIn {\n    float4 aps5_position [[position]];\n";
     std::string accessors;
-    for (const auto& [location, qualifier] : state.fragmentInputs) {
+    using Mode = MslEmitterState::FragmentInput::Mode;
+    constexpr std::array locations {InterpolationLocation::Center, InterpolationLocation::Centroid, InterpolationLocation::Sample};
+    for (const auto& [location, input] : state.fragmentInputs) {
         const auto macro = location < 32u ? std::string("APS5_VERTEX_OUTPUTS") : std::string("APS5_VERTEX_OUTPUTS_HI");
         const auto guard = "#if ((" + macro + " >> " + std::to_string(location % 32u) + ") & 1)\n";
-        text += guard + "    float4 p" + std::to_string(location) + " [[user(locn" + std::to_string(location) + ")" + qualifier + "]];\n#endif\n";
-        accessors += guard + "#define aps5_input_" + std::to_string(location) + "(c) as_type<uint>(aps5_in.p" + std::to_string(location) + "[c])\n#else\n#define aps5_input_" + std::to_string(location) + "(c) 0u\n#endif\n";
+        const auto field = "p" + std::to_string(location);
+        const auto name = "aps5_input_" + std::to_string(location);
+        if (input.mode == Mode::Flat) {
+            text += guard + "    float4 " + field + " [[user(locn" + std::to_string(location) + "), flat]];\n#endif\n";
+            accessors += guard + "#define " + name + "(c) as_type<uint>(aps5_in." + field + "[c])\n#else\n#define " + name + "(c) 0u\n#endif\n";
+            continue;
+        }
+        const std::string perspective = input.mode == Mode::Linear ? "no_perspective" : "perspective";
+        // DECISIONS D38: several locations need pull-model interpolation (MSL specification 2.18,
+        // 6.12; an interpolant<> stage_in member takes no interpolation qualifier).
+        const bool pull = std::popcount(input.locations) > 1;
+        if (pull) text += guard + "    interpolant<float4, interpolation::" + perspective + "> " + field + " [[user(locn" + std::to_string(location) + ")]];\n#endif\n";
+        std::string defined;
+        std::string zero;
+        for (const auto at : locations) {
+            if ((input.locations & (1u << static_cast<std::uint32_t>(at))) == 0u) continue;
+            const auto accessor = name + "_" + LocationName(at);
+            if (!pull) text += guard + "    float4 " + field + " [[user(locn" + std::to_string(location) + "), " + LocationName(at) + "_" + perspective + "]];\n#endif\n";
+            const auto value = !pull ? "aps5_in." + field : at == InterpolationLocation::Sample ? "aps5_in." + field + ".interpolate_at_sample(aps5_sample_id)" : "aps5_in." + field + ".interpolate_at_" + LocationName(at) + "()";
+            defined += "#define " + accessor + "(c) as_type<uint>(" + value + "[c])\n";
+            zero += "#define " + accessor + "(c) 0u\n";
+        }
+        accessors += guard + defined + "#else\n" + zero + "#endif\n";
     }
     // MslAbi Version 5: per-vertex values and emulated barycentrics (triangle-vertices draws).
     for (std::uint32_t location = 0; location < 64u; ++location) {
@@ -790,8 +898,22 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += "#endif\n";
         accessors += guard + "#define aps5_pv_" + std::to_string(location) + "(v, c) aps5_in.pv" + std::to_string(location) + "_##v[c]\n#else\n#define aps5_pv_" + std::to_string(location) + "(v, c) 0.0f\n#endif\n";
     }
-    if ((state.reflection.emulatedBarycentrics & 1u) != 0u) text += "    float3 aps5_bw [[user(aps5_bw), center_perspective]];\n";
-    if ((state.reflection.emulatedBarycentrics & 2u) != 0u) text += "    float3 aps5_bwl [[user(aps5_bwl), center_no_perspective]];\n";
+    // The corner weights at each location read (DECISIONS D38): one location takes its qualifier,
+    // several make the weights an interpolant<>.
+    for (std::uint32_t linear = 0u; linear < 2u; ++linear) {
+        if ((state.reflection.emulatedBarycentrics & (1u << linear)) == 0u) continue;
+        const std::string field = linear != 0u ? "aps5_bwl" : "aps5_bw";
+        const std::string perspective = linear != 0u ? "no_perspective" : "perspective";
+        const auto read = state.barycentricLocations[linear];
+        const bool pull = std::popcount(read) > 1;
+        if (pull) text += "    interpolant<float3, interpolation::" + perspective + "> " + field + " [[user(" + field + ")]];\n";
+        for (const auto at : locations) {
+            if ((read & (1u << static_cast<std::uint32_t>(at))) == 0u) continue;
+            if (!pull) text += "    float3 " + field + " [[user(" + field + "), " + LocationName(at) + "_" + perspective + "]];\n";
+            const auto value = !pull ? "aps5_in." + field : at == InterpolationLocation::Sample ? "aps5_in." + field + ".interpolate_at_sample(aps5_sample_id)" : "aps5_in." + field + ".interpolate_at_" + LocationName(at) + "()";
+            accessors += "#define " + field + "_" + LocationName(at) + " " + value + "\n";
+        }
+    }
     text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentInputFields() + "#endif\n";
     text += "};\n" + accessors + "\n";
     std::string members;

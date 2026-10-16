@@ -21,23 +21,25 @@ namespace Agc::Marker {
 
 std::uint32_t* Push(CommandBuffer* buf, const char* str, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
-    const char* text = str ? str : "";
+    const char* text = str ? Agc::Command::Host(str) : ""; // the text may live in displaced memory (D31, D33)
     const std::size_t bytes = std::strlen(text) + 1;
     const auto payload = static_cast<std::uint32_t>((bytes + 3) / 4);
     Agc::Command::Require(payload <= 0x4000u, function, "marker text too long");
-    auto* packet = Agc::Command::Allocate(buf, payload + 1, function);
+    auto* const guestPacket = Agc::Command::Allocate(buf, payload + 1, function);
+    auto* packet = Agc::Command::Host(guestPacket);
     packet[0] = Agc::Command::Header(OpcodeNop, payload + 1, CustomPushMarker << 2);
     std::memset(packet + 1, 0, payload * sizeof(std::uint32_t));
     std::memcpy(packet + 1, text, bytes);
-    return packet;
+    return guestPacket;
 }
 
 std::uint32_t* Pop(CommandBuffer* buf, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
-    auto* packet = Agc::Command::Allocate(buf, 2, function);
+    auto* const guestPacket = Agc::Command::Allocate(buf, 2, function);
+    auto* packet = Agc::Command::Host(guestPacket);
     packet[0] = Agc::Command::Header(OpcodeNop, 2, CustomPopMarker << 2);
     packet[1] = 0;
-    return packet;
+    return guestPacket;
 }
 
 }

@@ -18,6 +18,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
 
@@ -382,7 +383,7 @@ static int getParam(const SaveDataMountPoint* mount_point, uint32_t param_type, 
         return SAVE_DATA_ERROR_PARAMETER;
     }
     const SaveDataParam param = load_param(g_slots[slot].real_path);
-    std::memcpy(param_buf, reinterpret_cast<const char*>(&param) + field.offset, field.size);
+    std::memcpy(GuestArena::HostRange(param_buf, field.size), reinterpret_cast<const char*>(&param) + field.offset, field.size); // guest buffers: alias if displaced (D31, D33)
     if (got_size != nullptr) {
         *got_size = field.size;
     }
@@ -418,14 +419,15 @@ static int getSaveDataMemory2(SaveDataMemoryGet2* get_param) {
             return SAVE_DATA_ERROR_INTERNAL;
         }
         f.seekg(static_cast<std::streamoff>(d->offset));
-        f.read(static_cast<char*>(d->buf), static_cast<std::streamsize>(d->buf_size));
+        f.read(static_cast<char*>(GuestArena::HostRange(d->buf, d->buf_size)), static_cast<std::streamsize>(d->buf_size)); // guest buffer: alias if displaced (D31, D33)
         if (!f) {
             return SAVE_DATA_ERROR_INTERNAL;
         }
     }
     if (get_param->param != nullptr) {
-        std::memset(get_param->param, 0, sizeof(SaveDataParam));
-        read_param_file(mem_path(get_param->user_id, get_param->slot_id, "param"), get_param->param);
+        auto* param = GuestArena::HostRange(get_param->param, sizeof(SaveDataParam));
+        std::memset(param, 0, sizeof(SaveDataParam));
+        read_param_file(mem_path(get_param->user_id, get_param->slot_id, "param"), param);
     }
     if (get_param->icon != nullptr) {
         get_param->icon->data_size = 0;
@@ -509,7 +511,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     g_slots[slot].used = true;
     g_slots[slot].mount_point = mountPoint;
     g_slots[slot].real_path = real_path;
-    std::memcpy(mount_result->mount_point.data, mountPoint.c_str(), mountPoint.size() + 1);
+    std::memcpy(GuestArena::HostRange(mount_result->mount_point.data, mountPoint.size() + 1), mountPoint.c_str(), mountPoint.size() + 1);
     mount_result->required_blocks = 0;
     mount_result->mount_status = (create || (create2 && !exists)) ? 1u : 0u;
     return SAVE_DATA_OK;
@@ -562,12 +564,12 @@ static int setParam(const SaveDataMountPoint* mount_point, uint32_t param_type, 
     char* destination = reinterpret_cast<char*>(&param) + field.offset;
     if (field.text) {
         const std::size_t length = std::min(param_buf_size, field.size - 1);
-        const char* text = static_cast<const char*>(param_buf);
+        const char* text = static_cast<const char*>(GuestArena::HostRange(param_buf, length));
         const char* end = static_cast<const char*>(std::memchr(text, '\0', length));
         std::memset(destination, 0, field.size);
         std::memcpy(destination, text, end != nullptr ? static_cast<std::size_t>(end - text) : length);
     } else {
-        std::memcpy(destination, param_buf, field.size);
+        std::memcpy(destination, GuestArena::HostRange(param_buf, field.size), field.size);
     }
     if (param_type != SAVE_DATA_PARAM_TYPE_MTIME) {
         param.mtime = static_cast<std::int64_t>(std::time(nullptr));
@@ -615,7 +617,7 @@ static int setSaveDataMemory2(const SaveDataMemorySet2* set_param) {
             if (d.buf_size == 0) {
                 continue;
             }
-            std::memcpy(memory.data() + d.offset, d.buf, d.buf_size);
+            std::memcpy(memory.data() + d.offset, GuestArena::HostRange(d.buf, d.buf_size), d.buf_size); // guest buffer: alias if displaced (D31, D33)
         }
         if (!write_file_replace(path, memory)) {
             return SAVE_DATA_ERROR_INTERNAL;
@@ -623,7 +625,7 @@ static int setSaveDataMemory2(const SaveDataMemorySet2* set_param) {
     }
     if (set_param->param != nullptr) {
         std::vector<char> pd(sizeof(SaveDataParam));
-        std::memcpy(pd.data(), set_param->param, sizeof(SaveDataParam));
+        std::memcpy(pd.data(), GuestArena::HostRange(set_param->param, sizeof(SaveDataParam)), sizeof(SaveDataParam));
         if (!write_file_replace(mem_path(set_param->user_id, set_param->slot_id, "param"), pd)) {
             return SAVE_DATA_ERROR_INTERNAL;
         }
@@ -664,7 +666,7 @@ static int setupSaveDataMemory2(const SaveDataMemorySetup2* setup_param, SaveDat
         std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
         if (needParam) {
             std::vector<char> pd(sizeof(SaveDataParam));
-            std::memcpy(pd.data(), setup_param->init_param, sizeof(SaveDataParam));
+            std::memcpy(pd.data(), GuestArena::HostRange(setup_param->init_param, sizeof(SaveDataParam)), sizeof(SaveDataParam));
             if (!write_file_replace(paramPath, pd)) {
                 return SAVE_DATA_ERROR_INTERNAL;
             }

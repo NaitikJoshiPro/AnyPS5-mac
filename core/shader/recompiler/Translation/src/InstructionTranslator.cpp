@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -340,14 +341,19 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto* ps = options.inputInfo.pixel;
         const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
         const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
-        // The sample pairs (PERSP/LINEAR_SAMPLE) carry the same host barycentrics: v_interp reads of
-        // them are host-interpolated at the sample (AttributeInstructions, pixelSampleInputs).
-        for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth},
-                                         std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective},
-                                         std::pair{PixelInput::PerspectiveSample, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::LinearSample, StageInputKind::BaryCoordNoPerspective}}) {
+        // The centroid and sample pairs (PERSP/LINEAR_CENTROID, _SAMPLE) carry the same host
+        // barycentrics, flagged with their location (DECISIONS D38): v_interp reads of them are
+        // host-interpolated there (AttributeInstructions), and the emulated barycentrics of exact or
+        // 16-bit reads are interpolated there too.
+        for (const auto [input, kind, location] : {std::tuple{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth, InterpolationLocation::Center}, std::tuple{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth, InterpolationLocation::Centroid},
+                                                   std::tuple{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Center}, std::tuple{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Centroid},
+                                                   std::tuple{PixelInput::PerspectiveSample, StageInputKind::BaryCoordSmooth, InterpolationLocation::Sample}, std::tuple{PixelInput::LinearSample, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Sample}}) {
             if (!loaded(input)) continue;
-            setVector(static_cast<VectorReg>(vgpr(input)), builtin(kind, 0u));
-            setVector(static_cast<VectorReg>(vgpr(input) + 1u), builtin(kind, 1u));
+            for (std::uint32_t component = 0u; component < 2u; ++component) {
+                IrValue& value = builtin(kind, component);
+                value.SetFlags<std::uint32_t>(InterpolationLocationFlags(location));
+                setVector(static_cast<VectorReg>(vgpr(input) + component), value);
+            }
         }
         if (loaded(PixelInput::PositionX)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionX)), builtin(StageInputKind::FragCoord, 0u));
@@ -525,6 +531,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled, options.barycentricFallback);
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
+        context.SetNativeF32Flush(options.nativeF32Flush);
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {

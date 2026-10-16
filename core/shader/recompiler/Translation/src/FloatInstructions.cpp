@@ -575,6 +575,7 @@ bool TranslationContext::floatBinary(const RdnaInstruction& inst, IrOpcode opcod
         args[index] = readOperand(operand, IrOpcodeArgumentType(opcode, index));
     }
     IrValue* result = &ir.Emit(opcode, IrOpcodeType(opcode), {args[0], args[1]});
+    if (opcode == IrOpcode::FPMul32 && nativeF32FlushOp == NativeF32Flush::Product) result->SetFlags<std::uint32_t>(FPMulNativeFlushFlag);
     if (opcode == IrOpcode::FPMul32) result = &flushTinyProduct(args[0], args[1], result).Value();
     if (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32) result = nanResultF32({args[0], args[1]}, result);
     if (opcode == IrOpcode::FPSub32) {
@@ -593,6 +594,9 @@ bool TranslationContext::floatTernary(const RdnaInstruction& inst, IrOpcode opco
         args[index] = type == IrType::F32 && mix ? &readMixF32(operand).Value() : readOperand(operand, type);
     }
     IrValue* result = &ir.Emit(opcode, IrOpcodeType(opcode), {args[0], args[1], args[2]});
+    if (opcode == IrOpcode::FPFma32 && nativeF32FlushOp == NativeF32Flush::Product) {
+        result->SetFlags<std::uint32_t>(FPMulNativeFlushFlag);
+    }
     if (opcode == IrOpcode::FPFma32) result = &flushTinyProduct(args[0], args[1], result, args[2]).Value();
     const bool f32Sources = !mix || !(sourceAt(inst, 0u).opSelHi || sourceAt(inst, 1u).opSelHi || (!accumulator && sourceAt(inst, 2u).opSelHi));
     if (opcode == IrOpcode::FPFma32 && f32Sources) result = nanResultF32({args[0], args[1], args[2]}, result, &invalidProductF32(args[0], args[1]));

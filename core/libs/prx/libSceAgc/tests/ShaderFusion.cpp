@@ -2,6 +2,9 @@
 #include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include <array>
 #include <cstdint>
@@ -242,6 +245,95 @@ void testHullHalves() {
     check(backSh[4].value == 0u, "hull fusion wrote the back half's registers");
 }
 
+// Copies a shader graph into guest memory at `guest` (written through its host view), rebasing every table pointer.
+class Relocation {
+public:
+    explicit Relocation(std::uintptr_t guest) : guest_(guest), host_(GuestArena::HostAddress(guest)) {}
+    template <typename T>
+    T* Copy(const T* source, std::size_t bytes, std::size_t alignment = alignof(T)) {
+        if (source == nullptr) return nullptr;
+        cursor_ = (cursor_ + alignment - 1) & ~(alignment - 1);
+        std::memcpy(reinterpret_cast<void*>(host_ + cursor_), static_cast<const void*>(source), bytes);
+        auto* placed = reinterpret_cast<T*>(guest_ + cursor_);
+        cursor_ += bytes;
+        return placed;
+    }
+    Shader* Place(const Shader& shader) {
+        Shader moved = shader;
+        moved.code = Copy(static_cast<const std::uint8_t*>(const_cast<const void*>(shader.code)), shader.shader_size, 256);
+        moved.sh_registers = Copy(shader.sh_registers, shader.num_sh_registers * sizeof(ShaderRegister));
+        moved.cx_registers = Copy(shader.cx_registers, shader.num_cx_registers * sizeof(ShaderRegister));
+        moved.specials = Copy(shader.specials, sizeof(ShaderSpecialRegs));
+        moved.input_semantics = Copy(shader.input_semantics, shader.num_input_semantics * sizeof(ShaderSemantic));
+        moved.output_semantics = Copy(shader.output_semantics, shader.num_output_semantics * sizeof(ShaderSemantic));
+        if (shader.user_data != nullptr) {
+            ShaderUserData userData = *shader.user_data;
+            userData.direct_resource_offset = Copy(userData.direct_resource_offset, userData.direct_resource_count * sizeof(std::uint16_t));
+            for (std::size_t i = 0; i < 4; ++i) userData.sharp_resource_offset[i] = Copy(userData.sharp_resource_offset[i], userData.sharp_resource_count[i] * sizeof(ShaderSharp));
+            moved.user_data = Copy(&userData, sizeof(userData));
+        }
+        return Copy(&moved, sizeof(moved), 16);
+    }
+    void* Reserve(std::size_t bytes, std::size_t alignment) {
+        cursor_ = (cursor_ + alignment - 1) & ~(alignment - 1);
+        auto* placed = reinterpret_cast<void*>(guest_ + cursor_);
+        cursor_ += bytes;
+        return placed;
+    }
+    template <typename T>
+    T* Host(T* guest) const { return reinterpret_cast<T*>(GuestArena::HostAddress(reinterpret_cast<std::uintptr_t>(guest))); }
+
+private:
+    std::uintptr_t guest_;
+    std::uintptr_t host_;
+    std::size_t cursor_ = 0;
+};
+
+// Halves, scratch and the fused result in displaced guest memory (D31, D33; ASTRO BOT's shaders live at 0x5xxxxxxxx):
+// libSceAgc and the driver's registration read and write them through host views, so fusing and registering takes
+// no displaced fault, and the fused shader is the one ordinary memory gives (at its own address).
+void testDisplacedFusion() {
+#if defined(__APPLE__) && defined(__aarch64__)
+    constexpr std::uintptr_t Base = 0x400000000ull;
+    constexpr std::size_t Bytes = 0x40000;
+    check(GuestArena::GuestDisplacedActive_nid_no_patch() && GuestArena::IsDisplaced(Base), "0x400000000 is not displaced");
+    GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(Base), Bytes, 0x04, 0x4000);
+    GuestAllocations::Mutation().Add(reinterpret_cast<void*>(Base), Bytes, true, true, true);
+    Halves halves;
+    Relocation memory(Base);
+    auto* front = memory.Place(halves.front);
+    auto* back = memory.Place(halves.back);
+    const auto faults = [] {
+        std::uint64_t count = 0, patches = 0;
+        GuestArena::GuestDisplacedStats_nid_no_patch(&count, &patches);
+        return count;
+    };
+    const auto before = faults();
+    SizeAlign size{};
+    check(sceAgcGetFusedShaderSize_0080(&size, front, back) == 0, "displaced fused size query failed");
+    auto* scratch = static_cast<std::uint8_t*>(memory.Reserve(size.m_size, 256));
+    Shader fused{};
+    check(sceAgcFuseShaderHalves_0200(&fused, front, back, scratch) == 0, "displaced fusion failed");
+    const auto taken = faults() - before;
+    if (taken != 0) throw std::runtime_error("displaced fusion took " + std::to_string(taken) + " displaced faults (a native read through the guest address)");
+    check(fused.code == scratch && fused.shader_size == 256 + halves.back.shader_size, "displaced fused code placement is wrong");
+    const auto* code = memory.Host(scratch);
+    check(word(code, 0) == SMovS0 && word(code, 1) == VMovV0 && word(code, 64) == halves.backCode[0], "displaced fused program was not copied");
+    const auto inside = [&](const void* pointer) {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        return address >= reinterpret_cast<std::uintptr_t>(scratch) && address < reinterpret_cast<std::uintptr_t>(scratch) + size.m_size;
+    };
+    check(inside(fused.sh_registers) && inside(fused.cx_registers) && inside(fused.specials) && inside(fused.user_data), "displaced fused tables are not at their guest addresses");
+    const auto* userData = memory.Host(fused.user_data);
+    check(inside(userData->direct_resource_offset) && memory.Host(userData->direct_resource_offset)[1] == 9u, "displaced fused user data is wrong");
+    const auto* lo = memory.Host(fused.sh_registers);
+    bool patched = false;
+    for (std::size_t i = 0; i < fused.num_sh_registers; ++i) patched |= lo[i].offset == 0x0C8u && lo[i].value == static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(scratch) >> 8u);
+    check(patched, "displaced fused program address is not the guest address");
+    GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(Base));
+#endif
+}
+
 }
 
 int main() {
@@ -254,6 +346,7 @@ int main() {
         testFusion(0, SSwappcNullS6);
         testRejections();
         testHullHalves();
+        testDisplacedFusion();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC shader fusion tests passed");
         return 0;

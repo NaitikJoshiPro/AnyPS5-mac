@@ -12,6 +12,7 @@ namespace {
 
 int SetRewindState(std::uint32_t* cmd, std::uint8_t state, const char* function) {
     Agc::Command::ValidatePacket(cmd, 0x59u, 2, function);
+    cmd = Agc::Command::Host(cmd);
     Agc::Command::CheckBits(state, 1, function);
     std::atomic_ref<std::uint32_t>(cmd[1]).store(static_cast<std::uint32_t>(state) << 31u, std::memory_order_release);
     return 0;
