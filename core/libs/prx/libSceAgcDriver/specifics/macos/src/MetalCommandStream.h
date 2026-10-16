@@ -226,8 +226,8 @@ void SetActiveRecorderCalls(const ActiveRecorderCalls& calls);
 ActiveRecorderCalls ActiveRecorder();
 
 // The driver's helper kernels (MSL in RecorderKernels.h), compiled once per device and kept for
-// the process: FillPattern, MeshArguments, SampleCounter, SampleDumps, DispatchArguments.
-enum class HelperKernel { FillPattern, MeshArguments, SampleCounter, SampleDumps, DispatchArguments, Count };
+// the process: FillPattern, MeshArguments, SampleCounter, SampleDumps, DispatchArguments, IndexGather.
+enum class HelperKernel { FillPattern, MeshArguments, SampleCounter, SampleDumps, DispatchArguments, IndexGather, Count };
 id<MTLComputePipelineState> HelperPipeline(id<MTLDevice> device, HelperKernel kernel);
 
 // A VkCommandBuffer handle carries the address of a CommandStream.

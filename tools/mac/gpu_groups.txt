@@ -523,6 +523,7 @@ agc_driver_zero_position_vertex G3
 agc_driver_zero_stride_vertex_fetch G3
 agc_import_watch G3
 agc_metadata_pass G3
+agc_metal_draw_index_gather G3
 agc_metal_draw_primitives G3
 agc_metal_draw_targets G3
 agc_metal_msaa_a2c G3
