@@ -190,7 +190,7 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     Require(pipeline.maxTotalThreadsPerMeshThreadgroup >= hostThreads, name + ": the mesh pipeline allows " + std::to_string(pipeline.maxTotalThreadsPerMeshThreadgroup) + " threads per threadgroup, the program needs " + std::to_string(hostThreads));
     std::printf("%s: mesh<%u, %u> with %u host threads, linked with the fragment function\n", test.name, outputVertices, outputPrimitives, hostThreads);
     if (rectList) {
-        Require(!Has(source, "aps5_tv_v["), name + ": a rect-list mesh function has the triangle-vertices mode");
+        Require(!Has(source, "aps5_tv_v[") && !Has(source, "aps5_lds_words[aps5_i * "), name + ": a rect-list mesh function has the triangle-vertices mode");
         return;
     }
 
@@ -201,7 +201,8 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     const auto split = Abi::MeshTriangleVerticesPrimitives(test.mesh.maxPrimitives);
     Require(split * 3u <= Abi::MeshMaxVertices && split * Abi::MeshTriangleVerticesSplits(test.mesh.maxPrimitives) >= test.mesh.maxPrimitives, name + ": the triangle-vertices split does not cover the subgroup");
     Require(Has(source, ", " + std::to_string(3u * split) + ", " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>"), name + ": no triangle-vertices mesh<> of " + std::to_string(3u * split) + " vertices and " + std::to_string(split) + " primitives");
-    Require(Has(source, "aps5_tv_v[") && Has(source, "float4 pv0_0 [[user(aps5_pv0_0)]]") && Has(source, "float3 aps5_bw [[user(aps5_bw)]]"), name + ": the triangle-vertices epilogue or its outputs are missing");
+    // The staging is in the guest's LDS words when the program has LDS (DECISIONS D77).
+    Require((Has(source, "aps5_tv_v[") || Has(source, "aps5_lds_words[aps5_i * ")) && Has(source, "float4 pv0_0 [[user(aps5_pv0_0)]]") && Has(source, "float3 aps5_bw [[user(aps5_bw)]]"), name + ": the triangle-vertices epilogue or its outputs are missing");
     ShaderRecompiler::ShaderPixelStageInfo perVertexPixel{};
     perVertexPixel.interpolatorCount = 1;
     perVertexPixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PerspectiveCenter);
@@ -258,8 +259,8 @@ int main() {
             Require(target.backend == ShaderRecompiler::ShaderBackend::Msl, "the Metal device's target is not the MSL backend");
             Require(target.mesh.has_value(), "the Metal target advertises no mesh shader limits");
             // tests/Mesh.cpp's subgroups: {input primitive, primitives and vertices per group, max
-            // vertices, max primitives, threads, LDS bytes, provoking vertex, ESGS item size}.
-            const std::array<MeshCase, 10> cases{{
+            // vertices, max primitives, threads, LDS dwords, provoking vertex, ESGS item size}.
+            const std::array<MeshCase, 11> cases{{
                 {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
@@ -271,6 +272,10 @@ int main() {
                 {"rect list, one-wave subgroups, wave64", {17u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, false},
                 {"rect list, two-wave subgroups, wave64", {17u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"rect list, wave32", {17u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
+                // DECISIONS D77: 20 KiB of LDS (5120 dwords) beside the triangle-vertices staging of
+                // 192 vertices: together past the 32 KiB threadgroup limit, so the staging reuses the
+                // LDS once the guest program returned (ASTRO BOT's worldmap meshes).
+                {"triangle list, LDS beside the triangle-vertices staging", {4u, 64u, 192u, 192u, 64u, 192u, 5120u, 0u, 4u}, 64u, true},
             }};
             for (const auto& test : cases) Check(metal, target, test);
         }
