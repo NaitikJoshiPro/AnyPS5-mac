@@ -308,12 +308,17 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
     const std::uint32_t minQueued = queueSize * std::clamp(buffers, 2u, 16u);
     const std::uint64_t waitStart = sceKernelGetProcessTime();
 
-    while (SDL_GetQueuedAudioSize(port.device) > minQueued) {
-        if (sceKernelGetProcessTime() - waitStart > DRAIN_TIMEOUT_US) {
+    // Sleep for as long as the excess takes to play instead of polling every millisecond (D79): one wake-up per
+    // output in the steady state, at least DRAIN_SLEEP_US so a device that takes whole buffers is not polled.
+    const std::uint64_t bytesPerSecond = static_cast<std::uint64_t>(port.spec.freq) * port.spec.channels * (SDL_AUDIO_BITSIZE(port.spec.format) / 8u);
+    for (std::uint32_t queued = SDL_GetQueuedAudioSize(port.device); queued > minQueued; queued = SDL_GetQueuedAudioSize(port.device)) {
+        const std::uint64_t waited = sceKernelGetProcessTime() - waitStart;
+        if (waited > DRAIN_TIMEOUT_US) {
             SDL_ClearQueuedAudio(port.device);
             break;
         }
-        sleepUs(lock, DRAIN_SLEEP_US);
+        const std::uint64_t excessUs = bytesPerSecond != 0 ? 1000000ULL * (queued - minQueued) / bytesPerSecond : DRAIN_SLEEP_US;
+        sleepUs(lock, std::clamp<std::uint64_t>(excessUs, DRAIN_SLEEP_US, DRAIN_TIMEOUT_US - waited + DRAIN_SLEEP_US));
     }
 
     if (SDL_QueueAudio(port.device, queueData, queueSize) < 0) {
