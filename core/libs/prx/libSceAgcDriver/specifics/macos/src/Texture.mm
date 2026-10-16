@@ -2059,7 +2059,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) { layerOriginal.assign(trackedLayers, false); originalDroppedBy = "Texture.mm:2062"; }
         else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
@@ -2108,7 +2108,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) { layerOriginal.assign(trackedLayers, false); originalDroppedBy = "Texture.mm:2111"; }
         else captureGuestBytes(layers);
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
@@ -3313,6 +3313,7 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
         if (!selected(layer)) continue;
         layerPending[layer] = false;
         layerOriginal[layer] = false;
+        originalDroppedBy = "Texture.mm:3315";
     }
     if (!anyLayerPending()) {
         ++dropped;
@@ -3374,6 +3375,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             texture->dirty = false;
             texture->layerPending.assign(texture->trackedLayers, false);
             texture->layerOriginal.assign(texture->trackedLayers, false);
+            texture->originalDroppedBy = "Texture.mm:3376";
             it = pending.textures.erase(it);
             ++discarded;
         } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
@@ -3386,6 +3388,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 if (!texture->layerPending[unit] || unitBegin < address || unitBegin + texture->layerBytes(unit) > end) continue;
                 texture->layerPending[unit] = false;
                 texture->layerOriginal[unit] = false;
+                texture->originalDroppedBy = "Texture.mm:3388";
                 unitsDropped.fetch_add(1, std::memory_order_relaxed);
                 dropped = true;
             }
@@ -3588,6 +3591,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     Metal::Vk::CmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
     recorder->EndGpuTiming(timing, guestBytes);
     layerOriginal.assign(trackedLayers, false);
+    originalDroppedBy = "Texture.mm:3590";
     uploadedKeys = keys;
     filledKeys = DccKeys::Uncompressed;
     keyProof = {};
@@ -3688,6 +3692,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
                 if (auto shared = texture->weak_from_this().lock()) untrackedOverlaps.push_back(std::move(shared));
             } else {
                 texture->layerOriginal.assign(texture->trackedLayers, false);
+                texture->originalDroppedBy = "Texture.mm:3690";
             }
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
@@ -3739,7 +3744,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // walk, the write-back's own walk would stamp them above this generation and keep their
     // blocks, and the fill's pattern would be lost in them.
     const bool watched = GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    if (watched) layerOriginal.assign(trackedLayers, false);
+    if (watched) { layerOriginal.assign(trackedLayers, false); originalDroppedBy = "Texture.mm:3742"; }
     uploadedKeys = DccKeys::Uncompressed;
     if (layer != WholeImage && trackedLayers > 1) {
         // The cleared layer's units alone: their stamps above lie below this generation, the other
@@ -3831,6 +3836,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
                 continue;
             }
             texture->layerOriginal.assign(texture->trackedLayers, false);
+            texture->originalDroppedBy = "Texture.mm:3833";
         }
     }
     for (const auto& texture : untrackedOverlaps) texture->keepComparable();
@@ -3882,7 +3888,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // As after a clear: the image holds the surface, guest memory follows at the write-back (which
     // keeps the 64 KiB blocks the CPU writes from now on; the collect is uncached for the reason
     // given in FillClear).
-    if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) layerOriginal.assign(trackedLayers, false);
+    if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) { layerOriginal.assign(trackedLayers, false); originalDroppedBy = "Texture.mm:3885"; }
     else captureGuestBytes(nullptr);
     uploadedKeys = DccKeys::Uncompressed;
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
@@ -4176,7 +4182,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     const auto forgetStored = [&] {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-            if (layers[layer]) layerOriginal[layer] = false;
+            if (layers[layer]) { layerOriginal[layer] = false; originalDroppedBy = "Texture.mm:4179"; }
         }
     };
     bool unsavedOutsideWatch = false;
@@ -4255,7 +4261,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         char where[160];
         std::snprintf(where, sizeof(where), " (image 0x%llx+0x%llx, %u layers; write watch covers it now: %d, first unsaved layer %u)", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0,
             static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
-        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where);
+        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where + " (saved bytes last dropped at " + (originalDroppedBy != nullptr ? originalDroppedBy : "none: never saved") + ")");
     }
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
@@ -4406,7 +4412,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         char where[160];
         std::snprintf(where, sizeof(where), " (image 0x%llx+0x%llx, %u layers; write watch covers it now: %d, first unsaved layer %u)", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0,
             static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
-        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where);
+        Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where + " (saved bytes last dropped at " + (originalDroppedBy != nullptr ? originalDroppedBy : "none: never saved") + ")");
     }
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
