@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <condition_variable>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -73,6 +74,11 @@ struct AudioOut2Port {
 
 struct AudioOut2Context {
     std::mutex lock;
+    // Signalled by the device callback when it consumed output: a blocking push waiting on a full queue
+    // wakes when the hardware takes a grain, as on the console, instead of polling (D79).
+    std::condition_variable consumed;
+    std::uint64_t fullWaits = 0;   // blocking pushes that found the queue full
+    std::uint64_t fullWakeups = 0; // times such pushes woke before the queue had room or the timeout
     std::uint32_t grain = AUDIO_OUT2_DEFAULT_GRAIN;
     std::uint32_t queueDepth = 1;
     // Fallback hardware queue model for a context without an SDL device: pushes that have not

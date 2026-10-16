@@ -232,6 +232,7 @@ static void DeviceCallback(void* userdata, Uint8* stream, int length) {
         context.priming = true;
         context.primes++;
     }
+    if (count != 0) context.consumed.notify_all();
 }
 
 static void TraceSummary(AudioOut2Context& context, Clock::time_point now) {
@@ -299,6 +300,15 @@ int APS5_VABI sceAudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
     return 0;
 }
 
+// For tests (D79): blocking pushes that found the queue full, and the extra wake-ups they took.
+extern "C" void AudioOut2ContextWaitStats_nid_no_patch(AudioOut2ContextHandle ctx, std::uint64_t* waits, std::uint64_t* wakeups) {
+    auto* context = FromHandle(ctx);
+    if (context == nullptr) return;
+    std::lock_guard lock(context->lock);
+    if (waits != nullptr) *waits = context->fullWaits;
+    if (wakeups != nullptr) *wakeups = context->fullWakeups;
+}
+
 int APS5_VABI sceAudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level, uint32_t* available_queue) {
     auto* context = FromHandle(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
@@ -318,6 +328,7 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
     std::unique_lock lock(context->lock);
     auto now = Clock::now();
     const auto waitStart = now;
+    bool waited = false;
     while (QueueLevel(*context, now) >= context->queueDepth) {
         if (!blocking) {
             context->fullRejects++;
@@ -325,9 +336,14 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
             return SCE_AUDIO_OUT2_ERROR_QUEUE_FULL;
         }
         if (now - waitStart > FULL_WAIT_TIMEOUT) break;
-        lock.unlock();
-        PreciseSleepUs(std::chrono::microseconds(FULL_WAIT_STEP).count());
-        lock.lock();
+        if (!waited) context->fullWaits++;
+        else context->fullWakeups++;
+        waited = true;
+        // Sleep until the queue can have room: without a device, when the oldest modelled grain finishes; with
+        // one, when its callback consumes output (it notifies), bounded by a grain in case a callback is late.
+        auto until = now + GrainDuration(*context);
+        if (context->device == 0 && context->queued > 0) until = context->playHead - GrainDuration(*context) * (context->queued - 1);
+        context->consumed.wait_until(lock, std::min(until, waitStart + FULL_WAIT_TIMEOUT + FULL_WAIT_STEP));
         now = Clock::now();
     }
     context->queued++;
@@ -344,7 +360,7 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
             const auto readAt = context->pendingSince.front() + READ_DELAY;
             if (Clock::now() < readAt) {
                 lock.unlock();
-                while (Clock::now() < readAt) std::this_thread::yield();
+                std::this_thread::sleep_until(readAt); // was a yield spin of up to READ_DELAY per grain (D79)
                 lock.lock();
                 continue;
             }
