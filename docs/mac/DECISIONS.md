@@ -571,3 +571,29 @@ Context: macOS sched_yield returns at once when no other thread wants the core. 
 Options: (a) leave yields as host yields; (b) map a yield to a fixed short sleep, which would slow legitimate one-off yields; (c) adaptive: plain yields first, then sleeps that grow while the streak lasts.
 Choice: (c). YieldBackoff (libkernel Pthread/include/YieldBackoff.hpp) gives 64 plain yields per streak, then sleeps of 50 us doubling to 400 us. A gap of more than 1 ms between yields ends the streak. It applies to scePthreadYield, sched_yield and pthread_yield.
 Evidence: test guest_yield_backoff. Title measurements pending (PERF5's measurement turn).
+
+## D79: Audio pushes sleep until the output takes a grain (2026-10-16)
+Context: the user order "go after the top 4 wastes", item W3: ASTRO BOT's audio thread (SceSndzAudioOutMain) looked like it ran at 100% of a core, with the hypothesis that sceAudioOut2ContextPush returns before the hardware consumes the grain.
+Findings:
+- The hypothesis does not hold. With APS5_TRACE_AUDIOOUT2 the pushes run at 93.9/s, which is real time for 512-sample grains at 48 kHz, and every push blocks (4,285 blocking, 0 queue-full rejects). In run a2nc, 602 samples of the thread were waits inside the push.
+- `sample` showed the thread "busy" 96-100% only because it was runnable on a saturated machine: both clusters were 100% active (a1, a2nc). The kernel's per-thread counters gave it 16.7-18.4% of a core at P 1.9 GHz and 8% at P 3.6 GHz (cq1). profile_title now flags "sampled busy well above CPU %" as CPU contention and reports time spent waiting for a core.
+- What D79 does remove is polling. A blocking push on a full queue slept in 1 ms steps, about ten wake-ups per 10.7 ms grain. The read delay was a yield spin. AudioOut v1 polled SDL's queue every 1 ms.
+Choice:
+- The SDL device callback notifies a condition variable whenever it consumes output, and a full-queue push waits on it. The wait is bounded by one grain and by the 200 ms give-up.
+- A context without a device sleeps until its modelled oldest grain ends.
+- The read delay sleeps instead of spinning.
+- AudioOut v1 sleeps for as long as the excess takes to play, at least 1 ms.
+Evidence: test audio_out2_timing, new TestBlockingPushWakesOnConsumption: 60 pushes at real time with at most two wake-ups per full wait. Title measurements of ASTRO and DOOM (an --audio-file capture with no underruns or drift) are pending PERF5's landing turn.
+
+## D80: Event-driven completion and label waits (2026-10-16)
+Context: W4. Nothing told a waiting thread that the GPU had finished. Queue workers polled completions every 1 ms. WAIT_REG_MEM spun for 1.5 ms on queue 0 (100 us elsewhere) and then slept in 200 us steps, reading the timeline on each tick. ASTRO's async queues 0x40 and 0x48 sit in these waits for most of each frame.
+Choice:
+- A process-wide progress event (Progress.cpp) carries an epoch, a condition variable and a hook. It is raised by:
+  - the Metal timeline listener, when a batch's serial is reached (MTLSharedEventListener on a user-interactive serial queue);
+  - reaped completion labels;
+  - finished packets;
+  - recorded writes (the write generation).
+- WAIT_REG_MEM spins for 250 us on queue 0 (APS5_WAIT_SPIN_US), then waits for an event with a 500 us fallback (APS5_WAIT_POLL_US). The fallback is there because labels written by the guest's CPU raise no event.
+- Queue workers waiting for completions are woken through the driver's condition variable by the hook, with a 4 ms fallback for a lost wake-up (APS5_COMPLETION_POLL_US).
+- The epoch is read before each check, so an event between the check and the wait is never lost.
+Evidence: test agc_progress (a wake on an event, a timeout without one, no lost wake-up, the hook, the counters). `[progress]` lines (APS5_PROFILE_GPU) count events, waits, wake-ups and timeouts. profile_title now reports context switches per second and the queue workers' CPU. ASTRO and Showcase before/after are pending PERF5's landing turn.
