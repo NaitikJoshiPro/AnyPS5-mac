@@ -272,7 +272,7 @@ int main() {
                 {"rect list, one-wave subgroups, wave64", {17u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, false},
                 {"rect list, two-wave subgroups, wave64", {17u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"rect list, wave32", {17u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
-                            // DECISIONS D77: 20 KiB of LDS (5120 dwords) beside the triangle-vertices staging of
+                // DECISIONS D77: 20 KiB of LDS (5120 dwords) beside the triangle-vertices staging of
                 // 192 vertices: together past the 32 KiB threadgroup limit, so the staging reuses the
                 // LDS once the guest program returned (ASTRO BOT's worldmap meshes).
                 {"triangle list, LDS beside the triangle-vertices staging", {4u, 64u, 192u, 192u, 64u, 192u, 5120u, 0u, 4u}, 64u, true},
