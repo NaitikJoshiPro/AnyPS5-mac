@@ -101,7 +101,10 @@ namespace ShaderRecompiler::MslAbi {
 //   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.
 // Version 14: vertex functions in the triangle-vertices mode take PrimitiveVerticesMacro (1 for
 //   points, 2 for lines, default 3): per-vertex fragment inputs of points and lines (DECISIONS D69).
-inline constexpr std::uint32_t Version = 14u;
+// Version 16: mesh functions take PrimitiveVerticesMacro too (DECISIONS D75): point and line draws
+//   output metal::topology::point / line with the primitive export's first one or two indices, in
+//   the plain and the triangle-vertices mode (N unshared vertices per primitive).
+inline constexpr std::uint32_t Version = 16u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
@@ -309,7 +312,13 @@ inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
 // Version 14: vertex (with TriangleVerticesMacro): the guest vertices per primitive when the draw is
 // a point (1) or line (2) list: host vertex v runs the guest program for guestVertex[N * (v / N) +
 // 0..N-1] and emits corner v % N; corners N..2 repeat the primitive's last vertex. Unset: 3.
+// Version 16: mesh (any mode): the draw's topology class, 1 for points, 2 for lines (the output
+// topology and the indices read from each primitive export).
 inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
+// Version 16: vertex and mesh: 1 when the draw is a point list (DECISIONS D75). A function whose guest
+// program exports no point size then writes [[point_size]] 1.0 (Metal leaves an unwritten size
+// undefined; Vulkan's maintenance5 default is 1.0; PA_SU_POINT_SIZE is not applied).
+inline constexpr const char* PointsMacro = "APS5_POINTS";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
 // - vertex and mesh (with TriangleVerticesMacro): the fragment function's

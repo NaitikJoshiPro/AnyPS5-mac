@@ -762,6 +762,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         // metal-tessellation: PA_SU_POINT_SIZE is not applied).
         const bool pointSize = std::any_of(state.program.Info().outputs.begin(), state.program.Info().outputs.end(), [](const auto& output) { return output.kind == StageOutputKind::PointSize; });
         if (stage == IrShaderStage::TessellationEvaluation && !pointSize) text += "#ifdef APS5_TESS_POINTS\n    float aps5_tess_point_size [[point_size]];\n#define APS5_TESS_POINT_SIZE_FIELD 1\n#endif\n";
+        if (stage == IrShaderStage::Vertex && !pointSize) text += "#if defined(" + std::string(MslAbi::PointsMacro) + ") && " + std::string(MslAbi::PointsMacro) + "\n    float aps5_default_point_size [[point_size]];\n#endif\n";
         // Metal's compiler fails past 124 scalar varyings (M2_DESIGN §4).
         if (scalars > 124u) state.Fail("the vertex function exceeds 124 scalar varyings");
         // MslAbi Version 5, triangle-vertices draws: each per-vertex location the fragment function
@@ -819,6 +820,8 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             }
         }
         if (scalars > 124u) state.Fail("the mesh function exceeds 124 scalar varyings");
+        // Point lists (MslAbi Version 16, DECISIONS D75): NGG programs export no point size here.
+        text += "#if defined(" + std::string(MslAbi::PointsMacro) + ") && " + std::string(MslAbi::PointsMacro) + "\n    float aps5_default_point_size [[point_size]];\n#endif\n";
         // MslAbi Version 13, the triangle-vertices mode (APS5_TRIANGLE_VERTICES, as the vertex
         // function's D20 emulation): every output triangle has its own three vertices, which carry
         // one-hot corner weights as the barycentrics; the corners' values of the per-vertex locations
@@ -844,10 +847,15 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n\n";
         } else {
             const auto split = MslAbi::MeshTriangleVerticesPrimitives(meshOutput.primitives);
+            // MslAbi Version 16 (DECISIONS D75): point and line draws output points and lines, one or
+            // two of the primitive export's indices per primitive (PrimitiveVerticesMacro).
+            const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
+            text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
+            text += "#if " + primitiveVertices + " == 1u\n#define APS5_MESH_TOPOLOGY metal::topology::point\n#elif " + primitiveVertices + " == 2u\n#define APS5_MESH_TOPOLOGY metal::topology::line\n#else\n#define APS5_MESH_TOPOLOGY metal::topology::triangle\n#endif\n";
             text += "#if " + TriangleVerticesCondition() + "\n";
-            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(3u * split) + ", " + std::to_string(split) + ", metal::topology::triangle>;\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(3u * split) + ", " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n";
             text += "#else\n";
-            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n";
             text += "#endif\n\n";
         }
         result.outputType = "Aps5MeshVertex";

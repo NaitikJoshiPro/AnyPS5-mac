@@ -664,11 +664,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
 
     // Per-vertex fragment inputs of points and lines draw in the triangle-vertices mode with one or
-    // two guest vertices per primitive (MslAbi Version 14, PrimitiveVerticesMacro; DECISIONS D69):
-    // the vertex path only. Conservative rasterization and cull distances stay triangle-only.
+    // two guest vertices per primitive (MslAbi Version 14, PrimitiveVerticesMacro; DECISIONS D69),
+    // mesh draws too (Version 16, D75). Conservative rasterization and cull distances stay
+    // triangle-only.
     const bool pointsOrLines = primitive.topologyClass != MTLPrimitiveTopologyClassTriangle;
-    if (triangleVertices && (graphics.rectList || (pointsOrLines && (conservativeMode != 0u || mesh)))) {
-        Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : mesh ? "mesh points or lines" : "points or lines"));
+    if (triangleVertices && (graphics.rectList || (pointsOrLines && conservativeMode != 0u))) {
+        Fail(std::string(conservativeMode != 0u ? "conservative rasterization" : "per-vertex fragment inputs") + " of " + (graphics.rectList ? "rect lists" : "points or lines"));
     }
     const std::uint32_t primitiveVertices = primitive.topologyClass == MTLPrimitiveTopologyClassPoint ? 1u : primitive.topologyClass == MTLPrimitiveTopologyClassLine ? 2u : 3u;
     // The mesh path fetches rect-list indices like any list (DECISIONS D41); the vertex function's
@@ -909,9 +910,16 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // Mesh draws expand rect lists from the mesh configuration (DECISIONS D41), not the macro.
     if (graphics.rectList && !mesh) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
     if (cullPoints) request.vertex.macros.push_back({Abi::CullPointsMacro, "1"});
+    // Mesh draws of points and lines output that topology in either mode (MslAbi Version 16, D75).
+    if (mesh && !graphics.rectList && primitiveVertices != 3u) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
+    // Point lists write a point size when the guest program exports none (MslAbi Version 16, D75).
+    if (!tess && !graphics.rectList && primitiveVertices == 1u) request.vertex.macros.push_back({Abi::PointsMacro, "1"});
+    // A mesh line under the last-vertex convention runs from its second vertex in the plain mode too.
+    if (mesh && !triangleVertices && primitiveVertices == 2u && graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT) request.vertex.macros.push_back({Abi::ProvokingLastMacro, "1"});
     if (triangleVertices) {
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
-        if (primitiveVertices != 3u) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
+
+        if (primitiveVertices != 3u && !mesh) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
         if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         if (perVertex) {
             request.vertex.macros.push_back({Abi::PerVertexLocationsMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations)) + "u"});
