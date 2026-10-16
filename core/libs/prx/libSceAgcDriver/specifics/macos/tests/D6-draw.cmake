@@ -7,6 +7,9 @@ set_target_properties(agc_metal_draw_tests PROPERTIES CXX_EXTENSIONS OFF OBJCXX_
 if(CMAKE_CXX_COMPILER_LAUNCHER)
     set_property(TARGET agc_metal_draw_tests PROPERTY OBJCXX_COMPILER_LAUNCHER ${CMAKE_CXX_COMPILER_LAUNCHER})
 endif()
+# D81: index expansions of indices recorded GPU work writes are gathered on the GPU.
+add_test(NAME agc_metal_draw_index_gather COMMAND agc_metal_draw_tests gather)
+set_tests_properties(agc_metal_draw_index_gather PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)
 foreach(agcMetalDrawMode IN ITEMS targets primitives)
     add_test(NAME agc_metal_draw_${agcMetalDrawMode} COMMAND agc_metal_draw_tests ${agcMetalDrawMode})
     set_tests_properties(agc_metal_draw_${agcMetalDrawMode} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)

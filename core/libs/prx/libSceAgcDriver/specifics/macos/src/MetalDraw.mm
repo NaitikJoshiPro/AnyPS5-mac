@@ -316,6 +316,15 @@ Metal::DrawCache& VulkanDevice::State::Draws() {
 namespace {
 
 std::atomic<std::uint64_t> emulatedDraws{0};
+// D81: index expansions gathered on the GPU, and those that read indices recorded work still
+// wrote on the CPU (each a recorder sync).
+std::atomic<std::uint64_t> indexGathers{0};
+std::atomic<std::uint64_t> indexSettles{0};
+
+bool GpuIndexGather() {
+    static const bool enabled = std::getenv("APS5_CPU_INDEX_EXPANSION") == nullptr;
+    return enabled;
+}
 std::atomic<std::uint64_t> emulatedSlicePasses{0};
 std::atomic<std::uint64_t> emulatedBegun{0};
 
@@ -1089,14 +1098,31 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
+    // D81: indices that recorded GPU work still writes are not read on the CPU (that waited for the
+    // whole recorder, Recorder.Sync inside the draw). Without a primitive restart that matters, the
+    // expansion depends on positions alone: it is planned over positions, and a helper kernel
+    // gathers the guest indices at those positions into the draw's index list on the GPU, ordered
+    // after the writers in queue order. Restarts (values decide the segments), the triangle-vertices
+    // table (its ids add each call's base vertex on the CPU), unwrappable or misaligned memory and
+    // a pending CPU write-back over the indices (FlushForGpuRead waited then) read them on the CPU
+    // as before. APS5_CPU_INDEX_EXPANSION=1 always reads them on the CPU.
+    const bool restartMatters = graphics.primitiveRestart && (listTopology || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP);
+    std::uint64_t gatherSource = 0;
+    if (expand && draw.indexed && !triangleVertices && !restartMatters && GpuIndexGather() && (draw.indexSize == 2u ? indexBegin % 2u == 0u : indexBegin % 4u == 0u) && (state.recorder->PendingWriteOverlaps(indexBegin, indexBytes) || state.recorder->PendingLabelIn(indexBegin, indexBytes))) {
+        gatherSource = state.TryWrap(indexBegin, indexBytes);
+        if (gatherSource != 0u && !Graphics::Metal::FlushForGpuRead(indexBegin, indexBytes)) gatherSource = 0u;
+    }
+    const bool gather = gatherSource != 0u;
     if (expand) {
         std::vector<std::byte> guest;
-        if (draw.indexed) {
+        if (draw.indexed && !gather) {
+            if (state.recorder->PendingWriteOverlaps(indexBegin, indexBytes) || state.recorder->PendingLabelIn(indexBegin, indexBytes)) indexSettles.fetch_add(1u, std::memory_order_relaxed);
             state.SettleRange(indexBegin, indexBytes);
             guest.resize(indexBytes);
             std::memcpy(guest.data(), reinterpret_cast<const void*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes);
         }
         const auto indexAt = [&](std::uint32_t position) -> std::uint32_t {
+            if (gather) return position;
             if (draw.indexSize == 2u) {
                 std::uint16_t value;
                 std::memcpy(&value, guest.data() + position * 2u, 2u);
@@ -1175,6 +1201,31 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             const auto vertexOffset = draw.indexed ? call.vertexOffset : static_cast<std::int32_t>(call.first);
             fanCalls.push_back({static_cast<std::uint32_t>(fanIndices.size()) - first, call.instances, first, vertexOffset, call.firstInstance});
         }
+    }
+    // D81: the positions become guest indices on the GPU, before the pass (a compute encoder ends an
+    // open one; the render encoder's queue barrier orders the index fetch after the kernel).
+    std::uint64_t gatheredAddress = 0;
+    if (gather && !fanIndices.empty()) {
+        auto& stream = Graphics::Metal::Stream(recorder.Commands());
+        const auto positions = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
+        const auto gathered = stream.Allocate(fanIndices.size() * 4u, 16u);
+        struct {
+            std::uint64_t source;
+            std::uint64_t positions;
+            std::uint64_t target;
+            std::uint32_t count;
+            std::uint32_t indexSize;
+        } parameters{gatherSource, positions.address, gathered.address, static_cast<std::uint32_t>(fanIndices.size()), draw.indexSize};
+        static_assert(sizeof(parameters) == 32);
+        // Earlier recorded writers of the indices (this encoder's dispatches and blits) first.
+        stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        id<MTLComputePipelineState> pipeline = Graphics::Metal::HelperPipeline(state.device, Graphics::Metal::HelperKernel::IndexGather);
+        const NSUInteger width = std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 256u);
+        stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake((fanIndices.size() + width - 1u) / width, 1u, 1u), MTLSizeMake(width, 1u, 1u));
+        state.KeepWrapped(indexBegin, indexBytes);
+        recorder.NotePendingRead(indexBegin, static_cast<std::size_t>(indexBytes), Recorder::ReadKind::DrawInput);
+        gatheredAddress = gathered.address;
+        indexGathers.fetch_add(1u, std::memory_order_relaxed);
     }
 
     state.WrapUnions(plans);
@@ -1461,7 +1512,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             [cache.vertexArguments setAddress:upload.address atIndex:Abi::Index(Abi::BufferIndex::TriangleVertices)];
         } else if (expanded) {
             indexType = MTLIndexTypeUInt32;
-            if (!fanIndices.empty()) {
+            if (gatheredAddress != 0u) {
+                indexAddress = gatheredAddress;
+                indexLength = fanIndices.size() * 4u;
+            } else if (!fanIndices.empty()) {
                 const auto upload = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
                 indexAddress = upload.address;
                 indexLength = fanIndices.size() * 4u;
@@ -1630,6 +1684,10 @@ namespace Graphics::Metal {
 
 EmulatedSampleStatistics EmulatedSampleCounts() {
     return {emulatedDraws.load(std::memory_order_relaxed), emulatedSlicePasses.load(std::memory_order_relaxed), emulatedBegun.load(std::memory_order_relaxed)};
+}
+
+IndexExpansionStatistics IndexExpansionCounts() {
+    return {indexGathers.load(std::memory_order_relaxed), indexSettles.load(std::memory_order_relaxed)};
 }
 
 }

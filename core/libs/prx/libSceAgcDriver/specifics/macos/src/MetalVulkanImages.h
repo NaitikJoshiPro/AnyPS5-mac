@@ -151,6 +151,13 @@ struct EmulatedSampleStatistics {
     std::uint64_t begun = 0;
 };
 EmulatedSampleStatistics EmulatedSampleCounts();
+// Index expansions (MetalDraw.mm, D81), cumulative: gathered on the GPU from indices recorded
+// work writes, and read on the CPU after a recorder sync because recorded work wrote them.
+struct IndexExpansionStatistics {
+    std::uint64_t gathered = 0;
+    std::uint64_t settled = 0;
+};
+IndexExpansionStatistics IndexExpansionCounts();
 
 // A CB resolve (DECISIONS D27): every pixel of `destination` (single-sample, the same pixel format
 // and extent) becomes the box-filtered average of `source`'s samples, through a render pass whose

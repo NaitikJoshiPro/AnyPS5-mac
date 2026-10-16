@@ -5,8 +5,9 @@
 // Graphics/shaders (MeshArguments.comp, SampleCounter.comp, SampleDumps.comp) and the parameter
 // blocks keep their push-constant layouts, now uploaded and bound at buffer index 0 (Metal 4 has
 // no push constants). FillPattern is new: Metal fills bytes only, so dword and 16-byte pattern
-// fills (vkCmdFillBuffer, the device's pattern fills) run it. Every kernel runs as one threadgroup
-// of one thread except FillPattern (one thread per dword). Compiled at first use per device
+// fills (vkCmdFillBuffer, the device's pattern fills) run it; IndexGather is new too (D81). Every
+// kernel runs as one threadgroup of one thread except FillPattern and IndexGather (one thread per
+// dword or index). Compiled at first use per device
 // (Metal::HelperPipeline).
 
 namespace AgcDriver::Graphics::Metal {
@@ -96,6 +97,23 @@ struct SampleDumpParameters {
     uint firstSegment;
     uint lastSegment;
 };
+
+// Index expansion of indices recorded GPU work writes (W1, D81): target[i] is the guest index at
+// position positions[i] of the source (16- or 32-bit), so the expansion's order (fans, provoking
+// vertex rotation) is planned on the CPU from positions alone and the values never cross to it.
+struct IndexGatherParameters {
+    device const uchar* source;
+    device const uint* positions;
+    device uint* target;
+    uint count;
+    uint indexSize;
+};
+
+kernel void IndexGather(constant IndexGatherParameters& p [[buffer(0)]], uint index [[thread_position_in_grid]]) {
+    if (index >= p.count) return;
+    const uint position = p.positions[index];
+    p.target[index] = p.indexSize == 2u ? uint(reinterpret_cast<device const ushort*>(p.source)[position]) : reinterpret_cast<device const uint*>(p.source)[position];
+}
 
 kernel void SampleDumps(constant SampleDumpParameters& p [[buffer(0)]]) {
     uint low = p.counter[0];

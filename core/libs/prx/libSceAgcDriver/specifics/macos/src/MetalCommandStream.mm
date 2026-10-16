@@ -314,7 +314,7 @@ id<MTLComputePipelineState> HelperPipeline(id<MTLDevice> device, HelperKernel ke
     static std::mutex mutex;
     static std::map<std::pair<const void*, HelperKernel>, id<MTLComputePipelineState>> pipelines;
     static std::map<const void*, id<MTLLibrary>> libraries;
-    static constexpr std::array<const char*, static_cast<std::size_t>(HelperKernel::Count)> names{"FillPattern", "MeshArguments", "SampleCounter", "SampleDumps"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(HelperKernel::Count)> names{"FillPattern", "MeshArguments", "SampleCounter", "SampleDumps", "IndexGather"};
     if (device == nil) Fail("a helper kernel needs a Metal device");
     const auto key = std::pair{(__bridge const void*)device, kernel};
     std::lock_guard lock(mutex);
