@@ -566,6 +566,7 @@ agc_metal_msl_wave_lds G7
 agc_metal_native_f32_flush G7
 agc_metal_wave64_lane_local G7
 agc_metal_wave64_lane_local_plan G7
+agc_metal_nan_test_elimination G7
 agc_metal_pipeline_cache G7
 agc_metal_pipeline_cache_background G7
 agc_metal_pipeline_cache_save_race G7
