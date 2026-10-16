@@ -1219,6 +1219,18 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    // Debug aid: APS5_TRACE_WATCH_FAULTS=1 prints the write watch's fault count every 5 s.
+    static const bool traceFaults = std::getenv("APS5_TRACE_WATCH_FAULTS") != nullptr;
+    if (traceFaults) {
+        static std::atomic<std::int64_t> last{0};
+        static std::atomic<std::uint64_t> lastFaults{0};
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto previous = last.load(std::memory_order_relaxed);
+        if (now - previous >= 5000 && last.compare_exchange_strong(previous, now)) {
+            const auto faults = GuestWriteWatch::GuestWriteWatchFaults_nid_postfix();
+            std::fprintf(stderr, "[write-watch] %llu faults (+%llu), %llu collect epochs\n", static_cast<unsigned long long>(faults), static_cast<unsigned long long>(faults - lastFaults.exchange(faults)), static_cast<unsigned long long>(collectEpochBumps.load()));
+        }
+    }
 }
 
 std::uint64_t CollectEpochBumps() {

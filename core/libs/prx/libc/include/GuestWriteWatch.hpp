@@ -9,6 +9,8 @@ namespace GuestWriteWatch {
 extern "C" {
 
 bool GuestWriteWatchAvailable_nid_postfix();
+// Faults the handler has seen (statistics).
+std::uint64_t GuestWriteWatchFaults_nid_postfix();
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestWriteWatchCovers_nid_postfix(std::uintptr_t address, std::size_t bytes);

@@ -41,6 +41,10 @@
 #define APS5_GUEST_WRITE_WATCH 1
 #endif
 
+namespace {
+std::atomic<std::uint64_t> g_faults{0};
+}
+
 namespace GuestWriteWatch {
 namespace {
 
@@ -516,19 +520,7 @@ private:
 
     static void fault(int signal, siginfo_t* info, void* context) {
         auto& watch = Get();
-        {
-            // Debug aid: APS5_TRACE_FAULT_LOOP=1 counts the faults this handler sees.
-            static const bool trace = true;
-            if (trace) {
-                static std::atomic<std::uint64_t> total{0};
-                const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (count <= 3 || count % 20000 == 0) {
-                    char message[200];
-                    const int length = std::snprintf(message, sizeof(message), "[write-watch] %llu faults; this one: signal %d code %d address 0x%llx\n", static_cast<unsigned long long>(count), signal, info->si_code, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
-                    if (length > 0) (void)!write(STDERR_FILENO, message, static_cast<std::size_t>(length) < sizeof(message) ? static_cast<std::size_t>(length) : sizeof(message) - 1);
-                }
-            }
-        }
+        g_faults.fetch_add(1, std::memory_order_relaxed);
         if (!IsAlignmentFault(context) && watch.record(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
         const auto& previous = signal == SIGBUS ? watch._previousBus : watch._previousSegv;
         if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
@@ -786,6 +778,11 @@ bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t
     static_cast<void>(context);
     return false;
 #endif
+}
+
+
+std::uint64_t GuestWriteWatchFaults_nid_postfix() {
+    return g_faults.load(std::memory_order_relaxed);
 }
 
 }
