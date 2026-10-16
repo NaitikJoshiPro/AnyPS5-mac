@@ -244,6 +244,18 @@ public:
         std::uint64_t flushedAfterSkipSameSite;
     };
     static HookSkipCounts TakeHookSkipCounts();
+    // `original` snapshots (D82, Metal), cumulative: copied on the GPU because recorded work writes
+    // the bytes, landed in `original` at their batch's completion, and readers of `original` that
+    // had to wait for one first (a recorder sync).
+    struct SnapshotCounts {
+        std::uint64_t gpu;
+        std::uint64_t landed;
+        std::uint64_t settled;
+        // Upload captures over recorded writes kept on the CPU: shadowed unit, CPU write-back, no
+        // host import.
+        std::array<std::uint64_t, 3> refused;
+    };
+    static SnapshotCounts TakeSnapshotCounts();
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
@@ -337,7 +349,15 @@ private:
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
-    void captureGuestBytes(const std::vector<bool>* layers);
+    // readByUpload: the direct upload's detile reads the content from the host import next (D82).
+    void captureGuestBytes(const std::vector<bool>* layers, bool readByUpload = false);
+    // D82 (Metal): the snapshot of the selected units by a recorded GPU copy when recorded work
+    // writes them (the bytes reach `original` when the batch completes); false: read them now.
+    bool captureOnGpu(const std::vector<bool>& selected);
+    // Readers and CPU writers of `original` over [address, address + bytes): a GPU snapshot not yet
+    // landed there is waited for (settle), or dropped where the caller replaces the bytes (forget).
+    void settleSnapshot(std::uint64_t address, std::size_t bytes) const;
+    void forgetSnapshot(std::uint64_t address, std::size_t bytes);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
@@ -549,6 +569,8 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
+    // Per tracked layer, the GPU snapshot (D82) whose bytes `original` still waits for (0: none).
+    std::vector<std::uint64_t> layerSnapshot;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

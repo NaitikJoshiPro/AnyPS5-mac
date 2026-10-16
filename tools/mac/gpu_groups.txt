@@ -455,6 +455,7 @@ agc_driver_prepared_unregistered_graphics G4
 agc_driver_readonly_resummarize G4
 agc_driver_resolution_shutdown G4
 agc_driver_store_idle_results G4
+agc_driver_storage_gpu_snapshot G4
 agc_driver_store_over_untracked G4
 agc_driver_tessellation G4
 agc_driver_vertex_clip_cull_draw G4
