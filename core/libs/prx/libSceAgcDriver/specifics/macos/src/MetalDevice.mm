@@ -921,6 +921,13 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
         return value == nullptr || value[0] != '0';
     }();
     target.mslWave64LaneLocal = wave64LaneLocal;
+    // DECISIONS D63: NaN tests of values that cannot be a NaN are dropped (NanTestEliminator).
+    // APS5_MSL_NAN_TESTS=1 keeps every NaN test.
+    static const bool nanTestElimination = [] {
+        const char* value = std::getenv("APS5_MSL_NAN_TESTS");
+        return value == nullptr || value[0] != '1';
+    }();
+    target.mslNanTestElimination = nanTestElimination;
     return target;
 }
 

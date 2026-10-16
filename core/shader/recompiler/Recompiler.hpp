@@ -281,6 +281,10 @@ struct SpirvTarget {
     // lanes of its wave runs at one guest lane per host invocation instead of two
     // (MslPlanWave64LaneLocal). Never set for Vulkan.
     bool mslWave64LaneLocal = false;
+    // MSL only (DECISIONS D63): NaN tests of values that can never be a NaN are false
+    // (NanTestEliminator), so RDNA's NaN emulation stays only where a NaN can reach. Never set for
+    // Vulkan.
+    bool mslNanTestElimination = false;
 };
 
 struct BindingLayout {

@@ -209,6 +209,12 @@ private:
             return value == nullptr || value[0] != '0';
         }();
         request.target.mslWave64LaneLocal = wave64LaneLocal;
+        // DECISIONS D63, as the device: APS5_MSL_NAN_TESTS=1 keeps every NaN test.
+        static const bool nanTestElimination = [] {
+            const char* value = std::getenv("APS5_MSL_NAN_TESTS");
+            return value == nullptr || value[0] != '1';
+        }();
+        request.target.mslNanTestElimination = nanTestElimination;
         // Debug aid: --replay-width replays every request as if recorded for that host subgroup width.
         if (replayWidth != 0u) request.target.subgroupSize = replayWidth;
         ShaderRecompiler::RecompileResult compiled;

@@ -251,6 +251,7 @@ private:
         append(key, value.float16DenormPreserve);
         append(key, value.float32DenormFlushNative);
         append(key, value.mslWave64LaneLocal);
+        append(key, value.mslNanTestElimination);
     }
 };
 

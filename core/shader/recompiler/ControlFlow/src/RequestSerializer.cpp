@@ -778,6 +778,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteBool(request.target.float32DenormFlushNative);
     writer.WriteBool(request.target.mslWave64LaneLocal);
+    writer.WriteBool(request.target.mslNanTestElimination);
     return base64Encode(buffer);
 }
 
@@ -813,6 +814,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 21u) result.request.target.float16DenormPreserve = reader.ReadBool();
     if (version >= 24u) result.request.target.float32DenormFlushNative = reader.ReadBool();
     if (version >= 25u) result.request.target.mslWave64LaneLocal = reader.ReadBool();
+    if (version >= 25u) result.request.target.mslNanTestElimination = reader.ReadBool();
     return result;
 }
 

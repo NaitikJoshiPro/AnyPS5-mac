@@ -32,6 +32,7 @@
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
+#include "Optimization/include/Optimization/NanTestEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
@@ -268,6 +269,17 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     constexpr DenormalFlushEliminator denormalFlushEliminator;
     if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
+    }
+
+    // DECISIONS D63: NaN emulation only where a NaN can reach.
+    if (request.target.backend == ShaderBackend::Msl && request.target.mslNanTestElimination) {
+        constexpr NanTestEliminator nanTestEliminator;
+        if (nanTestEliminator.Eliminate(program).removedTests != 0u) {
+            constantFolder.Fold(program);
+            ResolveControlFlowIdentities(program);
+            deadCodeEliminator.RemoveIdentities(program);
+            deadCodeEliminator.Eliminate(program);
+        }
     }
 
     if (inputInfo.vertex != nullptr) {
