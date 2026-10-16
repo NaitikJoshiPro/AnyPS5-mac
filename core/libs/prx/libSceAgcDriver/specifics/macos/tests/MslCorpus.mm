@@ -201,6 +201,14 @@ private:
         result.stage = StageName(request.shader.stage);
         request.useCache = false;
         request.target.backend = ShaderRecompiler::ShaderBackend::Msl;
+        // As the Metal device's target (MetalDevice.mm): wave64 compute at one lane per invocation
+        // where exact (DECISIONS D62), also for requests recorded before the flag existed;
+        // APS5_MSL_WAVE64_LANE_LOCAL=0 replays the two-half layout.
+        static const bool wave64LaneLocal = [] {
+            const char* value = std::getenv("APS5_MSL_WAVE64_LANE_LOCAL");
+            return value == nullptr || value[0] != '0';
+        }();
+        request.target.mslWave64LaneLocal = wave64LaneLocal;
         // Debug aid: --replay-width replays every request as if recorded for that host subgroup width.
         if (replayWidth != 0u) request.target.subgroupSize = replayWidth;
         ShaderRecompiler::RecompileResult compiled;

@@ -914,6 +914,13 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
         return value == nullptr || value[0] != '0';
     }();
     target.float32DenormFlushNative = nativeF32Flush;
+    // DECISIONS D62: wave64 compute programs without cross-lane dependences run at one guest lane per
+    // invocation (MslLaneLocal.cpp). APS5_MSL_WAVE64_LANE_LOCAL=0 keeps the two-half layout.
+    static const bool wave64LaneLocal = [] {
+        const char* value = std::getenv("APS5_MSL_WAVE64_LANE_LOCAL");
+        return value == nullptr || value[0] != '0';
+    }();
+    target.mslWave64LaneLocal = wave64LaneLocal;
     return target;
 }
 

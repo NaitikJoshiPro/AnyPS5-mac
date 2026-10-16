@@ -250,6 +250,7 @@ private:
         append(key, value.vertexSubgroups);
         append(key, value.float16DenormPreserve);
         append(key, value.float32DenormFlushNative);
+        append(key, value.mslWave64LaneLocal);
     }
 };
 
