@@ -1498,7 +1498,16 @@ std::uint64_t VulkanDevice::State::WriteDriverData(Graphics::Metal::CommandStrea
 
 void VulkanDevice::State::NoteBindings(const StageBindings& plan) {
     if (!plan.reads.empty()) recorder->NotePendingReads(plan.reads, Recorder::ReadKind::DispatchElement);
-    if (!plan.writes.empty()) recorder->NotePendingWrites(plan.writes);
+    if (plan.writes.empty()) return;
+    recorder->NotePendingWrites(plan.writes);
+    // The GPU's stores through in-place V# bindings, linear color targets and GDS are the driver's
+    // own writes: stamped at record time like labels, fills and copies (readers sync on the pending
+    // set until they land). Over write-watched memory (page wrappers, watched imports: DECISIONS D74)
+    // the watch never sees them, and caches over the range would keep stale bytes after the batch
+    // retires; over unwatched memory the stamp records an unstamped store for NewestStamp.
+    for (const auto& [begin, end] : plan.writes) {
+        if (end > begin) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+    }
 }
 
 void VulkanDevice::State::CheckFaultsOnComplete(bool draw) {
