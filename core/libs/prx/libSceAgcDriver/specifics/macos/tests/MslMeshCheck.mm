@@ -190,7 +190,7 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     Require(pipeline.maxTotalThreadsPerMeshThreadgroup >= hostThreads, name + ": the mesh pipeline allows " + std::to_string(pipeline.maxTotalThreadsPerMeshThreadgroup) + " threads per threadgroup, the program needs " + std::to_string(hostThreads));
     std::printf("%s: mesh<%u, %u> with %u host threads, linked with the fragment function\n", test.name, outputVertices, outputPrimitives, hostThreads);
     if (rectList) {
-        Require(!Has(source, "aps5_tv_v["), name + ": a rect-list mesh function has the triangle-vertices mode");
+        Require(!Has(source, "aps5_tv_v[") && !Has(source, "aps5_lds_words[aps5_i * "), name + ": a rect-list mesh function has the triangle-vertices mode");
         return;
     }
 
@@ -201,7 +201,8 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     const auto split = Abi::MeshTriangleVerticesPrimitives(test.mesh.maxPrimitives);
     Require(split * 3u <= Abi::MeshMaxVertices && split * Abi::MeshTriangleVerticesSplits(test.mesh.maxPrimitives) >= test.mesh.maxPrimitives, name + ": the triangle-vertices split does not cover the subgroup");
     Require(Has(source, ", " + std::to_string(3u * split) + ", " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>"), name + ": no triangle-vertices mesh<> of " + std::to_string(3u * split) + " vertices and " + std::to_string(split) + " primitives");
-    Require(Has(source, "aps5_tv_v[") && Has(source, "float4 pv0_0 [[user(aps5_pv0_0)]]") && Has(source, "float3 aps5_bw [[user(aps5_bw)]]"), name + ": the triangle-vertices epilogue or its outputs are missing");
+    // The staging is in the guest's LDS words when the program has LDS (DECISIONS D77).
+    Require((Has(source, "aps5_tv_v[") || Has(source, "aps5_lds_words[aps5_i * ")) && Has(source, "float4 pv0_0 [[user(aps5_pv0_0)]]") && Has(source, "float3 aps5_bw [[user(aps5_bw)]]"), name + ": the triangle-vertices epilogue or its outputs are missing");
     ShaderRecompiler::ShaderPixelStageInfo perVertexPixel{};
     perVertexPixel.interpolatorCount = 1;
     perVertexPixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PerspectiveCenter);
