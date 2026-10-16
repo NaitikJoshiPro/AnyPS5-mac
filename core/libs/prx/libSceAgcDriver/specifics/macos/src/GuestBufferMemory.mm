@@ -957,7 +957,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     GuestMemory::ImportWatched(base, bytes, [&] {
         step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result) : createHostPointerImport(context, entry, result);
         return step == nullptr;
-    }, watchedHostPointer);
+    }, watchedHostPointer && std::getenv("APS5_D74_EXP_UNWATCH") == nullptr);
 #ifdef __linux__
     if (BackingFile backing; step != nullptr && watchedDmaBuf != watchedHostPointer && sharedBacking(context, entry, backing)) {
         GuestMemory::ImportWatched(base, bytes, [&] {
