@@ -291,13 +291,24 @@ def markdown(result):
         rows = threads["rows"]
         total = sum(row["cpu_ms"] for row in rows)
         p_total = sum(row["p_ms"] for row in rows)
+        sampled = {str(entry["tid"]): 100.0 * entry["busy"] / entry["total"]
+                   for entry in (result.get("sample") or {}).get("threads", []) if entry.get("total")}
         out += ["", f"## CPU per thread over {threads['seconds']:.1f} s (P/E time from the kernel's per-thread counters)", "",
                 f"Process: {total / 1000.0 / threads['seconds']:.2f} cores, {100.0 * p_total / total if total else 0:.0f}% "
                 "of it on P cores.", "",
-                "| thread | name | CPU % of a core | P share | P GHz | P IPC | E GHz | E IPC |", "|---|---|---|---|---|---|---|---|"]
+                "\"Sampled busy\" is the share of `sample`'s samples outside a wait. Well above the CPU % it means the "
+                "thread was runnable but not running (the cores were busy with other work) or suspended.", "",
+                "| thread | name | CPU % of a core | sampled busy % | P share | P GHz | P IPC | E GHz | E IPC |",
+                "|---|---|---|---|---|---|---|---|---|"]
+        starved = []
         for row in rows[:16]:
-            out.append(f"| {row['tid']} | {row['name'] or '-'} | {row['cpu_pct']:.1f} | {100 * row['p_share']:.0f}% | "
-                       f"{row['p_ghz']:.2f} | {row['p_ipc']:.2f} | {row['e_ghz']:.2f} | {row['e_ipc']:.2f} |")
+            busy = sampled.get(str(row["tid"]))
+            if busy is not None and busy > row["cpu_pct"] + 20.0:
+                starved.append(f"{row['name'] or row['tid']} ({busy:.0f}% sampled busy, {row['cpu_pct']:.0f}% CPU)")
+            out.append(f"| {row['tid']} | {row['name'] or '-'} | {row['cpu_pct']:.1f} | {'-' if busy is None else f'{busy:.0f}'} | "
+                       f"{100 * row['p_share']:.0f}% | {row['p_ghz']:.2f} | {row['p_ipc']:.2f} | {row['e_ghz']:.2f} | {row['e_ipc']:.2f} |")
+        if starved:
+            out += ["", "CPU contention: " + "; ".join(starved) + "."]
     sample = result.get("sample")
     if sample:
         total = sum(sample["totals"].values())

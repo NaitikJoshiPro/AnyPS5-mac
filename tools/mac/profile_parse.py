@@ -172,7 +172,7 @@ def classify_stack(path):
     if leaf_symbol in YIELD_LEAVES or leaf_symbol in ("cthread_yield", "pthread_yield_np"):
         owner = _first_owner(path)
         return "spin/yield", short_symbol(owner[0])
-    blocking = leaf_symbol in WAIT_LEAVES or (
+    blocking = leaf_symbol in WAIT_LEAVES or leaf_symbol in ("mach_msg2_trap", "mach_msg_trap", "mach_msg_overwrite_trap") or (
         leaf_module == "libsystem_kernel.dylib" and leaf_symbol.endswith("_trap") and
         re.search(r"(CFRunLoop|mach_msg_receive|dispatch_mach|_dispatch_sema|semaphore_wait|waitUntil|"
                   r"::WaitEvent\(|clock_get_time|nanosleep)", joined))
