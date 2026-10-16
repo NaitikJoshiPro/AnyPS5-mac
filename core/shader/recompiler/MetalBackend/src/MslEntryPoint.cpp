@@ -295,7 +295,9 @@ std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std
         for (const auto& stageOutput : state.program.Info().outputs) {
             if (stageOutput.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(stageOutput.location) + "\n";
-            text += "            aps5_p." + PerVertexField(stageOutput.location, corner) + " = aps5_v.p" + std::to_string(stageOutput.location) + ";\n#endif\n";
+            // Points and lines output only their own corners (DECISIONS D78).
+            const auto assignment = "            aps5_p." + PerVertexField(stageOutput.location, corner) + " = aps5_v.p" + std::to_string(stageOutput.location) + ";\n";
+            text += (corner == 0u ? assignment : "#if APS5_PRIMITIVE_VERTICES > " + std::to_string(corner) + "u\n" + assignment + "#endif\n") + "#endif\n";
         }
         text += "            if (" + c + "u < aps5_n) {\n";
         text += "                aps5_mesh.set_vertex(aps5_t * aps5_n + " + c + "u, aps5_v);\n";
@@ -602,7 +604,10 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         for (const auto& output : state.program.Info().outputs) {
             if (output.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(output.location) + "\n";
-            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    aps5_out." + PerVertexField(output.location, vertex) + " = aps5_v[" + std::to_string(vertex) + "].p" + std::to_string(output.location) + ";\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
+                const auto assignment = "    aps5_out." + PerVertexField(output.location, vertex) + " = aps5_v[" + std::to_string(vertex) + "].p" + std::to_string(output.location) + ";\n";
+                text += vertex == 0u ? assignment : "#if APS5_PRIMITIVE_VERTICES > " + std::to_string(vertex) + "u\n" + assignment + "#endif\n";
+            }
             text += "#endif\n";
         }
         text += "    const float3 aps5_weights = float3(aps5_corner == 0u ? 1.0f : 0.0f, aps5_corner == 1u ? 1.0f : 0.0f, aps5_corner == 2u ? 1.0f : 0.0f);\n";

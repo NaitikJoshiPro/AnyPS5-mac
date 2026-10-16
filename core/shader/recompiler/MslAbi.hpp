@@ -104,7 +104,9 @@ namespace ShaderRecompiler::MslAbi {
 // Version 16: mesh functions take PrimitiveVerticesMacro too (DECISIONS D75): point and line draws
 //   output metal::topology::point / line with the primitive export's first one or two indices, in
 //   the plain and the triangle-vertices mode (N unshared vertices per primitive).
-inline constexpr std::uint32_t Version = 16u;
+// Version 17 (DECISIONS D78): point and line draws in the triangle-vertices mode output and read only
+//   their own corners' per-vertex fields (PrimitiveVerticesMacro in the fragment function too).
+inline constexpr std::uint32_t Version = 17u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
@@ -314,6 +316,9 @@ inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
 // 0..N-1] and emits corner v % N; corners N..2 repeat the primitive's last vertex. Unset: 3.
 // Version 16: mesh (any mode): the draw's topology class, 1 for points, 2 for lines (the output
 // topology and the indices read from each primitive export).
+// Version 17 (DECISIONS D78): vertex, mesh and fragment in the triangle-vertices mode: the per-vertex
+// corner fields user(aps5_pv<L>_<j>) exist for j < N only; the fragment function reads corners past
+// N from corner N - 1. The triangle-vertices mesh<> holds N x MeshTriangleVerticesPrimitives vertices.
 inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
 // Version 16: vertex and mesh: 1 when the draw is a point list (DECISIONS D75). A function whose guest
 // program exports no point size then writes [[point_size]] 1.0 (Metal leaves an unwritten size

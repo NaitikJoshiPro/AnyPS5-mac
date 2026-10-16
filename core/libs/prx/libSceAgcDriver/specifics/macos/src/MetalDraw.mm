@@ -951,6 +951,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
         if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
         if (conservativeMode != 0u) function.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
+        // Point and line draws output only their own corners' per-vertex values (DECISIONS D78).
+        if (triangleVertices && primitiveVertices != 3u) function.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
