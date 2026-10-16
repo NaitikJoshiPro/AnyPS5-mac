@@ -64,7 +64,7 @@ id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRe
         // (per-vertex locations, barycentrics, topology) decide its sizes and scalar counts.
         std::string context = std::string(error.what()) + " (mesh function: output locations 0x";
         char hex[32];
-        std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(request.vertex.shader != nullptr ? request.vertex.shader->Reflection().outputLocations : 0u));
+        std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(request.vertex.shader != nullptr ? request.vertex.shader->reflection.outputLocations : 0u));
         context += hex;
         context += ", threadgroups x threads " + std::to_string(request.meshGroups) + " x " + std::to_string(request.meshThreads);
         for (const auto& [name, value] : request.vertex.macros) context += ", " + name + "=" + value;
