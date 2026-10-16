@@ -549,6 +549,8 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
+    // The site that last dropped saved bytes (named in the untracked write-back refusal).
+    const char* originalDroppedBy = nullptr;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

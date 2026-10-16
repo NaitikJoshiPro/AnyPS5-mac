@@ -204,11 +204,14 @@ void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler:
     // MslAbi Version 14 (DECISIONS D69): points and lines take one or two guest vertices per primitive.
     if (primitiveVertices != 3u) vertexMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
     id<MTLFunction> vertexFunction = Compile(device, what + " vertex", vertex, vertexMacros);
-    id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, @{
+    NSMutableDictionary<NSString*, NSObject*>* fragmentMacros = [@{
         @(Abi::VertexOutputsMacro): Decimal(vertexReflection.outputLocations & 0xffffffffu),
         @(Abi::VertexOutputsHighMacro): Decimal(vertexReflection.outputLocations >> 32u),
         @(Abi::ConservativeMacro): Decimal(conservative),
-    });
+    } mutableCopy];
+    // DECISIONS D78: points and lines output and read only their own corners.
+    if (primitiveVertices != 3u) fragmentMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
+    id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, fragmentMacros);
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = vertexFunction;
     descriptor.fragmentFunction = fragmentFunction;

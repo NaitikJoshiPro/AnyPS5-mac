@@ -43,6 +43,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "MetalResidency.h"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -648,6 +649,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (calls.empty()) return;
     Graphics::Metal::MeshDrawPlan meshPlan;
     std::uint32_t meshSplits = 1u;
+    std::uint32_t pointSplitVertices = 0u;
     if (mesh) {
         std::span<const std::byte> indices;
         if (draw.indexed) {
@@ -657,7 +659,13 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
         meshPlan = Graphics::Metal::PlanMeshDraw(graphics, draw, indices);
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
-        if (triangleVertices) {
+        if (triangleVertices && primitive.topologyClass == MTLPrimitiveTopologyClassPoint) {
+            // Points need no staging; their vertices are split by Metal's mesh output size (D78).
+            const auto outputs = vertexReflection.outputLocations;
+            pointSplitVertices = Abi::MeshPointSplitVertices(graphics.stages.mesh->maxVertices, graphics.stages.mesh->maxPrimitives, static_cast<std::uint32_t>(std::popcount(outputs)), static_cast<std::uint32_t>(std::popcount(fragmentReflection != nullptr ? fragmentReflection->perVertexLocations & outputs : 0u)));
+            meshSplits = Abi::MeshPointSplits(graphics.stages.mesh->maxVertices, pointSplitVertices);
+            if (static_cast<std::uint64_t>(meshPlan.groups) * meshPlan.instances * meshSplits > Graphics::Metal::MaxMeshThreadgroupsPerGrid) Fail("a point mesh draw of " + std::to_string(meshPlan.groups) + " groups x " + std::to_string(meshPlan.instances) + " instances x " + std::to_string(meshSplits) + " splits exceeds the mesh grid");
+        } else if (triangleVertices) {
             meshSplits = Abi::MeshTriangleVerticesSplits(graphics.stages.mesh->maxPrimitives);
             if (static_cast<std::uint64_t>(meshPlan.groups) * meshPlan.instances * meshSplits > Graphics::Metal::MaxMeshThreadgroupsPerGrid) Fail("a triangle-vertices mesh draw of " + std::to_string(meshPlan.groups) + " groups x " + std::to_string(meshPlan.instances) + " instances x " + std::to_string(meshSplits) + " splits exceeds the mesh grid");
         }
@@ -920,6 +928,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
 
         if (primitiveVertices != 3u && !mesh) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
+        if (pointSplitVertices != 0u) request.vertex.macros.push_back({Abi::PointSplitVerticesMacro, std::to_string(pointSplitVertices) + "u"});
         if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         if (perVertex) {
             request.vertex.macros.push_back({Abi::PerVertexLocationsMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations)) + "u"});
@@ -951,6 +960,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
         if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
         if (conservativeMode != 0u) function.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
+        // Point and line draws output only their own corners' per-vertex values (DECISIONS D78).
+        if (triangleVertices && primitiveVertices != 3u) function.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
