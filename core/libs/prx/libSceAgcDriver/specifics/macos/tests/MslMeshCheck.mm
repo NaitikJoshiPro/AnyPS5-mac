@@ -150,7 +150,10 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     const auto rects = std::min(test.mesh.maxPrimitives, test.mesh.primitivesPerGroup);
     const auto outputVertices = rectList ? std::min(test.mesh.maxVertices, test.mesh.verticesPerGroup) + rects : test.mesh.maxVertices;
     const auto outputPrimitives = rectList ? rects * 2u : test.mesh.maxPrimitives;
-    Require(Has(source, "[[mesh]] void " + std::string(Abi::EntryPoint)) && Has(source, ", " + std::to_string(outputVertices) + ", " + std::to_string(outputPrimitives) + ", metal::topology::triangle>"), name + ": no mesh<> output of the subgroup's limits");
+    Require(Has(source, "[[mesh]] void " + std::string(Abi::EntryPoint)) && Has(source, ", " + std::to_string(outputVertices) + ", " + std::to_string(outputPrimitives) + (rectList ? ", metal::topology::triangle>" : ", APS5_MESH_TOPOLOGY>")), name + ": no mesh<> output of the subgroup's limits");
+    // MslAbi Version 16 (DECISIONS D75): triangles unless the driver draws points or lines (rect lists
+    // are always triangles).
+    if (!rectList) Require(Has(source, "#define APS5_MESH_TOPOLOGY metal::topology::triangle") && Has(source, "#define APS5_MESH_TOPOLOGY metal::topology::line") && Has(source, "#define APS5_MESH_TOPOLOGY metal::topology::point"), name + ": the mesh output topology does not follow APS5_PRIMITIVE_VERTICES");
     Require(rectList == Has(source, "threadgroup Aps5MeshVertex aps5_rv[") && rectList == Has(source, "set_primitive_count(aps5_rects * 2u)"), name + ": rect-list expansion " + (rectList ? "missing" : "in a mesh function that is not a rect list"));
     Require(Has(source, "set_primitive_count(") && Has(source, "[[primitive_culled]]"), name + ": the mesh function does not set its primitive count and cull flags");
     Require(reflection.usesPushData, name + ": the mesh function does not read the draw words from the push data");
@@ -197,7 +200,7 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     // record, user(aps5_bw) from the vertices).
     const auto split = Abi::MeshTriangleVerticesPrimitives(test.mesh.maxPrimitives);
     Require(split * 3u <= Abi::MeshMaxVertices && split * Abi::MeshTriangleVerticesSplits(test.mesh.maxPrimitives) >= test.mesh.maxPrimitives, name + ": the triangle-vertices split does not cover the subgroup");
-    Require(Has(source, ", " + std::to_string(3u * split) + ", " + std::to_string(split) + ", metal::topology::triangle>"), name + ": no triangle-vertices mesh<> of " + std::to_string(3u * split) + " vertices and " + std::to_string(split) + " primitives");
+    Require(Has(source, ", " + std::to_string(3u * split) + ", " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>"), name + ": no triangle-vertices mesh<> of " + std::to_string(3u * split) + " vertices and " + std::to_string(split) + " primitives");
     Require(Has(source, "aps5_tv_v[") && Has(source, "float4 pv0_0 [[user(aps5_pv0_0)]]") && Has(source, "float3 aps5_bw [[user(aps5_bw)]]"), name + ": the triangle-vertices epilogue or its outputs are missing");
     ShaderRecompiler::ShaderPixelStageInfo perVertexPixel{};
     perVertexPixel.interpolatorCount = 1;
