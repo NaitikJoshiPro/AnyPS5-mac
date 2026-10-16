@@ -32,7 +32,7 @@ bool OneLanePerInvocationNarrow(const MslEmitterState& state) {
 }
 
 void RequireHostWave(MslEmitterState& state, const IrValue& instruction) {
-    if (OneLanePerInvocationNarrow(state) && !MslGraphicsHalfWave(state)) state.Fail(instruction, "a cross-lane read of a wave64 program at one lane per invocation spans two host SIMD groups (work package B3)");
+    if (OneLanePerInvocationNarrow(state) && !MslGraphicsHalfWave(state) && !state.laneLocal) state.Fail(instruction, "a cross-lane read of a wave64 program at one lane per invocation spans two host SIMD groups (work package B3)");
 }
 
 // A lane of the guest wave as a statement-level temporary.
@@ -55,10 +55,24 @@ std::string Shuffle(MslEmitterState& state, const IrValue& instruction, std::siz
         const auto low = Constant(state, valueType, "simd_shuffle(" + wrap(state.HalfArg(instruction, index, 0u)) + ", " + host + ")");
         const auto high = Constant(state, valueType, "simd_shuffle(" + wrap(state.HalfArg(instruction, index, 1u)) + ", " + host + ")");
         result = Constant(state, valueType, "((" + lane + ") & 32u) != 0u ? " + high + " : " + low);
+    } else if (state.laneLocal) {
+        // Wave64 at one lane per invocation: callers read lanes of the reading lane's 32-lane half,
+        // which is this SIMD group (WaveRead reads any lane).
+        result = Constant(state, valueType, "simd_shuffle(" + wrap(state.Arg(instruction, index)) + ", ushort((" + lane + ") & 31u))");
     } else {
         result = Constant(state, valueType, "simd_shuffle(" + wrap(state.Arg(instruction, index)) + ", ushort(" + lane + "))");
     }
     return flag ? "(" + result + " != 0u)" : result;
+}
+
+// The value of argument `index` in any guest lane `lane`: Shuffle, or at one lane per invocation of
+// a wave64 program (DECISIONS D62) a read through threadgroup memory.
+std::string WaveRead(MslEmitterState& state, const IrValue& instruction, std::size_t index, const std::string& lane) {
+    if (!state.laneLocal) return Shuffle(state, instruction, index, lane);
+    const IrType type = instruction.Argument(index)->Type();
+    if (type != IrType::U32 && type != IrType::F32 && type != IrType::S32) state.Fail(instruction, "reads a lane of a " + MslType(type) + " value through threadgroup memory (only 32-bit values)");
+    const auto bits = state.ExchangeRead("as_type<uint>(" + state.Arg(instruction, index) + ")", lane);
+    return "as_type<" + MslType(type) + ">(" + bits + ")";
 }
 
 // The bit of `lane` in a 64-lane ballot (uint2), false past the wave.
@@ -505,9 +519,9 @@ void Ballot(MslEmitterState& state, const IrValue& instruction) {
 
 void ReadFirstLane(MslEmitterState& state, const IrValue& instruction) {
     RequireHostWave(state, instruction);
-    const auto ballot = Constant(state, "uint2", state.WaveBallot(instruction.Argument(1u)), "aps5_b");
+    const auto ballot = Constant(state, "uint2", state.laneLocal ? state.ExchangeBallot(instruction.Argument(1u)) : state.WaveBallot(instruction.Argument(1u)), "aps5_b");
     const auto first = Constant(state, "uint", ballot + ".x != 0u ? ctz(" + ballot + ".x) : (" + ballot + ".y != 0u ? 32u + ctz(" + ballot + ".y) : 0u)", "aps5_fl");
-    state.Define(instruction, Shuffle(state, instruction, 0u, first));
+    state.Define(instruction, WaveRead(state, instruction, 0u, first));
 }
 
 void ReadLane(MslEmitterState& state, const IrValue& instruction) {
@@ -552,7 +566,7 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
         if (lane >= 32u && state.hostSubgroupSize != 1u) state.Fail(instruction, "v_readlane_b32 of lane " + std::to_string(lane) + " is outside the 32-lane host SIMD group that runs this wave64 graphics program at one lane per invocation (work package B6)");
     }
     const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & " + U32(state.program.WaveSize() - 1u), "aps5_rl");
-    state.Define(instruction, Shuffle(state, instruction, 0u, lane));
+    state.Define(instruction, WaveRead(state, instruction, 0u, lane));
 }
 
 void WriteLane(MslEmitterState& state, const IrValue& instruction) {
@@ -569,7 +583,7 @@ void DppMove(MslEmitterState& state, const IrValue& instruction) {
         state.Define(instruction, "(" + target.valid + ") ? " + shuffled + " : 0u");
         return;
     }
-    const auto ballot = Constant(state, "uint2", state.WaveBallot(instruction.Argument(1u)), "aps5_b");
+    const auto ballot = Constant(state, "uint2", state.HalfBallot(instruction.Argument(1u)), "aps5_b");
     state.Define(instruction, "((" + target.valid + ") && " + LaneActive(state, ballot, target.lane) + ") ? " + shuffled + " : 0u");
 }
 
@@ -584,7 +598,7 @@ void DppUpdate(MslEmitterState& state, const IrValue& instruction) {
         writable += " && (" + target.valid + ")";
         if (!flags.fetchInactive && (flags.control & DppMoveFlags::Lanes8) == 0u) {
             RequireHostWave(state, instruction);
-            const auto ballot = Constant(state, "uint2", state.WaveBallot(instruction.Argument(2u)), "aps5_b");
+            const auto ballot = Constant(state, "uint2", state.HalfBallot(instruction.Argument(2u)), "aps5_b");
             writable += " && " + LaneActive(state, ballot, target.lane);
         }
     }
@@ -606,7 +620,7 @@ void Permlane16(MslEmitterState& state, const IrValue& instruction) {
         state.Define(instruction, shuffled);
         return;
     }
-    const auto ballot = Constant(state, "uint2", state.WaveBallot(instruction.Argument(3u)), "aps5_b");
+    const auto ballot = Constant(state, "uint2", state.HalfBallot(instruction.Argument(3u)), "aps5_b");
     state.Define(instruction, LaneActive(state, ballot, target) + " ? " + shuffled + " : " + (flags.boundControl ? std::string("0u") : state.Arg(instruction, 4u)));
 }
 
