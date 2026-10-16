@@ -259,7 +259,11 @@ int main() {
             Require(target.mesh.has_value(), "the Metal target advertises no mesh shader limits");
             // tests/Mesh.cpp's subgroups: {input primitive, primitives and vertices per group, max
             // vertices, max primitives, threads, LDS bytes, provoking vertex, ESGS item size}.
-            const std::array<MeshCase, 10> cases{{
+            const std::array<MeshCase, 11> cases{{
+                // DECISIONS D77: 20 KiB of LDS beside the triangle-vertices staging of 192 vertices
+                // (12.3 KiB): together past the 32 KiB threadgroup limit, so the staging reuses the
+                // LDS once the guest program returned (ASTRO BOT's worldmap meshes).
+                {"triangle list, LDS beside the triangle-vertices staging", {4u, 64u, 192u, 192u, 64u, 192u, 20480u, 0u, 4u}, 64u, true},
                 {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},

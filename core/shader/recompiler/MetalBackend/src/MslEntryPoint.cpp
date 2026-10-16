@@ -201,6 +201,16 @@ std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& ou
 // (any invocation's export feeds any triangle). Corner 0 is the provoking vertex, then the guest
 // primitive's order (rotated for last-vertex provoking, which keeps the winding), as the vertex
 // function's TriangleVerticesHeader order, so P0/P10/P20 and the weights agree between the paths.
+// The triangle-vertices mode's staging (MeshTriangleVerticesEpilogue): every vertex record
+// (position, parameters and at most two float3 weight sets, 16 bytes each), then every primitive's
+// packed indices.
+std::uint32_t MeshTriangleVerticesStagingBytes(const MslEmitterState& state) {
+    const auto& mesh = state.inputInfo.vertex->mesh;
+    std::uint32_t parameters = 0u;
+    for (const auto& stageOutput : state.program.Info().outputs) parameters += stageOutput.kind == StageOutputKind::Parameter ? 1u : 0u;
+    return mesh.maxVertices * (16u * (1u + parameters) + 32u) + mesh.maxPrimitives * 4u;
+}
+
 std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std::uint32_t ldsBytes) {
     const auto& mesh = state.inputInfo.vertex->mesh;
     const auto split = MslAbi::MeshTriangleVerticesPrimitives(mesh.maxPrimitives);
@@ -210,7 +220,11 @@ std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std
     for (const auto& stageOutput : state.program.Info().outputs) parameters += stageOutput.kind == StageOutputKind::Parameter ? 1u : 0u;
     // Aps5MeshVertex: position and parameters, plus at most two float3 weight sets (16 bytes each).
     const auto vertexBytes = 16u * (1u + parameters) + 32u;
-    const auto total = mesh.maxVertices * vertexBytes + mesh.maxPrimitives * 4u + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u);
+    // The guest's LDS is dead once the body returned, so the staging reuses it (aps5_lds_words is
+    // declared at the larger of the two in this mode; DECISIONS D77): ASTRO BOT's worldmap meshes
+    // stage 80 vertices of 224 bytes beside 16 KiB of LDS.
+    const auto staging = MeshTriangleVerticesStagingBytes(state);
+    const auto total = (ldsBytes != 0u ? std::max(staging, ldsBytes) : staging) + 8u + (layer ? mesh.maxVertices * 4u : 0u);
     if (total > state.target.maxThreadgroupMemoryBytes) {
         return "#error \"the triangle-vertices mesh function (per-vertex fragment inputs of a mesh draw) stages " + std::to_string(mesh.maxVertices) + " vertices of " + std::to_string(vertexBytes) + " bytes in threadgroup memory: " + std::to_string(total) + " bytes with LDS exceed the " + std::to_string(state.target.maxThreadgroupMemoryBytes) + "-byte limit\"\n";
     }
@@ -221,8 +235,13 @@ std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std
     // PROVOKING_VTX_LAST; State.cpp leaves the mesh configuration's provokingVertex at 0), else the
     // configuration's.
     std::string text = "#if defined(" + std::string(MslAbi::ProvokingLastMacro) + ") && " + std::string(MslAbi::ProvokingLastMacro) + "\n    constexpr uint aps5_provoking = 2u;\n#else\n    constexpr uint aps5_provoking = " + provoking + "u;\n#endif\n";
-    text += "    threadgroup Aps5MeshVertex aps5_tv_v[" + std::to_string(mesh.maxVertices) + "];\n";
-    text += "    threadgroup uint aps5_tv_p[" + std::to_string(mesh.maxPrimitives) + "];\n";
+    if (ldsBytes != 0u) {
+        text += "    threadgroup Aps5MeshVertex* aps5_tv_v = reinterpret_cast<threadgroup Aps5MeshVertex*>(aps5_lds_words);\n";
+        text += "    threadgroup uint* aps5_tv_p = reinterpret_cast<threadgroup uint*>(aps5_tv_v + " + std::to_string(mesh.maxVertices) + ");\n";
+    } else {
+        text += "    threadgroup Aps5MeshVertex aps5_tv_v[" + std::to_string(mesh.maxVertices) + "];\n";
+        text += "    threadgroup uint aps5_tv_p[" + std::to_string(mesh.maxPrimitives) + "];\n";
+    }
     text += "    const uint aps5_vertices = min(aps5_malloc[0], " + std::to_string(mesh.maxVertices) + "u);\n";
     text += "    const uint aps5_primitives = min(aps5_malloc[1], " + std::to_string(mesh.maxPrimitives) + "u);\n";
     text += "    const uint aps5_last = max(aps5_vertices, 1u) - 1u;\n";
@@ -297,8 +316,13 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         const auto first = line.find_first_not_of(' ');
         if (first != std::string::npos && line.compare(first, 12u, "threadgroup ") == 0) {
             if (line.compare(first, 26u, "threadgroup uint aps5_lds[") != 0) state.Fail("threadgroup declaration in a mesh program's prologue: " + line);
-            hoisted += line;
             lds = static_cast<std::uint32_t>(std::stoul(line.substr(first + 26u))) * 4u;
+            // 16-byte words, so the triangle-vertices mode can stage its vertex records in them once
+            // the body returned (MeshTriangleVerticesEpilogue, DECISIONS D77).
+            const auto words = [](std::uint32_t bytes) { return std::to_string((bytes + 15u) / 16u); };
+            hoisted += "#if " + TriangleVerticesCondition() + "\n    threadgroup uint4 aps5_lds_words[" + words(std::max(lds, MeshTriangleVerticesStagingBytes(state))) + "];\n#else\n";
+            hoisted += "    threadgroup uint4 aps5_lds_words[" + words(lds) + "];\n#endif\n";
+            hoisted += "    threadgroup uint* aps5_lds = reinterpret_cast<threadgroup uint*>(aps5_lds_words);\n";
             helperParameters.push_back("threadgroup uint* aps5_lds");
             arguments.push_back("aps5_lds");
             continue;

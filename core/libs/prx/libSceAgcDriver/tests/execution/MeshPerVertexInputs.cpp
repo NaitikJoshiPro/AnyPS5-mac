@@ -322,7 +322,9 @@ int main() {
         const auto stripDraw = AgcDriver::Pm4::DrawParameters{0, static_cast<std::uint32_t>(Strip.size()), 0, 1, 0, false};
         // {input primitive, primitives and vertices per group, max vertices, max primitives,
         // threads, LDS dwords, provoking vertex, ESGS item size}, as tests/Mesh.cpp.
-        const std::array<Case, 11> cases{{
+        const std::array<Case, 12> cases{{
+            // DECISIONS D77: 20 KiB of LDS beside 192 staged vertices; the staging reuses the LDS.
+            {"triangle list, 64-primitive subgroups with 20 KiB of LDS", {4u, 64u, 192u, 192u, 64u, 192u, 20480u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 32u, false},
