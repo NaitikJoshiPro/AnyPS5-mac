@@ -482,6 +482,45 @@ void GuestArenaUnmapAlias_nid_postfix(void* alias) {
 }
 #endif
 
+#ifdef __APPLE__
+namespace {
+std::mutex aliasMutex;
+std::map<std::uintptr_t, std::size_t> aliasBytes;
+}
+
+void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0) throw std::runtime_error("guest arena alias: empty range");
+    mach_vm_address_t alias = 0;
+    vm_prot_t current = VM_PROT_NONE;
+    vm_prot_t maximum = VM_PROT_NONE;
+    const auto host = static_cast<mach_vm_address_t>(HostAddress(address));
+    if (mach_vm_remap(mach_task_self(), &alias, bytes, 0, VM_FLAGS_ANYWHERE, mach_task_self(), host, FALSE, &current, &maximum, VM_INHERIT_NONE) != KERN_SUCCESS) {
+        throw std::runtime_error("guest arena alias: mach_vm_remap of 0x" + std::to_string(address) + " failed");
+    }
+    // The watch may have armed the source pages read-only: the alias is made writable on its own.
+    if ((maximum & VM_PROT_WRITE) == 0 || mach_vm_protect(mach_task_self(), alias, bytes, FALSE, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), alias, bytes);
+        throw std::runtime_error("guest arena alias: the range cannot be mapped writable");
+    }
+    std::lock_guard lock(aliasMutex);
+    aliasBytes[static_cast<std::uintptr_t>(alias)] = bytes;
+    return reinterpret_cast<void*>(alias);
+}
+
+void GuestArenaUnmapAlias_nid_postfix(void* alias) {
+    if (alias == nullptr) return;
+    std::size_t bytes = 0;
+    {
+        std::lock_guard lock(aliasMutex);
+        const auto found = aliasBytes.find(reinterpret_cast<std::uintptr_t>(alias));
+        if (found == aliasBytes.end()) return;
+        bytes = found->second;
+        aliasBytes.erase(found);
+    }
+    mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(alias), bytes);
+}
+#endif
+
 #if defined(__linux__) || defined(__APPLE__)
 namespace {
 int PosixProtection(std::uint32_t windowsProtection) {

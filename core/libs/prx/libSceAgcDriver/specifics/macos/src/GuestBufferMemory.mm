@@ -306,7 +306,7 @@ struct RetiredImport {
         const auto& entry = node.mapped();
         destroyBuffer(device, entry.buffer, nullptr);
         freeMemory(device, entry.memory, nullptr);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
     }
@@ -376,7 +376,9 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
         return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
     }();
     if (tracedPage != 0 && tracedPage >= entry.base && tracedPage < entry.base + entry.bytes) std::fprintf(stderr, "[metal] import 0x%llx+0x%llx covers traced page: %s\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), AgcDriver::Metal::VmWiredInfo(GuestArena::HostAddress(tracedPage)).c_str());
-    id<MTLBuffer> buffer = AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), entry.base, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
+    // A watched import wraps its read-write alias (D74); the guest's own pages keep their protection.
+    id<MTLBuffer> buffer = entry.alias != nullptr ? [Metal::DeviceOf(context) newBufferWithBytesNoCopy:entry.alias length:entry.bytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil]
+                                                  : AgcDriver::Metal::NewNoCopyBuffer(Metal::DeviceOf(context), entry.base, entry.bytes, MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     if (trace) std::fprintf(stderr, "[metal] host import 0x%llx after:  %s\n", static_cast<unsigned long long>(entry.base), AgcDriver::Metal::VmRegionInfo(hostBase).c_str());
     if (buffer == nil) {
         failure = VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -936,9 +938,21 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     const bool watchedHostPointer = entry.alias != nullptr || !state.unwatchImports;
     const bool watchedDmaBuf = watchedHostPointer;
 #else
-    // Metal: both false (decideImportWatch), so the import window unwatches the range itself.
-    const bool watchedHostPointer = !state.unwatchImports;
-    const bool watchedDmaBuf = !state.unwatchDmaBufImports;
+    // Metal: imports are compared and unwatched by default (decideImportWatch). Watched (D74), the GPU
+    // wraps a second, read-write mapping of the pages, so the guest's own mapping can stay
+    // write-protected: a no-copy buffer over pages the watch armed read-only is wired read-only at
+    // its first GPU use, and the GPU's stores never reach the CPU's view (Showcase 1.0.2 then waited
+    // forever on a GPU-written fence). Without the alias the import is unwatched.
+    if (!state.unwatchImports) {
+        try {
+            entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
+        } catch (const std::runtime_error& error) {
+            static std::atomic<int> reports{0};
+            if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] host import 0x%llx+0x%llx stays unwatched: %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), error.what());
+        }
+    }
+    const bool watchedHostPointer = entry.alias != nullptr;
+    const bool watchedDmaBuf = watchedHostPointer;
 #endif
     GuestMemory::ImportWatched(base, bytes, [&] {
         step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result) : createHostPointerImport(context, entry, result);
@@ -954,7 +968,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #endif
     entry.unwatched = step == nullptr && !(entry.dmaBuf ? watchedDmaBuf : watchedHostPointer);
     if (step != nullptr) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
         state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
@@ -1015,7 +1029,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
                 state.parked[state.device].push_back(std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, std::move(node)));
                 continue;
             }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
             GuestArena::GuestArenaUnmapAlias_nid_postfix(node.mapped().alias);
 #endif
         }
@@ -1992,7 +2006,7 @@ void ClearHostImports(VkDevice device) {
     for (const auto& [address, entry] : state.imports) {
         state.destroyBuffer(state.device, entry.buffer, nullptr);
         state.freeMemory(state.device, entry.memory, nullptr);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
     }

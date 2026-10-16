@@ -48,6 +48,13 @@ void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer);
 bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const void* source, std::size_t bytes);
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 #endif
+#ifdef __APPLE__
+// A second, read-write host mapping of the pages behind [address, address + bytes) (mach_vm_remap,
+// shared, not a copy): the GPU wraps it while the guest's own mapping stays write-watched
+// (DECISIONS D74). Throws when the range cannot be remapped.
+void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestArenaUnmapAlias_nid_postfix(void* alias);
+#endif
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 
