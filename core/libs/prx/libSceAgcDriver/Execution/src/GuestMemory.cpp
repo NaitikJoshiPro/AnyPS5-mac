@@ -1289,7 +1289,12 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return true;
     }
     const WindowCopy window{first, saved};
-    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) {
+        unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+        return true;
+    }
+    // EXPERIMENT (D74): arm every page of the import so the CPU's next stores are seen.
+    if (std::getenv("APS5_D74_EXP_ARM") != nullptr) walkWrites(tracker, first, stop, StampKind::Cpu);
     return true;
 }
 
