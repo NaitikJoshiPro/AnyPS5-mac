@@ -247,6 +247,10 @@ ImageBindings::ImageBindings(ImageCache& cache, std::function<void(std::uint64_t
 ImageBindings::~ImageBindings() = default;
 
 void ImageBindings::Prepare(const ShaderRecompiler::RecompileResult& shader) {
+    // Each stage has its own build: a draw whose vertex and fragment functions both bind images
+    // wrote the fragment's entries from the vertex function's build ("the build has no binding 66",
+    // ASTRO BOT's worldmap; DECISIONS D76).
+    resources = nullptr;
     if (!HasImages(shader)) return;
     const auto* context = cache.ImageContext();
     if (context == nullptr) FailD5("a dispatch binds guest images before the image cache is attached to the device's Context");
@@ -276,6 +280,7 @@ void ImageBindings::Prepare(const ShaderRecompiler::RecompileResult& shader) {
             }
         }
     }
+    if (std::find(builds.begin(), builds.end(), resources) == builds.end()) builds.push_back(resources);
 }
 
 void ImageBindings::Write(const ShaderRecompiler::DescriptorBinding& binding, std::span<std::uint64_t> entries) {
@@ -287,11 +292,12 @@ void ImageBindings::Write(const ShaderRecompiler::DescriptorBinding& binding, st
 void ImageBindings::Commit(Recorder& recorder) {
     if (committed) return;
     committed = true;
-    if (resources == nullptr) return;
     // ShaderResources::MarkGpuWrites marks the written storage images dirty (pending: stored when a
-    // reader needs their memory) and notes their ranges; the batch keeps the build.
-    resources->MarkGpuWrites(recorder);
-    recorder.Keep(resources);
+    // reader needs their memory) and notes their ranges; the batch keeps every stage's build.
+    for (auto& build : builds) {
+        build->MarkGpuWrites(recorder);
+        recorder.Keep(build);
+    }
 }
 
 }

@@ -382,6 +382,7 @@ agc_driver_packed_mip_tail_target G3
 agc_driver_packed_unorm_color_target G3
 agc_driver_pixel_ancillary_word G3
 agc_driver_pixel_barycentric_emulation G3
+agc_driver_stage_image_bindings G3
 agc_driver_pixel_fixed_point_position G3
 agc_driver_pixel_helper_lanes G3
 agc_driver_pixel_interlock G3

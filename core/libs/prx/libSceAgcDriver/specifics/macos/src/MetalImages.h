@@ -113,13 +113,16 @@ public:
     // images pending (ShaderResources::MarkGpuWrites) and keeps the build with the batch.
     void Commit(Recorder& recorder);
 
-    bool Empty() const { return resources == nullptr; }
+    bool Empty() const { return builds.empty(); }
 
 private:
     ImageCache& cache;
-    // The upstream build (ShaderResources twin, MetalImagesOnly) over the cache's attached Context:
-    // the image and sampler entries come from it, and the pending/live storage registries, the
+    // The upstream builds (ShaderResources twin, MetalImagesOnly) over the cache's attached Context,
+    // one per stage that binds images (a draw's vertex and fragment functions each have their own):
+    // the image and sampler entries come from them, and the pending/live storage registries, the
     // texture caches and the resource cache are upstream's (Texture.mm, ShaderResources.mm).
+    // `resources` is the build of the shader Prepare saw last, which its Writes read.
+    std::vector<std::shared_ptr<ShaderResources>> builds;
     std::shared_ptr<ShaderResources> resources;
     bool committed = false;
 };
