@@ -25,6 +25,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <list>
 #include <map>
 #include <mutex>
@@ -38,6 +39,7 @@
 #include <stdexcept>
 #include <thread>
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -144,10 +146,6 @@ std::shared_ptr<const ShaderSnapshot> ReadUserDataTailContinuation(std::span<con
 }
 
 std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shaders, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
-    // A program outside every registered shader's code is read raw, as compute dispatches do (a title
-    // can register its own shaders and also draw unregistered ones: the oops-sdk registers its display
-    // shaders through sceAgcCreateShader while radeonsi submits raw programs). An address inside a
-    // registered shader of another type throws in RegisteredProgram.
     if (auto registered = RegisteredProgram(shaders, address, types)) return registered;
     return ReadRawShader(address);
 }
@@ -159,12 +157,25 @@ std::map<std::uint64_t, std::uint64_t> rawGraphicsRanges;
 }
 
 void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot) {
-    const auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);
+    if (snapshot.rawGraphicsNoted->load(std::memory_order_acquire)) return;
+    auto begin = snapshot.codeAddress;
+    auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);
     {
         std::lock_guard lock(rawGraphicsMutex);
-        auto& recorded = rawGraphicsRanges[snapshot.codeAddress];
-        recorded = std::max(recorded, end);
+        auto next = rawGraphicsRanges.upper_bound(begin);
+        if (next != rawGraphicsRanges.begin() && std::prev(next)->second >= begin) {
+            const auto previous = std::prev(next);
+            begin = previous->first;
+            end = std::max(end, previous->second);
+            rawGraphicsRanges.erase(previous);
+        }
+        while (next != rawGraphicsRanges.end() && next->first <= end) {
+            end = std::max(end, next->second);
+            next = rawGraphicsRanges.erase(next);
+        }
+        rawGraphicsRanges.emplace(begin, end);
     }
+    snapshot.rawGraphicsNoted->store(true, std::memory_order_release);
     rawGraphicsDrawn.store(true, std::memory_order_relaxed);
 }
 
@@ -173,11 +184,10 @@ bool RawGraphicsDrawn() {
 }
 
 bool RawGraphicsDrawnIn(std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return false;
     std::lock_guard lock(rawGraphicsMutex);
-    for (auto found = rawGraphicsRanges.begin(); found != rawGraphicsRanges.end() && found->first < end; ++found) {
-        if (found->second > begin) return true;
-    }
-    return false;
+    const auto next = rawGraphicsRanges.lower_bound(end);
+    return next != rawGraphicsRanges.begin() && std::prev(next)->second > begin;
 }
 
 namespace {
@@ -821,6 +831,8 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         const auto count = RegisterValue(state.context, 0x1b6) & 0x3fu;
         if (registration && count != 0) return nullptr;
         pixel = Graphics::DecodePixelStageInfo(state.context, {});
+        const auto& capabilities = device.Target().supportedCapabilities;
+        if (pixel->stencilRefExportEnable && std::ranges::find(capabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == capabilities.end()) return nullptr;
         wave = pixel->wave32 ? 32u : 64u;
     } else {
         const auto routing = RegisterValue(state.context, 0x2d5);
@@ -1472,8 +1484,6 @@ void Driver::RegisterShader(const Shader* shader) {
     GuestMemory::CheckRange(shader, fields.header_size, 1);
     const auto* code = const_cast<const void*>(fields.code);
     GuestMemory::CheckRange(code, fields.shader_size, 256);
-    // Draws keep raw snapshots of unregistered programs (revalidated by reading them raw again), so a
-    // registration over code that was drawn raw would give one program two identities.
     require(!RawGraphicsDrawnIn(reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(code) + fields.shader_size), "a shader was registered over a graphics program that was drawn without registration");
     ShaderSnapshot snapshot{reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(shader), fields.type, {}, {}};
     snapshot.code.resize(fields.shader_size / sizeof(std::uint32_t));

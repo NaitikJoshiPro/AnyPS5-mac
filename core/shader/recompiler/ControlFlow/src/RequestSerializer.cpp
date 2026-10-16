@@ -342,6 +342,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteBool(info.frontFaceAllBits);
     writer.WriteU8(info.quadPixelMask);
     for (const std::uint16_t mask : info.quadSampleMask) writer.WriteU32(mask);
+    writer.WriteU32(info.reversedBlend);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
@@ -403,6 +404,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
             mask = static_cast<std::uint16_t>(value);
         }
     }
+    if (version >= 30u) info.reversedBlend = reader.ReadU32();
     if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };
         info.inputAddr = input(PixelInput::PerspectiveSample, info.hasPerspectiveCenterVgpr && inputAddrOrCenterVgpr == 2u) | input(PixelInput::PerspectiveCenter, info.hasPerspectiveCenterVgpr) |
@@ -774,7 +776,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(30u);
+    writer.WriteU32(31u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -808,7 +810,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 30u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 31u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -844,8 +846,8 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
-    // Mac fork (D-float32 denorm flush): version 30 appends float32DenormFlushNative after upstream's v29 layout.
-    if (version >= 30u) {
+    // Mac fork (D-float32 denorm flush): version 31 appends float32DenormFlushNative after upstream's v30 layout.
+    if (version >= 31u) {
         const auto float32DenormFlushNative = reader.ReadU8();
         if (float32DenormFlushNative > 1u) throw std::runtime_error("RequestSerializer: invalid float32DenormFlushNative value");
         result.request.target.float32DenormFlushNative = float32DenormFlushNative != 0u;

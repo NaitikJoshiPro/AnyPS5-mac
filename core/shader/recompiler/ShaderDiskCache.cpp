@@ -90,11 +90,11 @@ static_assert(sizeof(RecompileResult) == 472, "RecompileResult changed: update E
 static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
-static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
+static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 352, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
-static_assert(sizeof(ImageResource) == 88, "ImageResource changed: update the info encoder");
+static_assert(sizeof(ImageResource) == 92, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 24, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
@@ -104,7 +104,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 160, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 584, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 712, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
@@ -140,12 +140,12 @@ constexpr std::size_t fieldCount() {
 
 static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
-static_assert(fieldCount<ImageResource>() == 37, "ImageResource changed: update the info encoder");
+static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 21, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 23, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
@@ -577,6 +577,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(parameter.perVertex);
         out.Value(parameter.custom);
         out.Value(parameter.flatP10);
+        out.Value(parameter.vertexOrder);
     });
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
@@ -623,6 +624,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.perVertex);
         in.Value(parameter.custom);
         in.Value(parameter.flatP10);
+        in.Value(parameter.vertexOrder);
     });
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
@@ -782,6 +784,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.depthBitsCompatible);
         out.Value(image.constantSwizzle);
         out.Value(image.constantSwizzleCompatible);
+        out.Value(image.cubeFaceCompatible);
         out.Value(image.flatVolumeCompatible);
         out.Value(image.singleMipPlaneBiasCompatible);
         out.Value(image.flatLineCompatible);
@@ -856,7 +859,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.List(info.images, 76, [](Reader& in, ImageResource& image) {
+    reader.List(info.images, 77, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
         in.Value(image.resourceClass);
@@ -883,6 +886,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.depthBitsCompatible);
         in.Value(image.constantSwizzle);
         in.Value(image.constantSwizzleCompatible);
+        in.Value(image.cubeFaceCompatible);
         in.Value(image.flatVolumeCompatible);
         in.Value(image.singleMipPlaneBiasCompatible);
         in.Value(image.flatLineCompatible);
@@ -1141,6 +1145,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
     writer.Value(plan.srtGuardOffset);
     writer.Values(std::span<const std::uint8_t>(plan.cleanFlatSlots));
     writer.Values(std::span<const std::uint8_t>(plan.pureFlatSlots));
+    writer.Value(plan.denseValueIds);
     writer.Value(plan.requiresSpecializationMemory);
     writer.Value(plan.srtPlanComplete);
     writer.Value(plan.resourceTrackingComplete);
@@ -1296,6 +1301,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     reader.Value(plan.srtGuardOffset);
     reader.Values(plan.cleanFlatSlots);
     reader.Values(plan.pureFlatSlots);
+    reader.Value(plan.denseValueIds);
     reader.Value(plan.requiresSpecializationMemory);
     reader.Value(plan.srtPlanComplete);
     reader.Value(plan.resourceTrackingComplete);
@@ -1314,12 +1320,15 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;
-    return std::ranges::all_of(plan.controlFlow, [&](const ResourceBlock& block) {
+    const bool blocksValid = std::ranges::all_of(plan.controlFlow, [&](const ResourceBlock& block) {
         return (block.condition == nullptr || block.successors.size() == 2u) &&
                std::ranges::all_of(block.successors, [&](std::uint32_t successor) { return successor < plan.controlFlow.size(); }) &&
                std::ranges::all_of(block.sources, knownSource) &&
                std::ranges::all_of(block.images, [&](std::uint32_t image) { return image < plan.info.images.size(); });
     });
+    if (!blocksValid) return false;
+    ResourceMaterializer::CompactPlan(plan);
+    return true;
 }
 
 constexpr std::string_view NeutralSwitches[] = {

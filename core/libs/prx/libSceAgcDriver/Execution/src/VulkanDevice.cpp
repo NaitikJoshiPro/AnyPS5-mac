@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "BdaAbi.hpp"
@@ -134,6 +135,7 @@ using ResourceCache = Graphics::ResourceCache;
 
 std::uint32_t DumpScale();
 void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale);
+FrameDumpOutput frameDumpOutput;
 
 class FrameDumpWriter {
 public:
@@ -150,6 +152,7 @@ public:
         std::lock_guard lock(mutex);
         require(!stopping, "frame dump writer has stopped");
         require(pixels.size() <= maxBytes - queuedBytes, "frame dump queue exceeded 64 MiB");
+        if (!frameDumpOutput.Enabled_nid_no_patch()) return;
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, scale, std::move(pixels)});
@@ -318,6 +321,10 @@ struct VulkanDevice::State {
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex sparseQueueMutex;
+    VkQueue settleQueue = VK_NULL_HANDLE;
+    std::uint32_t settleFamily = 0;
+    VkCommandPool settlePool = VK_NULL_HANDLE;
+    std::mutex settleQueueMutex;
     bool memoryBudget = false;
     bool depthRangeUnrestricted = false;
     bool samplerAnisotropy = false;
@@ -756,6 +763,7 @@ struct VulkanDevice::State {
             if (pool != VK_NULL_HANDLE) {
                 destroyPool(device, pool, nullptr);
             }
+            if (settlePool != VK_NULL_HANDLE) destroyPool(device, settlePool, nullptr);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
@@ -1418,6 +1426,29 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
+#ifdef _WIN32
+    const float priorities[2]{1.0f, 1.0f};
+    bool settleQueue = false;
+    std::uint32_t settleFamily = family;
+    std::uint32_t families = 0;
+    auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+    getFamilies(selected, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> queues(families);
+    getFamilies(selected, &families, queues.data());
+    if (family < families && queues[family].queueCount >= 2) {
+        queueInfo.queueCount = 2;
+        queueInfo.pQueuePriorities = priorities;
+        settleQueue = true;
+    } else {
+        const auto copies = [&](std::uint32_t index) { return index != family && queues[index].queueCount != 0 && (queues[index].queueFlags & (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) != 0; };
+        for (std::uint32_t i = 0; i < families && !settleQueue; ++i) {
+            if (copies(i) && (queues[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) == 0) settleFamily = i, settleQueue = true;
+        }
+        for (std::uint32_t i = 0; i < families && !settleQueue; ++i) {
+            if (copies(i)) settleFamily = i, settleQueue = true;
+        }
+    }
+#endif
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1479,6 +1510,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         enabled.sparseBinding = state->sparseBinding ? VK_TRUE : VK_FALSE;
     }
     deviceInfo.pQueueCreateInfos = queueInfos;
+#ifdef _WIN32
+    if (settleQueue && settleFamily != family) {
+        if (deviceInfo.queueCreateInfoCount == 1) {
+            queueInfos[1] = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            queueInfos[1].queueFamilyIndex = settleFamily;
+            queueInfos[1].queueCount = 1;
+            queueInfos[1].pQueuePriorities = &priority;
+            deviceInfo.queueCreateInfoCount = 2;
+        } else {
+            settleQueue = false;
+        }
+    }
+#endif
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;
     enabled.multiDrawIndirect = available.multiDrawIndirect;
@@ -1763,6 +1807,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
+#ifdef _WIN32
+    if (settleQueue) {
+        state->settleFamily = settleFamily;
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, settleFamily, settleFamily == family ? 1 : 0, &state->settleQueue);
+    }
+#endif
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
     if (deviceFault || checkpoints) {
@@ -1779,6 +1829,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
+    if (state->settleQueue != VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo settlePoolInfo = poolInfo;
+        settlePoolInfo.queueFamilyIndex = state->settleFamily;
+        check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &settlePoolInfo, nullptr, &state->settlePool), "vkCreateCommandPool settle");
+    }
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
         Graphics::FillDeviceFunctions(graphicsContext(), state->deviceFunctions);
@@ -1787,7 +1842,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     Graphics::PrepareImportWatch(graphicsContext());
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties);
+    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, window != nullptr || compileOnly);
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
     state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
@@ -2051,6 +2106,8 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
 }
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
+    static const bool syncDumps = std::getenv("APS5_SYNC_SAMPLE_DUMPS") != nullptr || std::getenv("APS5_NO_GPU_SAMPLE_DUMPS") != nullptr;
+    if (syncDumps) return false;
     if (!state->recorder) return false;
     auto& recorder = *state->recorder;
     constexpr std::size_t bytes = Pm4::SampleDumpBytes;
@@ -2665,20 +2722,10 @@ void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std:
         return value ? std::atoi(value) : 0;
     }();
     static int dumped = 0;
-    if (dumped < dumpLimit) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumped < dumpLimit) {
         char name[32];
         std::snprintf(name, sizeof(name), "frame_%03d.bmp", dumped++);
-        if (std::FILE* file = std::fopen(name, "wb")) {
-            const std::uint32_t imageBytes = width * height * 4;
-            const std::uint32_t header[13] = {0, 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<std::int32_t>(height)), 1u | (32u << 16u), 0, imageBytes, 2835, 2835, 0, 0};
-            const std::uint16_t magic = 0x4d42;
-            const std::uint32_t fileBytes = 54 + imageBytes;
-            std::fwrite(&magic, 2, 1, file);
-            std::fwrite(&fileBytes, 4, 1, file);
-            std::fwrite(header + 1, 4, 12, file);
-            std::fwrite(pixels.data(), 1, pixels.size(), file);
-            std::fclose(file);
-        }
+        frameDumpOutput.Write_nid_no_patch(name, width, height, pixels);
     }
     // Tests and tools present pixels synchronously; the game path splits the steps (see Driver::Present).
     if (!present(width, height, true, pixels)) return;
@@ -2706,6 +2753,7 @@ std::uint32_t DumpScale() {
 // frame_<index>.bmp: every DumpScale()-th pixel of a BGRA8 image, 32-bit top-down.
 void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale) {
     require(scale != 0 && full.size() == static_cast<std::size_t>(fullWidth) * fullHeight * 4, "invalid frame dump pixels");
+    if (!frameDumpOutput.Enabled_nid_no_patch()) return;
     const std::uint32_t width = (fullWidth + scale - 1) / scale;
     const std::uint32_t height = (fullHeight + scale - 1) / scale;
     std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4);
@@ -2714,20 +2762,7 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     }
     char name[32];
     std::snprintf(name, sizeof(name), "frame_%03d.bmp", index);
-    {
-        std::ofstream file;
-        file.exceptions(std::ios::failbit | std::ios::badbit);
-        file.open(name, std::ios::binary);
-        const std::uint32_t imageBytes = width * height * 4;
-        const std::uint32_t header[13] = {0, 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<std::int32_t>(height)), 1u | (32u << 16u), 0, imageBytes, 2835, 2835, 0, 0};
-        const std::uint16_t magic = 0x4d42;
-        const std::uint32_t fileBytes = 54 + imageBytes;
-        file.write(reinterpret_cast<const char*>(&magic), 2);
-        file.write(reinterpret_cast<const char*>(&fileBytes), 4);
-        file.write(reinterpret_cast<const char*>(header + 1), 48);
-        file.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
-        file.close();
-    }
+    frameDumpOutput.Write_nid_no_patch(name, width, height, pixels);
 }
 
 ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter, std::uint32_t& layer) {
@@ -2833,7 +2868,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         if (passthrough) ensureHdrScaler(DisplayTexelFormat(buffer.pixelFormat));
         const auto pixels = passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
         bool dumpFrame = false;
-        if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
             if (passthrough) {
                 WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, ReadDisplayBuffer(buffer), DumpScale());
             } else if (dumps.cpu) {
@@ -2888,7 +2923,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     }
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     bool dumpFrame = false;
-    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
         if (dumps.cpu || (passthrough && resident == nullptr)) {
             auto full = cleared ? std::vector<std::byte>(static_cast<std::size_t>(buffer.width) * buffer.height * cleared->size()) : ReadDisplayBuffer(buffer);
             for (std::size_t offset = 0; cleared && offset < full.size(); offset += cleared->size()) std::memcpy(full.data() + offset, cleared->data(), cleared->size());
@@ -3417,6 +3452,10 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseFamily = state->sparseFamily;
     context.sparseQueue = state->sparseQueue;
     context.sparseQueueMutex = &state->sparseQueueMutex;
+    context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
+    context.settlePool = state->settlePool;
+    context.settleFamily = state->settleFamily;
+    context.settleQueueMutex = &state->settleQueueMutex;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.vertexInputs = state->vertexInputs.get();
