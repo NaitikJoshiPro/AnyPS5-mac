@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -308,6 +309,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (reap) {
             const auto withWorkBefore = pollProfile ? Graphics::Recorder::ReapsWithWork() : 0;
             localDevice->ReapRecorded();
+            Progress::Notify();
             ++outcomes.pollReaps;
             if (pollProfile) {
                 ++poll.reaps;
@@ -327,7 +329,19 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
     } blocked{*this, queue};
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
-    const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
+    // D80: the spin catches a label that lands within microseconds; after it the wait sleeps until a progress event
+    // (GPU completion, reaped labels, a finished packet, a recorded write) or the fallback period, for labels the
+    // guest's CPU writes (those raise no event). Queue 0 spun 1.5 ms before (APS5_WAIT_SPIN_US overrides).
+    static const auto queue0Spin = [] {
+        const char* text = std::getenv("APS5_WAIT_SPIN_US");
+        return std::chrono::microseconds(text != nullptr && *text != 0 ? std::atoi(text) : 250);
+    }();
+    static const auto fallback = [] {
+        const char* text = std::getenv("APS5_WAIT_POLL_US");
+        return std::chrono::microseconds(text != nullptr && *text != 0 ? std::max(20, std::atoi(text)) : 500);
+    }();
+    const auto spinLimit = queue == 0 ? queue0Spin : std::min(queue0Spin, std::chrono::microseconds(100));
+    auto progressSeen = Progress::Epoch();
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
@@ -346,7 +360,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if ((polls & 63u) != 0) continue;
             if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
         } else if (pauseSpin || polls >= 4000) {
-            PollSleep();
+            Progress::Wait(progressSeen, std::chrono::steady_clock::now() + fallback);
+            progressSeen = Progress::Epoch();
         } else {
             std::this_thread::yield();
         }

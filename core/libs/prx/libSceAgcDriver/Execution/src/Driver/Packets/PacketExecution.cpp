@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -196,6 +197,7 @@ void Driver::execute(const Submission& submission) {
                 if (!counted) return;
                 --driver.packetsInFlight;
                 ++driver.packetsDone;
+                ::AgcDriver::Progress::Notify();
             }
         } progress{*this, !waitPacket};
         if (!waitPacket) ++packetsInFlight;
