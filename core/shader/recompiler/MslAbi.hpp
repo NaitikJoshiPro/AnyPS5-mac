@@ -112,6 +112,24 @@ inline constexpr std::uint32_t Version = 17u;
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
 // a subgroup's primitives are split over the grid's z dimension in equal parts.
 inline constexpr std::uint32_t MeshMaxVertices = 256u;
+// Version 17 (DECISIONS D78): point draws in the mesh function's triangle-vertices mode need no
+// staging: every vertex record carries its own per-vertex values (user(aps5_pv<L>_0)) and corner
+// weight, and each point takes its vertex's. Metal's mesh output holds at most MeshMaxOutputBytes,
+// so the subgroup's vertices are split over the grid's z in runs of MeshPointSplitVertices
+// (PointSplitVerticesMacro); a point belongs to the run holding its vertex. The record estimate:
+// position, parameters, per-vertex values, weights and point size at 16 bytes each, 16 bytes a
+// primitive.
+inline constexpr std::uint32_t MeshMaxOutputBytes = 32768u;
+inline constexpr std::uint32_t MeshPointSplitVertices(std::uint32_t maxVertices, std::uint32_t maxPrimitives, std::uint32_t parameters, std::uint32_t perVertexLocations) {
+    const std::uint32_t record = 16u * (1u + parameters + perVertexLocations) + 32u;
+    const std::uint32_t primitives = maxPrimitives * 16u;
+    const std::uint32_t available = primitives < MeshMaxOutputBytes ? MeshMaxOutputBytes - primitives : 0u;
+    const std::uint32_t vertices = available / record;
+    return vertices == 0u ? 1u : vertices < maxVertices ? vertices : (maxVertices == 0u ? 1u : maxVertices);
+}
+inline constexpr std::uint32_t MeshPointSplits(std::uint32_t maxVertices, std::uint32_t splitVertices) {
+    return maxVertices == 0u ? 1u : (maxVertices + splitVertices - 1u) / splitVertices;
+}
 inline constexpr std::uint32_t MeshTriangleVerticesSplits(std::uint32_t maxPrimitives) {
     constexpr std::uint32_t limit = MeshMaxVertices / 3u;
     return maxPrimitives == 0u ? 1u : (maxPrimitives + limit - 1u) / limit;
@@ -324,6 +342,9 @@ inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
 // program exports no point size then writes [[point_size]] 1.0 (Metal leaves an unwritten size
 // undefined; Vulkan's maintenance5 default is 1.0; PA_SU_POINT_SIZE is not applied).
 inline constexpr const char* PointsMacro = "APS5_POINTS";
+// Version 17 (DECISIONS D78): mesh, triangle-vertices mode of a point draw: MeshPointSplitVertices,
+// the vertices each threadgroup outputs (threadgroup z outputs [z x it, (z + 1) x it)).
+inline constexpr const char* PointSplitVerticesMacro = "APS5_POINT_SPLIT_VERTICES";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
 // - vertex and mesh (with TriangleVerticesMacro): the fragment function's

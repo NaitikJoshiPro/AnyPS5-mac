@@ -839,10 +839,17 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += "#if " + TriangleVerticesCondition() + "\n";
         text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
         text += "#if (APS5_BARYCENTRICS & 2)\n    float3 aps5_bwl [[user(aps5_bwl)]];\n#endif\n";
+        // Point draws (MslAbi Version 17, DECISIONS D78): each vertex carries its own per-vertex values.
+        text += "#if APS5_PRIMITIVE_VERTICES == 1u\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n    float4 " + PerVertexField(output.location, 0u) + " [[user(aps5_" + PerVertexField(output.location, 0u) + ")]];\n#endif\n";
+        }
+        text += "#endif\n";
         text += "#endif\n";
         text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
         if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
-        text += "#if " + TriangleVerticesCondition() + "\n";
+        text += "#if (" + TriangleVerticesCondition() + ") && APS5_PRIMITIVE_VERTICES > 1u\n";
         for (const auto& output : state.program.Info().outputs) {
             if (output.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(output.location) + "\n";
@@ -861,7 +868,9 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
             text += "#if " + primitiveVertices + " == 1u\n#define APS5_MESH_TOPOLOGY metal::topology::point\n#elif " + primitiveVertices + " == 2u\n#define APS5_MESH_TOPOLOGY metal::topology::line\n#else\n#define APS5_MESH_TOPOLOGY metal::topology::triangle\n#endif\n";
             text += "#if " + TriangleVerticesCondition() + "\n";
-            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, APS5_PRIMITIVE_VERTICES * " + std::to_string(split) + "u, " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n";
+            text += "#if " + primitiveVertices + " == 1u\n#ifndef " + std::string(MslAbi::PointSplitVerticesMacro) + "\n#define " + std::string(MslAbi::PointSplitVerticesMacro) + " " + std::to_string(meshOutput.vertices) + "u\n#endif\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::string(MslAbi::PointSplitVerticesMacro) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n#else\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, APS5_PRIMITIVE_VERTICES * " + std::to_string(split) + "u, " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n#endif\n";
             text += "#else\n";
             text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n";
             text += "#endif\n\n";
