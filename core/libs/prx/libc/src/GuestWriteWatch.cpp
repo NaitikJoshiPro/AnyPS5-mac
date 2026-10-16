@@ -522,7 +522,7 @@ private:
             if (trace) {
                 static std::atomic<std::uint64_t> total{0};
                 const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (count % 20000 == 0) {
+                if (count <= 3 || count % 20000 == 0) {
                     char message[200];
                     const int length = std::snprintf(message, sizeof(message), "[write-watch] %llu faults; this one: signal %d code %d address 0x%llx\n", static_cast<unsigned long long>(count), signal, info->si_code, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)));
                     if (length > 0) (void)!write(STDERR_FILENO, message, static_cast<std::size_t>(length) < sizeof(message) ? static_cast<std::size_t>(length) : sizeof(message) - 1);

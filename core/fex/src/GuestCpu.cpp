@@ -451,7 +451,7 @@ void OnFault(int signal, siginfo_t* info, void* context) {
             lastAddress = address;
             static std::atomic<std::uint64_t> total{0};
             const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count % 100000 == 0) {
+            if (count <= 3 || count % 100000 == 0) {
                 char message[256];
                 const int length = std::snprintf(message, sizeof(message), "[aps5-fex] %llu faults; this one: signal %d code %d pc 0x%llx instruction 0x%08x address 0x%llx\n", static_cast<unsigned long long>(count), signal, info->si_code,
                     static_cast<unsigned long long>(pc), *reinterpret_cast<const std::uint32_t*>(pc), static_cast<unsigned long long>(address));

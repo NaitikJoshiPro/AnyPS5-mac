@@ -853,6 +853,19 @@ bool Return(void* context) {
 }
 
 void OnTrap(int signal, siginfo_t* info, void* context) {
+    {
+        static const bool traceLoop = std::getenv("APS5_TRACE_FAULT_LOOP") != nullptr;
+        if (traceLoop) {
+            static std::atomic<std::uint64_t> total{0};
+            const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 3 || count % 20000 == 0) {
+                auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
+                char line[160];
+                const int length = std::snprintf(line, sizeof(line), "[displaced] %llu traps; this one: pc 0x%llx\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(arm_thread_state64_get_pc(machine->__ss)));
+                if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
+            }
+        }
+    }
     if (Return(context)) return;
     if ((g_previousTrap.sa_flags & SA_SIGINFO) != 0 && g_previousTrap.sa_sigaction != nullptr) {
         g_previousTrap.sa_sigaction(signal, info, context);
@@ -875,7 +888,7 @@ void OnFault(int signal, siginfo_t* info, void* context) {
         if (traceLoop) {
             static std::atomic<std::uint64_t> total{0};
             const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count % 20000 == 0) {
+            if (count <= 3 || count % 20000 == 0) {
                 auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
                 char line[200];
                 const int length = std::snprintf(line, sizeof(line), "[displaced] %llu faults; this one: signal %d code %d pc 0x%llx addr 0x%llx esr 0x%llx redirected %d fixed %d\n", static_cast<unsigned long long>(count), signal, info->si_code,
