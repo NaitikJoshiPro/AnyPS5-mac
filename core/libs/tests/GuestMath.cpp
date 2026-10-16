@@ -111,7 +111,7 @@ std::int64_t APS5_VABI llround_nid_postfix(double);
 std::int64_t APS5_VABI llroundf_nid_postfix(float);
 std::int64_t APS5_VABI llroundl_nid_postfix(long double);
 int APS5_VABI __isfinitef_nid_postfix(float);
-int APS5_VABI __isfinitel_nid_postfix(long double);
+int APS5_VABI __isfinitel_nid_postfix(GuestLongDouble);
 int APS5_VABI __isnormal_nid_postfix(double);
 int APS5_VABI __isnormalf_nid_postfix(float);
 int APS5_VABI __isinff_nid_postfix(float);
@@ -1064,6 +1064,7 @@ int main() {
     Require(__isfinitef_nid_postfix(nan) == 0);
     std::feclearexcept(FE_ALL_EXCEPT);
     std::feraiseexcept(FE_DIVBYZERO);
+#if defined(__x86_64__)
     for (const long double value : {0.0L, -0.0L, 1.0L, -1.0L, std::numeric_limits<long double>::denorm_min(),
                                   -std::numeric_limits<long double>::denorm_min(), std::numeric_limits<long double>::min(),
                                   std::numeric_limits<long double>::max(), std::numeric_limits<long double>::lowest(),
@@ -1075,6 +1076,25 @@ int main() {
                                   std::numeric_limits<long double>::signaling_NaN(), -std::numeric_limits<long double>::signaling_NaN()}) {
         Require(__isfinitel_nid_postfix(value) == 0);
     }
+#else
+    // arm64: guest long doubles are x87 storage built from doubles, plus the encodings doubles cannot reach.
+    for (const double value : {0.0, -0.0, 1.0, -1.0, std::numeric_limits<double>::denorm_min(), std::numeric_limits<double>::max(),
+                               std::numeric_limits<double>::lowest()}) {
+        Require(__isfinitel_nid_postfix(GuestLongDoubleFromDouble(value)) == 1);
+    }
+    GuestLongDouble largest = GuestLongDoubleFromDouble(1.0);
+    largest.signExponent = 0x7ffe;
+    largest.significand = ~std::uint64_t{0};
+    Require(__isfinitel_nid_postfix(largest) == 1);
+    for (const double value : {std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN(), -std::numeric_limits<double>::quiet_NaN()}) {
+        Require(__isfinitel_nid_postfix(GuestLongDoubleFromDouble(value)) == 0);
+    }
+    GuestLongDouble pseudo = GuestLongDoubleFromDouble(1.0);
+    pseudo.signExponent = 0xffff;
+    pseudo.significand = 0x4000000000000000ull;
+    Require(__isfinitel_nid_postfix(pseudo) == 0);
+#endif
     Require(std::fetestexcept(FE_ALL_EXCEPT) == FE_DIVBYZERO);
     std::feclearexcept(FE_ALL_EXCEPT);
     Require(__isnormalf_nid_postfix(1.f) == 1 && __isnormalf_nid_postfix(0.f) == 0);
