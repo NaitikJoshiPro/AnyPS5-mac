@@ -11,6 +11,9 @@ foreach(agcMetalDeviceMode IN ITEMS bindings submission profile imports memory r
     add_test(NAME agc_metal_device_${agcMetalDeviceMode} COMMAND agc_metal_device_tests ${agcMetalDeviceMode})
     set_tests_properties(agc_metal_device_${agcMetalDeviceMode} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
 endforeach()
+# APS5_WRITE_WATCH_IMPORTS=watch: imports stay in the write watch (DECISIONS D74).
+add_test(NAME agc_metal_device_imports_watched COMMAND agc_metal_device_tests imports_watched)
+set_tests_properties(agc_metal_device_imports_watched PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
 # D19.5 teardown hygiene: a failed MSL compile, a dispatch in flight and a wrapped static page at teardown
 # (through ~VulkanDevice, and with the device still alive at exit()). Run under validation via gpu_suite.
 add_test(NAME agc_metal_device_teardown COMMAND agc_metal_device_tests teardown)

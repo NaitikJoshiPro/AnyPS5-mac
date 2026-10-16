@@ -544,6 +544,7 @@ agc_metal_color_transfer G7
 agc_metal_device_bindings G7
 agc_metal_device_import_window G7
 agc_metal_device_imports G7
+agc_metal_device_imports_watched G7
 agc_metal_device_memory G7
 agc_metal_device_profile G7
 agc_metal_device_residency G7

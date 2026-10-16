@@ -644,11 +644,14 @@ void decideImportWatch(const Context& context, HostImports& state) {
     // write-protects pages (mprotect); GPU stores through a no-copy buffer do not go through it,
     // and a probe would have the GPU store into write-protected pages on purpose (DECISIONS D19).
     // Unwatching an import also lifts that protection from pages the GPU may write.
-    static_cast<void>(importWatchRequest);
+    // APS5_WRITE_WATCH_IMPORTS=watch keeps them watched, as page wrappers already are (NewNoCopyBuffer
+    // wraps watched pages and the watch re-arms them): GPU stores reach guest memory through the
+    // driver's own stamps (MarkWritten), CPU stores through the watch.
     state.watchDevice = context.device;
-    state.unwatchImports = true;
-    state.unwatchDmaBufImports = true;
-    if (std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Metal host imports are compared, not watched\n");
+    state.unwatchImports = importWatchRequest() != ImportWatchRequest::Watch;
+    state.unwatchDmaBufImports = state.unwatchImports;
+    if (!state.unwatchImports && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Metal host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
+    if (state.unwatchImports && std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Metal host imports are compared, not watched\n");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;

@@ -393,6 +393,37 @@ void CommitEmpty(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4Comman
     Require([event waitUntilSignaledValue:value timeoutMS:5000], "residency: an empty command buffer did not complete in 5 s");
 }
 
+// APS5_WRITE_WATCH_IMPORTS=watch (agc_metal_device_imports_watched): an import keeps its range in the
+// write watch, as page wrappers do. GPU stores through it land in write-protected guest pages and are
+// read back by the CPU; a CPU store after the watch re-arms is still collected; and the driver treats
+// the range as tracked (GuestMemory::Watched), so images on it skip the full-copy comparisons.
+void CheckWatchedImports(AgcDriver::VulkanDevice& device) {
+    Require(GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix(), "watched imports: the guest write watch is not available");
+    MappedGuestBlock block(65536);
+    const auto address = reinterpret_cast<std::uintptr_t>(block.Words());
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        const std::uint32_t seed = 2000u * (round + 1u);
+        block.Words()[0] = seed;
+        block.Arm();
+        Require((PageProtection(block.Words()) & VM_PROT_WRITE) == 0, "watched imports: round " + std::to_string(round) + ": the write watch did not write-protect the page");
+        RunImportAtomics(device, block.Words(), seed, "watched round " + std::to_string(round));
+        Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, 65536), "watched imports: round " + std::to_string(round) + ": the import took the block out of the write watch");
+        Require(AgcDriver::GuestMemory::Watched(address, 65536), "watched imports: round " + std::to_string(round) + ": the driver does not treat the imported block as tracked");
+        block.Arm();
+        Require((PageProtection(block.Words()) & VM_PROT_WRITE) == 0, "watched imports: round " + std::to_string(round) + ": the watch did not re-arm after the GPU stores");
+        block.Words()[4096] = seed + 7u;
+        std::uintptr_t written[2] = {0, 0};
+        GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(address, 65536, [](void* context, std::uintptr_t begin, std::uintptr_t end) {
+            auto* range = static_cast<std::uintptr_t*>(context);
+            if (range[0] == 0 || begin < range[0]) range[0] = begin;
+            range[1] = std::max(range[1], end);
+        }, written);
+        const auto store = reinterpret_cast<std::uintptr_t>(block.Words() + 4096);
+        Require(written[0] <= store && store < written[1], "watched imports: round " + std::to_string(round) + ": a CPU store after the GPU's was not collected");
+    }
+    std::printf("watched imports: 3 rounds of GPU atomics through an import over write-protected guest pages, results read by the CPU, the block stays watched and CPU stores are collected\n");
+}
+
 void CheckResidency(AgcDriver::VulkanDevice& device) {
     namespace Metal = AgcDriver::Graphics::Metal;
     namespace Residency = AgcDriver::Metal::Residency;
@@ -962,6 +993,8 @@ int main(int argc, char** argv) {
             CheckImports(*device);
         } else if (mode == "residency") {
             CheckResidency(*device);
+        } else if (mode == "imports_watched") {
+            CheckWatchedImports(*device);
         } else if (mode == "import_window") {
             CheckImportWindow(*device);
         } else if (mode == "submission") {
