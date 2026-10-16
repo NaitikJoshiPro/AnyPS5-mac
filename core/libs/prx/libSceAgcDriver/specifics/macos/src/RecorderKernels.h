@@ -22,15 +22,6 @@ static inline void AddSamples(thread uint& low, thread uint& high, device const 
     low = sum;
 }
 
-// The 16 render-backend entries of a ZPASS_DONE dump: entry 0 holds the total, the others 0, each
-// with bit 63 (valid) set.
-static inline void StoreDump(device uint* target, uint low, uint high) {
-    for (uint db = 0u; db < 16u; ++db) {
-        target[db * 4u] = db == 0u ? low : 0u;
-        target[db * 4u + 1u] = (db == 0u ? high : 0u) | 0x80000000u;
-    }
-}
-
 struct FillParameters {
     device uint* target;
     uint pattern[4];
@@ -80,12 +71,26 @@ struct SampleCounterParameters {
 };
 
 kernel void SampleCounter(constant SampleCounterParameters& p [[buffer(0)]]) {
+    // A ZPASS_DONE dump is 16 render-backend entries: entry 0 holds the total, the others 0, each
+    // with bit 63 (valid) set. store 1, 3, 2 publish a dump in three dispatches (barriers between): the high word without
+    // the ready bit, then the low word (and the counter), then the ready bit, so the CPU never
+    // sees the ready marker before the counts (upstream 6b164f21af).
+    if (p.store == 2u) {
+        for (uint db = 0u; db < 16u; ++db) p.target[db * 4u + 1u] |= 0x80000000u;
+        return;
+    }
     uint low = p.counter[0];
     uint high = p.counter[1];
     for (uint i = 0u; i < p.count; ++i) AddSamples(low, high, p.counter + 4u + 2u * i);
+    if (p.store == 1u) {
+        for (uint db = 0u; db < 16u; ++db) p.target[db * 4u + 1u] = db == 0u ? (high & 0x7fffffffu) : 0u;
+        return;
+    }
+    if (p.store == 3u) {
+        for (uint db = 0u; db < 16u; ++db) p.target[db * 4u] = db == 0u ? low : 0u;
+    }
     p.counter[0] = low;
     p.counter[1] = high;
-    if (p.store != 0u) StoreDump(p.target, low, high);
 }
 
 struct SampleDumpParameters {
@@ -95,6 +100,7 @@ struct SampleDumpParameters {
     uint dumpCount;
     uint firstSegment;
     uint lastSegment;
+    uint phase;
 };
 
 kernel void SampleDumps(constant SampleDumpParameters& p [[buffer(0)]]) {
@@ -105,8 +111,15 @@ kernel void SampleDumps(constant SampleDumpParameters& p [[buffer(0)]]) {
         const uint end = p.dumps[dump * 4u + 2u];
         for (; segment < end; ++segment) AddSamples(low, high, p.counter + 4u + 2u * segment);
         const ulong address = ulong(p.dumps[dump * 4u]) | (ulong(p.dumps[dump * 4u + 1u]) << 32u);
-        StoreDump(reinterpret_cast<device uint*>(address), low, high);
+        device uint* target = reinterpret_cast<device uint*>(address);
+        // Phases 0, 1, 2 (separate dispatches): high word without the ready bit, low word, ready bit.
+        for (uint db = 0u; db < 16u; ++db) {
+            if (p.phase == 0u) target[db * 4u + 1u] = db == 0u ? (high & 0x7fffffffu) : 0u;
+            else if (p.phase == 1u) target[db * 4u] = db == 0u ? low : 0u;
+            else target[db * 4u + 1u] = (db == 0u ? high : 0u) | 0x80000000u;
+        }
     }
+    if (p.phase != 2u && p.dumpCount != 0u) return;
     for (; segment < p.lastSegment; ++segment) AddSamples(low, high, p.counter + 4u + 2u * segment);
     p.counter[0] = low;
     p.counter[1] = high;

@@ -202,7 +202,7 @@ constexpr std::uint32_t SegmentFoldCapacity = 1024;
 constexpr std::uint32_t DumpFoldCapacity = 1024;
 constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
-constexpr std::uint32_t SampleDumpPushBytes = 32;
+constexpr std::uint32_t SampleDumpPushBytes = 40;
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
 
 // macOS: an occlusion segment pool is a visibility result buffer of SegmentSlots 8-byte counters
@@ -333,6 +333,16 @@ void ObjectsDeleter::operator()(RecorderObjects* objects) const noexcept {
 
 void ObjectsDeleter::operator()(BatchObjects* objects) const noexcept {
     delete objects;
+}
+
+namespace {
+thread_local const char* failNextSubmit = nullptr;
+thread_local bool failSubmitBeforeCommit = false;
+}
+
+void FailNextRecorderSubmit(const char* what, bool beforeCommit) {
+    failNextSubmit = what;
+    failSubmitBeforeCommit = beforeCommit;
 }
 
 }
@@ -1854,7 +1864,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
             }
             const auto before = dumpIndex;
             foldQueuedDumps(commands, stores, first, end, dumpIndex, consumed);
-            if (dumpIndex != before) ++barriers;
+            if (dumpIndex != before) barriers += 3;
             first = end;
         }
         if (dumps) {
@@ -2331,9 +2341,21 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
         std::uint32_t dumps;
         std::uint32_t firstSegment;
         std::uint32_t lastSegment;
-    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment};
+        std::uint32_t phase;
+    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment, 0u};
     static_assert(sizeof(parameters) == SampleDumpPushBytes);
-    Metal::Stream(commands).DispatchHelper(Metal::HelperPipeline(metal->device, Metal::HelperKernel::SampleDumps), std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    auto& stream = Metal::Stream(commands);
+    MetalPipeline pipeline = Metal::HelperPipeline(metal->device, Metal::HelperKernel::SampleDumps);
+    stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    if (dumps == 0) return;
+    // The counts land before the ready bit (phases 1 then 2, each behind a barrier).
+    const auto publish = [&](std::uint32_t phase) {
+        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        parameters.phase = phase;
+        stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    };
+    publish(1u);
+    publish(2u);
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
@@ -2393,9 +2415,19 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         } parameters{sampleCounter->DeviceAddress(), target, count, last && target != 0 ? 1u : 0u};
         static_assert(sizeof(parameters) == SampleCounterPushBytes);
         stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+        if (parameters.store == 1u) {
+            // The counts land before the ready bit (stores 3 then 2, each behind a barrier).
+            const auto publish = [&](std::uint32_t store) {
+                recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                parameters.store = store;
+                stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+            };
+            publish(3u);
+            publish(2u);
+        }
     } while (done < pendingSamples.size());
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT);
-    CountBarriers(CommandClass::Copy, 2);
+    CountBarriers(CommandClass::Copy, target != 0 ? 4u : 2u);
     pendingSamples.clear();
 }
 
@@ -3399,7 +3431,18 @@ void Recorder::Submit() {
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
     auto batch = std::move(open);
+    // A batch that fails before its commit is discarded (its labels and completion counts leave
+    // the tables) instead of leaking (upstream 72d6c9e16b). Metal's commit reports no device loss
+    // (that arrives in the commit feedback), so there is no vkDeviceWaitIdle step here.
+    struct DiscardUnsubmitted {
+        Recorder& recorder;
+        std::unique_ptr<Batch>& batch;
+        ~DiscardUnsubmitted() {
+            if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
+        }
+    } discardUnsubmitted{*this, batch};
     MetalCommandBuffer commandBuffer = batch->metal->stream->End();
+    if (Metal::failNextSubmit != nullptr && Metal::failSubmitBeforeCommit) throw std::runtime_error(std::exchange(Metal::failNextSubmit, nullptr));
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
@@ -3427,6 +3470,7 @@ void Recorder::Submit() {
         feedback->delivered.store(true, std::memory_order_release);
     }];
     const auto submitStart = std::chrono::steady_clock::now();
+    if (Metal::failNextSubmit != nullptr) throw std::runtime_error(std::exchange(Metal::failNextSubmit, nullptr));
     MetalCommandBuffer commandBuffers[1] = {commandBuffer};
     // Under the residency lock: the commit walks the queue's residency sets, which the release
     // thread changes (MetalResidency.h, D44).
@@ -3973,18 +4017,34 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     // The batch's label entries leave the table (a later label to the same dword already replaced
     // its entry and belongs to another batch). Correctness never depended on this removal.
-    if (!batch->labelDwords.empty() || !batch->wideLabels.empty()) {
+    removeLabels(*batch);
+    release(*batch);
+}
+
+void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    removeLabels(*batch);
+    if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
+    if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
+    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    release(*batch);
+    try {
+        publishPendingWrites();
+    } catch (...) {
+    }
+}
+
+void Recorder::removeLabels(Batch& batch) {
+    if (!batch.labelDwords.empty() || !batch.wideLabels.empty()) {
         std::lock_guard tableLock(labelTableMutex);
-        for (const auto dword : batch->labelDwords) {
+        for (const auto dword : batch.labelDwords) {
             const auto found = labels.find(dword);
-            if (found != labels.end() && found->second.batch == batch.get()) labels.erase(found);
+            if (found != labels.end() && found->second.batch == &batch) labels.erase(found);
         }
-        for (const auto entry : batch->wideLabels) wideLabels.erase(entry);
+        for (const auto entry : batch.wideLabels) wideLabels.erase(entry);
         recordedLabels.store(labels.size(), std::memory_order_relaxed);
     }
-    batch->labelDwords.clear();
-    batch->wideLabels.clear();
-    release(*batch);
+    batch.labelDwords.clear();
+    batch.wideLabels.clear();
 }
 
 void Recorder::release(Batch& batch) noexcept {

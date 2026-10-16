@@ -471,7 +471,7 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
         return;
     }
     recorder.Sync();
-    std::memset(keys, 0x00, keyCount);
+    std::memset(keys, 0x00, bytes);
     MarkDccUncompressed(context, address, surfaceBytes);
     Require(recorder.PendingWriteOverlaps(address, keyCount) && keys[0] == 0x00, "the uncompressed key store did not stay pending");
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed, "the keys after a pending uncompressed store do not read as uncompressed");
@@ -483,8 +483,13 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrite(address, keyCount);
     NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill did not read as its keys without a wait");
+    Require(KnownPendingDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill were not known without a wait");
+    Require(KnownPendingDccKeys(address + 16, surfaceBytes / 2) == DccKeys::Clear0001, "a key range inside a pending fill was not known");
+    Require(!KnownPendingDccKeys(address, 2 * surfaceBytes).has_value() && recorder.PendingWriteOverlaps(address, keyCount), "a range wider than the pending fill was known, or waited for");
     recorder.NotePendingWrite(address, 2 * keyCount);
+    Require(!KnownPendingDccKeys(address, surfaceBytes).has_value() && recorder.PendingWriteOverlaps(address, keyCount), "the keys under a later writer over a pending fill were known");
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later wider writer over a pending fill was not waited for");
+    Require(!KnownPendingDccKeys(address, surfaceBytes).has_value(), "keys nothing writes were known as pending keys");
     recorder.NotePendingFill(address, keyCount / 2, 0x40);
     recorder.NotePendingFill(address + keyCount / 2, keyCount / 2, 0x40);
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of pending 0001 fills over both halves did not read as 0001 without a wait");

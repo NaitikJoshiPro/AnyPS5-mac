@@ -1,6 +1,7 @@
 # M2 GPU test groups (docs/mac/M2_DESIGN.md §8), written by tools/mac/gpu_groups.py --write.
 # <test> <group>; gpu_suite.sh never runs the tests gpu_groups.HOLD matches, whatever their group (none at present: agc_driver_lds_atomics64 was released 2026-10-13; G5 runs headless).
 agc_branch_patch_tests G0
+agc_buffer_resource_vcc G0
 agc_cb_cond_write_tests G0
 agc_commands G0
 agc_compute_pipeline_capture G0
@@ -17,9 +18,15 @@ agc_dma_data_tests G0
 agc_dpp_write G0
 agc_driver_depth_plane_guest_layers G0
 agc_driver_depth_storage G0
+agc_driver_depth_surface_last_writer G0
 agc_driver_draw_program_trace G0
+agc_driver_draw_write_ranges G0
 agc_driver_image_table_cache G0
 agc_driver_key_miss G0
+agc_driver_native_depth_clear_refusals G0
+agc_driver_native_depth_clears G0
+agc_driver_native_depth_retirement G0
+agc_driver_native_multisample_depth G0
 agc_driver_register_key G0
 agc_driver_registration_prepare_shutdown G0
 agc_driver_sparse_buffer_holes G0
@@ -31,6 +38,7 @@ agc_fma_mix_once G0
 agc_formatted_buffer_byte_stores G0
 agc_formatted_buffer_once G0
 agc_fragment_barycentric G0
+agc_frame_dump_io G0
 agc_gs_oversubscription_tests G0
 agc_gs_prim_payload_tests G0
 agc_host_hdr G0
@@ -75,6 +83,7 @@ agc_shader_memory G0
 agc_shader_mode_register G0
 agc_shader_quad_mask_no_demote G0
 agc_shader_srt_read_patching G0
+agc_shader_type_zero_image_materialization G0
 agc_spirv_branch_targets G0
 agc_spirv_lds_atomic_lock G0
 agc_spirv_module G0
@@ -140,6 +149,7 @@ agc_driver_buffer_descriptor_runtime G1
 agc_driver_buffer_format G1
 agc_driver_buffer_integer_atomics G1
 agc_driver_buffer_load_store G1
+agc_driver_buffer_resource_vcc G1
 agc_driver_buffer_unaligned_base G1
 agc_driver_cache_control G1
 agc_driver_constant_store G1
@@ -149,6 +159,7 @@ agc_driver_copied_writer_copy G1
 agc_driver_cross_workgroup_flag G1
 agc_driver_d16_memory G1
 agc_driver_depth_fast_clear G1
+agc_driver_depth_htile_write G1
 agc_driver_depth_storage_reuse G1
 agc_driver_device_selection G1
 agc_driver_displaced_guest_memory G1
@@ -304,6 +315,7 @@ agc_driver_vcmp_f32_denormals G1
 agc_driver_vcvt_i16_f16_output_modifiers G1
 agc_driver_vcvt_pknorm_f16_source_modifiers G1
 agc_driver_vector_window_direct_access G1
+agc_driver_vector_window_narrowing G1
 agc_driver_vop1_control G1
 agc_driver_vop1_float_unary G1
 agc_driver_vop1_vop2_integer G1
@@ -362,6 +374,7 @@ agc_driver_image_one_dimensional_array G2
 agc_driver_image_packed16_load G2
 agc_driver_image_packed_horizontal_gather G2
 agc_driver_image_pipe_bank_xor G2
+agc_driver_image_plane_address_on_cube G2
 agc_driver_image_plane_address_on_line G2
 agc_driver_image_plane_compare_on_line G2
 agc_driver_image_sample_aniso_override G2
@@ -386,6 +399,7 @@ agc_driver_image_volume_address_on_plane G2
 agc_driver_image_volume_address_planar_texture G2
 agc_driver_image_xor_swizzle_volume G2
 agc_driver_pending_exact_surface G2
+agc_driver_staged_clear_sampled_read G2
 agc_driver_storage_cache_budget G2
 agc_driver_storage_one_slice_alias G2
 agc_driver_undithered_alpha_to_coverage_state G2
@@ -436,6 +450,7 @@ agc_driver_quad_pixel_mask G3
 agc_driver_recorded_kept_bytes G3
 agc_driver_relative_ancillary G3
 agc_driver_relative_stage_inputs G3
+agc_driver_reversed_order_blend G3
 agc_driver_sample_mask_depth_stencil G3
 agc_driver_sample_mask_multisample G3
 agc_driver_sample_multisample_target G3
@@ -453,6 +468,7 @@ agc_driver_vertex_target_range_copied G3
 agc_driver_vertex_target_range_imported G3
 agc_driver_zero_position_vertex G3
 agc_driver_zero_stride_vertex_fetch G3
+agc_import_watch G3
 agc_metadata_pass G3
 agc_metal_draw_primitives G3
 agc_metal_draw_targets G3
@@ -472,6 +488,7 @@ agc_pending_write_snapshot G3
 agc_pipeline_cache_file G3
 agc_queued_write_groups G3
 agc_recorder_read_list G3
+agc_sample_dumps G3
 agc_shadowed_key_stores G3
 agc_slice_dirty G3
 agc_space_pending_writes G3
@@ -489,6 +506,7 @@ agc_driver_compute_user_data_calls_registered G4
 agc_driver_constant_dword_fill G4
 agc_driver_depth_fast_clear_submit G4
 agc_driver_draw_cache_reuse G4
+agc_driver_draw_cache_reuse_inline G4
 agc_driver_draw_cache_reuse_off G4
 agc_driver_draw_cache_reuse_verify G4
 agc_driver_draw_unsupported_buffer_type G4
@@ -497,18 +515,26 @@ agc_driver_fragment_user_data_tail G4
 agc_driver_gated_dispatch_capture G4
 agc_driver_gated_dispatch_capture_short_timeout G4
 agc_driver_gds_append_consume G4
+agc_driver_gpu_indirect_arguments_misaligned_writer_ahead G4
+agc_driver_gpu_indirect_arguments_written_ahead G4
 agc_driver_inactive_vertex_point_size G4
 agc_driver_indirect_arguments_written_ahead G4
 agc_driver_indirect_patched_stage G4
 agc_driver_layered_volume_submit G4
 agc_driver_memory_value_fill G4
 agc_driver_mesh G4
+agc_driver_mesh_index_cache G4
 agc_driver_msaa_enable_single_sample G4
 agc_driver_multisample_fill_host_only G4
 agc_driver_oversized_dispatch G4
 agc_driver_pattern_buffer_fill G4
+agc_driver_pipelined_dma G4
+agc_driver_pipelined_fill G4
+agc_driver_pipelined_predicated_label_order G4
+agc_driver_pipelined_predication_read G4
 agc_driver_pm4 G4
 agc_driver_pm4_failure G4
+agc_driver_pm4_failure_inline G4
 agc_driver_pm4_replay G4
 agc_driver_pm4_replay_tool G4
 agc_driver_preparation_scope_settle G4
@@ -528,11 +554,13 @@ agc_driver_prepared_shaders_registered_workgroup G4
 agc_driver_prepared_shaders_registered_workgroup_sync G4
 agc_driver_prepared_shaders_uncached G4
 agc_driver_prepared_unregistered_graphics G4
+agc_driver_queue_zero_idle_wait G4
 agc_driver_readonly_resummarize G4
 agc_driver_resolution_shutdown G4
 agc_driver_same_queue_label_wait G4
 agc_driver_sample_mask_draw G4
 agc_driver_skip_shader G4
+agc_driver_stencil_ref_export_unused G4
 agc_driver_storage_write_back_overhang G4
 agc_driver_store_idle_results G4
 agc_driver_store_over_untracked G4

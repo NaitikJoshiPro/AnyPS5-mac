@@ -240,6 +240,11 @@ inline VkCommandBuffer Handle(CommandStream& stream) {
     return reinterpret_cast<VkCommandBuffer>(&stream);
 }
 
+// Test hook (RecorderKeptBytesMetal.mm, the twin of upstream's mocked vkEndCommandBuffer and
+// vkQueueSubmit failures): the next Recorder::Submit on this thread throws `what` after ending its
+// command buffer (`beforeCommit`) or instead of committing it, before the batch counts as submitted.
+void FailNextRecorderSubmit(const char* what, bool beforeCommit);
+
 }
 
 #endif

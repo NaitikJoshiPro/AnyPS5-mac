@@ -164,6 +164,49 @@ struct ActiveRecorder {
     }
 };
 
+void WindowPromotionOutlivesTheHold(const Device& device) {
+    struct RestoreWindow {
+        ~RestoreWindow() { SetHostImportRangeWindow(std::uint64_t{64} << 20u); }
+    } restore;
+    SetHostImportRangeWindow(Alignment);
+    Heap heap;
+    ActiveRecorder active(device.GetContext());
+    auto& recorder = *active.recorder;
+    const auto& context = device.GetContext();
+    QueueGate gate(device);
+    VkBuffer retired = VK_NULL_HANDLE;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto* taken = HostImportFor(context, heap.Address(), 4096);
+        Expect(taken != nullptr && taken->bytes == Alignment, "the first access did not import one window");
+        if (taken == nullptr) return;
+        retired = taken->buffer;
+        Track(retired);
+        const auto* whole = HostImportFor(context, heap.Address(), RangeBytes);
+        Expect(whole != nullptr && whole->base == heap.Address() && whole->bytes == RangeBytes && whole->buffer != retired, "a held import window could not be promoted to its whole registered range");
+        if (whole == nullptr) return;
+        Expect(Live(retired) && taken->buffer == retired && taken->bytes == Alignment, "promotion invalidated the held window or its entry");
+        recorder.Commands();
+        recorder.Submit();
+        recorder.Sync();
+        Expect(Live(retired), "a sync inside the promoting hold destroyed its old window");
+        recorder.Commands();
+        // Upstream leaves this batch's fence unsignaled: it stays in flight until the gate opens.
+        gate.Hold();
+        recorder.Submit();
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Expect(Live(retired), "the old window died while its hold's later batch was in flight");
+    }
+    gate.Open();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    Expect(!Live(retired), "the old window survived every batch of the promoting hold");
+}
+
 void IdleRetireOutlivesTheHold(const Device& device) {
     Heap heap;
     ActiveRecorder active(device.GetContext());
@@ -261,6 +304,7 @@ int main() {
     try {
         @autoreleasepool {
             Device device;
+            WindowPromotionOutlivesTheHold(device);
             IdleRetireOutlivesTheHold(device);
             BusyRetireOutlivesALaterBatch(device);
         }

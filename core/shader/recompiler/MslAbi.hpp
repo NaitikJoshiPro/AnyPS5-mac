@@ -99,7 +99,7 @@ namespace ShaderRecompiler::MslAbi {
 //   corners' per-vertex values in the primitive record (user(aps5_pv<L>_<j>)). A mesh holds at most
 //   MeshTriangleVerticesPrimitives(maxPrimitives) triangles, so the driver draws the grid (mesh
 //   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.
-// Version 15 (upstream sync to 721db55dc):
+// Version 15 (upstream sync to 5d9dcc42d2):
 // - fragment: APS5_SAMPLE_MASK (SampleMaskMacro), the uniform PA_SC_AA_MASK in guest sample bits
 //   (upstream 1ffc5f672 HostSampleMask, the Vulkan pipeline's pSampleMask): the function ANDs its
 //   [[sample_mask]] with it before the APS5_SAMPLE_BASE shift, and a function with other outputs
@@ -119,6 +119,16 @@ namespace ShaderRecompiler::MslAbi {
 //   HeaderElementBase + element (the Metal driver's per-shader builds keep the base 0). A missed key,
 //   poisoned word, out-of-range element or driver rejection records BdaAbi fault reason ImageTable
 //   (bytes = poison index) as the SPIR-V path does, and the access yields zero.
+// - fragment: APS5_REVERSED_BLEND (ReversedBlendMacro, upstream 16ea32c97/c434467f6): a function with
+//   an MRT0 output gains a float4 aps5_rb [[color(0), index(1)]] member under the macro, and each MRT0
+//   store routes copies of the export through the ReversedBlendCode in function constant
+//   PipelineSpecialization::ReversedBlend: SecondShift routes into aps5_rb, ColorShift routes (when
+//   not all Own) into c0. The library does not compile (#error) for a uint MRT0, other colour
+//   outputs or APS5_DUAL_SOURCE alongside it.
+// - images: a cube T# read through DIM 2D image_sample / image_load (upstream 3b96840e6, the
+//   front end's cubeFaceCompatible runtime mode Dim2DArray + cube) reads face 0: the missing face
+//   coordinate is 0 instead of a "too few coordinate components" failure. Direct 2D images whose
+//   accesses allow it gain that mode in their ImageBase selector switch.
 inline constexpr std::uint32_t Version = 15u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
@@ -313,6 +323,9 @@ inline constexpr const char* WindowSpaceHeightMacro = "APS5_WINDOW_SPACE_HEIGHT"
 // - fragment: 1 when the pipeline blends with two sources (PipelineSpecialization::DualSourceBlend):
 //   colour location 1 becomes color(0) index(1) (Reflection::dualSource: the function writes it);
 inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";
+// - fragment: 1 when PipelineSpecialization::ReversedBlend is not 0 (Version 15, upstream 16ea32c97):
+//   the function writes MRT0's second blend source aps5_rb at color(0) index(1);
+inline constexpr const char* ReversedBlendMacro = "APS5_REVERSED_BLEND";
 // - fragment: the MSL type of colour output n (float4, uint4 or int4; default from pixelInfo),
 //   APS5_COLOR<n>_TYPE.
 inline constexpr const char* ColorTypeMacroPrefix = "APS5_COLOR";

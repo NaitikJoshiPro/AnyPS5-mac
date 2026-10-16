@@ -1160,7 +1160,9 @@ SampleCoord CoordF32(MslEmitterState& state, const Access& access, std::uint32_t
     const auto encoded = AddressDimension(access).coordinateComponents;
     const bool cube = access.image.cube;
     const auto present = std::min(encoded, components);
-    if (first == NoImageComponent || (encoded < components && (cube || encoded == 0u)) || access.mem.imageAddressComponents < first + present) state.Fail(access.inst, "has an image address with too few coordinate components");
+    // A cube T# read through DIM 2D (upstream 3b96840e6): face 0, the missing face coordinate reads as 0.
+    const bool cubeFace = cube && access.mem.imageDimension == RdnaImageDimension::Dim2D;
+    if (first == NoImageComponent || (encoded < components && ((cube && !cubeFace) || encoded == 0u)) || access.mem.imageAddressComponents < first + present) state.Fail(access.inst, "has an image address with too few coordinate components");
     const auto component = [&](std::uint32_t index) { return index < present ? AddressF32(state, access, first + index) : std::string("0.0f"); };
     auto x = component(0);
     switch (access.image.dimension) {

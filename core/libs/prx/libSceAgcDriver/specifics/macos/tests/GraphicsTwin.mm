@@ -19,8 +19,10 @@
 // skips as Vulkan-only (memory-type and heap choice of a buffer); --image-table-allocation, --image-table-snapshot
 // and --sampler-table-{lod-bias,anisotropy,reduction-compare} skip: they check Vulkan descriptor-set allocation and
 // vkCreateSampler on MockVulkan, while Metal's image and sampler tables are MslAbi v15 arrays of MTLResourceIDs
-// (exercised by the upstream ImageTable* execution tests). Of upstream's 104 checks (the 102 of Checks() plus RunBdaResourceTests
-// and RunTextureDetilerTests), 90 run on Metal, 4 of them through Metal twins; 14 are listed in VulkanOnly.
+// (exercised by the upstream ImageTable* execution tests); --unused-stencil-reference runs upstream's
+// stencilReferenceUnusedTests as it is (State decoding only). Of upstream's 109 checks (the 107 of Checks() plus
+// RunBdaResourceTests and RunTextureDetilerTests), 95 run on Metal, 5 of them through Metal twins; 14 are listed in
+// VulkanOnly.
 
 #define main AgcDriverGraphicsVulkanMain
 #include "../../../tests/Graphics.cpp"
@@ -120,6 +122,7 @@ std::vector<Check> Checks() {
         {"earlyFragmentTestsTests", earlyFragmentTestsTests},
         {"orderedPixelShaderTests", orderedPixelShaderTests},
         {"stencilRefExportTests", stencilRefExportTests},
+        {"stencilReferenceUnusedTests", stencilReferenceUnusedTests},
         {"aliasedBufferViewTests", aliasedBufferViewTests},
         {"LineStripTests", LineStripTests},
         {"ProvokingVertexTests", ProvokingVertexTests},
@@ -131,8 +134,11 @@ std::vector<Check> Checks() {
         {"BlendBypassTests", BlendBypassTests},
         {"CompactedExportTests", CompactedExportTests},
         {"ReversedComponentOrderTests", ReversedComponentOrderTests},
+        {"ReversedComponentOrderBlendTests", ReversedComponentOrderBlendTests},
+        {"ReversedBlendRoutingTests", ReversedBlendRoutingTests},
         {"ShadersWriteMemoryTests", ShadersWriteMemoryTests},
         {"DualSourceBlendTests", DualSourceBlendTests},
+        {"ReversedBlendShaderTests", ReversedBlendShaderTests},
         {"metadataPassTests", metadataPassTests},
         {"cmaskTests", cmaskTests},
         {"uint16ExportTests", uint16ExportTests},
@@ -159,6 +165,7 @@ std::vector<Check> Checks() {
         {"descriptorPoolTests", descriptorPoolTests},
         {"pushConstantTests", pushConstantTests},
         {"resourceTests", resourceTests},
+        {"oversizedDescriptorTests", oversizedDescriptorTests},
         {"descriptorSnapshotTests", descriptorSnapshotTests},
         {"descriptorCacheTests", descriptorCacheTests},
         {"bufferBudgetPlacementTests", bufferBudgetPlacementTests},
@@ -450,6 +457,56 @@ void MetalCopiedWriterIndirectOverlapTests() {
     ::operator delete(copiedBlock, std::align_val_t{half});
 }
 
+// oversizedDescriptorTests on Metal (upstream e9c98900e7): a V# whose size passes the storage buffer range limit
+// is bound up to the end of the registered allocation behind it when that is under the limit, refused when the
+// allocation reaches the limit, and bound as the empty buffer when no allocation is registered behind it. Upstream
+// also compares the bound range and bytes with the MockVulkan descriptor write; Metal writes the descriptor
+// tables into the per-batch upload ring, so the twin checks what ShaderResources accepts and refuses over the
+// Metal device's Context, with mockContext's 16 KiB range limit.
+void MetalOversizedDescriptorTests() {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::Graphics;
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t tailBytes = 8192;
+    void* block = ::operator new(blockBytes, std::align_val_t{blockBytes});
+    std::memset(block, 0x5a, blockBytes);
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, blockBytes, true, true, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    const auto oversized = [](const void* pointer) { return makeBinding(Role::GuestBuffers, 0, 1, vsharp(pointer, 0xffffffffu)); };
+    const auto* tail = static_cast<const std::byte*>(block) + blockBytes - tailBytes;
+    {
+        MetalGraphicsDevice device;
+        const auto& context = device.Attach([](Context& context) {
+            context.hostImportAlignment = blockBytes;
+            context.limits.minStorageBufferOffsetAlignment = 16;
+            context.limits.maxStorageBufferRange = 16384;
+        });
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto color = AgcDriver::Graphics::DecodeState(makeState()).color;
+        const auto build = [&](const void* pointer) {
+            RecompileResult vertex;
+            RecompileResult fragment;
+            vertex.runtimeAbiVersion = RuntimeAbi::Version;
+            fragment.runtimeAbiVersion = RuntimeAbi::Version;
+            vertex.bindings.push_back(oversized(pointer));
+            ShaderResources resources(context, vertex, fragment, color, 0, 0);
+        };
+        build(tail);
+        expectFailure([&] { build(block); }, "descriptor range limit");
+        build(reinterpret_cast<const void*>(0x1000));
+        ClearHostImports(context.device);
+    }
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    ::operator delete(block, std::align_val_t{blockBytes});
+}
+
 // agc_sparse_buffer_holes on Metal: upstream's RunSparseBufferHoleTests (tests/BdaResources.cpp) over the Metal
 // device's Context; the bytes of a copy are the contents of the shared MTLBuffer its descriptor names.
 int MetalSparseBufferHoles() {
@@ -583,6 +640,7 @@ const std::vector<Twin> MetalTwins{
     {"descriptorCacheTests", "dedicated pools for oversized sets, per-set limits, update-after-bind sets with a variable image table", MetalDescriptorCacheTests},
     {"copiedWriterIndirectOverlapTests", "copied vs direct written ranges over a Metal host import", MetalCopiedWriterIndirectOverlapTests},
     {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export or a quad pixel mask", MetalEarlyFragmentTestsTests},
+    {"oversizedDescriptorTests", "a V# past the range limit bound up to its registered allocation, refused at the limit, empty when unregistered", MetalOversizedDescriptorTests},
 };
 
 const Twin* TwinOf(const std::string& name) {
@@ -666,6 +724,9 @@ int main(int argc, char** argv) {
     setenv("APS5_PIN_WAIT_MS", "200", 1);
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
     const std::string_view mode = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
+    // agc_driver_graphics --unused-stencil-reference (upstream 3490838653): State decoding only, as upstream; the
+    // check prints its own summary line.
+    if (mode == "--unused-stencil-reference") return RunMode({"stencilReferenceUnusedTests", stencilReferenceUnusedTests}, nullptr);
     if (mode == "--descriptor-layout-flags") return RunMode({"descriptorLayoutFlagTests", MetalDescriptorLayoutFlagTests}, "Descriptor layout cache and exported binding flags passed on Metal");
     if (mode == "--sparse-buffer-holes") {
         try {
@@ -701,7 +762,7 @@ int main(int argc, char** argv) {
     if (mode == "--covered-centroid-state") return RunMode({"multisampleTests", multisampleTests}, "Covered-centroid and multisample state checks passed");
     if (mode == "--probe") return Probe();
     if (argc != 1) {
-        std::cerr << "usage: " << argv[0] << " [--probe | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key";
+        std::cerr << "usage: " << argv[0] << " [--probe | --unused-stencil-reference | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key";
         for (const auto& skipped : SkippedModes) std::cerr << " | " << skipped.flag;
         std::cerr << "]\n";
         return 2;

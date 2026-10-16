@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "MetalVulkanImages.h"
 #include "MetalCommandStream.h"
 #include "prx/libc/include/General.hpp"
@@ -800,7 +801,8 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer, std::shared_ptr<OwnedImage> owner) : context(context), owned(std::move(owner)) {
+    Require(owned == nullptr || (owned->image == depthImage && owned->context.device == context.device), "a depth sampled view must retain its own device and image");
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
@@ -1245,7 +1247,7 @@ private:
 
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
-    std::mutex mutex;
+    SlimMutex mutex;
     PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
@@ -3836,9 +3838,11 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
         query.found = nullptr;
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);
-        for (const auto* texture : pending.textures) {
-            if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
-            if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+        if (pending.textures.MayOverlap(query.begin, bytes)) {
+            for (const auto* texture : pending.textures) {
+                if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
+                if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+            }
         }
         for (const auto* texture : pending.flushing) {
             if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;

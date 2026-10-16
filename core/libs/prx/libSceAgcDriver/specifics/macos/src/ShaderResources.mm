@@ -412,7 +412,7 @@ void logLookup(const LookupRecord& record) {
     log.push_back(record);
 }
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0);
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false);
 
 std::uint64_t heldBytes(const StorageTexture& image) {
     return std::max<std::uint64_t>(image.AllocationBytes(), image.GuestBytes());
@@ -577,12 +577,17 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
-    CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     if (resource.dimension == TextureDimension::k2DMsaa) {
+        Require(!depthCompare, "native multisampled depth comparison sampling is not implemented");
+        if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
+            logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+            return depth;
+        }
         auto target = MultisampleTargetTexture(context, resource, components);
         logLookup({target.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
         return target;
     }
+    CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
@@ -680,10 +685,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // after them is current at the generation of a second (memoized) collect. The store marks the
     // surface's DCC keys uncompressed, so the keys are read after it.
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (source == nullptr && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    const auto observedKeys = keys.has_value() ? *keys : scanKeys();
+    const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
+    bool stagedFlushed = false;
+    if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         generation = GuestMemory::CollectWrites(address, bytes);
-        keys.reset();
+        if (stagedClear) {
+            stagedFlushed = true;
+            keys = DccKeys::Uncompressed;
+        } else {
+            keys.reset();
+        }
+        if (stagedFlushed) source.reset();
     }
     if (!keys.has_value()) keys = scanKeys();
     if (disabled) {
@@ -721,7 +735,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
-            if ((source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
+            if (!stagedFlushed && (source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
                 if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
@@ -936,10 +950,11 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, bool written) {
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
     RequireNoMultisampleTarget(viewed.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a storage image access");
     if (auto depth = DepthSurfaceStorage(context, words, viewed, mip)) return depth;
+    if (written) RetireDepthSurfaces(context.device, viewed.baseAddress, guestBytes != 0 ? guestBytes : DescribeSurface(viewed).guestBytes);
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return StorageTexture::Create(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
@@ -3005,7 +3020,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (storageIndex >= storageTextures.size()) return false;
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
-                        else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex]);
+                        else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageWritten[storageIndex]);
                         if (expected != storageTextures[storageIndex]) return false;
                         ++storageIndex;
                     }
@@ -3659,7 +3674,13 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
     Require(descriptor.Type() == 0u, "buffer descriptor uses an unsupported type");
     const auto address = descriptor.Base48();
-    const auto byteSize = descriptor.GetSize();
+    auto byteSize = descriptor.GetSize();
+    // A V# past the range limit binds the memory behind it (upstream e9c98900e7).
+    if (byteSize > context.limits.maxStorageBufferRange) {
+        const auto mappedEnd = RegisteredReadableEnd(address);
+        if (mappedEnd <= address) byteSize = 0;
+        else if (mappedEnd - address < context.limits.maxStorageBufferRange) byteSize = mappedEnd - address;
+    }
     if (byteSize == 0 || address == 0) {
         allocations.push_back({0, EmptyBufferBytes, false, nullptr, ShaderRecompiler::DescriptorRole::GuestBuffers, false});
         return allocations.size() - 1;
@@ -4203,14 +4224,15 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
         if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+        // Images the shader only reads have nothing to store back.
+        const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
-        else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
+        else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
-        // Images the shader only reads have nothing to store back.
-        storageWritten.push_back(element >= binding.imageWritten.size() || binding.imageWritten[element]);
+        storageWritten.push_back(written);
         storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);
         storageAtomic64.push_back(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]);
         describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
@@ -4650,7 +4672,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    std::vector<std::size_t> selected;
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     for (std::size_t index = 0; index < allocations.size(); ++index) {

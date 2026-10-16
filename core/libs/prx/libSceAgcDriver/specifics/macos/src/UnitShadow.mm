@@ -3,6 +3,7 @@
 // image cache, kept by the batches that use them as upstream).
 #include "MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -101,7 +102,7 @@ struct UnitShadow {
 };
 
 struct Shadows {
-    std::mutex mutex;
+    SlimMutex mutex;
     std::map<std::uint64_t, std::shared_ptr<UnitShadow>> byBase;
     std::uint64_t liveBytes = 0;
     std::uint64_t peakBytes = 0;

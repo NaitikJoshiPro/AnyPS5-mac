@@ -260,6 +260,19 @@ constexpr std::string_view DitheredAlphaToMaskText = R"(static uint aps5_dithere
 }
 )";
 
+// Reversed-order blending (upstream 16ea32c97 / c434467f6, FragmentOutputSpecialization.hpp): each
+// component of a ReversedBlendCode route field (RouteBits per component) picks the export's own
+// component, component 0, 0 or 1.
+constexpr std::string_view ReversedBlendRouteText = R"(static float4 aps5_reversed_route(float4 color, uint routes) {
+    float4 result;
+    for (uint c = 0u; c < 4u; ++c) {
+        const uint route = (routes >> (2u * c)) & 3u;
+        result[c] = route == 0u ? color[c] : route == 1u ? color[0] : route == 2u ? 0.0f : 1.0f;
+    }
+    return result;
+}
+)";
+
 // EmitBuiltinU32 for vertex and pixel programs: the value's bits as a uint.
 std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
     const auto stage = StageOf(state);
@@ -601,6 +614,21 @@ std::string ExportPacking(MslEmitterState& state, std::uint32_t target, const st
     return name;
 }
 
+// Upstream 16ea32c97 / c434467f6 (SpecializeFragmentOutputs): with APS5_REVERSED_BLEND (the driver
+// sets it when PipelineSpecialization::ReversedBlend is not 0) the MRT0 store also writes the second
+// blend source color(0) index(1) from the SecondShift routes and, when the ColorShift routes are not
+// all Own, stores the ColorShift routing of the export instead; both come from copies of the export.
+void EmitReversedBlend(MslEmitterState& state) {
+    if (state.declarations.find("aps5_reversed_route") == std::string::npos) state.AddDeclaration(ReversedBlendRouteText);
+    const auto code = state.FunctionConstant(PipelineSpecialization::ReversedBlend, 0u);
+    const auto source = state.Temporary("aps5_rs");
+    state.Line(std::string("#if defined(") + MslAbi::ReversedBlendMacro + ") && " + MslAbi::ReversedBlendMacro);
+    state.Line("const float4 " + source + " = float4(aps5_out.c0);");
+    state.Line("aps5_out.aps5_rb = aps5_reversed_route(" + source + ", (" + code + " >> " + U32(ReversedBlendCode::SecondShift) + ") & " + U32(ReversedBlendCode::Routes) + ");");
+    state.Line("if (((" + code + " >> " + U32(ReversedBlendCode::ColorShift) + ") & " + U32(ReversedBlendCode::Routes) + ") != 0u) aps5_out.c0 = APS5_COLOR0_TYPE(aps5_reversed_route(" + source + ", (" + code + " >> " + U32(ReversedBlendCode::ColorShift) + ") & " + U32(ReversedBlendCode::Routes) + "));");
+    state.Line("#endif");
+}
+
 void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
     const auto stage = StageOf(state);
     if (stage != IrShaderStage::Vertex && stage != IrShaderStage::Pixel && stage != IrShaderStage::Mesh && stage != IrShaderStage::TessellationEvaluation) state.Fail(instruction, "exports of this stage are not implemented in the MSL backend yet (work package B6)");
@@ -679,6 +707,7 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
                 }
                 if (!uintOutput && mode != 5u && mode != 6u) value = ExportPacking(state, exp.index, value);
                 state.Line("aps5_out.c" + std::to_string(output->location) + " = as_type<APS5_COLOR" + std::to_string(output->location) + "_TYPE>(" + value + ");");
+                if (output->location == 0u && !uintOutput) EmitReversedBlend(state);
             } else {
                 state.Line(record + ".p" + std::to_string(output->location) + " = as_type<float4>(" + value + ");");
             }
@@ -1024,6 +1053,17 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         default:
             break;
         }
+    }
+    // Reversed-order blending (EmitReversedBlend): the second blend source of MRT0. Upstream refuses
+    // it with dual-source blending, for a non-float MRT0 and next to other colour outputs.
+    if ((state.reflection.colorOutputs & 1u) != 0u) {
+        const std::string guard = std::string("#if defined(") + MslAbi::ReversedBlendMacro + ") && " + MslAbi::ReversedBlendMacro + "\n";
+        const bool uintOutput0 = std::ranges::any_of(state.program.Info().outputs, [&](const StageOutput& output) { return output.kind == StageOutputKind::Mrt && output.location == 0u && output.index < std::size(pixel.targetOutputMode) && pixel.targetOutputMode[output.index] == 7u; });
+        members += guard;
+        if (uintOutput0) members += "#error \"reversed-order blending needs a float4 MRT0 output\"\n";
+        if ((state.reflection.colorOutputs & ~1u) != 0u) members += "#error \"reversed-order blending needs MRT0 to be the only color output\"\n";
+        members += "#if defined(APS5_DUAL_SOURCE) && APS5_DUAL_SOURCE\n#error \"reversed-order blending cannot be combined with dual-source blending\"\n#endif\n";
+        members += "    float4 aps5_rb [[color(0), index(1)]];\n#endif\n";
     }
     // Upstream 1ffc5f672: a partial per-pixel PA_SC_AA_MASK writes its coverage (EmitMslEntryPoint).
     if ((pixel.psAlphaToCoverage || pixel.QuadSampleMaskPartial()) && !state.reflection.exportsSampleMask) {

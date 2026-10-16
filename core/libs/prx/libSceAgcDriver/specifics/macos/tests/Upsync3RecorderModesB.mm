@@ -430,6 +430,25 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto keyed = StorageTexture::FindPending(address, surfaceBytes);
     Require(keyed != nullptr && keyed != unkeyed && keyed->Descriptor().dccAddress == color.dccAddress, "a pass over a resident image under other keys did not remake it under the target's keys");
     Require(keysUncompressed() && memoryHolds({0xff, 0xff, 0xff, 0xff}), "a pass over a remade resident image did not store the 1111 value");
+    {
+        const auto* import = HostImportFor(base, address, bytes);
+        Require(import != nullptr, "the metadata pass block lost its import");
+        const auto commands = recorder.Commands();
+        Metal::Stream(commands).FillBuffer(Metal::BufferOf(import->buffer), static_cast<NSUInteger>(color.dccAddress - import->base), keyCount, 0x20202020u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrite(color.dccAddress, keyCount);
+        NoteKeysFillOnGpu(color.dccAddress, keyCount, DccKeys::ClearRegister);
+    }
+    Require(KnownPendingDccKeys(color.dccAddress, surfaceBytes) == DccKeys::ClearRegister, "the keys of a pending register clear store were not known");
+    const std::array<std::uint32_t, 4> clearPattern{0x80402010u, 0x80402010u, 0x80402010u, 0x80402010u};
+    const char* refusal = nullptr;
+    Require(!keyed->FillClear(clearPattern, StorageTexture::WholeImage, refusal) && refusal != nullptr && std::strcmp(refusal, "keys pending") == 0, "a clear over pending keys was not refused without the proof");
+    refusal = nullptr;
+    Require(keyed->FillClear(clearPattern, StorageTexture::WholeImage, refusal, true), "a clear over known pending keys was refused");
+    Require(recorder.PendingWriteOverlaps(color.dccAddress, keyCount) && keys[0] == 0xff, "the clear over known pending keys waited for the key store");
+    MarkDccUncompressed(context, color.dccAddress, surfaceBytes);
+    Require(memoryHolds({0x10, 0x20, 0x40, 0x80}), "the clear recorded behind a pending key store did not store CB_COLOR_CLEAR_WORD");
+    Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the keys after a clear behind a pending key store are not uncompressed");
 }
 
 void tiledResolveTests(const Device& device, Recorder& recorder) {
@@ -928,6 +947,27 @@ int pipelineCacheFileTests() {
     {
         Metal::PipelineCache reloaded(device, directory);
         Require(holds(reloaded, 1), "an invalid cache file was not replaced by the saving object's pipelines");
+    }
+    // Upstream e37e5f0aba/d65cc07a1b: a cache that loaded the file, kept it unchanged and added a pipeline saves
+    // both. Upstream's unseeded caches (PipelineCache(context, properties, false), SaveNow) have no Metal
+    // counterpart: every Metal::PipelineCache loads the archive generations (D51) and saves its own generation
+    // at teardown, so those two cases are not run (upstream runs them after its idle check, here they are absent).
+    {
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+    }
+    {
+        Metal::PipelineCache writer(device, directory);
+        build(writer, 0);
+    }
+    {
+        Metal::PipelineCache extender(device, directory);
+        Require(holds(extender, 0), "the cache file lost a pipeline");
+        build(extender, 1);
+    }
+    {
+        Metal::PipelineCache reloaded(device, directory);
+        Require(holds(reloaded, 0) && holds(reloaded, 1), "a cache that saved over an unchanged file lost pipelines");
     }
     std::cout << "Pipeline cache file merge tests passed\n";
     return 0;

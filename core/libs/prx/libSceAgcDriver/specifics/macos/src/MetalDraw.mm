@@ -975,6 +975,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // Dual-source blending: the fragment function writes color(0) index(1) too.
         const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
         if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
+        // Blending into a target with a reversed component order (upstream 16ea32c97d/c434467f6d,
+        // State::reversedBlend): MRT0's SRC1 blend factors read the second source aps5_rb, which the
+        // function writes at color(0) index(1) under ReversedBlendMacro (MslAbi Version 15). The
+        // library refuses it beside APS5_DUAL_SOURCE.
+        const bool reversedBlend = graphics.reversedBlend != 0u || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::ReversedBlend && constant.value != 0u; });
+        if (reversedBlend) {
+            if (dualSource) throw std::runtime_error("Metal draw: a reversed component order blend beside dual-source blending is not supported (one color(0) index(1) output)");
+            function.macros.push_back({Abi::ReversedBlendMacro, "1"});
+        }
         if (conservativeMode != 0u) function.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         // The uniform PA_SC_AA_MASK (upstream HostSampleMask, guest sample bits; none when full).
         if (hostSampleMask) function.macros.push_back({Abi::SampleMaskMacro, std::to_string(static_cast<std::uint32_t>(Graphics::HostSampleMask(graphics))) + "u"});

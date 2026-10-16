@@ -309,6 +309,25 @@ void EarlyTests(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& targe
     std::puts("early fragment tests: earlyZ without alpha-to-coverage, depth or stencil export");
 }
 
+// Upstream 16ea32c97 / c434467f6: a reversed-order blend code routes copies of the MRT0 export into
+// the second blend source (color(0) index(1), under APS5_REVERSED_BLEND) and, for non-Own colour
+// routes, into MRT0 itself.
+void ReversedBlend(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    namespace Code = ShaderRecompiler::ReversedBlendCode;
+    const auto inputs = PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::LinearCenter);
+    // Second source: every component reads component 0; colour: component 3 reads 1.
+    const std::uint32_t code = Code::Enable | (0x55u << Code::SecondShift) | (Code::One << (Code::ColorShift + 3u * Code::RouteBits));
+    const auto result = RecompilePixel(target, F16PixelCode, 0u, inputs, [&](auto& pixel) { pixel.reversedBlend = code; });
+    const auto& source = result.msl.Source();
+    Require(Has(source, "aps5_rb [[color(0), index(1)]]") && Has(source, "aps5_reversed_route("), "reversed blend: no second blend source from the MRT0 export");
+    Require(Constant(result, ShaderRecompiler::PipelineSpecialization::ReversedBlend) == code, "reversed blend: ReversedBlend is not specialised from the request");
+    static_cast<void>(MustCompile(device, "reversed blend", result, @{@(Abi::ReversedBlendMacro): @"1"}));
+    static_cast<void>(MustCompile(device, "reversed blend, macro unset", result, @{}));
+    std::string failure;
+    Require(Compile(device, result, @{@(Abi::ReversedBlendMacro): @"1", @(Abi::DualSourceMacro): @"1"}, failure) == nil && Has(failure, "dual-source"), "reversed blend: the library compiles with dual-source blending");
+    std::puts("reversed blend: MRT0 routes into color(0) index(1) under APS5_REVERSED_BLEND");
+}
+
 void LayerField(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
     for (const bool exported : {false, true}) {
         const auto result = RecompilePixel(target, LayerFieldPixelCode, 0u, PixelInputBit(PixelInput::Ancillary), [&](auto& pixel) {
@@ -380,6 +399,7 @@ int main() {
             ComparedF16(metal, target);
             EarlyTests(metal, target);
             LayerField(metal, target);
+            ReversedBlend(metal, target);
             CoherentGds(metal, target);
             GdsAddF32(metal, target);
             OrderedCount(metal, target);

@@ -7,6 +7,8 @@
 // Upstream's target retirement on unmap (f7fd7569f), absorbed compute fills (5acd68f94), sampling a
 // target or a never-rendered uniform MSAA surface (4b71846fa, 6e6334e7e, 84f636494, d0cd50c82) and
 // FMASK decompress (9394a6f51) are ported; sampling goes through the D27 view of the host image.
+// Upstream sync 4 (5d9dcc42d2, ee1ba73a2f da9fe3c708): the read guard and unmap observer are shared with
+// DepthSurface.mm's resident-depth guards (InstallResidentImageReadGuard / UpdateResidentImageUnmapObserver).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -17,6 +19,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -264,6 +267,7 @@ void guardReads(std::uint64_t address, std::size_t bytes) {
 // GuestAllocations' unmap observer (upstream f7fd7569f): a target whose whole guarded range is unmapped
 // is retired, so memory mapped there again is not taken for it.
 void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
+    RetireUnmappedDepth_nid_no_patch(address, bytes);
     std::unique_lock lock(guardedMutex());
     std::erase_if(guarded(), [&](const auto& range) {
         if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;
@@ -287,9 +291,7 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
     std::unique_lock lock(guardedMutex());
     guarded().push_back({context.device, target.address, bytes, target.samples, active});
     anyGuarded().store(true, std::memory_order_release);
-    static std::once_flag installed;
-    std::call_once(installed, [] { GuestMemory::SetReadGuard(&guardReads); });
-    GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(&retireUnmapped);
+    InstallResidentImageReadGuard_nid_no_patch();
 }
 
 std::mutex& targetsMutex() {
@@ -371,6 +373,18 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     return created;
 }
 
+}
+
+void InstallResidentImageReadGuard_nid_no_patch() {
+    static std::once_flag installed;
+    std::call_once(installed, [] { GuestMemory::SetReadGuard(&guardReads); });
+    UpdateResidentImageUnmapObserver_nid_no_patch();
+}
+
+void UpdateResidentImageUnmapObserver_nid_no_patch() {
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(anyGuarded().load(std::memory_order_acquire) || HasResidentDepthGuards_nid_no_patch() ? &retireUnmapped : nullptr);
 }
 
 void MultisampledCmask::NoteFill(std::uint64_t fillAddress, std::size_t fillBytes, std::uint32_t pattern) {
@@ -651,10 +665,11 @@ void ClearMultisampleTargets(VkDevice device) {
     std::unique_lock guardLock(guardedMutex());
     std::erase_if(guarded(), [&](const auto& range) { return range.device == device; });
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
-    if (guarded().empty()) GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(nullptr);
+    UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
+    RequireNoResidentDepthRead_nid_no_patch(address, bytes);
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return;
     std::shared_lock lock(guardedMutex());
     for (const auto& range : guarded()) {
