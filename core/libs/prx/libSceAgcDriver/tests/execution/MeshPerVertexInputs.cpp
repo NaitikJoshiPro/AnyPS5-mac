@@ -339,8 +339,8 @@ int main() {
             {"line list", {2u, 4u, 8u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"line list, last vertex provoking", {2u, 4u, 8u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, true},
             {"point list", {1u, 4u, 4u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
-            // DECISIONS D77: 20 KiB of LDS beside 192 staged vertices; the staging reuses the LDS.
-            {"triangle list, 64-primitive subgroups with 20 KiB of LDS", {4u, 64u, 192u, 192u, 64u, 192u, 20480u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
+            // DECISIONS D77: 18 KiB of LDS beside 240 staged vertices; the staging reuses the LDS.
+            {"triangle list, 80-primitive subgroups with 18 KiB of LDS", {4u, 80u, 240u, 240u, 80u, 240u, 4608u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
         }};
         std::vector<float> reference(Pixels.size());
         std::uint32_t compared = 0;
