@@ -439,6 +439,24 @@ bool HandleUnaligned(int signal, siginfo_t* info, __darwin_mcontext64* machine) 
 void OnFault(int signal, siginfo_t* info, void* context) {
     auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
     const std::uint64_t pc = arm_thread_state64_get_pc(machine->__ss);
+    {
+        // Debug aid: APS5_TRACE_FAULT_LOOP=1 names a fault that repeats at the same pc and address
+        // (a handler that returns without making the access possible loops forever).
+        static const bool traceLoop = std::getenv("APS5_TRACE_FAULT_LOOP") != nullptr;
+        if (traceLoop) {
+            static thread_local std::uint64_t lastPc = 0, lastAddress = 0, repeats = 0;
+            const auto address = reinterpret_cast<std::uint64_t>(info->si_addr);
+            repeats = pc == lastPc && address == lastAddress ? repeats + 1 : 0;
+            lastPc = pc;
+            lastAddress = address;
+            if (repeats == 10000) {
+                char message[256];
+                const int length = std::snprintf(message, sizeof(message), "[aps5-fex] fault loop: signal %d code %d pc 0x%llx instruction 0x%08x address 0x%llx esr 0x%llx, 10000 repeats\n", signal, info->si_code,
+                    static_cast<unsigned long long>(pc), *reinterpret_cast<const std::uint32_t*>(pc), static_cast<unsigned long long>(address), static_cast<unsigned long long>(machine->__es.__esr));
+                if (length > 0) (void)!write(STDERR_FILENO, message, std::min(static_cast<std::size_t>(length), sizeof(message) - 1));
+            }
+        }
+    }
     if (IsGuestCode(pc) && reinterpret_cast<std::uint64_t>(info->si_addr) == pc) {
         machine->__ss.__x[16] = pc;
         arm_thread_state64_set_pc_fptr(machine->__ss, &Aps5GuestCallEntry);
