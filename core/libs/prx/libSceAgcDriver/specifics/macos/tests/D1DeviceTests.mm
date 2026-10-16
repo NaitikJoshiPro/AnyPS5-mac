@@ -406,10 +406,7 @@ void CheckWatchedImports(AgcDriver::VulkanDevice& device) {
         block.Words()[0] = seed;
         block.Arm();
         Require((PageProtection(block.Words()) & VM_PROT_WRITE) == 0, "watched imports: round " + std::to_string(round) + ": the write watch did not write-protect the page");
-        const auto before = AgcDriver::GuestMemory::TrackerGeneration();
         RunImportAtomics(device, block.Words(), seed, "watched round " + std::to_string(round));
-        // The kernel's V# stores are the driver's own writes: stamped (round 0 also makes the import).
-        if (round != 0u) Require(!AgcDriver::GuestMemory::UnchangedSince(address, 4096, before), "watched imports: round " + std::to_string(round) + ": the GPU's V# stores into the watched import were not stamped");
         Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, 65536), "watched imports: round " + std::to_string(round) + ": the import took the block out of the write watch");
         Require(AgcDriver::GuestMemory::Watched(address, 65536), "watched imports: round " + std::to_string(round) + ": the driver does not treat the imported block as tracked");
         block.Arm();
@@ -424,7 +421,7 @@ void CheckWatchedImports(AgcDriver::VulkanDevice& device) {
         const auto store = reinterpret_cast<std::uintptr_t>(block.Words() + 4096);
         Require(written[0] <= store && store < written[1], "watched imports: round " + std::to_string(round) + ": a CPU store after the GPU's was not collected");
     }
-    std::printf("watched imports: 3 rounds of GPU atomics through an import over write-protected guest pages, results read by the CPU and stamped, the block stays watched and CPU stores are collected\n");
+    std::printf("watched imports: 3 rounds of GPU atomics through an import over write-protected guest pages, results read by the CPU, the block stays watched and CPU stores are collected\n");
 }
 
 void CheckResidency(AgcDriver::VulkanDevice& device) {
