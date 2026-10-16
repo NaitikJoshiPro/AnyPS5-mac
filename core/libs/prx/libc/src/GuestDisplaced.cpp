@@ -867,7 +867,23 @@ void OnTrap(int signal, siginfo_t* info, void* context) {
 
 void OnFault(int signal, siginfo_t* info, void* context) {
     const int saved = errno;
-    const bool handled = Redirect(info, context) || FixUnaligned(signal, info, context);
+    const bool redirected = Redirect(info, context);
+    const bool handled = redirected || FixUnaligned(signal, info, context);
+    {
+        // Debug aid: APS5_TRACE_FAULT_LOOP=1 counts the faults this handler sees and how it took them.
+        static const bool traceLoop = std::getenv("APS5_TRACE_FAULT_LOOP") != nullptr;
+        if (traceLoop) {
+            static std::atomic<std::uint64_t> total{0};
+            const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count % 20000 == 0) {
+                auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
+                char line[200];
+                const int length = std::snprintf(line, sizeof(line), "[displaced] %llu faults; this one: signal %d code %d pc 0x%llx addr 0x%llx esr 0x%llx redirected %d fixed %d\n", static_cast<unsigned long long>(count), signal, info->si_code,
+                    static_cast<unsigned long long>(arm_thread_state64_get_pc(machine->__ss)), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)), static_cast<unsigned long long>(machine->__es.__esr), redirected ? 1 : 0, handled && !redirected ? 1 : 0);
+                if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
+            }
+        }
+    }
     static std::atomic<int> unhandled{0};
     if (!handled && g_trace && unhandled.fetch_add(1) < 16) {
         auto* machine = static_cast<ucontext_t*>(context)->uc_mcontext;
