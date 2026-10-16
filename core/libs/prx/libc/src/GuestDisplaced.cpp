@@ -854,7 +854,7 @@ bool Return(void* context) {
 
 void OnTrap(int signal, siginfo_t* info, void* context) {
     {
-        static const bool traceLoop = std::getenv("APS5_TRACE_FAULT_LOOP") != nullptr;
+        static const bool traceLoop = true;
         if (traceLoop) {
             static std::atomic<std::uint64_t> total{0};
             const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -884,7 +884,7 @@ void OnFault(int signal, siginfo_t* info, void* context) {
     const bool handled = redirected || FixUnaligned(signal, info, context);
     {
         // Debug aid: APS5_TRACE_FAULT_LOOP=1 counts the faults this handler sees and how it took them.
-        static const bool traceLoop = std::getenv("APS5_TRACE_FAULT_LOOP") != nullptr;
+        static const bool traceLoop = true;
         if (traceLoop) {
             static std::atomic<std::uint64_t> total{0};
             const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;

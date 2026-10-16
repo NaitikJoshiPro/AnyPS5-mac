@@ -518,7 +518,7 @@ private:
         auto& watch = Get();
         {
             // Debug aid: APS5_TRACE_FAULT_LOOP=1 counts the faults this handler sees.
-            static const bool trace = std::getenv("APS5_TRACE_FAULT_LOOP") != nullptr;
+            static const bool trace = true;
             if (trace) {
                 static std::atomic<std::uint64_t> total{0};
                 const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
