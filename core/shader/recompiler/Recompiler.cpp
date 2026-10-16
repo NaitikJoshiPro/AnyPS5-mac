@@ -32,6 +32,7 @@
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
+#include "Optimization/include/Optimization/NanTestEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
@@ -270,6 +271,17 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         deadCodeEliminator.Eliminate(program);
     }
 
+    // DECISIONS D63: NaN emulation only where a NaN can reach.
+    if (request.target.backend == ShaderBackend::Msl && request.target.mslNanTestElimination) {
+        constexpr NanTestEliminator nanTestEliminator;
+        if (nanTestEliminator.Eliminate(program).removedTests != 0u) {
+            constantFolder.Fold(program);
+            ResolveControlFlowIdentities(program);
+            deadCodeEliminator.RemoveIdentities(program);
+            deadCodeEliminator.Eliminate(program);
+        }
+    }
+
     if (inputInfo.vertex != nullptr) {
         constexpr TessellationLowering tessellationLowering;
         tessellationLowering.Lower(program, inputInfo.vertex->tess);
@@ -482,6 +494,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         mslOptions.maxThreadgroupMemoryBytes = request.target.maxWorkgroupSharedMemoryBytes;
         mslOptions.keepF32Denormals = request.context.floatMode.has_value() && ((request.context.floatMode->floatMode >> 4u) & 3u) == 3u;
         mslOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+        mslOptions.wave64LaneLocal = request.target.mslWave64LaneLocal;
         mslOptions.storageImageMultisample = std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStorageImageMultisample)) != request.target.supportedCapabilities.end();
         constexpr MslEmitter mslEmitter;
         result.msl = SharedMsl(mslEmitter.Emit(program, inputInfo, bindings, mslOptions));

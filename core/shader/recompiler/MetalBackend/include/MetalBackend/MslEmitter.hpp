@@ -28,6 +28,8 @@ struct MslTargetOptions {
     // from the half) instead of decoding the bits with integer operations. Halves of fields narrower
     // than 16 bits keep the decode, as on the SPIR-V path.
     bool float16DenormPreserve = false;
+    // SpirvTarget::mslWave64LaneLocal (DECISIONS D62).
+    bool wave64LaneLocal = false;
 };
 
 // IR -> Metal Shading Language, the MetalBackend counterpart of SpirvEmitter (same inputs, same

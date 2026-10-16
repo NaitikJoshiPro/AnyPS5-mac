@@ -187,6 +187,9 @@ private:
         const auto* condition = blockInfo.condition;
         if (kind == BranchCondition::ScalarInstruction || kind == BranchCondition::GotoVariable || kind == BranchCondition::IndirectTarget) return state.HalfValue(condition, 0u);
         if (state.laneCount == 1u && !IsWaveMaskBranch(kind)) return state.HalfValue(condition, 0u);
+        // Wave64 at one lane per invocation (DECISIONS D62): the lane's own condition where
+        // MslLaneLocal.cpp proved that exact, else a vote through threadgroup memory.
+        if (state.laneLocal && !state.votedBranches.contains(blockInfo.id)) return state.HalfValue(condition, 0u);
         // A wave-uniform condition is the same in every lane: no vote needed.
         if (state.laneCount == 2u && (condition->Resolve()->HasImmediate() || state.SharedAcrossHalves(*condition))) return state.HalfValue(condition, 0u);
         // EXEC/VCC (and, at laneCount 2, every other per-lane condition as the SPIR-V path does):
