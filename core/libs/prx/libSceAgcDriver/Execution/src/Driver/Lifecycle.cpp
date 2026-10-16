@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -146,6 +147,7 @@ Driver& Driver::Get() {
 }
 
 Driver::~Driver() {
+    Progress::SetHook(nullptr, nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }
@@ -198,6 +200,8 @@ Driver::Driver() {
     static const bool driverMemory = (MapDriverMemory(), true);
     static_cast<void>(driverMemory);
     static_cast<void>(GuestMemory::TrackerGeneration());
+    // D80: GPU completions and landed labels wake the queue workers that wait for them.
+    Progress::SetHook([](void* driver) { static_cast<Driver*>(driver)->changed.notify_all(); }, this);
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });

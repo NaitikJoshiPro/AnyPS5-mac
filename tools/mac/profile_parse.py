@@ -324,6 +324,57 @@ def read_thread_counts(pid):
     return result
 
 
+_TASK_INFO = struct.Struct("<6Q12i")  # struct proc_taskinfo (sys/proc_info.h), PROC_PIDTASKINFO = 4
+_TASK_FIELDS = ("virtual_size", "resident_size", "total_user", "total_system", "threads_user", "threads_system",
+                "policy", "faults", "pageins", "cow_faults", "messages_sent", "messages_received", "syscalls_mach",
+                "syscalls_unix", "csw", "threadnum", "numrunning", "priority")
+RUSAGE_FIELDS = {"user": 0, "system": 1, "qos_default": 18, "qos_maintenance": 19, "qos_background": 20, "qos_utility": 21,
+                 "qos_legacy": 22, "qos_user_initiated": 23, "qos_user_interactive": 24, "runnable": 34}
+
+
+def decode_task_info(raw):
+    return dict(zip(_TASK_FIELDS, _TASK_INFO.unpack_from(raw, 0))) if len(raw) >= _TASK_INFO.size else {}
+
+
+def decode_rusage(raw):
+    """rusage_info_v6 (sys/resource.h): a 16-byte UUID, then 64-bit fields; times in Mach ticks."""
+    if len(raw) < 16 + 8 * 35:
+        return {}
+    values = struct.unpack_from("<35Q", raw, 16)
+    return {name: values[index] for name, index in RUSAGE_FIELDS.items()}
+
+
+def read_process_counters(pid):
+    """Context switches, system calls and faults (PROC_PIDTASKINFO), and CPU time by QoS class and time spent
+    runnable (proc_pid_rusage RUSAGE_INFO_V6). Same user, no root."""
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    task = (ctypes.c_uint8 * 256)()
+    got = lib.proc_pidinfo(pid, 4, ctypes.c_uint64(0), task, 256)
+    usage = (ctypes.c_uint8 * 1024)()
+    rc = lib.proc_pid_rusage(pid, 6, usage)
+    return {"task": decode_task_info(bytes(task[:max(got, 0)])), "rusage": decode_rusage(bytes(usage)) if rc == 0 else {}}
+
+
+def diff_process_counters(before, after, ns_per_tick, seconds):
+    """Per second: context switches (wake-ups), Unix and Mach system calls, faults; CPU by QoS class; and the share
+    of runnable time spent waiting for a core (runnable includes running)."""
+    if not before or not after:
+        return {}
+    task0, task1 = before.get("task", {}), after.get("task", {})
+    out = {}
+    for key in ("csw", "syscalls_unix", "syscalls_mach", "faults", "messages_sent"):
+        if key in task0 and key in task1:
+            out[f"{key}_per_s"] = ((task1[key] - task0[key]) & 0xffffffff) / seconds
+    ru0, ru1 = before.get("rusage", {}), after.get("rusage", {})
+    if ru0 and ru1:
+        delta = {key: max(ru1[key] - ru0[key], 0) * ns_per_tick / 1e6 for key in RUSAGE_FIELDS}
+        cpu = delta["user"] + delta["system"]
+        out["cpu_ms"] = cpu
+        out["runnable_wait_ms"] = max(delta["runnable"] - cpu, 0.0)
+        out["qos_ms"] = {key[4:]: value for key, value in delta.items() if key.startswith("qos_") and value > 0}
+    return out
+
+
 def mach_timebase_ns():
     class Timebase(ctypes.Structure):
         _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]

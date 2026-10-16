@@ -170,6 +170,28 @@ class CountsTests(unittest.TestCase):
         self.assertAlmostEqual(rows[1]["p_share"], 0.0)  # a thread started inside the window counts from zero
 
 
+class ProcessCounterTests(unittest.TestCase):
+    def test_decode_and_diff(self):
+        task = struct.pack("<6Q12i", 1, 2, 3, 4, 5, 6, 0, 100, 0, 0, 0, 0, 10, 20, 1000, 8, 2, 31)
+        self.assertEqual(pp.decode_task_info(task)["csw"], 1000)
+        usage = bytearray(16 + 8 * 60)
+        struct.pack_into("<Q", usage, 16 + 8 * 0, 1000)   # user
+        struct.pack_into("<Q", usage, 16 + 8 * 1, 500)    # system
+        struct.pack_into("<Q", usage, 16 + 8 * 24, 1200)  # user-interactive QoS
+        struct.pack_into("<Q", usage, 16 + 8 * 34, 2000)  # runnable
+        decoded = pp.decode_rusage(bytes(usage))
+        self.assertEqual(decoded["runnable"], 2000)
+        before = {"task": pp.decode_task_info(task), "rusage": {key: 0 for key in pp.RUSAGE_FIELDS}}
+        later = struct.pack("<6Q12i", 1, 2, 3, 4, 5, 6, 0, 300, 0, 0, 0, 0, 30, 60, 3000, 8, 2, 31)
+        after = {"task": pp.decode_task_info(later), "rusage": decoded}
+        diff = pp.diff_process_counters(before, after, ns_per_tick=1e6, seconds=2.0)  # 1 ms per tick
+        self.assertAlmostEqual(diff["csw_per_s"], 1000.0)
+        self.assertAlmostEqual(diff["syscalls_unix_per_s"], 20.0)
+        self.assertAlmostEqual(diff["cpu_ms"], 1500.0)
+        self.assertAlmostEqual(diff["runnable_wait_ms"], 500.0)
+        self.assertAlmostEqual(diff["qos_ms"]["user_interactive"], 1200.0)
+
+
 class PowermetricsTests(unittest.TestCase):
     def test_parse_and_summary(self):
         samples = pp.parse_powermetrics(POWERMETRICS)

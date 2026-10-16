@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -117,6 +118,16 @@ const std::atomic<std::uint64_t>*& Driver::workerQueued() {
     return queued;
 }
 
+// D80: how long a queue worker waits for completions before it checks again without a wake-up. GPU completions and
+// reaped labels notify (Progress), so this only bounds a wake-up lost between a check and the wait.
+std::chrono::microseconds CompletionPollFallback() {
+    static const auto value = [] {
+        const char* text = std::getenv("APS5_COMPLETION_POLL_US");
+        return std::chrono::microseconds(text != nullptr && *text != 0 ? std::max(100, std::atoi(text)) : 4000);
+    }();
+    return value;
+}
+
 void Driver::reapCompletionLabels() {
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
     if (!gpuLock.owns_lock()) {
@@ -128,6 +139,8 @@ void Driver::reapCompletionLabels() {
 
     bumpEpoch(&EpochBumps::reaps);
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
+    gpuLock.unlock();
+    Progress::Notify();
 }
 
 void Driver::run(std::uint32_t id) noexcept {
@@ -188,7 +201,8 @@ void Driver::run(std::uint32_t id) noexcept {
                     lock.lock();
                     return done();
 #else
-                    return changed.wait_for(lock, std::chrono::milliseconds(1), done);
+                    // A GPU completion wakes this wait (Progress hook, D80); the timeout only bounds a missed wake-up.
+                    return changed.wait_for(lock, CompletionPollFallback(), done);
 #endif
                 };
 

@@ -251,6 +251,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderRegistry.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/DeferredLabels.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LabelHistory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/Progress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
@@ -656,6 +657,17 @@ if(BUILD_TESTING)
         set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+add_test_executable(agc_progress_tests EXCLUDE_FROM_ALL
+        tests/Progress.cpp
+        Execution/src/Driver/Synchronization/Progress.cpp
+)
+target_include_directories(agc_progress_tests PRIVATE ${LIBS_INCLUDE_DIR})
+if(BUILD_TESTING)
+    set_target_properties(agc_progress_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_progress COMMAND agc_progress_tests)
+    set_tests_properties(agc_progress PROPERTIES TIMEOUT 30)
 endif()
 
 add_test_executable(agc_thread_priority_tests EXCLUDE_FROM_ALL

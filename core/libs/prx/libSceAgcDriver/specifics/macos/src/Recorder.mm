@@ -8,6 +8,7 @@
 // Store runs (labels) are uploads copied into the host imports; [gputime] ranges are MTL4 counter
 // heap timestamps; occlusion samples are visibility-result counters of the render passes, folded
 // by the MSL twins of the SampleCounter/SampleDumps kernels (RecorderKernels.h).
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "MetalCommandStream.h"
 #include "MetalVmTrace.h"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -350,6 +351,19 @@ void FailNextRecorderSubmit(const char* what, bool beforeCommit) {
 }
 
 namespace {
+
+// One listener for every recorder's timeline notifications (D80), on a serial user-interactive queue: its blocks only
+// raise a progress event.
+MTLSharedEventListener* ProgressListener() {
+    static MTLSharedEventListener* listener = [[MTLSharedEventListener alloc]
+        initWithDispatchQueue:dispatch_queue_create("aps5.gpu-progress", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0))];
+    return listener;
+}
+
+MTLSharedEventNotificationBlock ProgressBlock() {
+    static MTLSharedEventNotificationBlock block = ^(MetalEvent, uint64_t) { ::AgcDriver::Progress::Notify(); };
+    return block;
+}
 
 // The handle the shared code passes around for a batch's commands (a CommandStream's address).
 VkCommandBuffer CommandsOf(const std::unique_ptr<Metal::BatchObjects, Metal::ObjectsDeleter>& objects) {
@@ -1406,6 +1420,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     }
     // A poller that refused the group as unclosed re-consults the table on the next generation.
     writeGeneration.fetch_add(1, std::memory_order_release);
+    ::AgcDriver::Progress::Notify();
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
@@ -2624,6 +2639,13 @@ void Recorder::readGpuTiming(Batch& batch) {
     timingBatches = 0;
     lock.unlock();
     reportBarriers();
+    // D80: progress events and the waits they served, per 10 s.
+    static ::AgcDriver::Progress::Counters lastProgress{};
+    const auto progress = ::AgcDriver::Progress::Read();
+    AgcDriver::ProfilePrint_nid_no_patch("[progress] %llu events, %llu waits over 10 s: %llu woken by an event, %llu timed out\n",
+        static_cast<unsigned long long>(progress.notifies - lastProgress.notifies), static_cast<unsigned long long>(progress.waits - lastProgress.waits),
+        static_cast<unsigned long long>(progress.wokenByEvent - lastProgress.wokenByEvent), static_cast<unsigned long long>(progress.timedOut - lastProgress.timedOut));
+    lastProgress = progress;
 }
 
 bool Recorder::FlipReadCheck() {
@@ -2885,7 +2907,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writeWords.push_back(word);
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
+    if (activeRecorder == this) {
+        writeGeneration.fetch_add(1, std::memory_order_release);
+        ::AgcDriver::Progress::Notify();
+    }
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
     if (SnapshotCovers(address, end)) {
@@ -2913,7 +2938,10 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
+    if (activeRecorder == this) {
+        writeGeneration.fetch_add(1, std::memory_order_release);
+        ::AgcDriver::Progress::Notify();
+    }
     if (!SnapshotCovers(address, address + bytes)) {
         const std::array ranges{std::pair{address, address + bytes}};
         publishPendingWrites(ranges);
@@ -3585,6 +3613,9 @@ void Recorder::Submit() {
         [metal->queue commit:commandBuffers count:1 options:options];
         [metal->queue signalEvent:metal->timeline value:serial];
     });
+    // D80: when the timeline reaches this batch, wake the threads waiting for completions or labels instead of
+    // letting them find it on their next poll.
+    [metal->timeline notifyListener:ProgressListener() atValue:serial block:ProgressBlock()];
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();

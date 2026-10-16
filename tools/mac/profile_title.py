@@ -79,6 +79,7 @@ def collect(pid, base, window, sample_seconds, use_powermetrics, started):
         time.sleep(delay)
     counts = {"ns_per_tick": pp.mach_timebase_ns()}
     try:
+        counts["process_before"] = pp.read_process_counters(pid)
         counts["before"] = {str(k): v for k, v in pp.read_thread_counts(pid).items()}
     except OSError as error:
         counts["error"] = str(error)
@@ -96,6 +97,7 @@ def collect(pid, base, window, sample_seconds, use_powermetrics, started):
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     time.sleep(max(started + start + length - time.monotonic(), 0.0))
     try:
+        counts["process_after"] = pp.read_process_counters(pid)
         counts["after"] = {str(k): v for k, v in pp.read_thread_counts(pid).items()}
     except OSError as error:
         counts["error"] = str(error)
@@ -188,6 +190,8 @@ def build_report(log_dir, title, tag):
             seconds = counts["t1"] - counts["t0"]
             rows = pp.diff_thread_counts(counts["before"], counts["after"], counts["ns_per_tick"], seconds)
             result["threads_cpu"] = {"seconds": seconds, "rows": rows}
+            result["process"] = pp.diff_process_counters(counts.get("process_before"), counts.get("process_after"),
+                                                         counts["ns_per_tick"], seconds)
 
     sample_path = Path(f"{base}-sample.txt")
     if sample_path.exists():
@@ -227,7 +231,8 @@ def compare_row(result):
     row = {"tag": result["tag"], "presents": summary.get("presents"), "p50": frame.get("p50"), "p99": frame.get("p99"),
            "p_mhz": power.get("p_active_mhz"), "e_mhz": power.get("e_active_mhz"), "gpu_mhz": power.get("gpu_mhz"),
            "gpu_active": power.get("gpu_active_pct"), "pressure": "/".join(sorted(power.get("pressure", {}))) or "-",
-           "audio": (result.get("args") or {}).get("audio", "device")}
+           "audio": (result.get("args") or {}).get("audio", "device"),
+           "csw_per_s": (result.get("process") or {}).get("csw_per_s")}
     threads = (result.get("threads_cpu") or {}).get("rows", [])
     seconds = (result.get("threads_cpu") or {}).get("seconds") or 1.0
     total = sum(entry["cpu_ms"] for entry in threads)
@@ -246,7 +251,7 @@ def compare_row(result):
 def compare(log_dir, title, tags):
     rows = [compare_row(build_report(Path(log_dir), title, tag)) for tag in tags]
     columns = ["tag", "presents", "p50", "p99", "cores", "p_share", "top_thread", "p_mhz", "e_mhz", "gpu_mhz", "gpu_active",
-               "pressure", "audio", "jit"]
+               "pressure", "audio", "csw_per_s", "jit"]
     lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
     for row in rows:
         cells = []
@@ -314,6 +319,14 @@ def markdown(result):
                        f"{100 * row['p_share']:.0f}% | {row['p_ghz']:.2f} | {row['p_ipc']:.2f} | {row['e_ghz']:.2f} | {row['e_ipc']:.2f} |")
         if starved:
             out += ["", "CPU contention: " + "; ".join(starved) + "."]
+        process = result.get("process") or {}
+        if process:
+            cpu = process.get("cpu_ms") or 0.0
+            out += ["", f"Process: {process.get('csw_per_s', 0):.0f} context switches/s (wake-ups), "
+                        f"{process.get('syscalls_unix_per_s', 0):.0f} Unix + {process.get('syscalls_mach_per_s', 0):.0f} Mach system calls/s, "
+                        f"{process.get('faults_per_s', 0):.0f} faults/s; waited for a core {process.get('runnable_wait_ms', 0) / 1000.0 / threads['seconds'] * 100:.0f}% "
+                        f"of a core-second per second; CPU by QoS: " +
+                        ", ".join(f"{name} {100.0 * value / cpu:.0f}%" for name, value in sorted(process.get("qos_ms", {}).items(), key=lambda kv: -kv[1]) if cpu) + "."]
     sample = result.get("sample")
     if sample:
         total = sum(sample["totals"].values())
