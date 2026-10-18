@@ -584,6 +584,7 @@ void ThreadCancel::EndWait() {
     BeginWait(nullptr);
 }
 
+#if defined(__x86_64__)
 extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg);
 
 asm(".text\n"
@@ -608,6 +609,13 @@ asm(".text\n"
     ret
     .cfi_endproc
 )" APS5_ASM_FUNCTION_END("Aps5CallGuestEntry_nid_no_patch"));
+#else
+// arm64 host (FEX): the guest entry runs in the translator, whose guest frame chain starts at the bridge,
+// so the x86 zero-record trampoline (upstream ff9bf22281) is not needed.
+static void* Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg) {
+    return entry(arg);
+}
+#endif
 
 static void RunThread(std::unique_ptr<ThreadArgs> args) {
     APS5_LOG_OUT("RunThread entry=0x%llx arg=%p self=%p", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(args->entry)), args->arg, static_cast<void*>(args->self));

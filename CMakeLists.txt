@@ -6,6 +6,10 @@ if(CMAKE_HOST_APPLE AND NOT ANYPS5_RELINKER_ONLY)
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Write compile_commands.json")
 endif()
 project(Relinker CXX)
+if(APPLE)
+    # Metal driver twins and their tests are Objective-C++ (.mm); targets in several directories compile them.
+    enable_language(OBJCXX)
+endif()
 
 set(ANYPS5_TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 set(ANYPS5_WINDOWS_TEST_EXIT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsTestExit.cpp")

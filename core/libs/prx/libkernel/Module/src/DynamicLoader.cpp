@@ -292,6 +292,10 @@ int APS5_VABI dlclose_nid_postfix(void* handle) {
         GuestAllocations::Mutation mutation;
 #ifdef _WIN32
         mutation.UnregisterImage(module->native);
+#elif defined(__APPLE__)
+        // macOS: the runner registers (and forgets) guest module images itself when it maps them, and dyld
+        // handles carry no load address; nothing to unregister here.
+        static_cast<void>(mutation);
 #else
         mutation.UnregisterImage(reinterpret_cast<const void*>(static_cast<link_map*>(module->native)->l_addr));
 #endif

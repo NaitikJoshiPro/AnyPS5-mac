@@ -122,16 +122,6 @@ float AtanhfLog1p(float x) {
     return kFloat * Ln2High - ((halfSquare - (s * (halfSquare + r) + (kFloat * Ln2Low + c))) - f);
 }
 
-#if defined(__x86_64__)
-// The x87-exact asinl below needs the host long double to be the guest's x87 type. On arm64 the
-// long double exports take the host's double (see TechnicalDebt.md, "long double math exports").
-static_assert(std::numeric_limits<long double>::digits == 64, "guest long double is the x87 80-bit format");
-
-struct ExtendedParts {
-    std::uint64_t mantissa;
-    std::uint16_t signExponent;
-};
-
 template <typename TValue, typename THypot>
 TValue Hypot3(TValue x, TValue y, TValue z, THypot hypot) {
     if (std::isnan(x)) return x;
@@ -148,6 +138,17 @@ TValue Hypot3(TValue x, TValue y, TValue z, THypot hypot) {
     if (y >= x && y >= z) return hypot(y, hypot(x, z));
     return hypot(x, hypot(y, z));
 }
+
+#if defined(__x86_64__)
+// The x87-exact asinl below needs the host long double to be the guest's x87 type. On arm64 the
+// long double exports take the host's double (see TechnicalDebt.md, "long double math exports").
+static_assert(std::numeric_limits<long double>::digits == 64, "guest long double is the x87 80-bit format");
+
+struct ExtendedParts {
+    std::uint64_t mantissa;
+    std::uint16_t signExponent;
+};
+
 
 ExtendedParts SplitExtended(long double value) {
     unsigned char bytes[sizeof(long double)];
