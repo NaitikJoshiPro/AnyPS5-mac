@@ -106,7 +106,7 @@ def macos_check(found, ran, entries, markdown):
 
 
 def reason(output):
-    lines = [line.strip() for line in output.splitlines() if line.startswith("skipped")]
+    lines = [line.strip() for line in output.splitlines() if line.strip().lower().startswith("skipped")]
     return next((line for line in lines if not CTEST_MESSAGE.match(line)), lines[0] if lines else "")
 
 

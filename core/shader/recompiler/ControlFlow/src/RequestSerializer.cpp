@@ -240,7 +240,7 @@ ConservativeZExport readConservativeZExport(Reader& reader) {
 
 ColorExportPacking readColorExportPacking(Reader& reader) {
     const auto value = reader.ReadU8();
-    if (value > static_cast<std::uint8_t>(ColorExportPacking::Unorm10_11_11)) {
+    if (value > static_cast<std::uint8_t>(ColorExportPacking::Float11_11_10)) {
         throw std::runtime_error("RequestSerializer: invalid ColorExportPacking value");
     }
     return static_cast<ColorExportPacking>(value);
@@ -519,6 +519,7 @@ void writeMeshConfiguration(Writer& writer, const MeshConfiguration& configurati
     writer.WriteU32(configuration.ldsSizeDwords);
     writer.WriteU32(configuration.provokingVertex);
     writer.WriteU32(configuration.esgsItemSize);
+    writer.WriteU32(configuration.outputPrimitiveSize);
 }
 
 MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
@@ -532,6 +533,7 @@ MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
     configuration.ldsSizeDwords = reader.ReadU32();
     configuration.provokingVertex = reader.ReadU32();
     configuration.esgsItemSize = version >= 4u ? reader.ReadU32() : 4u;
+    if (version >= 31u) configuration.outputPrimitiveSize = reader.ReadU32();
     return configuration;
 }
 
@@ -777,7 +779,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(32u);
+    writer.WriteU32(34u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -802,6 +804,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
+    writer.WriteBool(request.target.spannedWaves);
     writer.WriteBool(request.target.float32DenormFlushNative);
     writer.WriteBool(request.target.mslWave64LaneLocal);
     writer.WriteBool(request.target.mslNanTestElimination);
@@ -813,7 +816,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 32u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 34u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -849,15 +852,16 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
-    // Mac fork tail after upstream's v30 layout: version 31 appends float32DenormFlushNative, version 32 also
+    if (version >= 32u) result.request.target.spannedWaves = reader.ReadBool();
+    // Mac fork tail after upstream's v32 layout: version 33 appends float32DenormFlushNative, version 34 also
     // mslWave64LaneLocal and mslNanTestElimination (D62, D63).
     const auto macFlag = [&](const char* name) {
         const auto value = reader.ReadU8();
         if (value > 1u) throw std::runtime_error(std::string("RequestSerializer: invalid ") + name + " value");
         return value != 0u;
     };
-    if (version >= 31u) result.request.target.float32DenormFlushNative = macFlag("float32DenormFlushNative");
-    if (version >= 32u) {
+    if (version >= 33u) result.request.target.float32DenormFlushNative = macFlag("float32DenormFlushNative");
+    if (version >= 34u) {
         result.request.target.mslWave64LaneLocal = macFlag("mslWave64LaneLocal");
         result.request.target.mslNanTestElimination = macFlag("mslNanTestElimination");
     }

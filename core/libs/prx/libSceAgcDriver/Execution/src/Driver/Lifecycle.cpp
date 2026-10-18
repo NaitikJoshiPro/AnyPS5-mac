@@ -1,12 +1,18 @@
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "ShaderDiskCache.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +44,7 @@ void PrintFailure(std::exception_ptr error) {
     } catch (...) {
         std::fprintf(stderr, "[gpu] driver failure with a non-standard exception\n");
     }
+    FlushAsyncLog_nid_no_patch();
     std::fflush(stderr);
 }
 
@@ -76,8 +83,7 @@ bool StackHoldsImport() {
     const auto low = bounds.low;
     const auto high = bounds.high;
 #endif
-    const volatile unsigned char marker = 0;
-    const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
+    const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     return frame >= low && frame < high && frame - low >= InlineImportStackBytes;
 }
 
@@ -122,18 +128,25 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    DrawPipeline::Queue0().Stop();
     StopWorkerSampler();
     CloseRegistrationPreparation();
+    Graphics::StopPipelineLibraryWorker();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     device.Reset();
     replacedDevices.clear();
+    Graphics::FlushPipelineJournal();
     Graphics::ShutdownGuestBufferWorkers();
+    Graphics::StopCompareHelpers();
+    ShaderRecompiler::ShaderDiskCache::Shutdown();
     PerformanceTrace::StopOutput();
+    FlushAsyncLogAtEnd_nid_no_patch();
     StopProfileOutput_nid_no_patch();
     stopped = true;
 }
 
 Driver::Driver() {
+    InstallAsyncLog_nid_no_patch();
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
@@ -223,6 +236,14 @@ void Driver::checkStopping() const {
 bool& Driver::onWorkerThread() {
     static thread_local bool worker = false;
     return worker;
+}
+
+}
+
+namespace AgcDriver {
+
+std::unique_lock<std::mutex> HoldAsyncLog() {
+    return AsyncLog::Get().Hold();
 }
 
 }

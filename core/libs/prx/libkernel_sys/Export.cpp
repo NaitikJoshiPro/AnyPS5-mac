@@ -134,8 +134,8 @@ std::int64_t ReadNativeLink(const std::filesystem::path& native, char* buffer, s
     const DWORD attributes = GetFileAttributesW(native.wstring().c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
         std::string target;
-        if (!File::WindowsSymbolicLink::ReadRelative(native, target, "readlink")) {
-            NotImplemented_nid_no_patch("readlink of a Windows reparse point other than a relative symbolic link");
+        if (!File::WindowsSymbolicLink::Read(native, target, "readlink") && !File::WindowsSymbolicLink::ReadJunction(native, target, "readlink")) {
+            NotImplemented_nid_no_patch("readlink of a Windows reparse point other than a symbolic link");
             return -1;
         }
         return CopyLinkTarget(target, buffer, size);
@@ -494,9 +494,14 @@ int APS5_VABI fchmodat_nid_postfix(int fd, const char* path, int mode, int flag)
         const bool symbolic = std::filesystem::is_symlink(std::filesystem::symlink_status(native, status));
 #endif
         if (symbolic) {
-            NotImplemented_nid_no_patch("fchmodat: AT_SYMLINK_NOFOLLOW on a symbolic link");
-            return -1;
+#ifdef __APPLE__
+        if (::fchmodat(AT_FDCWD, native.c_str(), static_cast<mode_t>(mode & 07777), AT_SYMLINK_NOFOLLOW) != 0) {
+            return static_cast<int>(Fail(GuestFileError(errno)));
         }
+#endif
+        RecordWrittenPath_nid_no_patch(native);
+        return 0;
+    }
     }
 #ifdef _WIN32
     if (::_wchmod(native.wstring().c_str(), mode & 07777) != 0) return static_cast<int>(Fail(GuestFileError(errno)));

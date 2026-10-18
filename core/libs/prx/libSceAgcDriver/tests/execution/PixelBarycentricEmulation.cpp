@@ -58,7 +58,15 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t st
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs, VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, std::uint32_t vertices = 3u) {
+// Geometry and Tessellation build the generated stages; Host is the Metal device, which draws emulated
+// barycentrics through its triangle-vertices expansion (MslAbi Version 5) instead of a generated stage.
+enum class Emulation {
+    Geometry,
+    Tessellation,
+    Host,
+};
+
+ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, Emulation emulation, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs, VkCullModeFlags cullMode = VK_CULL_MODE_NONE, VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, std::uint32_t vertices = 3u) {
     Pixels.fill(Unwritten);
     auto target = device.Target();
     target.fragmentShaderBarycentricEnabled = false;
@@ -98,11 +106,14 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     auto pixelResult = ShaderRecompiler::Recompile(fragment);
     std::vector<AgcDriver::Graphics::CompiledShader> shaders{{ShaderStage::Vertex, &vertexResult, 0}};
     ShaderRecompiler::RecompileResult geometry;
-    // The Metal device draws emulated barycentrics through its triangle-vertices expansion (MslAbi
-    // Version 5) instead of a geometry stage.
-    if (pixelResult.barycentricEmulation.active && target.backend != ShaderRecompiler::ShaderBackend::Msl) {
+    ShaderRecompiler::BarycentricTessellationShaders patches;
+    if (pixelResult.barycentricEmulation.active && emulation == Emulation::Geometry) {
         geometry = ShaderRecompiler::BuildBarycentricGeometryShader(vertexResult, pixelResult, target, device.GeometryLimits());
         shaders.push_back({ShaderStage::Geometry, &geometry, 0});
+    } else if (pixelResult.barycentricEmulation.active) {
+        patches = ShaderRecompiler::BuildBarycentricTessellationShaders(vertexResult, pixelResult, target, device.MaxFragmentInputComponents());
+        shaders.push_back({ShaderStage::TessellationControl, &patches.control, 0});
+        shaders.push_back({ShaderStage::TessellationEvaluation, &patches.evaluation, 0});
     }
     shaders.push_back({ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)});
 
@@ -116,7 +127,7 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
     state.negativeOneToOne = false;
     state.scissor = {{0, 0}, {Width, Height}};
-    state.cullMode = VK_CULL_MODE_NONE;
+    state.cullMode = cullMode;
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
@@ -234,6 +245,39 @@ void CheckInterpolated() {
     Require(checked > 200u, "v_interp_p1/p2: too few interior pixels were checked");
 }
 
+bool Drawn() {
+    return std::any_of(Pixels.begin(), Pixels.end(), [](float value) { return value != Unwritten; });
+}
+
+void CheckWinding(AgcDriver::VulkanDevice& device, Emulation emulation, const std::string& name) {
+    const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
+    for (const auto cullMode : {VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT}) {
+        Draw(device, emulation, InterpolatedPixelCode, perspective, cullMode);
+        const bool host = Drawn();
+        Draw(device, emulation, BarycentricPixelCode, perspective, cullMode);
+        Require(Drawn() == host, name + ": culling the " + (cullMode == VK_CULL_MODE_BACK_BIT ? "back" : "front") + " face does not match the draw without emulation");
+    }
+}
+
+void RunEmulation(AgcDriver::VulkanDevice& device, Emulation emulation) {
+    const std::string name = emulation == Emulation::Geometry ? "geometry stage" : emulation == Emulation::Tessellation ? "tessellation stages" : "Metal triangle-vertices expansion";
+    const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
+    const auto linear = PixelInputBit(PixelInput::LinearCenter);
+    auto result = Draw(device, emulation, BarycentricPixelCode, perspective);
+    Require(result.barycentricEmulation.active && result.barycentricEmulation.smooth && !result.barycentricEmulation.linear, "reading PERSP_CENTER I/J did not emulate perspective barycentrics");
+    const auto smooth = CheckBarycentrics(name + " PERSP_CENTER I/J", true);
+    result = Draw(device, emulation, BarycentricPixelCode, linear);
+    Require(result.barycentricEmulation.active && !result.barycentricEmulation.smooth && result.barycentricEmulation.linear, "reading LINEAR_CENTER I/J did not emulate linear barycentrics");
+    const auto noPerspective = CheckBarycentrics(name + " LINEAR_CENTER I/J", false);
+    result = Draw(device, emulation, VertexValuePixelCode, perspective);
+    Require(result.barycentricEmulation.active && result.fragmentParameters.size() == 1 && result.fragmentParameters[0].perVertex, "v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
+    CheckVertexValues();
+    result = Draw(device, emulation, InterpolatedPixelCode, perspective);
+    Require(!result.barycentricEmulation.active, "plain v_interp_p1/p2 needed a generated stage");
+    CheckInterpolated();
+    CheckWinding(device, emulation, name);
+    std::printf("barycentric emulation through the %s passed: %u perspective and %u linear I/J pixels, raw vertex values, host interpolation and face culling\n", name.c_str(), smooth, noPerspective);
+}
 
 // Points and lines (DECISIONS D69, MslAbi Version 14): per-vertex values and emulated barycentrics of
 // the primitive's own vertices. Corners past a primitive's vertices repeat its last vertex: a line's
@@ -244,7 +288,7 @@ void CheckPointsAndLines(AgcDriver::VulkanDevice& device) {
     const auto positions = ClipPositions();
     const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
     // Lines: the edge from corner 0 to corner 1.
-    auto result = Draw(device, VertexValuePixelCode, perspective, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 2u);
+    auto result = Draw(device, Emulation::Host, VertexValuePixelCode, perspective, VK_CULL_MODE_NONE, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 2u);
     Require(result.barycentricEmulation.active, "a line's v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
     const std::array<float, 3> lineValues{positions[1][0] - positions[0][0], positions[1][0] - positions[0][0], positions[0][0]};
     std::uint32_t linePixels = 0;
@@ -258,7 +302,7 @@ void CheckPointsAndLines(AgcDriver::VulkanDevice& device) {
         }
     }
     Require(linePixels >= 20u, "the line covered " + std::to_string(linePixels) + " pixels");
-    result = Draw(device, BarycentricPixelCode, perspective, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 2u);
+    result = Draw(device, Emulation::Host, BarycentricPixelCode, perspective, VK_CULL_MODE_NONE, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 2u);
     std::uint32_t lineWeights = 0;
     float lowest = 2.0f;
     float highest = -1.0f;
@@ -275,7 +319,7 @@ void CheckPointsAndLines(AgcDriver::VulkanDevice& device) {
     }
     Require(lineWeights >= 20u && lowest < 0.1f && highest > 0.9f, "line barycentrics do not run along the line (I from " + std::to_string(lowest) + " to " + std::to_string(highest) + ")");
     // Points: the three corners as single-pixel points.
-    result = Draw(device, VertexValuePixelCode, perspective, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 3u);
+    result = Draw(device, Emulation::Host, VertexValuePixelCode, perspective, VK_CULL_MODE_NONE, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 3u);
     Require(result.barycentricEmulation.active, "a point's v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
     std::uint32_t points = 0;
     for (std::uint32_t y = 0; y < Height; ++y) {
@@ -296,26 +340,21 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!device->GeometryLimits() && device->Target().backend != ShaderRecompiler::ShaderBackend::Msl) {
-            std::puts("skipped, the device lacks geometryShader");
-            return VulkanTestSkipped;
+        if (device->Target().backend == ShaderRecompiler::ShaderBackend::Msl) {
+            RunEmulation(*device, Emulation::Host);
+            CheckPointsAndLines(*device);
+        } else {
+            const bool geometry = device->GeometryLimits().has_value();
+            const bool tessellation = device->Target().tessellation.has_value();
+            if (!geometry && !tessellation) {
+                std::puts("skipped, the device lacks geometryShader and tessellationShader");
+                return VulkanTestSkipped;
+            }
+            if (geometry) RunEmulation(*device, Emulation::Geometry);
+            else std::puts("geometry stage skipped, the device lacks geometryShader");
+            if (tessellation) RunEmulation(*device, Emulation::Tessellation);
+            else std::puts("tessellation stages skipped, the device lacks tessellationShader");
         }
-        const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
-        const auto linear = PixelInputBit(PixelInput::LinearCenter);
-        auto result = Draw(*device, BarycentricPixelCode, perspective);
-        Require(result.barycentricEmulation.active && result.barycentricEmulation.smooth && !result.barycentricEmulation.linear, "reading PERSP_CENTER I/J did not emulate perspective barycentrics");
-        const auto smooth = CheckBarycentrics("PERSP_CENTER I/J", true);
-        result = Draw(*device, BarycentricPixelCode, linear);
-        Require(result.barycentricEmulation.active && !result.barycentricEmulation.smooth && result.barycentricEmulation.linear, "reading LINEAR_CENTER I/J did not emulate linear barycentrics");
-        const auto noPerspective = CheckBarycentrics("LINEAR_CENTER I/J", false);
-        result = Draw(*device, VertexValuePixelCode, perspective);
-        Require(result.barycentricEmulation.active && result.fragmentParameters.size() == 1 && result.fragmentParameters[0].perVertex, "v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
-        CheckVertexValues();
-        result = Draw(*device, InterpolatedPixelCode, perspective);
-        Require(!result.barycentricEmulation.active, "plain v_interp_p1/p2 needed a geometry stage");
-        CheckInterpolated();
-        CheckPointsAndLines(*device);
-        std::printf("barycentric emulation tests passed: %u perspective and %u linear I/J pixels, raw vertex values and host interpolation\n", smooth, noPerspective);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

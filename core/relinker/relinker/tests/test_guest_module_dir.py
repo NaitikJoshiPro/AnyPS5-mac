@@ -39,8 +39,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="anyps5-module-dir-") as directory:
         work = Path(directory)
 
-        def convert(case, windows, options, executable=None, cwd=None):
-            (case / "sce_module").mkdir(parents=True, exist_ok=True)
+        def convert(case, windows, options, executable=None, cwd=None, standard=True):
+            case.mkdir(parents=True, exist_ok=True)
+            if standard:
+                (case / "sce_module").mkdir(exist_ok=True)
             source = case / "input.elf"
             source.write_bytes(main_fixture() if executable is None else executable)
             output = case / ("output.exe" if windows else "output.elf")
@@ -49,6 +51,26 @@ def main():
             return result, output
 
         for windows in (False, True):
+            for relative in (".", "Media/Plugins"):
+                case = work / f"{windows}-explicit-only-{relative == '.'}"
+                modules = case / relative
+                modules.mkdir(parents=True)
+                module = modules / "plugin.prx"
+                original = bytes(module_with_symbol(True))
+                module.write_bytes(original)
+                result, output = convert(case, windows, [], standard=False)
+                assert result.returncode == 2 and "was not found" in result.stderr, result.stderr
+                assert not output.exists()
+                result, output = convert(case, windows, ["--module-dir", relative], standard=False)
+                assert result.returncode == 0, (result.stdout, result.stderr)
+                artifact = case / "app0" / relative / "plugin.prx.guest.prx"
+                assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF")
+                assert module.read_bytes() == original
+                assert not (case / "sce_module").exists()
+                for invalid in ("missing", "../outside"):
+                    failed, _ = convert(case, windows, ["--module-dir", invalid], standard=False)
+                    assert failed.returncode == 2, (invalid, failed.stdout, failed.stderr)
+
             case = work / f"{windows}-plugins"
             plugins = case / "Media" / "Plugins"
             plugins.mkdir(parents=True)
@@ -137,6 +159,19 @@ def main():
                                       ("sce_module", "Duplicate guest module directory")):
                 result, output = convert(case, windows, ["--module-dir", rejected])
                 assert result.returncode == 2 and message in result.stderr, (rejected, result.stderr)
+
+            aliases = [["SCE_MODULE"], ["Media/Plugins", "media/plugins"]] if (case / "MEDIA").exists() else []
+            if os.name != "nt":
+                (case / "linked").symlink_to("sce_module", target_is_directory=True)
+                aliases.append(["linked"])
+            for names in aliases:
+                result, output = convert(case, windows, [option for name in names for option in ("--module-dir", name)])
+                assert result.returncode == 2 and "Duplicate guest module directory" in result.stderr, (names, result.stderr)
+            if not (case / "MEDIA").exists():
+                (case / "SCE_MODULE").mkdir()
+                result, output = convert(case, windows, ["--module-dir", "SCE_MODULE"])
+                assert result.returncode == 0, (result.stdout, result.stderr)
+                (case / "SCE_MODULE").rmdir()
 
             result, output = convert(case, windows, ["--skip-sce-module", "--module-dir", "Media/Plugins"])
             assert result.returncode != 0 and "conflicts with --skip-sce-module" in result.stderr, result.stderr

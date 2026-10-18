@@ -3,6 +3,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include <algorithm>
 #include <limits>
@@ -118,6 +119,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         try {
             const auto result = DoMapAnon(&mapped, rounded, protection, placement, alignment, exclusive);
             if (result != 0) return failed(GuestNoMemory);
+            if (fixedAnonymous) ReleaseFlexibleMappingRange(start, rounded);
             return mapped;
         } catch (const std::invalid_argument&) {
             return failed(fixedAnonymous ? GuestInvalid : GuestNoMemory);
@@ -134,6 +136,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         (mappingFlags & ~(GuestShared | GuestPrivate | GuestMapFixed | GuestMapNoOverwrite | GuestMapNoCoalesce)) != 0)
         return failed(GuestNotSupported);
     if (descriptor < 0) return failed(GuestBadDescriptor);
+    File::RefuseArchivedFile(descriptor, "mmap");
     if (offset < 0 || (static_cast<std::uint64_t>(offset) & (PS5_PAGE_SIZE - 1)) != 0 ||
         rounded > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
         static_cast<std::uint64_t>(offset) > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - rounded)
@@ -158,6 +161,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         mapped = address;
         const auto result = DoMapFileBacked_nid_no_patch(&mapped, rounded, protection, kind | placement, mappingDescriptor, static_cast<std::uint64_t>(offset), alignment);
         if (result != 0) return failed(result == SCE_KERNEL_ERROR_EINVAL ? GuestInvalid : GuestNoMemory);
+        if ((placement & GuestMapFixed) != 0) ReleaseFlexibleMappingRange(reinterpret_cast<std::uintptr_t>(mapped), rounded);
         return mapped;
     } catch (const std::invalid_argument&) {
         return failed(GuestInvalid);

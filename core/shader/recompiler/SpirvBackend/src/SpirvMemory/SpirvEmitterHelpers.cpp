@@ -165,7 +165,7 @@ void DefineInputs(SpirvEmitterState& state) {
     for (const auto& input : state.program.Info().inputs) {
         state.inputs.push_back(SpirvInputBinding {input});
     }
-    if (state.laneCount == 2u) {
+    if (state.laneCount == 2u || state.spannedWave) {
         const auto addBuiltin = [&](StageInputKind kind, std::uint32_t components, const char* name) {
             if (std::none_of(state.inputs.begin(), state.inputs.end(), [kind](const SpirvInputBinding& input) {
                 return input.kind == kind;
@@ -293,6 +293,10 @@ void DefineInputs(SpirvEmitterState& state) {
     if (state.requirements.subgroupLocalInvocationId) {
         const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput, "gl_SubgroupInvocationID");
         state.subgroupLocalInvocationIdVariable = variable;
+        if (state.spannedWave) {
+            state.subgroupIdVariable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput, "gl_SubgroupID");
+            state.module.AddAnnotation(spv::OpDecorate, state.subgroupIdVariable, spv::DecorationBuiltIn, spv::BuiltInSubgroupId);
+        }
         state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, spv::BuiltInSubgroupLocalInvocationId);
         if (state.program.Resources().stage == IrShaderStage::Pixel) {
             state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
@@ -467,17 +471,20 @@ void DefineDescriptors(SpirvEmitterState& state) {
             state.module.AddAnnotation(spv::OpDecorate, state.gdsVariable, spv::DecorationCoherent);
             break;
         case DescriptorBindingKind::ImageTable:
+        case DescriptorBindingKind::ImageStorageTable:
             RequireTableIndexing(state);
+            if (binding.kind == DescriptorBindingKind::ImageStorageTable) state.module.EmitCapability(spv::CapabilityStorageImageArrayDynamicIndexing);
             for (std::uint32_t resource = 0; resource < state.program.Info().images.size(); ++resource) {
                 const auto& image = state.program.Info().images[resource];
                 if (image.table == NoTable) continue;
                 for (const auto& mode : state.program.Info().runtimeImageModes.at(resource)) {
                     if (!TableModeEmitted(mode)) continue;
                     const auto kind = DescriptorBindingForImage(mode);
+                    if ((ImageBindingResourceClass(kind) == ImageResourceClass::Storage) != (binding.kind == DescriptorBindingKind::ImageStorageTable)) continue;
                     if (std::any_of(state.tableImageVariables.begin(), state.tableImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; })) continue;
                     const auto name = "table_images_" + std::to_string(static_cast<std::uint32_t>(kind));
                     state.tableImageVariables.push_back({kind, Define(state.module.Type(spv::OpTypeRuntimeArray, ImageType(state, mode)), name.c_str(), spv::StorageClassUniformConstant)});
-                    if (mode.dimension == RdnaImageDimension::Dim1D || mode.dimension == RdnaImageDimension::Dim1DArray) state.module.EmitCapability(spv::CapabilitySampled1D);
+                    if (mode.dimension == RdnaImageDimension::Dim1D || mode.dimension == RdnaImageDimension::Dim1DArray) state.module.EmitCapability(binding.kind == DescriptorBindingKind::ImageStorageTable ? spv::CapabilityImage1D : spv::CapabilitySampled1D);
                 }
             }
             break;

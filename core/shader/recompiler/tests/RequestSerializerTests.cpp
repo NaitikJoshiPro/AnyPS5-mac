@@ -11,9 +11,9 @@
 
 namespace {
 
-// Mac fork: after upstream's version 30 layout, version 31 appends float32DenormFlushNative and version 32
+// Mac fork: after upstream's version 32 layout, version 33 appends float32DenormFlushNative and version 34
 // mslWave64LaneLocal and mslNanTestElimination (one byte each).
-constexpr std::uint8_t kCurrentVersion = 32u;
+constexpr std::uint8_t kCurrentVersion = 34u;
 constexpr std::size_t kMacTailBytes = 3u;
 
 constexpr char kHistoricalVersion21[] =
@@ -215,7 +215,7 @@ int main() {
             if (fixture.pixel) upgraded.insert(upgraded.begin() + 258u, {0u, 0u, 0u});
             if (fixture.pixel) InsertPixelDefaultsAfterFrontFace(upgraded);
             if (fixture.tessellation) upgraded.insert(upgraded.end() - 35u, 5u, 0u);
-            upgraded.insert(upgraded.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
+            upgraded.insert(upgraded.end(), sizeof(std::uint64_t) + 1u + kMacTailBytes, 0u);
             Require(serializer.Serialize(request) == EncodeBase64(upgraded));
             auto truncated = bytes;
             truncated.pop_back();
@@ -254,7 +254,7 @@ int main() {
                 layered.insert(layered.begin() + 259u, {0u, 0u});
                 InsertPixelDefaultsAfterFrontFace(layered);
                 if (fixture.tessellation) layered.insert(layered.end() - 35u, 5u, 0u);
-                layered.insert(layered.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
+                layered.insert(layered.end(), sizeof(std::uint64_t) + 1u + kMacTailBytes, 0u);
                 Require(serializer.Serialize(layerReplay.request) == EncodeBase64(layered));
             }
         }
@@ -278,7 +278,7 @@ int main() {
             bytes[4] = kCurrentVersion;
             bytes.insert(bytes.begin() + 259u, {0u, 0u});
             InsertPixelDefaultsAfterFrontFace(bytes);
-            bytes.insert(bytes.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
+            bytes.insert(bytes.end(), sizeof(std::uint64_t) + 1u + kMacTailBytes, 0u);
             Require(serializer.Serialize(replay.request) == EncodeBase64(bytes));
 
             auto truncated23 = DecodeBase64(encoded23);
@@ -402,7 +402,7 @@ int main() {
                 upgraded[4] = kCurrentVersion;
                 if (fixture.pixel) upgraded.insert(upgraded.begin() + 259u, {0u, 0u});
                 if (fixture.pixel) InsertPixelDefaultsAfterFrontFace(upgraded);
-                upgraded.insert(upgraded.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
+                upgraded.insert(upgraded.end(), sizeof(std::uint64_t) + 1u + kMacTailBytes, 0u);
                 Require(serializer.Serialize(request) == EncodeBase64(upgraded));
                 for (const bool dither : {false, true}) {
                     if (!fixture.pixel && dither) continue;
@@ -417,14 +417,14 @@ int main() {
                         main25.insert(main25.begin() + 260u, 0u);
                         InsertPixelDefaultsAfterFrontFace(main25);
                     }
-                    main25.insert(main25.end(), sizeof(std::uint64_t) + kMacTailBytes, 0u);
+                    main25.insert(main25.end(), sizeof(std::uint64_t) + 1u + kMacTailBytes, 0u);
                     Require(serializer.Serialize(replay25.request) == EncodeBase64(main25));
                 }
             }
         }
     }
 
-    // The Mac tail: float32DenormFlushNative (v31), mslWave64LaneLocal and mslNanTestElimination (v32).
+    // The Mac tail: float32DenormFlushNative (v33), mslWave64LaneLocal and mslNanTestElimination (v34).
     for (unsigned flags = 0; flags < 8u; ++flags) {
         ShaderRecompiler::RecompileRequest flagRequest{};
         flagRequest.target.float32DenormFlushNative = (flags & 1u) != 0u;
@@ -449,15 +449,15 @@ int main() {
             }
             Require(invalidRejected);
         }
-        auto version31 = bytes;
-        version31[4] = 31u;
-        version31.resize(tail + 1u);
-        const auto earlier = serializer.Deserialize(EncodeBase64(version31));
+        auto version33 = bytes;
+        version33[4] = 33u;
+        version33.resize(tail + 1u);
+        const auto earlier = serializer.Deserialize(EncodeBase64(version33));
         Require(earlier.request.target.float32DenormFlushNative == flagRequest.target.float32DenormFlushNative);
-        auto version30 = bytes;
-        version30[4] = 30u;
-        version30.resize(tail);
-        const auto upstream = serializer.Deserialize(EncodeBase64(version30));
+        auto version32 = bytes;
+        version32[4] = 32u;
+        version32.resize(tail);
+        const auto upstream = serializer.Deserialize(EncodeBase64(version32));
         Require(!upstream.request.target.float32DenormFlushNative);
     }
 
@@ -486,6 +486,11 @@ int main() {
             rejected = std::string_view(error.what()) == "RequestSerializer: truncated data";
         }
         Require(rejected);
+    }
+
+    for (const bool spanned : {false, true}) {
+        request.target.spannedWaves = spanned;
+        Require(serializer.Deserialize(serializer.Serialize(request)).request.target.spannedWaves == spanned);
     }
 
     return 0;

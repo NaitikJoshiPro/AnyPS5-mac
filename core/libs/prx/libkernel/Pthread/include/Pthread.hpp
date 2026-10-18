@@ -59,6 +59,7 @@ struct PthreadRwlockPrivate {
 
 struct PthreadCondattrPrivate {
     int _clockid;
+    int _pshared = 0;
 };
 
 struct PthreadCondPrivate {
@@ -144,6 +145,8 @@ struct PthreadPrivate {
     void* _retval;
     bool _detached;
     bool _adopted;
+    Pthread* _handleStorage;
+    std::atomic<bool> _joined;
     std::mutex _join_mtx;
     TimedWait::Condition _join_cv;
     std::atomic<bool> cancelPending{false};
@@ -165,5 +168,7 @@ void SetLiveGuestThreadsAffinity(KernelCpumask mask);
 KernelCpumask LiveGuestThreadsAffinity();
 bool GuestThreadIsLive(const PthreadPrivate* thread);
 bool LiveGuestThreadExists(std::int64_t tid);
+bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& mask);
+bool SetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask mask);
 
 #endif

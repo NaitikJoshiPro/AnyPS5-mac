@@ -41,6 +41,7 @@ static constexpr std::size_t FIBER_OPT_PARAM_SIZE = 0x80;
 static constexpr std::size_t FIBER_MIN_CONTEXT_SIZE = 512;
 static constexpr std::uint64_t FIBER_CONTEXT_FILL = 0xdeadbeefdeadbeefull;
 static constexpr std::size_t FIBER_HOST_STACK_MARGIN = 1u << 20;
+static constexpr std::size_t FIBER_GUEST_STACK_MIN = 64u << 10;
 
 using GuestFiberEntry = void (APS5_VABI*)(std::uint64_t argOnInitialize, std::uint64_t argOnRun);
 
@@ -187,6 +188,9 @@ Aps5FiberSwitchStack_nid_no_patch:
 Aps5FiberTrampoline_nid_no_patch:
     mov %r12, %rcx
     and $-16, %rsp
+    push $0
+    push $0
+    mov %rsp, %rbp
     sub $32, %rsp
     call Aps5FiberMain_nid_no_patch
     ud2
@@ -257,6 +261,9 @@ asm(".text\n"
     APS5_ASM_FUNCTION("Aps5FiberTrampoline_nid_no_patch") R"(
     mov %r12, %rdi
     and $-16, %rsp
+    push $0
+    push $0
+    mov %rsp, %rbp
     call )" APS5_ASM_SYMBOL("Aps5FiberMain_nid_no_patch") R"(
     ud2
 )" APS5_ASM_FUNCTION_END("Aps5FiberTrampoline_nid_no_patch"));
@@ -378,6 +385,7 @@ static std::uint64_t* ContextWords(const Fiber* fiber) {
 #ifdef _WIN32
 
 static StackBounds FiberBounds(const Fiber* fiber) {
+    if (!fiber->hostStack) return {fiber->context + fiber->contextSize, fiber->context, fiber->context};
     return {fiber->hostStack + fiber->hostStackBytes, fiber->hostStack + HostStackGuardBytes(), fiber->hostStack};
 }
 
@@ -578,7 +586,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     fiber->context = static_cast<std::uint8_t*>(addr_context);
     fiber->contextSize = size_context;
     std::strncpy(fiber->name, GuestArena::HostPointer(name), FIBER_MAX_NAME_LENGTH);
-    AllocateHostStack(fiber);
+    if (size_context < FIBER_GUEST_STACK_MIN) AllocateHostStack(fiber);
     fiber->contextSizeCheck = g_contextSizeCheck.load(std::memory_order_relaxed);
     if (fiber->contextSizeCheck) {
         auto* words = ContextWords(fiber);
