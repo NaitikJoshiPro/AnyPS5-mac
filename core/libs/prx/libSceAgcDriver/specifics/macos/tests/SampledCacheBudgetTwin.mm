@@ -11,10 +11,42 @@
 //   VK_EXT_memory_budget query answered with usage = the device's currently allocated size and a budget bounded by
 //   the working set, the system's free memory and OS memory pressure. The `memory` mode replaces the report with
 //   upstream's fixed one, as upstream does.
+// Upstream's recorderEvictionTests (resource-admission mode) reads the evicted storage image back with
+// vkCmdCopyImageToBuffer through Context::Function; here that call is D4's Metal::Vk::CmdCopyImageToBuffer (the
+// entry point the texture twins use for it), recorded into the active Metal recorder's command stream. The type
+// name is swapped for a twin-local callable only while the upstream file compiles, so no shared header changes.
 
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+
+// Declared as in ../src/MetalVulkanImages.h, which is included after the upstream file (it imports Foundation).
+namespace AgcDriver::Graphics::Metal::Vk {
+void CmdCopyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions);
+}
+
+namespace MetalSampledCacheTwin {
+
+struct CopyImageToBuffer {
+    void operator()(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkBuffer buffer, std::uint32_t count, const VkBufferImageCopy* regions) const {
+        AgcDriver::Graphics::Metal::Vk::CmdCopyImageToBuffer(commands, image, layout, buffer, count, regions);
+    }
+};
+
+}
+
+namespace AgcDriver::Graphics {
+
+template<>
+inline MetalSampledCacheTwin::CopyImageToBuffer Context::Function<MetalSampledCacheTwin::CopyImageToBuffer>(const char*) const {
+    return {};
+}
+
+}
+
+#define PFN_vkCmdCopyImageToBuffer MetalSampledCacheTwin::CopyImageToBuffer
 #define main AgcDriverSampledCacheBudgetVulkanMain
 #include "../../../tests/execution/SampledCacheBudget.cpp"
 #undef main
+#undef PFN_vkCmdCopyImageToBuffer
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -32,9 +64,10 @@ constexpr int Skipped = 77;
 id<MTLDevice> reportingDevice = nil;
 
 // The Metal test device as upstream's Device: GetContext() is the image cache's Context (detiler, placeholders,
-// sampler and texture caches). No recorder is active, as upstream's test has none: with one, the batch it records
-// keeps evicted storage images and rejected resources until it completes (MetalTextures.mm, ShaderResources.mm), as
-// on Vulkan, and the lifetime checks would see them alive; the image work runs in one-shot CommandBatches.
+// sampler and texture caches). No recorder is active outside upstream's recorderEvictionTests, as upstream's test has
+// none: with one, the batch it records keeps evicted storage images and rejected resources until it completes
+// (MetalTextures.mm, ShaderResources.mm), as on Vulkan, which is what recorderEvictionTests checks; the other image
+// work runs in one-shot CommandBatches.
 class Device {
 public:
     Device() : cache(test.device, test.queue) {
@@ -85,6 +118,7 @@ int main(int argc, char** argv) {
         if (memory) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             memoryTests(context);
+            storageMemoryTests(context);
             ClearCachedTextures(context.device);
             std::puts("sampled texture memory budget tests passed on Metal");
             return 0;

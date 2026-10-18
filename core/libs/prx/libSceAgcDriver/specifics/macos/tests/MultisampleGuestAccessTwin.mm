@@ -11,7 +11,8 @@
 // twin requires the sample count and does not look at nullDescriptor. Upstream sync 3 cases ported as written: a
 // 2D multisample T# (type 14) over the rendered target is sampled as a view of the target's texture (one Texture
 // per lookup, MultisampleSources, not reusable), mismatched sample count/width, an unrendered linear T# and storage
-// access are refused, and a remapped or removed allocation retires the target (a new view, a new sampled texture);
+// access are refused (upstream 5c42e97f47: storage access moves the target to a storable image when the device has
+// shaderStorageImageMultisample; the Metal device leaves Context::storageImageMultisample false, so it is refused), and a remapped or removed allocation retires the target (a new view, a new sampled texture);
 // clearTargets submits and waits before ClearMultisampleTargets. Expected values are upstream's.
 
 #include "RecorderTwinHarness.h"
@@ -102,6 +103,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     {
         std::lock_guard gpu(GpuMutex());
         Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "the multisampled target has no view");
+        Require(!MultisampleTargetStorable(context, target), "a multisampled target nothing stored to was created with storage usage");
         recorder.Submit();
         device.WaitQueue();
         recorder.Sync();
@@ -187,7 +189,31 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     refusedSample(ShaderRecompiler::DescriptorKind::SampledImage, multisampledWords(side, 3u, address), "as a 64x64 texture of 8 samples", "sampling a 4x target as an 8x texture");
     refusedSample(ShaderRecompiler::DescriptorKind::SampledImage, multisampledWords(side / 2u, 2u, address), "as a 32x64 texture of 4 samples", "sampling a 4x target as a narrower texture");
     refusedSample(ShaderRecompiler::DescriptorKind::SampledImage, multisampledWords(side, 2u, address + 4u * 65536u), "which no draw rendered to and whose tile mode 0 has no modeled multisampled color footprint", "sampling a linear multisampled texture no draw rendered to");
-    refusedSample(ShaderRecompiler::DescriptorKind::StorageImage, multisampledWords(side, 2u, address), "storage image access to a multisampled texture", "storage access to a multisampled texture");
+    if (context.storageImageMultisample) {
+        const auto stored = sampledProgram(ShaderRecompiler::DescriptorKind::StorageImage, multisampledWords(side, 2u, address));
+        const CompiledShader storedCompute{ShaderRecompiler::ShaderStage::Compute, &stored, 0};
+        std::lock_guard gpu(GpuMutex());
+        const auto rendered = MultisampleTargetView(context, target);
+        Require(!MultisampleTargetStorable(context, target), "sampling the multisampled target gave it storage usage");
+        ShaderResources resources(context, storedCompute);
+        Require(MultisampleTargetStorable(context, target) && MultisampleTargetView(context, target) != rendered, "a storage binding did not move the multisampled target to an image with storage usage");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    } else {
+        // Upstream's refusal comes from the MultisampleTarget storage path; the Metal ShaderResources twin refuses
+        // a multisampled storage view before it reaches the target (ShaderResources.mm), with its own message.
+        std::string message;
+        try {
+            const auto refusedProgram = sampledProgram(ShaderRecompiler::DescriptorKind::StorageImage, multisampledWords(side, 2u, address));
+            const CompiledShader refusedCompute{ShaderRecompiler::ShaderStage::Compute, &refusedProgram, 0};
+            std::lock_guard gpu(GpuMutex());
+            ShaderResources resources(context, refusedCompute);
+        } catch (const std::exception& error) {
+            message = error.what();
+        }
+        Require(message.find("as a storage image at its sample count") != std::string::npos || message.find("storage image access to a multisampled texture") != std::string::npos, "storage access to a multisampled target without shaderStorageImageMultisample did not throw: " + message);
+    }
     refused([&] { AgcDriver::GuestMemory::Read(address + 3u * 65536u + 256u, texels); }, "a CPU read", "a CPU read in the padding of a later sample plane");
     AgcDriver::GuestMemory::Read(address + 4u * 65536u, texels);
     clearTargets();

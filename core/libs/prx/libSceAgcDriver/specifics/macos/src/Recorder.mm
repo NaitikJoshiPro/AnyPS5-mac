@@ -10,6 +10,7 @@
 // by the MSL twins of the SampleCounter/SampleDumps kernels (RecorderKernels.h).
 #include "MetalCommandStream.h"
 #include "MetalVmTrace.h"
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
@@ -4009,7 +4010,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             try {
                 action();
             } catch (const std::exception& error) {
-                std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
+                AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
     }

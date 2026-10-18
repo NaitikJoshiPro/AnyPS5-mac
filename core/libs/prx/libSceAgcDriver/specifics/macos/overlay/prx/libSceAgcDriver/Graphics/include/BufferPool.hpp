@@ -48,8 +48,12 @@ class BufferPool {
 public:
     explicit BufferPool(const Context& context);
     // The device tier's budget: an eighth of the largest device-local heap, at least 512 MiB
-    // (APS5_STAGING_POOL_MIB overrides). On Metal the heap is the device's recommended working set.
-    static VkDeviceSize DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory);
+    // (APS5_STAGING_POOL_MIB overrides), limited by the heap's `reported` budget when it has one. On
+    // Metal the heap is the device's recommended working set.
+    static VkDeviceSize DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported = nullptr);
+    // The bytes the texture caches are asked to release (Context::cacheReclaim) when an allocation of
+    // `bytes` fails after trimming the pool.
+    static VkDeviceSize ReclaimTarget(VkDeviceSize bytes);
     ~BufferPool();
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
@@ -59,8 +63,9 @@ public:
     // Upstream's slab block size for a size class (Vulkan slabs; Metal pools whole buffers). Kept for the shared
     // tests' expectations.
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
-    // A new allocation of `capacity` bytes (resident). Retained allocations are trimmed and the
-    // allocation retried once when Metal refuses it.
+    // A new allocation of `capacity` bytes (resident). When Metal refuses it, retained allocations are
+    // trimmed and the allocation retried, then the texture caches are released (Context::cacheReclaim)
+    // and it is retried again.
     BufferAllocation Allocate(std::size_t capacity, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
@@ -111,6 +116,7 @@ private:
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
     static std::size_t MaxSlots();
     std::size_t maxSlots;
+    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes);
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
     Tier smallTier;

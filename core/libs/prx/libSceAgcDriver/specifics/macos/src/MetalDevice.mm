@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -732,6 +733,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             if (![state->device supportsFamily:MTLGPUFamilyMetal4] || ![state->device supportsFamily:MTLGPUFamilyApple7]) throw std::runtime_error("Metal device: the GPU lacks the Metal 4 / Apple7 feature set this driver needs");
             NSError* error = nil;
             state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
+            state->computePipelinesAtStart = Graphics::Metal::ComputePipelineCreationCounts().created;
             state->compiler = state->pipelines->Compiler();
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
             // ImageGatherExtended + nonConstantImageOffsets (Target()): MSL's sample/gather take a
@@ -821,6 +823,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
             Graphics::Metal::DescribeMemory(context, state->device);
+            // Upstream 8cda58273: an allocation the heap refuses releases the texture caches and retries.
+            context.cacheReclaim = Graphics::ReleaseTextureCaches;
             context.bufferPool = std::make_shared<Graphics::BufferPool>(context);
             state->recorder = std::make_unique<Graphics::Recorder>(context, true);
             context.recorder = state->recorder.get();
@@ -854,6 +858,33 @@ VulkanDevice::~VulkanDevice() {
 
 ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePipelineCapture&, std::span<const std::byte>) {
     Unimplemented("ReplayComputePipeline (Vulkan pipeline captures)", "work package D1");
+}
+
+// Upstream 4aafda8e3 journals the compute pipelines of a run (Graphics/PipelineJournal) and builds
+// them ahead on the next run's device. The Metal device keeps that job in its pipeline cache: the
+// MTL4Archive persists every compiled pipeline and the prewarm thread recompiles the stored
+// libraries at startup (PipelineCache.mm), so no journal replay starts here. The hook still builds
+// a compute result through the cache (false when the cache already held the pipeline: no guest
+// pipeline was created by this call; a concurrent build on another thread may blur that answer).
+bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool) {
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    if (state->pipelines == nullptr || shader.msl.empty() || shader.msl.Reflection().stage != Abi::Stage::Kernel) return false;
+    const auto before = Graphics::Metal::ComputePipelineCreationCounts().created;
+    state->pipelines->Compute(shader);
+    return Graphics::Metal::ComputePipelineCreationCounts().created != before;
+}
+
+void VulkanDevice::startJournalReplay() {
+}
+
+void VulkanDevice::WaitForPipelineJournalReplay() {
+    startJournalReplay();
+}
+
+// Guest compute pipelines the pipeline cache built since this device's cache was created (the count
+// is process-wide: two live devices building at once share it; tests run one device at a time).
+std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
+    return Graphics::Metal::ComputePipelineCreationCounts().created - state->computePipelinesAtStart;
 }
 
 std::string VulkanDevice::DeviceName() const {
@@ -969,6 +1000,21 @@ ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t) const {
     return Target();
 }
 
+// Upstream 7a6cc7178 (VK_EXT_subgroup_size_control computeFullSubgroups) spans a wave64 program over
+// two full 32-lane subgroups (SpirvTarget::spannedWaves, opt-in). Metal guarantees no full SIMD
+// groups for a dispatch, and the MSL backend runs wave64 its own way (two halves or lane-local,
+// DECISIONS D62), so the Metal device reports no full-subgroup guarantee.
+bool VulkanDevice::ComputeFullSubgroups() const {
+    return false;
+}
+
+// Upstream 03f4f6718e bounds the barycentric tessellation emulation by the fragment input limit.
+// Metal Feature Set Tables: 124 scalar fragment inputs on Apple GPUs (the bound Target() uses for
+// mesh and tessellation varyings).
+std::uint32_t VulkanDevice::MaxFragmentInputComponents() const {
+    return 124u;
+}
+
 VkDevice VulkanDevice::Device() const {
     return state->context.device;
 }
@@ -1009,6 +1055,8 @@ void VulkanDevice::WaitIdle() {
 
 void VulkanDevice::PrepareForReplacement() {
     GuestMemory::AssertGpuLockHeld("VulkanDevice::PrepareForReplacement");
+    // Upstream 81e3db853: library prebuilds still queued name this device; they finish first.
+    DriverDetail::AwaitLibraryPrebuilds();
     WaitIdle();
 }
 
@@ -1292,6 +1340,18 @@ VulkanDevice::ComputePipelineCreation VulkanDevice::ComputePipelineCounts() {
     return {counts.created, counts.underGpuMutex};
 }
 
+// Upstream 89d255c5f (dispatch moves) and 2a15be09c (DCC key pre-syncs) work on the Vulkan
+// device's compute templates and its stage-A pre-sync. The Metal device prepares no resources in
+// PrepareDispatch and binds every dispatch's buffers by address at the record, so it neither moves
+// template buffers nor pre-syncs: the counts stay zero.
+VulkanDevice::DispatchMoveCount VulkanDevice::DispatchMoveCounts() {
+    return {};
+}
+
+VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
+    return {};
+}
+
 std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::uint64_t) {
     // As upstream: an incompatible runtime ABI is refused before anything is prepared.
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
@@ -1390,14 +1450,16 @@ namespace {
 // Upstream d9e47d1e9's image table binds at RuntimeAbi::ImageTableBinding (StageCount x
 // Binding::Count, past every stage group): `binding % Count` would read it as group StageCount's
 // first binding, so it is named here (MslAbi Version 15 gives every stage function its own entry).
+// Upstream 603dc01db put the image storage table at that binding and moved the image table one past.
 ShaderRecompiler::RuntimeAbi::Binding TableKind(std::uint32_t binding) {
     if (binding == ShaderRecompiler::RuntimeAbi::ImageTableBinding) return ShaderRecompiler::RuntimeAbi::Binding::ImageTable;
+    if (binding == ShaderRecompiler::RuntimeAbi::ImageStorageTableBinding) return ShaderRecompiler::RuntimeAbi::Binding::ImageStorageTable;
     if (binding > ShaderRecompiler::RuntimeAbi::ImageTableBinding) throw std::runtime_error("Metal device: RuntimeAbi binding " + std::to_string(binding) + " lies past the image table binding");
     return static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
 }
 
 bool TableRole(ShaderRecompiler::DescriptorRole role) {
-    return role == ShaderRecompiler::DescriptorRole::ImageTable || role == ShaderRecompiler::DescriptorRole::SamplerTable || role == ShaderRecompiler::DescriptorRole::ImageTableMap;
+    return role == ShaderRecompiler::DescriptorRole::ImageTable || role == ShaderRecompiler::DescriptorRole::ImageStorageTable || role == ShaderRecompiler::DescriptorRole::SamplerTable || role == ShaderRecompiler::DescriptorRole::ImageTableMap;
 }
 }
 
@@ -1556,6 +1618,7 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
         case ShaderRecompiler::DescriptorRole::GuestImages:
         case ShaderRecompiler::DescriptorRole::GuestSamplers:
         case ShaderRecompiler::DescriptorRole::ImageTable:
+        case ShaderRecompiler::DescriptorRole::ImageStorageTable:
         case ShaderRecompiler::DescriptorRole::SamplerTable:
         case ShaderRecompiler::DescriptorRole::ImageTableMap:
             break;

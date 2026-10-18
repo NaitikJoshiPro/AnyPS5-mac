@@ -135,6 +135,27 @@ namespace ShaderRecompiler::MslAbi {
 //   front end's cubeFaceCompatible runtime mode Dim2DArray + cube) reads face 0: the missing face
 //   coordinate is 0 instead of a "too few coordinate components" failure. Direct 2D images whose
 //   accesses allow it gain that mode in their ImageBase selector switch.
+// - image tables carry stores (upstream 603dc01db, RuntimeAbi 14 ImageStorageTable): a written,
+//   non-atomic table image reads and writes through the ImageStorageTable range, ImageStorageTableSlots
+//   Aps5TableArray entries (struct Aps5ImageStorageTable, member k<b> typed as storage heap binding
+//   b = FirstStorageImageBinding + slot, texture<T, access::read_write>; the multisampled and atomic
+//   slots are Aps5Buffer placeholders). The driver writes the array of storage-view MTLResourceIDs
+//   of the table's elements (same element indices as the ImageTable array) to every slot and marks
+//   every bound element written. Atomic, packed, BY2/BY4, multisampled and dynamic-mip table stores
+//   are not emitted (the front end poisons them, or emission fails).
+// - fragment: ColorExportPacking::Float11_11_10 (upstream 49b0e805f): an 11_11_10 float target is
+//   a 32-bit uint attachment, the export packed into its red channel as the 10_11_11 UNORM one.
+// - mesh: a program whose ShaderMeshInputInfo::outputPrimitiveSize is 2 (upstream a0347cfed, NGG
+//   line-strip output) sets PrimitiveVerticesMacro to 2 in its own source, whatever the driver passes.
+// - images: D16 stores to SINT storage images (upstream a18d6e9a6) convert each half as the D16 format
+//   buffer stores do (sign-extended, then saturated); an unnormalized base-level sample folds its texel
+//   offset into the coordinate (upstream 7c19c66de).
+// - wave: a v_readlane_b32 at a row's last lane (15, 31) of a DPP row scan in a wave32 graphics
+//   program becomes a SIMD reduction over the active invocations of that row (upstream 859dcae2a).
+// - images: a sampled (not storage, not packed) format-43 T# (10_11_11 float, upstream 571fecadd)
+//   has no conversionFormat and the Float numeric class: the function samples the driver's repacked
+//   RG11B10Float view (channel order fixed by the view's BGRA swizzle) as a plain float texture,
+//   then applies the T# dst_sel as for any texture. Storage and packed accesses keep the conversion.
 inline constexpr std::uint32_t Version = 18u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
@@ -214,6 +235,9 @@ enum class EntryKind : std::uint32_t {
 // Version 18: the ImageTable range holds one Aps5TableArray entry per sampled heap binding
 // (FirstImageBinding .. FirstStorageImageBinding - 1), all pointing at the same texture array.
 inline constexpr std::uint32_t ImageTableSlots = RuntimeAbi::FirstStorageImageBinding - RuntimeAbi::FirstImageBinding;
+// Version 18: the ImageStorageTable range holds one Aps5TableArray entry per storage heap binding
+// (FirstStorageImageBinding .. Samplers - 1), all pointing at the same storage texture array.
+inline constexpr std::uint32_t ImageStorageTableSlots = static_cast<std::uint32_t>(RuntimeAbi::Binding::Samplers) - RuntimeAbi::FirstStorageImageBinding;
 
 // The entry kind of a RuntimeAbi binding (its number within a stage group).
 // RuntimeAbi 12 (upstream d9e47d1e9) adds the runtime-indexed tables: SamplerTable, ImageTableMap and
@@ -221,7 +245,7 @@ inline constexpr std::uint32_t ImageTableSlots = RuntimeAbi::FirstStorageImageBi
 // all three are buffer entries (Version 15): the map's words, and arrays of MTLResourceIDs.
 inline EntryKind KindOf(RuntimeAbi::Binding binding) {
     const auto value = static_cast<std::uint32_t>(binding);
-    if (binding == RuntimeAbi::Binding::ImageTable) return EntryKind::Buffer;
+    if (binding == RuntimeAbi::Binding::ImageTable || binding == RuntimeAbi::Binding::ImageStorageTable) return EntryKind::Buffer;
     if (value >= static_cast<std::uint32_t>(RuntimeAbi::Binding::Count)) throw std::runtime_error("MslAbi: invalid RuntimeAbi binding " + std::to_string(value));
     if (binding == RuntimeAbi::Binding::SamplerTable || binding == RuntimeAbi::Binding::ImageTableMap) return EntryKind::Buffer;
     if (binding == RuntimeAbi::Binding::Samplers) return EntryKind::Sampler;

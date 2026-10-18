@@ -23,3 +23,15 @@ agc_driver_draw_cache_reuse_verify | SKIP_RETURN_CODE=77 | metal-graphics-pipeli
 agc_driver_draw_cache_reuse_inline | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_host_import_sparse | udmabuf imports are Linux only | metal-linux-udmabuf
 agc_driver_sparse_dma_buf_import | udmabuf imports are Linux only | metal-linux-udmabuf
+agc_pipeline_journal | the Metal device keeps no pipeline journal | metal-pipeline-journal
+agc_pipeline_library_clear_waits_for_build | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
+agc_pipeline_store_lazy_buffer_pool | the device has no Vulkan pipeline store | metal-vulkan-internal-tests
+agc_draw_descriptors | the device writes no Vulkan descriptor sets | metal-vulkan-internal-tests
+agc_driver_dcc_key_presync | no stage-A dispatch preparation | metal-dispatch-templates
+agc_driver_resource_cache_growth | buffer-only dispatches never enter the resource cache | metal-dispatch-templates
+agc_driver_dispatch_move | SKIP_RETURN_CODE=77 | metal-dispatch-templates
+agc_driver_dispatch_move_depth | SKIP_RETURN_CODE=77 | metal-dispatch-templates
+agc_driver_pipeline_journal | the pipeline journal is Vulkan-only | metal-pipeline-journal
+agc_driver_draw_cache_relocation | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_command_batch_failure | the device has no Vulkan command batches | metal-vulkan-internal-tests
+agc_descriptor_cache_failure | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests

@@ -7,6 +7,14 @@
 // to a memory type on the host heap and skips the device tier on release. Apple GPUs have unified memory: one heap
 // (recommendedMaxWorkingSetSize, BufferPool.mm), private and shared storage both live in it, so there is no other
 // heap to place into and nothing for the case to observe.
+// Upstream 5d9dcc42d2..0d078f75d3 cases: SmallDeviceRetention (27ded2c4d: small device buffers stay in the small
+// tier unless APS5_BUFFER_POOL_SHARED, also run alone as --small-device-retention under the environments of
+// agc_buffer_pool_small_device_shared / _no_staging) and CacheReclaimRecovery (8cda58273: after the trim, the
+// texture caches are asked once for the request plus its reserve, and only a release that freed bytes is retried)
+// are ported; Metal cannot be made to refuse an allocation on demand, so the refusal is a buffer over the device's
+// maxBufferLength. SlabMetadataFailure, SlabMapFailure (a4485bd82: slabs) and DeviceBindingFailures (432fe5cf9:
+// vkBindBufferMemory) have no Metal counterpart: the pool has no slabs and a Metal buffer is created with its memory
+// in one call, so there is no separate mapping or binding to fail.
 
 #include "MetalTestDevice.h"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -179,6 +187,105 @@ void SmallDeviceClasses(const Context& device) {
     Expect(nextArgs.Handle() == tiny && GetBufferPool(context)->Counts().made == made, "a 20-byte device request did not reuse the retained 256-byte buffer of its class");
 }
 
+// Upstream 27ded2c4d: churning large device buffers through the device tier's budget keeps a retained small device
+// buffer (it lives in the small tier), unless APS5_BUFFER_POOL_SHARED puts every device buffer in one tier. The
+// budget is the pool's own (APS5_STAGING_POOL_MIB; 0 disables the device tier, and the large tier's 512 MiB evicts).
+void SmallDeviceRetention(const Context& device) {
+    const auto context = Fresh(device);
+    const auto pool = GetBufferPool(context);
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const auto deviceBudget = pool->Counts().device.budget;
+    const auto bytes = static_cast<std::size_t>((deviceBudget != 0 ? deviceBudget : 512 * MiB) / 2) + MiB;
+    VkBuffer small = VK_NULL_HANDLE;
+    {
+        DeviceBuffer buffer(context, 256, usage);
+        small = buffer.Handle();
+    }
+    const auto destroyed = pool->Counts().destroyed;
+    {
+        std::vector<std::unique_ptr<DeviceBuffer>> large;
+        for (int i = 0; i < 2; ++i) large.push_back(std::make_unique<DeviceBuffer>(context, bytes, usage));
+    }
+    Expect(pool->Counts().destroyed != destroyed, "large device buffers did not exercise pool budget eviction");
+    const auto made = pool->Counts().made;
+    const bool isolated = std::getenv("APS5_BUFFER_POOL_SHARED") == nullptr;
+    DeviceBuffer again(context, 256, usage);
+    // A destroyed buffer's handle may be reused by the next allocation, so the shared case is judged by the count.
+    if (isolated) Expect(again.Handle() == small, "small device buffer retention did not follow the separate pool budget");
+    Expect(pool->Counts().made == made + (isolated ? 0 : 1), "large device buffer churn changed small buffer allocation reuse");
+    const auto counts = pool->Counts();
+    Expect(counts.resident == counts.made - counts.destroyed, "device pool tier retention left " + std::to_string(counts.resident) + " allocations resident, not the " + std::to_string(counts.made - counts.destroyed) + " alive or retained");
+}
+
+struct ReclaimProbe {
+    std::uint64_t requests = 0;
+    VkDeviceSize asked = 0;
+    VkDeviceSize released = 0;
+};
+
+ReclaimProbe reclaimProbe;
+
+VkDeviceSize ProbeCacheReclaim(VkDeviceSize bytes) {
+    ++reclaimProbe.requests;
+    reclaimProbe.asked = bytes;
+    return reclaimProbe.released;
+}
+
+// Upstream 8cda58273 (Context::cacheReclaim, 0f1564cc2): an allocation the trim did not satisfy asks the texture
+// caches once for ReclaimTarget of its size and is retried only when they released something; the failure reports
+// both the trimmed and the released bytes. Metal refuses a buffer longer than maxBufferLength, so that request fails
+// every attempt and the attempt count shows the retries.
+void CacheReclaimRecovery(const Context& device, std::uint64_t maxBufferLength) {
+    Expect(BufferPool::ReclaimTarget(4 * MiB) == 260 * MiB, "a 4 MiB request does not ask the caches for 256 MiB on top of itself");
+    Expect(BufferPool::ReclaimTarget(512 * MiB) == 1024 * MiB, "a 512 MiB request does not ask the caches for twice its size");
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const auto refused = static_cast<std::size_t>(maxBufferLength) + MiB;
+    const auto target = BufferPool::ReclaimTarget(BufferPool::Capacity(refused, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+    const auto withReclaim = [&] {
+        Context context = device;
+        context.cacheReclaim = ProbeCacheReclaim;
+        context.bufferPool = std::make_shared<BufferPool>(context);
+        return context;
+    };
+    const auto attempt = [&](const Context& context) {
+        try {
+            DeviceBuffer buffer(context, refused, usage);
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto contains = [](const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; };
+    {
+        reclaimProbe = {};
+        reclaimProbe.released = 10 * MiB;
+        const auto context = withReclaim();
+        { DeviceBuffer idle(context, 2 * MiB, usage); }
+        const auto before = GetBufferPool(context)->Counts();
+        const auto failure = attempt(context);
+        const auto after = GetBufferPool(context)->Counts();
+        Expect(!failure.empty(), "Metal allocated a buffer over maxBufferLength");
+        Expect(after.destroyed == before.destroyed + 1 && after.device.slots == 0, "the trim before the cache release did not free the retained buffer");
+        Expect(reclaimProbe.requests == 1 && reclaimProbe.asked == target, "the caches were not asked once for the request plus its reserve (" + std::to_string(reclaimProbe.requests) + " requests, last for " + std::to_string(reclaimProbe.asked) + " bytes)");
+        Expect(contains(failure, "released " + std::to_string(10 * MiB) + " cache bytes") && contains(failure, "attempts 3"), "an allocation the pool's own slots could not satisfy did not retry once after the trim and once after the cache release: " + failure);
+    }
+    {
+        reclaimProbe = {};
+        reclaimProbe.released = 10 * MiB;
+        const auto context = withReclaim();
+        const auto failure = attempt(context);
+        Expect(reclaimProbe.requests == 1 && contains(failure, "reclaimed 0 bytes") && contains(failure, "attempts 2"), "an empty pool did not go straight to the cache release and retry once: " + failure);
+    }
+    {
+        reclaimProbe = {};
+        const auto context = withReclaim();
+        const auto failure = attempt(context);
+        Expect(reclaimProbe.requests == 1 && contains(failure, "released 0 cache bytes") && contains(failure, "attempts 1"), "a cache release that freed nothing was retried after, or the failure lost the released bytes: " + failure);
+        DeviceBuffer later(context, 2 * MiB, usage);
+        Expect(later.Handle() != VK_NULL_HANDLE && reclaimProbe.requests == 1, "an allocation after the refused one asked the caches for memory");
+    }
+}
+
 // Metal: pooled buffers are resident on the queue (a GPU copy into them lands), and every
 // allocation alive or retained is in the pool's residency set.
 void ResidentForTheGpu(const Context& device) {
@@ -208,18 +315,32 @@ void ResidentForTheGpu(const Context& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // --small-device-retention runs that case alone under the environment ctest gives it (upstream's
+    // agc_buffer_pool_small_device_shared and _no_staging).
+    const bool retentionOnly = argc == 2 && std::string(argv[1]) == "--small-device-retention";
     // The device tier's budget for Budget(); read once, before the pool exists.
-    setenv("APS5_STAGING_POOL_MIB", "64", 1);
+    if (!retentionOnly) setenv("APS5_STAGING_POOL_MIB", "64", 1);
     @autoreleasepool {
         MetalTest::Device device;
         try {
+            if (retentionOnly) {
+                SmallDeviceRetention(device.context);
+                if (failures != 0) {
+                    std::fprintf(stderr, "%d small device retention checks failed\n", failures);
+                    return 1;
+                }
+                std::printf("small device retention tests passed\n");
+                return 0;
+            }
             SizeClassesAndDirections(device.context);
             LargerClass(device.context);
             KeptUntilRelease(device.context);
+            SmallDeviceRetention(device.context);
             Budget(device.context);
             AddressAndHostUnchanged(device.context);
             SmallDeviceClasses(device.context);
+            CacheReclaimRecovery(device.context, static_cast<std::uint64_t>(device.device.maxBufferLength));
             ResidentForTheGpu(device.context);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "%s\n", error.what());

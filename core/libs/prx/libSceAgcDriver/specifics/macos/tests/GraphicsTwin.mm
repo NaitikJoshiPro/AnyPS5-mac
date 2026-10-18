@@ -20,9 +20,13 @@
 // and --sampler-table-{lod-bias,anisotropy,reduction-compare} skip: they check Vulkan descriptor-set allocation and
 // vkCreateSampler on MockVulkan, while Metal's image and sampler tables are MslAbi v15 arrays of MTLResourceIDs
 // (exercised by the upstream ImageTable* execution tests); --unused-stencil-reference runs upstream's
-// stencilReferenceUnusedTests as it is (State decoding only). Of upstream's 109 checks (the 107 of Checks() plus
-// RunBdaResourceTests and RunTextureDetilerTests), 95 run on Metal, 5 of them through Metal twins; 14 are listed in
-// VulkanOnly.
+// stencilReferenceUnusedTests as it is (State decoding only); --multisample-dcc-state (agc_driver_msaa_dcc_state)
+// runs upstream's multisampleDccStateTests as it is (State decoding and the draw precheck); --descriptor-cache
+// (agc_descriptor_cache) runs the Metal twin of descriptorCacheTests; --pipeline-journal (agc_pipeline_journal),
+// --pipeline-library-clear-waits-for-build and --pipeline-store-lazy-buffer-pool skip as Vulkan-only (the VkPipeline
+// journal, library part builds and store of Graphics/src/Pipeline*.cpp, which the Metal draw path does not use).
+// Of upstream's 119 checks (the 117 of Checks() plus RunBdaResourceTests and RunTextureDetilerTests), 103 run on
+// Metal, 6 of them through Metal twins; 16 are listed in VulkanOnly.
 
 #define main AgcDriverGraphicsVulkanMain
 #include "../../../tests/Graphics.cpp"
@@ -104,8 +108,10 @@ std::vector<Check> Checks() {
         {"RunGuestLeaseWaitTests", RunGuestLeaseWaitTests},
         {"ResourceContentKeyTests", [] { ResourceContentKeyTests(false); }},
         {"stateTests", stateTests},
+        {"pipelineStoreLazyBufferPoolTests", pipelineStoreLazyBufferPoolTests},
         {"retainedPixelStageTests", retainedPixelStageTests},
         {"pipelineLibrarySetTests", pipelineLibrarySetTests},
+        {"pipelineLibraryClearWaitsForBuildTests", pipelineLibraryClearWaitsForBuildTests},
         {"hdrComponentSwapTests", hdrComponentSwapTests},
         {"depthMaintenanceTests", depthMaintenanceTests},
         {"hardwareScreenOffsetTests", hardwareScreenOffsetTests},
@@ -117,6 +123,7 @@ std::vector<Check> Checks() {
         {"memoryValueFillTests", memoryValueFillTests},
         {"ZExportTests", ZExportTests},
         {"unorm10_11_11TargetTests", unorm10_11_11TargetTests},
+        {"float11_11_10TargetTests", float11_11_10TargetTests},
         {"DepthBoundsBiasTests", DepthBoundsBiasTests},
         {"conservativeZExportTests", conservativeZExportTests},
         {"earlyFragmentTestsTests", earlyFragmentTestsTests},
@@ -130,8 +137,10 @@ std::vector<Check> Checks() {
         {"ConservativeRasterizationTests", ConservativeRasterizationTests},
         {"DisabledColorTests", DisabledColorTests},
         {"OpaqueDestinationAlphaTests", OpaqueDestinationAlphaTests},
+        {"Color565TargetTests", Color565TargetTests},
         {"Color1555TargetTests", Color1555TargetTests},
         {"BlendBypassTests", BlendBypassTests},
+        {"UnclampedNormalizedColorTests", UnclampedNormalizedColorTests},
         {"CompactedExportTests", CompactedExportTests},
         {"ReversedComponentOrderTests", ReversedComponentOrderTests},
         {"ReversedComponentOrderBlendTests", ReversedComponentOrderBlendTests},
@@ -145,13 +154,16 @@ std::vector<Check> Checks() {
         {"uint8x4TargetTests", uint8x4TargetTests},
         {"multisampleTests", multisampleTests},
         {"MsaaEnableSingleSampleTests", MsaaEnableSingleSampleTests},
+        {"multisampledDepthTests", multisampledDepthTests},
         {"clipDistanceTests", clipDistanceTests},
         {"framebufferLayerTests", framebufferLayerTests},
         {"UnwrittenSampleLocationTests", UnwrittenSampleLocationTests},
+        {"depthCopyFormatTests", depthCopyFormatTests},
         {"quadPixelMaskTests", quadPixelMaskTests},
         {"ShaderStageTests", ShaderStageTests},
         {"NggVertexWorkgroupTests", NggVertexWorkgroupTests},
         {"inactiveVertexPointSizeTests", inactiveVertexPointSizeTests},
+        {"PolygonPrimitiveTests", PolygonPrimitiveTests},
         {"TuningFieldTests", TuningFieldTests},
         {"PixelInputLayoutTests", PixelInputLayoutTests},
         {"UnexportedPixelInputTests", UnexportedPixelInputTests},
@@ -166,7 +178,9 @@ std::vector<Check> Checks() {
         {"pushConstantTests", pushConstantTests},
         {"resourceTests", resourceTests},
         {"oversizedDescriptorTests", oversizedDescriptorTests},
+        {"guestBufferViewBytesTests", guestBufferViewBytesTests},
         {"descriptorSnapshotTests", descriptorSnapshotTests},
+        {"dispatchMoveTests", dispatchMoveTests},
         {"descriptorCacheTests", descriptorCacheTests},
         {"bufferBudgetPlacementTests", bufferBudgetPlacementTests},
         {"imageTableAllocationTests", imageTableAllocationTests},
@@ -244,7 +258,10 @@ void MetalDescriptorPoolTests() {
 }
 
 // descriptorCacheTests on Metal: sets above the chain pool's capacity get a dedicated pool of their own, freed with
-// the set; the device's per-set limits and the supported descriptor types are enforced as upstream.
+// the set; the device's per-set limits and the supported descriptor types are enforced as upstream. Upstream's
+// lavapipe case (0627bc6bd: chain pools created with FREE_DESCRIPTOR_SET under individuallyFreeDescriptorSets, one
+// vkFreeDescriptorSets per freed set, the pool reset with its last set) checks MockVulkan's pool records only; Metal
+// pools are tokens with nothing to free, and the chain pool reuse it ends with is checked by MetalDescriptorPoolTests.
 void MetalDescriptorCacheTests() {
     auto context = mockContext();
     context.limits.maxDescriptorSetStorageBuffers = 8192;
@@ -507,6 +524,155 @@ void MetalOversizedDescriptorTests() {
     ::operator delete(block, std::align_val_t{blockBytes});
 }
 
+// dispatchMoveTests on Metal (upstream 89d255c5f, a58a70911): ShaderResources::MovedDispatchBuffers (ShaderResources.mm)
+// lists the read-only guest buffers of a compute dispatch that moved since its template was built and refuses the
+// moves it cannot serve, with upstream's checks and expected values. Upstream builds on MockVulkan's Context; the
+// twin builds on the Metal device's Context with mockContext's 16 KiB range limit (the limit cases depend on it),
+// a Metal recorder for the pending-write checks, and the registered block behind Metal host imports.
+void MetalDispatchMoveTests() {
+    using AgcDriver::Graphics::CompiledShader;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    using Refusal = ShaderResources::MoveRefusal;
+    constexpr std::size_t blockBytes = 65536;
+    MetalGraphicsDevice device;
+    const auto& context = device.Attach([](AgcDriver::Graphics::Context& context) {
+        context.hostImportAlignment = blockBytes;
+        context.limits.maxStorageBufferRange = 16384;
+    });
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult built;
+        built.runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+        auto inputs = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        inputs.bufferWritten = {false, false};
+        built.bindings.push_back(inputs);
+        auto output = makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8));
+        output.bufferWritten = {true};
+        built.bindings.push_back(output);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &built, 0};
+        ShaderResources resources(context, shader);
+        const auto moveTo = [&](std::size_t element, const void* where, std::uint32_t bytes) {
+            auto program = built;
+            const auto words = vsharp(where, bytes);
+            std::copy(words.begin(), words.end(), program.bindings[0].guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4);
+            return program;
+        };
+        const auto prove = [&](const ShaderRecompiler::RecompileResult& program, std::size_t maxBytes, ShaderResources::MoveProof& proof) {
+            return resources.MovedDispatchBuffers(CompiledShader{ShaderRecompiler::ShaderStage::Compute, &program, 0}, &recorder, maxBytes, proof);
+        };
+        const auto refuses = [&](const ShaderRecompiler::RecompileResult& program, std::size_t maxBytes, Refusal why, const char* what) {
+            ShaderResources::MoveProof refusal;
+            const auto listed = prove(program, maxBytes, refusal);
+            Require(!listed.has_value() && refusal.refusal == why, what);
+        };
+
+        ShaderResources::MoveProof proof;
+        auto moved = prove(built, 0, proof);
+        Require(moved.has_value() && moved->empty() && proof.refusal == Refusal::None && proof.buffers == 0, "a dispatch with every buffer where it was built moved something");
+
+        const auto relocated = moveTo(1, guestMovedSecond.data(), 24);
+        const CompiledShader relocatedShader{ShaderRecompiler::ShaderStage::Compute, &relocated, 0};
+        Require(ShaderResources::ContentKey(shader, false, true) == ShaderResources::ContentKey(relocatedShader, false, true), "moving a read-only buffer changed the movable content key");
+        Require(ShaderResources::ContentKey(shader, false, false) != ShaderResources::ContentKey(relocatedShader, false, false), "the fixed content key ignored a moved buffer");
+
+        moved = prove(relocated, 0, proof);
+        Require(moved.has_value() && moved->size() == 1 && proof.refusal == Refusal::None && proof.buffers == 1 && proof.bytes >= 24, "a moved read-only buffer was not listed");
+        Require(moved->front().address == reinterpret_cast<std::uintptr_t>(guestMovedSecond.data()) && moved->front().size == 24 && moved->front().words.empty(), "the listed buffer is not the moved range");
+
+        moved = prove(moveTo(0, guestFirst.data(), 8), 0, proof);
+        Require(moved.has_value() && moved->size() == 1 && moved->front().address == reinterpret_cast<std::uintptr_t>(guestFirst.data()) && moved->front().size == 8, "a buffer that only changed its size was not listed");
+
+        auto both = relocated;
+        const auto firstWords = vsharp(guestMovedFirst.data(), 12);
+        std::copy(firstWords.begin(), firstWords.end(), both.bindings[0].guestDescriptor.begin());
+        moved = prove(both, 1024, proof);
+        Require(moved.has_value() && moved->size() == 2 && proof.buffers == 2 && proof.bytes >= 36, "two moved buffers were not both listed");
+        refuses(both, 30, Refusal::Limit, "moved buffers past the byte budget together were served");
+
+        auto written = relocated;
+        written.bindings[0].bufferWritten[1] = true;
+        refuses(written, 0, Refusal::Written, "a moved buffer the dispatch writes was served");
+        refuses(moveTo(1, guestMovedSecond.data(), 20000), 0, Refusal::Written, "a moved buffer over the storage buffer range that no registered allocation holds was served");
+        refuses(relocated, 16, Refusal::Limit, "a moved buffer over the byte budget was served");
+        refuses(moveTo(1, reinterpret_cast<const void*>(std::uintptr_t{0x10}), 24), 0, Refusal::Inaccessible, "a moved buffer over unmapped memory was served");
+        refuses(moveTo(1, guestThird.data(), 8), 0, Refusal::Overlap, "a moved buffer over the dispatch's own written range was served");
+        auto shaped = relocated;
+        shaped.bindings[0].guestDescriptor.resize(4);
+        refuses(shaped, 0, Refusal::Shape, "a dispatch with another binding shape was served");
+        recorder.Sync();
+    }
+    {
+        void* block = ::operator new(blockBytes, std::align_val_t{blockBytes});
+        std::memset(block, 0x5a, blockBytes);
+        {
+            auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+            GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, blockBytes, true, true, true);
+            GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        }
+        const auto* end = static_cast<const std::byte*>(block) + blockBytes;
+        const auto strided = [](const void* pointer, std::uint32_t stride, std::uint32_t records) {
+            auto words = vsharp(pointer, records);
+            words[1] |= stride << 16u;
+            return words;
+        };
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(context);
+            const auto proveAgainst = [&](const ShaderRecompiler::RecompileResult& built, const std::vector<std::uint32_t>& incoming, ShaderResources::MoveProof& proof, std::optional<std::vector<ShaderResources::MovedBuffer>>& moved) {
+                const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &built, 0};
+                ShaderResources resources(context, shader);
+                auto program = built;
+                program.bindings[0].guestDescriptor = incoming;
+                moved = resources.MovedDispatchBuffers(CompiledShader{ShaderRecompiler::ShaderStage::Compute, &program, 0}, &recorder, 0, proof);
+            };
+            const auto readOnly = [&](const std::vector<std::uint32_t>& words) {
+                ShaderRecompiler::RecompileResult built;
+                built.runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+                auto binding = makeBinding(Role::GuestBuffers, 0, 1, words);
+                binding.bufferWritten = {false};
+                built.bindings.push_back(binding);
+                return built;
+            };
+            const auto address = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+            ShaderResources::MoveProof proof;
+            std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
+
+            const auto* tail = end - 8192;
+            const auto* nearEnd = end - 4096;
+            const auto oversized = readOnly(vsharp(tail, 0xffffffffu));
+            proveAgainst(oversized, vsharp(tail, 0xffffffffu), proof, moved);
+            Require(moved.has_value() && moved->empty() && proof.refusal == Refusal::None && proof.buffers == 0, "an unchanged V# the build cut to its allocation end was not an exact hit");
+            proveAgainst(oversized, vsharp(nearEnd, 0xffffffffu), proof, moved);
+            Require(moved.has_value() && moved->size() == 1 && proof.buffers == 1 && proof.bytes == 4096 && moved->front().address == address(nearEnd) && moved->front().size == 4096, "a moved V# past the range limit was not snapshotted at its clamped range");
+            proveAgainst(oversized, vsharp(nearEnd, 0xfffffff0u), proof, moved);
+            Require(moved.has_value() && moved->size() == 1 && moved->front().size == 4096, "another oversized size over the same allocation end listed another range");
+            proveAgainst(oversized, vsharp(tail, 4096), proof, moved);
+            Require(moved.has_value() && moved->size() == 1 && moved->front().address == address(tail) && moved->front().size == 4096, "a V# that now fits the range limit was not listed at its own size");
+
+            proveAgainst(oversized, vsharp(block, 0xffffffffu), proof, moved);
+            Require(!moved.has_value() && proof.refusal == Refusal::Limit, "a moved V# the allocation holds past the range limit was served");
+
+            const auto overhang = readOnly(strided(tail, 24, 342));
+            proveAgainst(overhang, strided(tail, 24, 342), proof, moved);
+            Require(moved.has_value() && moved->empty() && proof.refusal == Refusal::None, "an unchanged V# with a stride overhang past the allocation was not an exact hit");
+            proveAgainst(overhang, strided(nearEnd, 24, 171), proof, moved);
+            Require(moved.has_value() && moved->size() == 1 && moved->front().address == address(nearEnd) && moved->front().size == 4096 && proof.bytes == 4096, "a moved V# with a stride overhang was snapshotted past the allocation end");
+            proveAgainst(overhang, strided(nearEnd, 24, 100), proof, moved);
+            Require(moved.has_value() && moved->size() == 1 && moved->front().size == 2400, "a moved V# inside the allocation was not listed at its own size");
+            recorder.Sync();
+        }
+        AgcDriver::Graphics::ClearHostImports(context.device);
+        {
+            auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+            GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+            GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        }
+        ::operator delete(block, std::align_val_t{blockBytes});
+    }
+}
+
 // agc_sparse_buffer_holes on Metal: upstream's RunSparseBufferHoleTests (tests/BdaResources.cpp) over the Metal
 // device's Context; the bytes of a copy are the contents of the shared MTLBuffer its descriptor names.
 int MetalSparseBufferHoles() {
@@ -575,6 +741,9 @@ const std::vector<SkippedMode> SkippedModes{
     {"--sampler-table-lod-bias", "skipped, the Metal twin of --sampler-table-lod-bias (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
     {"--sampler-table-anisotropy", "skipped, the Metal twin of --sampler-table-anisotropy (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
     {"--sampler-table-reduction-compare", "skipped, the Metal twin of --sampler-table-reduction-compare (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
+    {"--pipeline-journal", "skipped, the Metal device keeps no pipeline journal: upstream's journal (Graphics/src/PipelineJournal.cpp) records the VkPipelines a run builds and replays them through Graphics::CachedPipeline and VulkanDevice's compute hook, which the Metal driver does not run; the MTL4Archive of PipelineCache.mm persists every Metal pipeline and its prewarm thread rebuilds them at startup (TechnicalDebt metal-pipeline-journal)"},
+    {"--pipeline-library-clear-waits-for-build", "skipped, graphics pipeline libraries are unavailable on Metal: pipelineLibraryClearWaitsForBuildTests checks that ClearCachedPipelines waits for a VkPipeline library part build on MockVulkan, while Metal builds whole render pipelines (TechnicalDebt metal-graphics-pipeline-libraries)"},
+    {"--pipeline-store-lazy-buffer-pool", "skipped, the device has no Vulkan pipeline store: pipelineStoreLazyBufferPoolTests checks that the VkPipeline store of Graphics/src/Pipeline.cpp keeps its entries when the device's BufferPool is created lazily; Metal pipelines are cached per MTLDevice by PipelineCache.mm and never keyed by the buffer pool (TechnicalDebt metal-vulkan-internal-tests)"},
 };
 
 // earlyFragmentTestsTests on Metal (upstream fdefd7660): the MSL fragment function carries
@@ -641,6 +810,7 @@ const std::vector<Twin> MetalTwins{
     {"copiedWriterIndirectOverlapTests", "copied vs direct written ranges over a Metal host import", MetalCopiedWriterIndirectOverlapTests},
     {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export or a quad pixel mask", MetalEarlyFragmentTestsTests},
     {"oversizedDescriptorTests", "a V# past the range limit bound up to its registered allocation, refused at the limit, empty when unregistered", MetalOversizedDescriptorTests},
+    {"dispatchMoveTests", "moved read-only dispatch buffers listed at their clamped ranges, written, over-budget, unmapped, overlapping and reshaped moves refused, over Metal host imports and a Metal recorder", MetalDispatchMoveTests},
 };
 
 const Twin* TwinOf(const std::string& name) {
@@ -667,6 +837,8 @@ const std::vector<std::pair<std::string, std::string>> VulkanOnly{
     {"imageTableSnapshotAllocationTests", "an empty image table in a draw snapshot on MockVulkan; Vulkan descriptor sets only (Metal tables: MslAbi v15 arrays)"},
     {"samplerTableNonSeamlessCubeTests", "sampler table entries and their vkCreateSampler flags on MockVulkan; Vulkan samplers only (Metal tables: MslAbi v15 arrays)"},
     {"samplerTableDeviceLimitTests", "sampler table entries refused by device limits on MockVulkan; Vulkan samplers only (Metal tables: MslAbi v15 arrays)"},
+    {"pipelineStoreLazyBufferPoolTests", "Vulkan-only: the VkPipeline store of Graphics/src/Pipeline.cpp ties its entries to the device's BufferPool; the Metal draw path does not use that store (Metal pipelines are cached per device by PipelineCache.mm, keyed by MSL library and render state, never by the buffer pool), and the Metal BufferPool refuses MockVulkan's Context (TechnicalDebt metal-vulkan-internal-tests)"},
+    {"pipelineLibraryClearWaitsForBuildTests", "graphics pipeline library part builds on MockVulkan: Metal has no pipeline libraries (TechnicalDebt metal-graphics-pipeline-libraries)"},
 };
 
 bool Listed(const std::string& name) {
@@ -760,9 +932,14 @@ int main(int argc, char** argv) {
     }
     // agc_driver_covered_centroid_state (upstream fdefd7660): register decoding only, as upstream.
     if (mode == "--covered-centroid-state") return RunMode({"multisampleTests", multisampleTests}, "Covered-centroid and multisample state checks passed");
+    // agc_driver_msaa_dcc_state (upstream a0c51d577): register decoding and the draw precheck only, as upstream.
+    if (mode == "--multisample-dcc-state") return RunMode({"multisampleDccStateTests", multisampleDccStateTests}, "Multisampled DCC state checks passed");
+    // agc_descriptor_cache: the Metal twin of descriptorCacheTests (upstream's lavapipe case, individually freed
+    // sets in a chain pool, is Vulkan-only: Metal pools are tokens and Free never reaches a Vulkan pool). Silent, as upstream.
+    if (mode == "--descriptor-cache") return RunMode({"descriptorCacheTests", MetalDescriptorCacheTests}, nullptr);
     if (mode == "--probe") return Probe();
     if (argc != 1) {
-        std::cerr << "usage: " << argv[0] << " [--probe | --unused-stencil-reference | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key";
+        std::cerr << "usage: " << argv[0] << " [--probe | --unused-stencil-reference | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key | --multisample-dcc-state | --descriptor-cache";
         for (const auto& skipped : SkippedModes) std::cerr << " | " << skipped.flag;
         std::cerr << "]\n";
         return 2;

@@ -245,6 +245,21 @@ struct CmaskParams {
 constant uint xMasks[13] = {0x008u, 0x000u, 0x040u, 0x000u, 0x080u, 0x000u, 0x100u, 0x000u, 0x200u, 0x008u, 0x010u, 0x040u, 0x020u};
 constant uint yMasks[13] = {0x000u, 0x010u, 0x000u, 0x040u, 0x000u, 0x080u, 0x000u, 0x100u, 0x000u, 0x008u, 0x010u, 0x020u, 0x040u};
 
+// Graphics/shaders/TextureRepack.comp: guest 10_11_11 float words (R in bits 0-9) as B10G11R11
+// (R in bits 0-10), lossless; the view's BGRA swizzle restores the channels (upstream 571fecadd).
+struct RepackParams {
+    uint words;
+    uint pad;
+    device uint* source;
+    device uint* destination;
+};
+
+kernel void texel_repack(constant RepackParams& params [[buffer(0)]], uint index [[thread_position_in_grid]]) {
+    if (index >= params.words) return;
+    const uint word = params.source[index];
+    params.destination[index] = ((word >> 21u) & 0x7ffu) | (((word >> 10u) & 0x7ffu) << 11u) | ((word & 0x3ffu) << 22u);
+}
+
 kernel void cmask_clear(constant CmaskParams& params [[buffer(0)]], uint2 pixel [[thread_position_in_grid]]) {
     if (pixel.x >= params.width || pixel.y >= params.height) return;
     const uint x = pixel.x & ~7u;
@@ -296,6 +311,14 @@ struct ImageParams {
     std::uint64_t tiled;
     std::uint64_t image;
 };
+
+struct RepackParams {
+    std::uint32_t words;
+    std::uint32_t pad;
+    std::uint64_t source;
+    std::uint64_t destination;
+};
+static_assert(sizeof(RepackParams) == 24 && offsetof(RepackParams, source) == 8);
 
 struct CmaskParams {
     std::uint32_t base;
@@ -372,6 +395,8 @@ void TextureDetiler::release() noexcept {
     if (module != VK_NULL_HANDLE) CFRelease(reinterpret_cast<CFTypeRef>(module));
     module = VK_NULL_HANDLE;
     cmaskErrors.reset();
+    if (repackPipeline != VK_NULL_HANDLE) CFRelease(reinterpret_cast<CFTypeRef>(repackPipeline));
+    repackPipeline = VK_NULL_HANDLE;
 }
 
 VkFormat TextureDetiler::ImageElementFormat(std::uint32_t elementBytes) {
@@ -409,8 +434,8 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     }
     std::array<std::uint32_t, 22> values{elementBytes, BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
     if (thick) {
-        const auto thickMode = tileMode == TextureTileMode::kStandard4KB ? 0x105u : tileMode == TextureTileMode::kStandard64KB ? 0x109u : tileMode == TextureTileMode::kS64KBX ? 0x119u : tileMode == TextureTileMode::kD64KBX ? 0x11au : 0u;
-        if (thickMode == 0u) Fail("3D textures are only detiled thick from SW_4KB_S, SW_64KB_S, SW_64KB_S_X or SW_64KB_D_X");
+        const auto thickMode = tileMode == TextureTileMode::kStandard4KB ? 0x105u : tileMode == TextureTileMode::kS4KBX ? 0x115u : tileMode == TextureTileMode::kStandard64KB ? 0x109u : tileMode == TextureTileMode::kS64KBX ? 0x119u : tileMode == TextureTileMode::kD64KBX ? 0x11au : 0u;
+        if (thickMode == 0u) Fail("3D textures are only detiled thick from SW_4KB_S, SW_4KB_S_X, SW_64KB_S, SW_64KB_S_X or SW_64KB_D_X");
         const auto* equation = FindTextureSwizzleEquation(thickMode, elementBytes);
         if (equation == nullptr) Fail("no thick swizzle equation for the element size");
         values[2] = 2u;
@@ -507,6 +532,27 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
     params.image = ImageResource(view);
     auto& stream = Metal::Stream(commands);
     stream.DispatchHelper(target, std::as_bytes(std::span(&params, 1)), MTLSizeMake((columnEnd - window.columnBegin + 7u) / 8u, (rowEnd - window.rowBegin + 7u) / 8u, 1), MTLSizeMake(8, 8, 1));
+}
+
+void TextureDetiler::DispatchRepack(VkCommandBuffer commands, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, std::uint64_t bytes) {
+    Require(commands != VK_NULL_HANDLE && source != VK_NULL_HANDLE && destination != VK_NULL_HANDLE, "a texel repack needs a command buffer and its buffers");
+    Require(bytes != 0 && bytes % 4u == 0 && sourceOffset % 4u == 0 && destinationOffset % 4u == 0, "a texel repack needs whole aligned words");
+    const auto words = bytes / 4u;
+    Require(words <= std::uint64_t{0xffffffffu} - 63u, "a texel repack exceeds the device's dispatch limits");
+    if (repackPipeline == VK_NULL_HANDLE) {
+        pipeline(TextureTileMode::kLinear, 4u, false, false);  // compiles the library
+        NSError* error = nil;
+        id<MTLFunction> function = [LibraryOf(module) newFunctionWithName:@"texel_repack"];
+        id<MTLComputePipelineState> state = function == nil ? nil : [DeviceFor(context) newComputePipelineStateWithFunction:function error:&error];
+        if (state == nil) Fail("cannot build the texel repack pipeline: " + Metal::Describe(error));
+        repackPipeline = reinterpret_cast<VkPipeline>(const_cast<void*>(CFBridgingRetain(state)));
+    }
+    RepackParams params{};
+    params.words = static_cast<std::uint32_t>(words);
+    params.source = Metal::BufferOf(source).gpuAddress + sourceOffset;
+    params.destination = Metal::BufferOf(destination).gpuAddress + destinationOffset;
+    auto& stream = Metal::Stream(commands);
+    stream.DispatchHelper(PipelineOf(repackPipeline), std::as_bytes(std::span(&params, 1)), MTLSizeMake((words + 63u) / 64u, 1, 1), MTLSizeMake(64, 1, 1));
 }
 
 std::uint32_t TextureDetiler::CmaskErrors() {

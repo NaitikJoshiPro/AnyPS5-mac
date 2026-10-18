@@ -605,12 +605,14 @@ void MeshRestartStart(MslEmitterState& state, const IrValue& instruction) {
     state.Define(instruction, "(" + state.Arg(instruction, 1u) + ") ? " + table + "[min(uint(" + state.Arg(instruction, 0u) + "), " + table + "[" + U32(MeshRestartLengthDword) + "] - 1u) + " + U32(MeshRestartTableDword) + "] : 0u");
 }
 
-// SelectExportPacking: 10_11_11 targets take the colour packed into the red channel.
+// SelectExportPacking: 10_11_11 UNORM and (upstream 49b0e805f) 11_11_10 float targets take the
+// colour packed into the red channel of a 32-bit uint attachment.
 std::string ExportPacking(MslEmitterState& state, std::uint32_t target, const std::string& color) {
     state.RequirePrelude(MslPreludeChunk::StageIo);
     const auto packing = state.FunctionConstant(PipelineSpecialization::ExportPackingBase + target, static_cast<std::uint32_t>(ColorExportPacking::None));
     const auto name = state.Temporary("aps5_pk");
-    state.Line("const uint4 " + name + " = " + packing + " == " + U32(static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11)) + " ? uint4(aps5_pack_unorm_10_11_11(" + color + "), 0u, 0u, 0u) : " + color + ";");
+    const auto floating = packing + " == " + U32(static_cast<std::uint32_t>(ColorExportPacking::Float11_11_10));
+    state.Line("const uint4 " + name + " = " + packing + " != " + U32(static_cast<std::uint32_t>(ColorExportPacking::None)) + " ? uint4(aps5_pack_export(" + color + ", " + floating + " ? APS5_FORMAT_10_11_11_FLOAT : APS5_FORMAT_11_11_10_UNORM), 0u, 0u, 0u) : " + color + ";");
     return name;
 }
 
@@ -748,9 +750,10 @@ static uint4 aps5_vertex_fetch(device const Aps5VertexFetch* records, uint locat
     return aps5_format_load(memory, info, record.stride << 16u, records_, word3, true, index, 0u, 0u, dstSel, 4u, false, stop);
 }
 
-// SelectExportPacking's 10_11_11 UNORM packing of an RGB colour (float bits).
-static uint aps5_pack_unorm_10_11_11(uint4 color) {
-    const Aps5Format info = aps5_format(APS5_FORMAT_11_11_10_UNORM);
+// SelectExportPacking's PackExport: the 10_11_11 UNORM or 11_11_10 float packing of an RGB colour
+// (float bits).
+static uint aps5_pack_export(uint4 color, uint format) {
+    const Aps5Format info = aps5_format(format);
     uint packed = 0u;
     for (uint component = 0u; component < info.count; ++component) packed |= aps5_format_store(info.type, info.bits[component], color[component]) << info.offsets[component];
     return packed;
@@ -950,6 +953,11 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             // MslAbi Version 16 (DECISIONS D75): point and line draws output points and lines, one or
             // two of the primitive export's indices per primitive (PrimitiveVerticesMacro).
             const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
+            // Upstream a0347cfed: an NGG geometry program with line-strip output
+            // (ShaderMeshInputInfo::outputPrimitiveSize 2) exports lines whatever the draw's topology.
+            const auto outputVertices = VertexInfo(state).mesh.outputPrimitiveSize;
+            if (outputVertices != 2u && outputVertices != 3u) state.Fail("mesh functions output lines or triangles, the program outputs primitives of " + std::to_string(outputVertices) + " vertices");
+            if (outputVertices == 2u) text += "#undef " + primitiveVertices + "\n#define " + primitiveVertices + " 2u\n";
             text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
             text += "#if " + primitiveVertices + " == 1u\n#define APS5_MESH_TOPOLOGY metal::topology::point\n#elif " + primitiveVertices + " == 2u\n#define APS5_MESH_TOPOLOGY metal::topology::line\n#else\n#define APS5_MESH_TOPOLOGY metal::topology::triangle\n#endif\n";
             text += "#if " + TriangleVerticesCondition() + "\n";
@@ -1128,7 +1136,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
 
 MslPreludeEntry MslStagePrelude(MslPreludeChunk chunk) {
     if (chunk != MslPreludeChunk::StageIo) throw std::runtime_error("MSL emission failed: prelude chunk " + std::to_string(static_cast<std::uint32_t>(chunk)) + " is not a stage chunk (work package B6)");
-    static const std::string text = "#define APS5_FORMAT_11_11_10_UNORM " + std::to_string(static_cast<std::uint32_t>(IrBufferFormat::Format11_11_10UNorm)) + "u\n" + std::string(StageIoText);
+    static const std::string text = "#define APS5_FORMAT_11_11_10_UNORM " + std::to_string(static_cast<std::uint32_t>(IrBufferFormat::Format11_11_10UNorm)) + "u\n#define APS5_FORMAT_10_11_11_FLOAT " + std::to_string(static_cast<std::uint32_t>(IrBufferFormat::Format10_11_11Float)) + "u\n" + std::string(StageIoText);
     return {text, OnBufferFormat};
 }
 

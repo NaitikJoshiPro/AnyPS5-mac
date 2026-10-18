@@ -338,12 +338,20 @@ std::string HeapElement(MslEmitterState& state, DescriptorBindingKind kind, std:
 }
 
 // The texture (heap element) a mode's access reads or writes. A table mode (MslAbi Version 15)
-// reads element tableAccess.element of the image table's array, typed as the mode's heap binding.
+// reads element tableAccess.element of the image table's array, typed as the mode's heap binding;
+// a storage table mode (Version 18, upstream 603dc01db) the same element of the storage table's.
 std::string Texture(MslEmitterState& state, const Access& access, std::uint32_t elementOffset = 0u) {
     const auto kind = DescriptorBindingForImage(access.image);
     if (access.image.table != NoTable) {
         if (!state.tableAccess.active) state.Fail(access.inst, "reads an image table texture outside a table access");
         const auto binding = static_cast<std::uint32_t>(kind);
+        if (access.image.resourceClass == ImageResourceClass::Storage) {
+            // Float (29-35) and uint (36-42) storage views; atomic modes are never table modes.
+            constexpr auto storageEnd = RuntimeAbi::FirstStorageImageBinding + 14u;
+            if (elementOffset != 0u || access.image.mipMode == ImageMipMode::DynamicStorage || binding < RuntimeAbi::FirstStorageImageBinding || binding >= storageEnd || !TableModeEmitted(access.image)) state.Fail(access.inst, "selects an image table storage mode that is not a non-atomic, single-sampled, static-mip storage view (an image table store to a multisampled image or through dynamic mips is not implemented)");
+            static_cast<void>(state.TableResource(DescriptorBindingKind::ImageStorageTable, 0u));
+            return "aps5_table." + MslTableField(DescriptorBindingKind::ImageStorageTable) + ".k" + std::to_string(binding) + ".address[" + state.tableAccess.element + "].value";
+        }
         if (elementOffset != 0u || access.image.resourceClass != ImageResourceClass::Sampled || binding < RuntimeAbi::FirstImageBinding || binding >= RuntimeAbi::FirstStorageImageBinding || !TableModeEmitted(access.image)) state.Fail(access.inst, "selects an image table mode that is not a sampled, single-sampled heap view");
         static_cast<void>(state.TableResource(DescriptorBindingKind::ImageTable, 0u));
         return "aps5_table." + MslTableField(DescriptorBindingKind::ImageTable) + ".k" + std::to_string(binding) + ".address[" + state.tableAccess.element + "].value";
@@ -884,7 +892,6 @@ std::string PackImageTexel(MslEmitterState& state, const Access& access, const s
 std::string StoreTexel(MslEmitterState& state, const Access& access, const std::string& data, bool integer) {
     const auto& mem = access.mem;
     const auto sint = SintStorageFormat(access.image);
-    if (sint.format != IrBufferFormat::Invalid && mem.dataBits == 16u) state.Fail(access.inst, "stores 16-bit data to an image of a SINT format");
     if (sint.format != IrBufferFormat::Invalid) state.RequirePrelude(MslPreludeChunk::BufferFormat);
     const auto dmask = EffectiveDmask(mem);
     std::array<std::string, 4> values;
@@ -905,7 +912,10 @@ std::string StoreTexel(MslEmitterState& state, const Access& access, const std::
         }
         values[component] = integer ? raw : mem.dataBits == 16u ? "aps5_f16_value(" + raw + ")" : "as_type<float>(" + raw + ")";
         if (component < sint.componentCount) {
-            values[component] = "aps5_format_store(" + U(FormatTypeCode(sint.type)) + ", " + U(sint.componentBits[component]) + ", " + values[component] + ")";
+            // Upstream a18d6e9a6: D16 data takes EmitD16StoreComponent (sign-extended, then
+            // saturated to the component width).
+            if (mem.dataBits == 16u) values[component] = "aps5_format_d16_store(" + U(FormatTypeCode(sint.type)) + ", " + U(sint.componentBits[component]) + ", " + raw + ")";
+            else values[component] = "aps5_format_store(" + U(FormatTypeCode(sint.type)) + ", " + U(sint.componentBits[component]) + ", " + values[component] + ")";
         }
     }
     const auto texel = state.Temporary("aps5_st");
@@ -1450,10 +1460,11 @@ void EmitSample(MslEmitterState& state, const Access& access, const ImageSampleL
     // Upstream #1418 (SpirvImageEmitter EmitSampleOp): a sampler that only samples with implicit LODs
     // or gradients (SamplesBaseLevelIfUnnormalized) and that the binding plan proves unnormalized
     // (function constant UnnormalizedBaseLevelBase + s, 1) samples the base level: an explicit LOD 0
-    // and no other operand, as the console's unnormalized samplers do.
+    // and no other operand, as the console's unnormalized samplers do. Upstream 7c19c66de: a texel
+    // offset is folded into the (unnormalized) coordinate there (FoldedOffsetCoord).
     if (!dref && SamplesBaseLevelIfUnnormalized(state.program.Info().samplers.at(mem.sampler))) {
         const auto selector = state.FunctionConstant(PipelineSpecialization::UnnormalizedBaseLevelBase + mem.sampler, 0u);
-        expression = selector + " != 0u ? " + texture + ".sample(" + sampler + ", " + coord.coord + slice + ", level(0.0f)) : " + expression;
+        expression = selector + " != 0u ? " + texture + ".sample(" + sampler + ", " + (hasOffset ? folded() : coord.coord) + slice + ", level(0.0f)) : " + expression;
     }
     state.Line("const " + type + " " + sample + " = " + expression + ";");
     const auto result = dref ? sample : UnpackImageTexel(state, access, sample);

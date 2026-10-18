@@ -930,6 +930,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             passKey = Mix(passKey, static_cast<std::uint64_t>(locations[sample].x * 16.0f) | (static_cast<std::uint64_t>(locations[sample].y * 16.0f) << 8u));
         }
     }
+    // Upstream 9bf98992ff: a multisampled rasterizer over one-sample targets draws one sample at sample
+    // 0's location (Graphics::State keeps it as a custom one-sample location). Without programmable
+    // positions the draw samples the pixel centre, as upstream's device without sample locations does.
+    const bool oneSamplePosition = graphics.samples == 1u && graphics.customSampleLocations && !graphics.sampleLocationGrid && state.device.programmableSamplePositionsSupported;
+    if (oneSamplePosition) {
+        const auto locations = Graphics::SampleLocations(graphics);
+        samplePositions[0] = MTLSamplePositionMake(locations[0].x, locations[0].y);
+        passKey = Mix(Mix(passKey, 1u), static_cast<std::uint64_t>(locations[0].x * 16.0f) | (static_cast<std::uint64_t>(locations[0].y * 16.0f) << 8u));
+    }
 
     // Pipelines: a second channel pass for alternate-alpha 8_8 targets, a back-face pass for
     // per-face depth bias (as upstream's secondChannel and backFaces pipelines).
@@ -1128,6 +1137,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
     // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
     const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
+    // Upstream f2a4236ab draws rect lists with the last vertex provoking by taking the flat inputs from
+    // the rectangle's third vertex. The MSL rect-list paths cannot tell which parameters are flat and
+    // would hand every corner the first vertex's: refused while the pixel shader has a flat input
+    // (TechnicalDebt metal-rect-list-last-vertex).
+    if (graphics.rectList && graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && fragment != nullptr && fragment->program != nullptr) {
+        const auto& parameters = fragment->program->fragmentParameters;
+        if (std::any_of(parameters.begin(), parameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flat; })) Fail("rect lists with the last vertex provoking and flat pixel inputs (TechnicalDebt metal-rect-list-last-vertex)");
+    }
     // Upstream 99edf9435 (Pipeline.cpp ValidateProvokingVertex): P10 of a flat input reads the
     // provoking vertex, measured only with the last vertex provoking.
     if (graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT && fragment != nullptr && fragment->program != nullptr) {
@@ -1355,6 +1372,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (graphics.samples > 1u) {
                 if (!state.device.programmableSamplePositionsSupported) Fail("the device has no programmable sample positions");
                 [pass setSamplePositions:samplePositions.data() + slice * hostSamples.samples count:hostSamples.samples];
+            } else if (oneSamplePosition) {
+                [pass setSamplePositions:samplePositions.data() count:1];
             }
             if (void* visibility = recorder.SampleVisibilityBuffer()) {
                 pass.visibilityResultBuffer = (__bridge id<MTLBuffer>)visibility;

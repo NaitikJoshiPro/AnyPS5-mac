@@ -39,6 +39,7 @@ std::string MslTableMemberType(DescriptorBindingKind kind) {
     // MslAbi Version 15: the runtime-indexed tables point at arrays of MTLResourceIDs.
     if (kind == DescriptorBindingKind::SamplerTable) return "Aps5TableArray<sampler>";
     if (kind == DescriptorBindingKind::ImageTable) return "Aps5ImageTable";
+    if (kind == DescriptorBindingKind::ImageStorageTable) return "Aps5ImageStorageTable";
     switch (MslAbi::KindOf(kind)) {
     case MslAbi::EntryKind::Buffer:
         return "Aps5Buffer";
@@ -74,7 +75,8 @@ std::string MslTableDeclaration(const MslAbi::TableLayout& layout) {
     // MslAbi Version 15: an image or sampler table entry is the GPU address of an array of 8-byte
     // MTLResourceIDs (Tier 2 argument buffer descriptors, read as Aps5TableEntry<T>), its size and flags.
     const bool imageTable = layout.Find(DescriptorBindingKind::ImageTable) != nullptr;
-    if (imageTable || layout.Find(DescriptorBindingKind::SamplerTable) != nullptr) {
+    const bool storageTable = layout.Find(DescriptorBindingKind::ImageStorageTable) != nullptr;
+    if (imageTable || storageTable || layout.Find(DescriptorBindingKind::SamplerTable) != nullptr) {
         text += "template <typename T> struct Aps5TableEntry {\n    T value;\n};\n";
         text += "template <typename T> struct Aps5TableArray {\n    const device Aps5TableEntry<T>* address;\n    uint bytes;\n    uint flags;\n};\n";
     }
@@ -90,11 +92,27 @@ std::string MslTableDeclaration(const MslAbi::TableLayout& layout) {
         }
         text += "};\nstatic_assert(sizeof(Aps5ImageTable) == " + std::to_string(MslAbi::ImageTableSlots * sizeof(MslAbi::BufferEntry)) + ", \"MslAbi image table size\");\n";
     }
+    if (storageTable) {
+        // MslAbi Version 18 (upstream 603dc01db): the storage views of a table's written images. Table
+        // stores never select multisampled or atomic modes: those slots are placeholders.
+        text += "struct Aps5ImageStorageTable {\n";
+        for (std::uint32_t slot = 0; slot < MslAbi::ImageStorageTableSlots; ++slot) {
+            const auto binding = RuntimeAbi::FirstStorageImageBinding + slot;
+            const auto dimension = slot % HeapDimensions;
+            const bool placeholder = dimension == 4u || dimension == 5u || slot >= 2u * HeapDimensions;
+            const auto type = placeholder ? std::string("Aps5Buffer") : "Aps5TableArray<" + MslTableMemberType(static_cast<DescriptorBindingKind>(binding)) + ">";
+            text += "    " + type + " k" + std::to_string(binding) + ";\n";
+        }
+        text += "};\nstatic_assert(sizeof(Aps5ImageStorageTable) == " + std::to_string(MslAbi::ImageStorageTableSlots * sizeof(MslAbi::BufferEntry)) + ", \"MslAbi image storage table size\");\n";
+    }
     text += "struct Aps5Table {\n";
     for (const auto& range : layout.ranges) {
         const auto type = MslTableMemberType(range.binding);
         if (range.binding == DescriptorBindingKind::ImageTable) {
             if (range.count != MslAbi::ImageTableSlots) throw std::runtime_error("MSL emission failed: the image table range must hold MslAbi::ImageTableSlots entries");
+            text += "    " + type + " " + MslTableField(range.binding) + ";\n";
+        } else if (range.binding == DescriptorBindingKind::ImageStorageTable) {
+            if (range.count != MslAbi::ImageStorageTableSlots) throw std::runtime_error("MSL emission failed: the image storage table range must hold MslAbi::ImageStorageTableSlots entries");
             text += "    " + type + " " + MslTableField(range.binding) + ";\n";
         } else if (range.kind == MslAbi::EntryKind::Buffer) text += "    " + type + " " + MslTableField(range.binding) + "[" + std::to_string(range.count) + "];\n";
         else text += "    array<" + type + ", " + std::to_string(range.count) + "> " + MslTableField(range.binding) + ";\n";
@@ -407,7 +425,7 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     for (const auto& descriptor : state.program.Metadata().bindings.descriptors) {
         if (!state.usedKinds.contains(descriptor.kind)) continue;
         // MslAbi Version 15: the image table holds one array entry per sampled heap binding.
-        const auto count = descriptor.kind == DescriptorBindingKind::ImageTable ? MslAbi::ImageTableSlots : std::max<std::uint32_t>(static_cast<std::uint32_t>(descriptor.resources.size()), 1u);
+        const auto count = descriptor.kind == DescriptorBindingKind::ImageTable ? MslAbi::ImageTableSlots : descriptor.kind == DescriptorBindingKind::ImageStorageTable ? MslAbi::ImageStorageTableSlots : std::max<std::uint32_t>(static_cast<std::uint32_t>(descriptor.resources.size()), 1u);
         tableBindings.push_back({descriptor.kind, count});
     }
     state.reflection.table = MslAbi::LayoutTable(tableBindings);

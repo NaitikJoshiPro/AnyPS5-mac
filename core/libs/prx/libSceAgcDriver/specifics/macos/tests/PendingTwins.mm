@@ -22,6 +22,25 @@ struct Pending {
 constexpr Pending Tests[] = {
     {"agc_driver_pipeline_optimized_readback_tests", "agc_driver_pipeline_optimized_readback_*", nullptr,
      "skipped, graphics pipeline libraries are unavailable or disabled: Metal has none, so there is no link-time optimized pipeline to read back"},
+    // UPSYNC3 round 3 (upstream 0d078f75d3). Vulkan-only behaviours (allowlisted):
+    {"agc_driver_dcc_key_presync_tests", "agc_driver_dcc_key_presync", nullptr,
+     "skipped, the Metal device has no stage-A dispatch preparation: it binds dispatch buffers by address at the record, so no DCC key writer is pre-synced"},
+    {"agc_driver_resource_cache_growth_tests", "agc_driver_resource_cache_growth", nullptr,
+     "skipped, buffer-only dispatches never enter the resource cache on Metal: it binds dispatch buffers by address at the record"},
+    {"agc_driver_pipeline_journal_tests", "agc_driver_pipeline_journal", nullptr,
+     "skipped, the pipeline journal is Vulkan-only: the Metal pipeline cache's MTL4Archive and prewarm thread replay pipelines in its place"},
+    {"agc_command_batch_failure_tests", "agc_command_batch_failure", nullptr,
+     "skipped, the device has no Vulkan command batches: RunCommandBatchFailureTests injects vkEndCommandBuffer/vkQueueSubmit/fence failures through Context.deviceProc, while a Metal CommandBatch records MTL4 command buffers that never call them"},
+    {"agc_descriptor_cache_failure_tests", "agc_descriptor_cache_failure", nullptr,
+     "skipped, the device has no Vulkan descriptor pools: DescriptorCacheFailure injects vkCreateDescriptorSetLayout/vkCreateDescriptorPool failures, while Metal descriptor layouts and pools are tokens that cannot fail"},
+    // Metal driver features not written yet (not allowlisted):
+    {"agc_driver_address_passes_tests", "agc_driver_address_passes*", nullptr, nullptr,
+     "skipped, the Metal draw path does not report render pass totals (DrawPassTotals): TechnicalDebt metal-draw-pass-totals"},
+    {"agc_driver_rect_list_indirect_tests", "agc_driver_rect_list_indirect", nullptr, nullptr,
+     "skipped, indirect draws read their records on the CPU on Metal (no GPU indirect path yet): TechnicalDebt metal-d6-indirect"},
+    // Port not written yet (not allowlisted): Metal fragment functions export [[stencil]] directly; the port checks the
+    // stencil results without upstream's vkCmdBindPipeline count and SPIR-V inspection.
+    {"agc_driver_stencil_null_feedback_tests", "agc_driver_stencil_null_feedback", "UPSYNC3 (Metal stencil-export port without the vkCmdBindPipeline count)", nullptr},
 };
 
 }

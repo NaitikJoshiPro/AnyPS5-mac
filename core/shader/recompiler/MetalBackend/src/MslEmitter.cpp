@@ -143,6 +143,8 @@ std::string MslTableField(DescriptorBindingKind kind) {
         return "image_table_map";
     case DescriptorBindingKind::ImageTable:
         return "image_table";
+    case DescriptorBindingKind::ImageStorageTable:
+        return "image_storage_table";
     default:
         return "images" + std::to_string(static_cast<std::uint32_t>(kind));
     }

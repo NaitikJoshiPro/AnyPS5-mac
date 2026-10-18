@@ -203,6 +203,9 @@ struct VulkanDevice::State {
     // D5's shader library and pipeline cache (MTL4Compiler + MTL4Archive, background builds); it
     // owns `compiler`. Destroyed in Teardown after the recorder is idle (joins its workers, saves).
     std::unique_ptr<Graphics::Metal::PipelineCache> pipelines;
+    // The process-wide guest compute pipeline count when `pipelines` was created: the base of
+    // VulkanDevice::ComputePipelinesCreated (upstream 4aafda8e3 counts per device).
+    std::uint64_t computePipelinesAtStart = 0;
     // D4/D5's image cache: textures and samplers of dispatch bindings, its residency set on the queue.
     std::unique_ptr<Graphics::Metal::ImageCache> images;
     // D6's draw objects (MetalDraw.mm): argument tables, depth surfaces, tiled target textures.
