@@ -265,7 +265,7 @@ struct WrittenPathRegistry {
     std::map<std::filesystem::path, bool> dirty;
     WriteMark mark = Now();
 };
-WrittenPathRegistry& Written() { static WrittenPathRegistry registry; return registry; }
+WrittenPathRegistry& Written() { static auto* registry = new WrittenPathRegistry; return *registry; }
 #ifdef _WIN32
 std::optional<WriteMark> WriteTime(const std::filesystem::path& path) {
     WIN32_FILE_ATTRIBUTE_DATA data;

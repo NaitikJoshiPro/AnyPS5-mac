@@ -128,9 +128,15 @@ inline void PreciseSpinPause() {
 }
 
 inline std::uint64_t PreciseMonotonicNanos() {
+#ifdef __APPLE__
+    // CLOCK_MONOTONIC has microsecond resolution on macOS, so a deadline taken from it ends up to 1 us before the
+    // same deadline on std::chrono::steady_clock; CLOCK_UPTIME_RAW is the nanosecond clock steady_clock reads.
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
+#endif
 }
 
 #ifdef __linux__

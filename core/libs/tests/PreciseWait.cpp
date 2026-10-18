@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#if !defined(_WIN32)
+#include <time.h>
+#endif
 
 namespace {
 
@@ -34,6 +37,25 @@ bool IsRunnerPreempted() {
     return maxGap > std::chrono::microseconds(25);
 }
 
+#if !defined(_WIN32)
+// PreciseSleepUs sleeps all but its last 100 us in nanosleep and spins the rest. A host whose timers fire later than
+// that (macOS coalesces timers on battery power: a 1 ms nanosleep then takes about 1.25 ms) cannot meet the
+// median bound whatever the library does.
+bool HostTimerSlackExceedsSpinTail() {
+    std::array<std::chrono::nanoseconds, 9> samples{};
+    for (auto& sample : samples) {
+        const auto start = std::chrono::steady_clock::now();
+        struct timespec request{0, 1000000};
+        nanosleep(&request, nullptr);
+        sample = std::chrono::steady_clock::now() - start - std::chrono::milliseconds(1);
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2] > std::chrono::microseconds(100);
+}
+#else
+bool HostTimerSlackExceedsSpinTail() { return false; }
+#endif
+
 template <class Fn>
 bool CheckMedianSleepBound(
     const char* label,
@@ -61,7 +83,7 @@ bool CheckMedianSleepBound(
             return true;
         }
     }
-    if (IsRunnerPreempted() || samples.back() - samples.front() > std::chrono::milliseconds(1)) {
+    if (IsRunnerPreempted() || samples.back() - samples.front() > std::chrono::milliseconds(1) || HostTimerSlackExceedsSpinTail()) {
         std::clog << "Skipping strict median bound for " << label << " on busy runner ("
                   << std::chrono::duration_cast<std::chrono::nanoseconds>(bestMedian).count() << " ns)\n";
         return true;

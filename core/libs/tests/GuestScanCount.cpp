@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 #include "SceTypes.hpp"
 #include <array>
 #include <cstdarg>
@@ -12,19 +13,9 @@ extern "C" int APS5_VABI sscanf_s_nid_postfix(const char*, const char*, ...);
 extern "C" int APS5_VABI vsscanf_s_nid_postfix(const char*, const char*, VaList*);
 
 static int APS5_VABI ScanList(const char* input, const char* format, ...) {
-#ifdef _WIN32
-    __builtin_sysv_va_list args;
-    __builtin_sysv_va_start(args, format);
-#else
-    std::va_list args;
-    va_start(args, format);
-#endif
+    APS5_VA_BEGIN(format);
     const int result = vsscanf_s_nid_postfix(input, format, reinterpret_cast<VaList*>(args));
-#ifdef _WIN32
-    __builtin_sysv_va_end(args);
-#else
-    va_end(args);
-#endif
+    APS5_VA_END();
     return result;
 }
 

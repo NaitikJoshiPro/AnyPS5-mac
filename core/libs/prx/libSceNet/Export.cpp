@@ -36,6 +36,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
+#include "prx/libkernel/Socket/include/SocketConnect.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 
 // Guest socket descriptors retain PS5 semantics while their transport is backed by host sockets.
@@ -182,7 +183,38 @@ struct NativeSocketHandle {
     explicit NativeSocketHandle(NativeSocket socket) : value(socket) {}
     ~NativeSocketHandle() {
         if (value != INVALID_NATIVE_SOCKET) close_socket(value);
+#ifdef __APPLE__
+        for (const int end : wake) if (end >= 0) ::close(end);
+#endif
     }
+#ifdef __APPLE__
+    // Darwin refuses shutdown of a socket that is not connected (ENOTCONN) without ending a receive
+    // blocked on it; Linux and FreeBSD 11 end it. A blocking datagram receive also polls this pipe,
+    // which an emulated shutdown, abort or close fills once and nobody drains.
+    std::mutex wake_mutex;
+    int wake[2] = {-1, -1};
+    bool woken = false;
+
+    int WakeDescriptor() {
+        std::lock_guard lock(wake_mutex);
+        if (wake[0] < 0) {
+            if (::pipe(wake) != 0) throw std::runtime_error("sceNet: pipe for the datagram receive wake failed");
+            for (const int end : wake) {
+                ::fcntl(end, F_SETFD, FD_CLOEXEC);
+                ::fcntl(end, F_SETFL, ::fcntl(end, F_GETFL) | O_NONBLOCK);
+            }
+            if (woken) (void)!::write(wake[1], "", 1);
+        }
+        return wake[0];
+    }
+
+    void Wake() {
+        std::lock_guard lock(wake_mutex);
+        if (woken) return;
+        woken = true;
+        if (wake[1] >= 0) (void)!::write(wake[1], "", 1);
+    }
+#endif
 };
 
 bool guest_to_native_address(const void* address, std::uint32_t length,
@@ -495,6 +527,44 @@ int native_message_flags(int flags) {
     return native;
 }
 
+#ifdef __APPLE__
+constexpr int RECEIVE_NOTHING = -1;
+
+// Linux and FreeBSD 11 end receives on a datagram socket whose receive side was shut down, even one
+// that is not connected; Darwin refuses that shutdown with ENOTCONN (NativeSocketHandle::Wake).
+// Returns 0 to go on to the host receive, RECEIVE_NOTHING when the receive returns 0, or an error.
+int wait_for_datagram(const Sock& socket, int flags) {
+    if (socket.type == NET_SOCK_STREAM) return 0;
+    if (socket.read_shut || socket.aborted) return RECEIVE_NOTHING;
+    if (socket.nonblock || (flags & NET_MSG_DONTWAIT) != 0) return 0;
+    pollfd descriptors[2] = {{socket.native->value, POLLIN, 0}, {socket.native->WakeDescriptor(), POLLIN, 0}};
+    const auto deadline = socket.rcv_timeout_us > 0
+        ? std::chrono::steady_clock::now() + std::chrono::microseconds(socket.rcv_timeout_us)
+        : std::chrono::steady_clock::time_point::max();
+    for (;;) {
+        int timeout = -1;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return NET_EAGAIN;
+            timeout = static_cast<int>(std::min<long long>(std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count(), INT_MAX));
+        }
+        const int ready = ::poll(descriptors, 2, timeout);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return native_error();
+        }
+        if (ready == 0) continue;
+        if (descriptors[1].revents != 0) return RECEIVE_NOTHING;
+        return 0;
+    }
+}
+
+// After a host shutdown of the receive side refused with ENOTCONN, a datagram socket's receives end.
+void emulate_receive_shutdown(const std::shared_ptr<NativeSocketHandle>& native, int type, int error) {
+    if (native && type != NET_SOCK_STREAM && error == ENOTCONN) native->Wake();
+}
+#endif
+
 #ifdef _WIN32
 bool has_local_address(NativeSocket native) {
     sockaddr_storage local{};
@@ -766,17 +836,25 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
 
 int APS5_VABI sceNetSocketClose(int s) {
     std::shared_ptr<NativeSocketHandle> native;
+#ifdef __APPLE__
+    int type = 0;
+#endif
     {
         std::lock_guard lk(g_mutex);
         const auto it = g_socks.find(s);
         if (it == g_socks.end()) return fail(NET_EBADF);
         native = it->second.native;
+#ifdef __APPLE__
+        type = it->second.type;
+#endif
         g_socks.erase(it);
     }
     KernelReleaseSocketNumber_nid_no_patch(s);
     if (native) {
 #ifdef _WIN32
         ::shutdown(native->value, SD_BOTH);
+#elif defined(__APPLE__)
+        if (::shutdown(native->value, SHUT_RDWR) != 0) emulate_receive_shutdown(native, type, errno);
 #else
         ::shutdown(native->value, SHUT_RDWR);
 #endif
@@ -788,15 +866,23 @@ int APS5_VABI sceNetSocketClose(int s) {
 int APS5_VABI sceNetSocketAbort(int s, int flags) {
     (void)flags;
     std::shared_ptr<NativeSocketHandle> native;
+#ifdef __APPLE__
+    int type = 0;
+#endif
     {
         std::lock_guard lk(g_mutex);
         auto it = g_socks.find(s);
         if (it == g_socks.end()) return fail(NET_EBADF);
         it->second.aborted = true;
         native = it->second.native;
+#ifdef __APPLE__
+        type = it->second.type;
+#endif
     }
 #ifdef _WIN32
     if (native) ::shutdown(native->value, SD_BOTH);
+#elif defined(__APPLE__)
+    if (native && ::shutdown(native->value, SHUT_RDWR) != 0) emulate_receive_shutdown(native, type, errno);
 #else
     if (native) ::shutdown(native->value, SHUT_RDWR);
 #endif
@@ -835,7 +921,11 @@ int APS5_VABI sceNetListen(int s, int backlog) {
         socket = it->second;
     }
     if (socket.type != NET_SOCK_STREAM) return fail(NET_EOPNOTSUPP);
+#ifdef __APPLE__
+    if (::listen(socket.native->value, HostListenBacklog(backlog)) != 0) return fail(native_error());
+#else
     if (::listen(socket.native->value, backlog) != 0) return fail(native_error());
+#endif
     std::lock_guard lk(g_mutex);
     auto it = g_socks.find(s);
     if (it != g_socks.end()) {
@@ -965,6 +1055,8 @@ int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
     }
 #ifdef _WIN32
     if (const int wait = wait_for_local_address(s, socket, len == 0)) return wait == RECEIVE_NOTHING ? 0 : fail(wait);
+#elif defined(__APPLE__)
+    if (const int wait = wait_for_datagram(socket, flags)) return wait == RECEIVE_NOTHING ? 0 : fail(wait);
 #endif
     const GuestArena::HostWrite destination(len == 0 ? nullptr : buf, len);
     if (!destination.Open()) return fail(NET_EFAULT);
@@ -992,6 +1084,10 @@ int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* 
     if (!lengthOutput.Open()) return fail(NET_EFAULT);
 #ifdef _WIN32
     if (const int wait = wait_for_local_address(s, socket, len == 0)) {
+#elif defined(__APPLE__)
+    if (const int wait = wait_for_datagram(socket, flags)) {
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
         if (wait != RECEIVE_NOTHING) return fail(wait);
         if (from) *fromlen = 0;
         return 0;
@@ -1093,6 +1189,10 @@ int64_t APS5_VABI sceNetRecvmsg(int s, NetMsghdr* msg, int flags) {
     const bool datagram = socket.type != NET_SOCK_STREAM;
 #ifdef _WIN32
     if (const int wait = wait_for_local_address(s, socket, total == 0)) {
+#elif defined(__APPLE__)
+    if (const int wait = wait_for_datagram(socket, flags)) {
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
         if (wait != RECEIVE_NOTHING) return fail(wait);
         msg->flags = 0;
         if (msg->name) msg->name_length = 0;
@@ -1144,6 +1244,9 @@ int APS5_VABI sceNetShutdown(int s, int how) {
         socket = it->second;
     }
     const int error = ::shutdown(socket.native->value, how) == 0 ? 0 : native_error();
+#ifdef __APPLE__
+    if (how != 1 && error != 0) emulate_receive_shutdown(socket.native, socket.type, errno);
+#endif
     if (how != 1) {
         std::lock_guard lk(g_mutex);
         const auto it = g_socks.find(s);

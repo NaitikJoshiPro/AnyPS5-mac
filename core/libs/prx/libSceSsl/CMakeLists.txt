@@ -60,6 +60,11 @@ target_link_libraries(libSceSsl PRIVATE mbedtls mbedx509 mbedcrypto)
 set_target_properties(libSceSsl PROPERTIES VISIBILITY_INLINES_HIDDEN ON)
 if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libSceSsl PRIVATE LINKER:--exclude-libs,ALL)
+elseif(APPLE)
+    # ld64 has no --exclude-libs: keep the static Mbed TLS (mbedtls_*, psa_*) out of the export
+    # table, or a program linking its own Mbed TLS (guest_ssl_transport_tests' server) binds to
+    # this copy, whose allocator is the per-context pool.
+    target_link_options(libSceSsl PRIVATE "LINKER:-unexported_symbol,_mbedtls_*" "LINKER:-unexported_symbol,_psa_*")
 endif()
 if(WIN32)
     target_link_libraries(libSceSsl PRIVATE bcrypt ws2_32)

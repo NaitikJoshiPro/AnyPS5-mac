@@ -1044,10 +1044,17 @@ int APS5_VABI sceKernelGetdents(int fd, char* buf, int nbytes) {
 // cookies. The descriptor's offset holds the index of the next entry instead, and each call lists
 // the directory through a separate descriptor; seeking the guest descriptor to 0 rewinds it.
 int APS5_VABI sceKernelGetdirentries(int fd, char* buf, int nbytes, int64_t* basep) {
+    if (GuestSockets::IsOpen(fd)) return SceErrorFromErrno(GUEST_EINVAL);
+    File::RefuseArchivedFile(fd, "getdirentries");
     constexpr std::size_t GuestHeaderBytes = 8;
     constexpr std::size_t GuestMaxName = 255;
     if (buf == nullptr) return SceErrorFromErrno(GUEST_EFAULT);
     if (nbytes <= 0) return SceErrorFromErrno(GUEST_EINVAL);
+    // FreeBSD's kern_getdirentries returns EINVAL for anything that is not a directory vnode
+    // (pipes included) and EBADF for a descriptor that is not open, as on Linux.
+    struct stat status{};
+    if (::fstat(fd, &status) != 0) return SceErrorFromErrno(errno);
+    if (!S_ISDIR(status.st_mode)) return SceErrorFromErrno(GUEST_EINVAL);
     const int savedErrno = errno;
     const off_t base = ::lseek(fd, 0, SEEK_CUR);
     if (base < 0) return SceErrorFromErrno(errno);

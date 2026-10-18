@@ -1,6 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -26,7 +27,11 @@ int APS5_VABI munlockall_nid_postfix();
 int* APS5_VABI __error_nid_postfix();
 }
 
-static void Require(bool value) { if (!value) std::abort(); }
+static void Require(bool value, int line = __builtin_LINE()) {
+    if (value) return;
+    std::fprintf(stderr, "mlock check failed at line %d\n", line);
+    std::abort();
+}
 
 static void RequireLockAllInvalid(int flags) {
     *__error_nid_postfix() = 0;

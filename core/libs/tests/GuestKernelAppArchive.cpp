@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -77,6 +78,21 @@ void OnMmapRefused() {
         std::strstr(error->what(), "mmap on a file read from app0.zar") != nullptr && std::strstr(error->what(), "not implemented") != nullptr;
     std::_Exit(refused ? 0 : 1);
 }
+
+#ifdef __APPLE__
+// macOS resolves the host std::terminate to libc++abi in two-level namespace, not to libc.prx's
+// export, so the refusal thrown out of the noexcept mmap export reaches the host handler.
+void OnHostMmapRefused() {
+    bool refused = false;
+    try {
+        if (const auto current = std::current_exception()) std::rethrow_exception(current);
+    } catch (const std::runtime_error& error) {
+        refused = std::strstr(error.what(), "mmap on a file read from app0.zar") != nullptr && std::strstr(error.what(), "not implemented") != nullptr;
+    } catch (...) {
+    }
+    std::_Exit(refused ? 0 : 1);
+}
+#endif
 
 template <typename TCall> bool NotImplemented(TCall call) {
     try {
@@ -243,6 +259,9 @@ int main(int argc, char** argv) {
         const int fd = sceKernelOpen("/app0/Data/Small.txt", SCE_KERNEL_O_RDONLY, 0);
         Check(fd >= 0);
         _ZSt13set_terminatePFvvE_nid_postfix(OnMmapRefused);
+#ifdef __APPLE__
+        std::set_terminate(OnHostMmapRefused);
+#endif
         (void)mmap_nid_postfix(nullptr, 16384, 1, 2, fd, 0);
         return 1;
     } else if (mode == "plain") {

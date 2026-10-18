@@ -1245,7 +1245,8 @@ class ProbeWriter:
 
 def mir_functions(text, target):
     """name -> (argument registers in order, argument stack ranges, result registers) from MIR after instruction
-    selection."""
+    selection; the result registers are None for a function without a return (it calls a noreturn function such as
+    NotImplemented_nid_no_patch), whose result locations the compiler never shows."""
     functions = {}
     for document in re.split(r"^---\s*$", text, flags=re.M):
         name = re.search(r"^name:\s+(\S+)", document, re.M)
@@ -1256,12 +1257,13 @@ def mir_functions(text, target):
         fixed = document.split("\nfixedStack:", 1)[1].split("\nstack:", 1)[0] if "\nfixedStack:" in document else ""
         stack = [(int(offset), int(size)) for offset, size in re.findall(r"- \{ id: \d+, type: \w+, offset: (-?\d+), size: (\d+)", fixed)]
         classes = dict(re.findall(r"- \{ id: (\d+), class: (\w+)", document))
-        returned = []
-        for line in re.findall(r"^\s*RET\S*.*$", document, re.M):
+        returns = re.findall(r"^\s*RET\S*.*$", document, re.M)
+        returned = [] if returns else None
+        for line in returns:
             for register, virtual in re.findall(r"\$(\w+)|%(\d+)", line):
                 if register or classes.get(virtual, "").startswith("rfp"):
                     returned.append(normalize_register(register, target) if register else "st0")
-        functions[name.group(1)] = (incoming, merge_stack(stack, target), list(dict.fromkeys(returned)))
+        functions[name.group(1)] = (incoming, merge_stack(stack, target), None if returned is None else list(dict.fromkeys(returned)))
     return functions
 
 
@@ -1335,6 +1337,8 @@ def compiled_exports(document, commands_path, root, work):
             for export, found in results:
                 expected = model_locations(host_layout(export), "host")
                 compared += 1
+                if found is not None and found[2] is None:
+                    expected = (*expected[:2], None)
                 if found != expected:
                     failures.append(f"host {export['name']} ({export['location']}): generator {expected}, compiler {found}")
     return compared, failures

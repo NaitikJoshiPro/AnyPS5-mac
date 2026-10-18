@@ -13,6 +13,8 @@
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #endif
 
 namespace ProcessParametersFixture {
@@ -20,6 +22,10 @@ namespace {
 
 #ifdef _WIN32
 [[gnu::section(".proctst"), gnu::used]] alignas(4) std::uint32_t metadata[2]{};
+#elif defined(__APPLE__)
+// The metadata a relinked macOS executable carries (__APS5DATA,__meta, version 2: load bias at 0x08, program header
+// count at 0x58, program headers from 0x60), which libc's dl_iterate_phdr reads from the main image.
+[[gnu::section("__APS5DATA,__meta"), gnu::used]] alignas(8) std::uint8_t metadata[0x60 + 2 * sizeof(Elf64_Phdr)]{};
 #endif
 
 bool Install(std::byte* process, std::size_t size) {
@@ -80,6 +86,24 @@ bool Install(std::byte* process, std::size_t size) {
         return 1;
     }, &request);
     return request.installed;
+#elif defined(__APPLE__)
+    const std::uint64_t version = 2;
+    const std::uint64_t loadBias = 0;
+    const std::uint64_t count = 2;
+    Elf64_Phdr headers[2] {};
+    headers[0].p_type = PT_LOAD;
+    headers[0].p_flags = 4 | PF_W;
+    headers[0].p_vaddr = headers[0].p_paddr = reinterpret_cast<std::uintptr_t>(process);
+    headers[0].p_filesz = headers[0].p_memsz = size;
+    headers[1].p_type = 0x61000001;
+    headers[1].p_flags = 4;
+    headers[1].p_vaddr = headers[1].p_paddr = reinterpret_cast<std::uintptr_t>(process);
+    headers[1].p_filesz = headers[1].p_memsz = size;
+    std::memcpy(metadata, &version, sizeof(version));
+    std::memcpy(metadata + 0x08, &loadBias, sizeof(loadBias));
+    std::memcpy(metadata + 0x58, &count, sizeof(count));
+    std::memcpy(metadata + 0x60, headers, sizeof(headers));
+    return true;
 #else
     return false;
 #endif

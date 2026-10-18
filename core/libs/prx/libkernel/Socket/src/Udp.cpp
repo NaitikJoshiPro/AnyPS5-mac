@@ -806,6 +806,13 @@ bool GuestSockets::Ready(int descriptor, bool write, std::int64_t* data, bool* e
 #ifdef _WIN32
         unsigned long available = 0;
         if (ioctlsocket(socket->value, FIONREAD, &available) == 0) *data = static_cast<std::int64_t>(available);
+#elif defined(__APPLE__)
+        // macOS FIONREAD also counts each datagram's source address; SO_NREAD is the next datagram's size, as on Linux.
+        int available = 0;
+        socklen_t availableSize = sizeof(available);
+        if (socket->type == 2 ? ::getsockopt(socket->value, SOL_SOCKET, SO_NREAD, &available, &availableSize) == 0
+                              : ::ioctl(socket->value, FIONREAD, &available) == 0)
+            *data = available;
 #else
         int available = 0;
         if (::ioctl(socket->value, FIONREAD, &available) == 0) *data = available;
@@ -1091,7 +1098,11 @@ int APS5_VABI listen_nid_postfix(int descriptor, int backlog) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     if (socket->type != 1) return Fail(45);
+#ifdef __APPLE__
+    if (::listen(socket->value, HostListenBacklog(backlog))) return Fail(NativeError());
+#else
     if (::listen(socket->value, backlog)) return Fail(NativeError());
+#endif
     std::lock_guard lock(socket->modeMutex);
     socket->options.listening = true;
     return 0;

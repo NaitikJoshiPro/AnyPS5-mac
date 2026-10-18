@@ -1,5 +1,6 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 #include "SceTypes.hpp"
 #include <cstdarg>
 #include <cstdio>
@@ -111,12 +112,20 @@ void APS5_VABI CallVariant(Variant variant, int status, int code, const char* fo
     __builtin_sysv_va_list args;
     __builtin_sysv_va_start(args, format);
     if (variant == Variant::WarnxSkipping) (void)__builtin_va_arg(args, int);
+    auto* list = reinterpret_cast<VaList*>(args);
+#elif defined(__aarch64__) && defined(__APPLE__)
+    // arm64's va_list is a plain stack pointer; the libraries read the guest's (System V) layout over it.
+    std::va_list args;
+    va_start(args, format);
+    if (variant == Variant::WarnxSkipping) (void)va_arg(args, int);
+    VaList guestArgs = LibcDetail::GuestVaList(args);
+    auto* list = &guestArgs;
 #else
     std::va_list args;
     va_start(args, format);
     if (variant == Variant::WarnxSkipping) (void)va_arg(args, int);
-#endif
     auto* list = reinterpret_cast<VaList*>(args);
+#endif
     switch (variant) {
     case Variant::Warn: vwarn_nid_postfix(format, list); break;
     case Variant::Warnc: vwarnc_nid_postfix(code, format, list); break;

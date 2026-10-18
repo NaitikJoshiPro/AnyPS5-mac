@@ -87,7 +87,7 @@ void* LibSystem(const char* name) {
 // same image) resolves its own slot, outside any signal handler.
 #define APS5_SHIMMED_CALLS(X) \
     X(accept) X(access) X(bind) X(chmod) X(clock_getres) X(clock_gettime) X(connect) X(dlopen) X(execv) X(faccessat) \
-    X(fcntl) X(fgets) X(fopen) X(fputs) X(fread) X(freopen) X(fsgetpath) X(fstat) X(fstatat) X(fstatfs) X(fstatvfs) \
+    X(fchmodat) X(fcntl) X(fgets) X(fopen) X(fputs) X(fread) X(freopen) X(fsgetpath) X(fstat) X(fstatat) X(fstatfs) X(fstatvfs) \
     X(futimes) X(fwrite) X(getentropy) X(getpeername) X(getrlimit) X(getrusage) X(getsockname) X(getsockopt) \
     X(gettimeofday) X(ioctl) X(kevent) X(lstat) X(lutimes) X(mach_msg) X(mach_timebase_info) X(mkdir) X(mkstemp) \
     X(nanosleep) X(open) X(openat) X(opendir) X(pipe) X(pipe2) X(poll) X(pread) X(preadv) X(pthread_setname_np) \
@@ -425,6 +425,10 @@ APS5_HOST_SHIM int access(const char* path, int mode) {
 
 APS5_HOST_SHIM int faccessat(int directory, const char* path, int mode, int flags) {
     return APS5_REAL(faccessat)(directory, HostString(path), mode, flags);
+}
+
+APS5_HOST_SHIM int fchmodat(int directory, const char* path, mode_t mode, int flags) {
+    return APS5_REAL(fchmodat)(directory, HostString(path), mode, flags);
 }
 
 APS5_HOST_SHIM int chmod(const char* path, mode_t mode) {

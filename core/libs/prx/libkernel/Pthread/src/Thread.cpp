@@ -609,9 +609,33 @@ asm(".text\n"
     ret
     .cfi_endproc
 )" APS5_ASM_FUNCTION_END("Aps5CallGuestEntry_nid_no_patch"));
+#elif defined(__aarch64__)
+// arm64 host: the same zero frame record (saved x29 and x30 both 0) under the entry, so a frame-pointer walk from a
+// native entry ends on the thread's own stack instead of climbing into the host's thread start. A guest entry is a
+// bridge thunk into the translator, whose x86 frame chain is the guest's own (TechnicalDebt.md).
+extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg);
+
+asm(".text\n"
+    ".p2align 2\n"
+    APS5_ASM_FUNCTION("Aps5CallGuestEntry_nid_no_patch") R"(
+    .cfi_startproc
+    stp x29, x30, [sp, #-32]!
+    .cfi_def_cfa_offset 32
+    .cfi_offset x30, -24
+    .cfi_offset x29, -32
+    stp xzr, xzr, [sp, #16]
+    add x29, sp, #16
+    mov x16, x0
+    mov x0, x1
+    blr x16
+    ldp x29, x30, [sp], #32
+    .cfi_def_cfa_offset 0
+    .cfi_restore x30
+    .cfi_restore x29
+    ret
+    .cfi_endproc
+)" APS5_ASM_FUNCTION_END("Aps5CallGuestEntry_nid_no_patch"));
 #else
-// arm64 host (FEX): the guest entry runs in the translator, whose guest frame chain starts at the bridge,
-// so the x86 zero-record trampoline (upstream ff9bf22281) is not needed.
 static void* Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg) {
     return entry(arg);
 }

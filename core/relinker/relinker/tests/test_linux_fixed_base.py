@@ -114,7 +114,11 @@ def main():
         assert plain_relocations == [(SLOT, 8, ENTRY)], plain_relocations
         assert relocations(fixed) == [(SLOT + BASE, 8, ENTRY + BASE)], relocations(fixed)
 
-        relocated = fixture(slots=5)
+        # Five slots are too few for the output; the bytes after them are not zero padding the table could grow into
+        # (that case is checked below), so the table moves past the input.
+        relocated = bytearray(fixture(slots=5))
+        relocated[0x158:0x198] = b"\x41" * 0x40
+        relocated = bytes(relocated)
         result, relocated_plain_path = relink(relinker, work, "relocated-plain", relocated)
         assert result.returncode == 0, (result.stdout, result.stderr)
         result, relocated_fixed_path = relink(relinker, work, "relocated-fixed", relocated, "--linux-fixed-base", hex(BASE))
@@ -137,10 +141,14 @@ def main():
         covering = next(header for header in relocated_fixed_headers if header[0] == PT_LOAD and header[3] <= relocated_entry < header[3] + header[5])
         assert covering[1] & 1, "the segment covering the entry is not executable"
 
-        filled = bytearray(relocated)
-        filled[0x158:0x198] = b"\x41" * 0x40
-        result, _ = relink(relinker, work, "relocated-filled", bytes(filled), "--linux-fixed-base", hex(BASE))
+        # Zero padding after a short table (a homebrew executable's): the table grows into it in place, rebased alike.
+        padded = fixture(slots=5)
+        result, padded_path = relink(relinker, work, "padded-fixed", padded, "--linux-fixed-base", hex(BASE))
         assert result.returncode == 0, (result.stdout, result.stderr)
+        padded_fixed = padded_path.read_bytes()
+        assert struct.unpack_from("<Q", padded_fixed, 0x20)[0] == 0x40, "the table did not grow into the zero padding"
+        assert struct.unpack_from("<H", padded_fixed, 0x38)[0] > 5, "the table grown into the zero padding has no more headers"
+        assert min(header[3] for header in headers(padded_fixed) if header[0] == PT_LOAD) == BASE, "the padded image does not start at the base"
 
         if sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64"):
             fixed_path.chmod(0o755)

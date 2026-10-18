@@ -753,7 +753,7 @@ int APS5_VABI sceKernelMunlock_nid_postfix(void* address, std::uint64_t length) 
 }
 
 int APS5_VABI sceKernelMunlockall_nid_postfix() {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     ::munlockall();
 #endif
     std::map<uintptr_t, size_t> ranges;
@@ -761,6 +761,14 @@ int APS5_VABI sceKernelMunlockall_nid_postfix() {
         std::lock_guard lock(g_lockedRangesLock);
         ranges.swap(g_lockedRanges);
     }
+#ifdef __APPLE__
+    // Darwin's munlockall fails with ENOSYS (and would clobber the guest errno). The recorded
+    // ranges hold guest addresses; each is wired at its host alias (D31, D33), as LockHostPages
+    // locked it. munmap already forgot unmapped ranges, so a failure here leaves nothing wired.
+    const int savedErrno = errno;
+    for (const auto& [start, len] : ranges) ::munlock(reinterpret_cast<void*>(GuestArena::HostAddress(start)), len);
+    errno = savedErrno;
+#endif
 #ifdef _WIN32
     for (const auto& [start, len] : ranges) {
         const auto end = start + len;
