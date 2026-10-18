@@ -299,6 +299,14 @@ struct SpirvTarget {
     // nearest even, v_add/v_sub/v_subrev/v_mul_f32 and the f32 compares skip the front end's explicit
     // operand and result flushes (MslTargetOptions, FPMulNativeFlushFlag). Never set for Vulkan.
     bool float32DenormFlushNative = false;
+    // MSL only (DECISIONS D62): a wave64 compute program whose results do not depend on the other
+    // lanes of its wave runs at one guest lane per host invocation instead of two
+    // (MslPlanWave64LaneLocal). Never set for Vulkan.
+    bool mslWave64LaneLocal = false;
+    // MSL only (DECISIONS D63): NaN tests of values that can never be a NaN are false
+    // (NanTestEliminator), so RDNA's NaN emulation stays only where a NaN can reach. Never set for
+    // Vulkan.
+    bool mslNanTestElimination = false;
 };
 
 struct BindingLayout {

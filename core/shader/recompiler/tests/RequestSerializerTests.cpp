@@ -11,9 +11,10 @@
 
 namespace {
 
-// Mac fork: version 31 appends float32DenormFlushNative (one byte) after upstream's version 30 layout.
-constexpr std::uint8_t kCurrentVersion = 31u;
-constexpr std::size_t kMacTailBytes = 1u;
+// Mac fork: after upstream's version 30 layout, version 31 appends float32DenormFlushNative and version 32
+// mslWave64LaneLocal and mslNanTestElimination (one byte each).
+constexpr std::uint8_t kCurrentVersion = 32u;
+constexpr std::size_t kMacTailBytes = 3u;
 
 constexpr char kHistoricalVersion21[] =
     "NVNQQRUAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAAAAF4VjQSAQEBOTAAAAA=";
@@ -423,24 +424,39 @@ int main() {
         }
     }
 
-    for (const bool flush : {false, true}) {
-        ShaderRecompiler::RecompileRequest flushRequest{};
-        flushRequest.target.float32DenormFlushNative = flush;
-        auto bytes = DecodeBase64(serializer.Serialize(flushRequest));
-        Require(bytes.size() >= 9u && bytes[4] == kCurrentVersion && bytes.back() == static_cast<std::uint8_t>(flush));
-        Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.float32DenormFlushNative == flush);
-        auto invalid = bytes;
-        invalid.back() = 2u;
-        bool invalidRejected = false;
-        try {
-            static_cast<void>(serializer.Deserialize(EncodeBase64(invalid)));
-        } catch (const std::runtime_error& error) {
-            invalidRejected = std::string_view(error.what()) == "RequestSerializer: invalid float32DenormFlushNative value";
+    // The Mac tail: float32DenormFlushNative (v31), mslWave64LaneLocal and mslNanTestElimination (v32).
+    for (unsigned flags = 0; flags < 8u; ++flags) {
+        ShaderRecompiler::RecompileRequest flagRequest{};
+        flagRequest.target.float32DenormFlushNative = (flags & 1u) != 0u;
+        flagRequest.target.mslWave64LaneLocal = (flags & 2u) != 0u;
+        flagRequest.target.mslNanTestElimination = (flags & 4u) != 0u;
+        auto bytes = DecodeBase64(serializer.Serialize(flagRequest));
+        Require(bytes.size() >= 8u + kMacTailBytes && bytes[4] == kCurrentVersion);
+        const auto tail = bytes.size() - kMacTailBytes;
+        Require(bytes[tail] == (flags & 1u) && bytes[tail + 1u] == ((flags >> 1u) & 1u) && bytes[tail + 2u] == ((flags >> 2u) & 1u));
+        const auto replay = serializer.Deserialize(EncodeBase64(bytes));
+        Require(replay.request.target.float32DenormFlushNative == flagRequest.target.float32DenormFlushNative);
+        Require(replay.request.target.mslWave64LaneLocal == flagRequest.target.mslWave64LaneLocal);
+        Require(replay.request.target.mslNanTestElimination == flagRequest.target.mslNanTestElimination);
+        for (std::size_t index = 0; index < kMacTailBytes; ++index) {
+            auto invalid = bytes;
+            invalid[tail + index] = 2u;
+            bool invalidRejected = false;
+            try {
+                static_cast<void>(serializer.Deserialize(EncodeBase64(invalid)));
+            } catch (const std::runtime_error& error) {
+                invalidRejected = std::string_view(error.what()).starts_with("RequestSerializer: invalid ");
+            }
+            Require(invalidRejected);
         }
-        Require(invalidRejected);
+        auto version31 = bytes;
+        version31[4] = 31u;
+        version31.resize(tail + 1u);
+        const auto earlier = serializer.Deserialize(EncodeBase64(version31));
+        Require(earlier.request.target.float32DenormFlushNative == flagRequest.target.float32DenormFlushNative);
         auto version30 = bytes;
         version30[4] = 30u;
-        version30.pop_back();
+        version30.resize(tail);
         const auto upstream = serializer.Deserialize(EncodeBase64(version30));
         Require(!upstream.request.target.float32DenormFlushNative);
     }

@@ -11,6 +11,7 @@
 #include "SceTypes.hpp"
 #include "prx/libSceVideoOut/include/Output.hpp"
 #include "prx/libSceVideoOut/include/DisplayMode.hpp"
+#include "prx/libc/include/ConsoleSettings.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
@@ -24,7 +25,8 @@ static VideoOutOutputStatus outputStatus(const auto& cfg) {
     VideoOutOutputStatus status{};
     // The output resolution is the console display mode's (the TV's), not the registered buffers' (D61).
     status.resolution = VideoOutCurrentDisplayMode_nid_no_patch().height >= 2160u ? 2u : 1u;
-    const bool hdr = AgcDriver::CurrentHostHdr().available;
+    // The TV's dynamic range (APS5_HDR, default SDR), the same for every title (D68); not the host display's.
+    const bool hdr = ConsoleHdrOutput();
     status.dynamicRange = hdr ? VIDEO_OUT_DYNAMIC_RANGE_HDR : VIDEO_OUT_DYNAMIC_RANGE_SDR;
     status.refreshRate = (cfg.outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     status.flags = hdr ? VIDEO_OUT_OUTPUT_STATUS_FLAG_HDR : 0;
@@ -176,7 +178,7 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     *status = outputStatus(*cfg);
-    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] GetOutputStatus(handle %d): resolution class %u (display mode %s), buffers %ux%u\n", handle, status->resolution, VideoOutCurrentDisplayMode_nid_no_patch().name, cfg->width, cfg->height);
+    if (VideoOutTraceEnabled_nid_no_patch()) std::fprintf(stderr, "[videoout] GetOutputStatus(handle %d): resolution class %u (display mode %s), dynamic range %u, buffers %ux%u\n", handle, status->resolution, VideoOutCurrentDisplayMode_nid_no_patch().name, status->dynamicRange, cfg->width, cfg->height);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

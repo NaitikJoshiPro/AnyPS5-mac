@@ -1124,7 +1124,11 @@ private:
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
-void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+// `gpuReader`: the access is GPU work this thread records into the open batch next (the Metal
+// present's display decode, D66). Every recorded GPU write over the range precedes it in queue
+// order, so the hook records what must land first (queued labels, storage image stores) and skips
+// both CPU waits; FlushForGpuRead only asks for that while no batch holds a CPU write-back.
+void FlushForAccessImpl(std::uint64_t address, std::size_t bytes, bool gpuReader) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -1141,7 +1145,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             record();
         }
     }
-    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
+    if (!gpuReader && (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes))) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1176,7 +1180,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     } else {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
     }
-    if (stored || published) {
+    if ((stored || published) && !gpuReader) {
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
         // mutex released when this acquisition is the outermost; a nested hook waits locked through
@@ -1193,6 +1197,13 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         }
     }
 }
+
+void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    FlushForAccessImpl(address, bytes, false);
+}
+
+std::atomic<std::uint64_t> gpuReadsOrdered{0};
+std::atomic<std::uint64_t> gpuReadsWaited{0};
 
 }
 
@@ -2952,6 +2963,19 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     return false;
 }
 
+bool Recorder::CompletionWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    if (open != nullptr && open->writeBackCompletionCount != 0 && overlaps(*open, address, end)) return true;
+    for (const auto& batch : inFlight) {
+        if (batch->writeBackCompletionCount != 0 && overlaps(*batch, address, end)) return true;
+    }
+    for (const auto* batch : finishing) {
+        if (batch->writeBackCompletionCount != 0 && overlaps(*batch, address, end)) return true;
+    }
+    return false;
+}
+
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }
@@ -4074,6 +4098,34 @@ void Recorder::release(Batch& batch) noexcept {
     } catch (...) {
     }
     batch.metal.reset();
+}
+
+}
+
+namespace AgcDriver::Graphics::Metal {
+
+bool FlushForGpuRead(std::uint64_t address, std::size_t bytes) {
+    // A completion action may write guest memory on the CPU when its batch finishes (a write-back):
+    // queue order does not cover that, so the access waits as a CPU read would.
+    bool writeBack = false;
+    if (Recorder::PendingWriteBackCompletions() != 0) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        writeBack = recorder != nullptr && recorder->CompletionWriteOverlaps(address, bytes);
+    }
+    if (writeBack) {
+        FlushForAccessImpl(address, bytes, false);
+        gpuReadsWaited.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    FlushForAccessImpl(address, bytes, true);
+    gpuReadsOrdered.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::pair<std::uint64_t, std::uint64_t> GpuReadCounts() {
+    return {gpuReadsOrdered.load(std::memory_order_relaxed), gpuReadsWaited.load(std::memory_order_relaxed)};
 }
 
 }

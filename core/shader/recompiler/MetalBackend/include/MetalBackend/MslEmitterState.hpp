@@ -100,6 +100,25 @@ public:
     // operands through HalfValue/HalfArg (ballots, readfirstlane, ...). Workgroup barriers and
     // MeshAllocate are emitted once.
     std::uint32_t laneCount = 1u;
+    // A wave64 compute program at one guest lane per invocation (laneCount 1, DECISIONS D62): its
+    // ballots are the lane's own bit and its wave-mask branches follow the lane's own condition
+    // (MslLaneLocal.cpp proves both exact).
+    bool laneLocal = false;
+    // Lane-local in a one-wave threadgroup that exchanges values through threadgroup memory
+    // (MslLaneLocalPlan::threadgroupExchange): exact ballots when fullBallots (else the lane's own
+    // bit), votes for the wave-mask branches of the blocks in votedBranches (the others follow the
+    // lane's own condition), lane reads.
+    bool threadgroupExchange = false;
+    bool fullBallots = false;
+    std::unordered_set<std::uint32_t> votedBranches;
+    // Threadgroup exchange (one-wave threadgroups, every invocation at the same point): the value of
+    // guest lane `lane` (uint expressions), a vote over the wave, an exact 64-lane ballot (uint2).
+    [[nodiscard]] std::string ExchangeRead(const std::string& value, const std::string& lane);
+    [[nodiscard]] std::string ExchangeVote(const IrValue* predicate, bool all);
+    [[nodiscard]] std::string ExchangeBallot(const IrValue* predicate);
+    // The ballot of this invocation's SIMD group in both words (bit = lane & 31): for cross-lane
+    // reads that stay in the reading lane's 32-lane half at one lane per invocation.
+    [[nodiscard]] std::string HalfBallot(const IrValue* predicate);
     std::uint32_t half = 0u;
     std::uint32_t hostSubgroupSize = 32u;
     const ShaderWorkgroupInputInfo* workgroup = nullptr;

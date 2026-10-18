@@ -1,4 +1,5 @@
 #include "MetalBackend/MslEmitterState.hpp"
+#include "MetalBackend/MslLaneLocal.hpp"
 #include "BdaAbi.hpp"
 #include <algorithm>
 #include <bit>
@@ -533,7 +534,64 @@ bool MslGraphicsHalfWave(const MslEmitterState& state) {
     return state.laneCount == 1u && state.program.WaveSize() > state.hostSubgroupSize && !state.ThreadgroupStage();
 }
 
+// Threadgroup exchange (DECISIONS D62): `threadgroup uint aps5_wx[128]` in two alternating halves of 64
+// (aps5_wp), so one barrier per exchange suffices: a half is written again only after the next
+// exchange's barrier, which every invocation reaches after reading this one.
+static void DeclareExchange(MslEmitterState& state) {
+    if (!state.threadgroupExchange) state.Fail("a wave64 program at one lane per invocation exchanges values without threadgroup exchange");
+    if (state.prologue.find("aps5_wx[") != std::string::npos) return;
+    state.AddPrologue("threadgroup uint aps5_wx[128];");
+    state.AddPrologue("uint aps5_wp = 0u;");
+}
+
+std::string MslEmitterState::ExchangeRead(const std::string& value, const std::string& lane) {
+    DeclareExchange(*this);
+    Line("aps5_wx[aps5_wp + " + GuestLane() + "] = " + value + ";");
+    Line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    const auto result = Temporary("aps5_xr");
+    Line("const uint " + result + " = aps5_wx[aps5_wp + ((" + lane + ") & 63u)];");
+    Line("aps5_wp ^= 64u;");
+    return result;
+}
+
+// One word per host SIMD group (guest lanes 0-31 and 32-63: the SIMD group of thread_index_in_threadgroup
+// / 32, as the two-half layout's lane mapping).
+static std::string ExchangeHalves(MslEmitterState& state, const std::string& perGroup) {
+    DeclareExchange(state);
+    const auto mine = state.Temporary("aps5_xg");
+    state.Line("const uint " + mine + " = " + perGroup + ";");
+    state.Line("if (simd_is_first()) aps5_wx[aps5_wp + (" + state.GuestLane() + " >> 5u)] = " + mine + ";");
+    state.Line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    const auto words = state.Temporary("aps5_xw");
+    state.Line("const uint2 " + words + " = uint2(aps5_wx[aps5_wp], aps5_wx[aps5_wp + 1u]);");
+    state.Line("aps5_wp ^= 64u;");
+    return words;
+}
+
+std::string MslEmitterState::ExchangeVote(const IrValue* predicate, bool all) {
+    const auto words = ExchangeHalves(*this, std::string("uint(") + (all ? "simd_all(" : "simd_any(") + Value(predicate) + "))");
+    return all ? "((" + words + ".x & " + words + ".y) != 0u)" : "((" + words + ".x | " + words + ".y) != 0u)";
+}
+
+std::string MslEmitterState::ExchangeBallot(const IrValue* predicate) {
+    return ExchangeHalves(*this, "uint(static_cast<simd_vote::vote_t>(simd_ballot(" + Value(predicate) + ")))");
+}
+
+std::string MslEmitterState::HalfBallot(const IrValue* predicate) {
+    if (!laneLocal) return WaveBallot(predicate);
+    const auto bits = Temporary("aps5_hb");
+    Line("const uint " + bits + " = uint(static_cast<simd_vote::vote_t>(simd_ballot(" + Value(predicate) + ")));");
+    return "uint2(" + bits + ", " + bits + ")";
+}
+
 std::string MslEmitterState::WaveBallot(const IrValue* predicate) {
+    if (laneLocal) {
+        if (fullBallots) return ExchangeBallot(predicate);
+        // The lane's own bit (MslLaneLocal.cpp (b): only own-bit consumers read it).
+        const auto lane = GuestLane();
+        const auto value = Value(predicate);
+        return "uint2((" + value + ") && " + lane + " < 32u ? 1u << " + lane + " : 0u, (" + value + ") && " + lane + " >= 32u ? 1u << (" + lane + " - 32u) : 0u)";
+    }
     if (laneCount == 2u) return "uint2(" + Vote(HalfValue(predicate, 0u)) + ", " + Vote(HalfValue(predicate, 1u)) + ")";
     if (MslGraphicsHalfWave(*this)) return "uint2(" + Vote(Value(predicate)) + ", 0u)";
     if (program.WaveSize() > hostSubgroupSize) Fail("a ballot of a wave64 program at one lane per invocation spans two host SIMD groups");
@@ -541,12 +599,15 @@ std::string MslEmitterState::WaveBallot(const IrValue* predicate) {
 }
 
 std::string MslEmitterState::WaveAny(const IrValue* predicate) {
+    // Branches lanes decide alone never get here (MslFlowEmitter Condition); the others vote.
+    if (laneLocal) return ExchangeVote(predicate, false);
     if (laneCount == 2u) return "bool(uint(simd_any(" + HalfValue(predicate, 0u) + ")) | uint(simd_any(" + HalfValue(predicate, 1u) + ")))";
     if (program.WaveSize() > hostSubgroupSize && !MslGraphicsHalfWave(*this)) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
     return "simd_any(" + Value(predicate) + ")";
 }
 
 std::string MslEmitterState::WaveAll(const IrValue* predicate) {
+    if (laneLocal) return ExchangeVote(predicate, true);
     if (laneCount == 2u) return "bool(uint(simd_all(" + HalfValue(predicate, 0u) + ")) & uint(simd_all(" + HalfValue(predicate, 1u) + ")))";
     if (program.WaveSize() > hostSubgroupSize && !MslGraphicsHalfWave(*this)) Fail("a wave vote of a wave64 program at one lane per invocation spans two host SIMD groups");
     return "simd_all(" + Value(predicate) + ")";
@@ -700,6 +761,22 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     if (state.hostSubgroupSize == 1u && stage != IrShaderStage::Vertex && stage != IrShaderStage::Local) state.Fail("one-lane waves are only laid out for vertex and local programs (a target without vertexSubgroups)");
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
+    if (state.laneCount == 2u && stage == IrShaderStage::Compute && (target.wave64LaneLocal || std::getenv("APS5_MSL_LANE_SURVEY") != nullptr)) {
+        const auto threads = std::max(state.workgroup->threadsNum[0], 1u) * std::max(state.workgroup->threadsNum[1], 1u) * std::max(state.workgroup->threadsNum[2], 1u);
+        // Twice the host invocations of the two-half layout: kept within what every pipeline
+        // supports (TechnicalDebt metal-wave64-lane-local).
+        const auto plan = MslPlanWave64LaneLocal(program, threads);
+        // The exchange buffer takes 512 bytes of threadgroup memory beside LDS kept there.
+        const auto ldsBytes = program.Info().sharedMemoryBytes != 0u ? 0u : (state.workgroup->ldsSizeDwords + 1u) * 4u;
+        const bool exchangeFits = !plan.threadgroupExchange || ldsBytes + 512u <= target.maxThreadgroupMemoryBytes;
+        if (target.wave64LaneLocal && plan.eligible && threads <= MslLaneLocalMaxThreads && exchangeFits) {
+            state.laneCount = 1u;
+            state.laneLocal = true;
+            state.threadgroupExchange = plan.threadgroupExchange;
+            state.fullBallots = plan.fullBallots;
+            state.votedBranches = plan.votedBranches;
+        }
+    }
     // Wave-uniform values: computed once for both lane halves at laneCount 2; at any lane count the
     // stores whose address is wave-uniform keep only the highest active lane's data (MslBufferShared).
     if (state.ThreadgroupStage()) state.waveUniform = WaveUniformValues(program);
@@ -722,6 +799,12 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     for (const auto& [id, value] : state.functionConstants) shader.reflection.functionConstants.push_back(id);
     const bool singleLane = state.hostSubgroupSize == 1u;
     shader.source = "#include <metal_stdlib>\nusing namespace metal;\n\n" + (singleLane ? std::string(SingleLaneDefines) : std::string()) + state.Prelude() + entry + (singleLane ? std::string(SingleLaneUndefines) : std::string());
+    if (const char* survey = std::getenv("APS5_MSL_LANE_SURVEY"); survey != nullptr && (state.laneCount == 2u || state.laneLocal) && stage == IrShaderStage::Compute) {
+        if (FILE* out = std::fopen(survey, "a")) {
+            std::fprintf(out, "[lane-size] hash=0x%llx bytes=%zu local=%d\n", static_cast<unsigned long long>(program.Resources().shaderHash), shader.source.size(), state.laneLocal ? 1 : 0);
+            std::fclose(out);
+        }
+    }
     static const bool dump = std::getenv("APS5_MSL_DUMP") != nullptr;
     if (dump) std::fprintf(stderr, "[msl] shader 0x%llx:\n%s\n[msl] IR:\n%s\n", static_cast<unsigned long long>(program.Resources().shaderHash), shader.source.c_str(), ProgramToString(program).c_str());
     return shader;

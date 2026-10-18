@@ -58,7 +58,8 @@ static void CheckDisplayModeParsing() {
     Require(ModeRejected("720p") && ModeRejected("1080") && ModeRejected("1920x1080") && ModeRejected(" 1080p"));
 }
 
-// argv[1]: the width and height APS5_DISPLAY_MODE selects for this run (default 1920 1080).
+// argv[1], argv[2]: the width and height APS5_DISPLAY_MODE selects for this run (default 1920 1080); argv[3] "hdr"
+// when APS5_HDR=1.
 int main(int argc, char** argv) {
     CheckDisplayModeParsing();
     const std::uint32_t expectedWidth = argc > 2 ? static_cast<std::uint32_t>(std::stoul(argv[1])) : 1920u;
@@ -88,6 +89,10 @@ int main(int argc, char** argv) {
     Require(sceVideoOutGetOutputStatus(handle, &output) == 0);
     Require(status.refreshRate == output.refreshRate);
     Require(output.resolution == (expectedHeight >= 2160u ? 2u : 1u));
+    // The TV's dynamic range (APS5_HDR, D68): 1 SDR with no flags, or 2 HDR with flag bit 0.
+    const bool hdr = argc > 3 && std::string(argv[3]) == "hdr";
+    Require(output.dynamicRange == (hdr ? 2u : 1u) && output.flags == (hdr ? 1u : 0u));
+    Require(output.refreshRate == 3u);
 
     std::array<std::byte, 96> vrr;
     vrr.fill(std::byte{0xff});

@@ -1,5 +1,6 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -776,7 +777,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(31u);
+    writer.WriteU32(32u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -802,6 +803,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
     writer.WriteBool(request.target.float32DenormFlushNative);
+    writer.WriteBool(request.target.mslWave64LaneLocal);
+    writer.WriteBool(request.target.mslNanTestElimination);
     return base64Encode(buffer);
 }
 
@@ -810,7 +813,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 31u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 32u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -846,11 +849,17 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
-    // Mac fork (D-float32 denorm flush): version 31 appends float32DenormFlushNative after upstream's v30 layout.
-    if (version >= 31u) {
-        const auto float32DenormFlushNative = reader.ReadU8();
-        if (float32DenormFlushNative > 1u) throw std::runtime_error("RequestSerializer: invalid float32DenormFlushNative value");
-        result.request.target.float32DenormFlushNative = float32DenormFlushNative != 0u;
+    // Mac fork tail after upstream's v30 layout: version 31 appends float32DenormFlushNative, version 32 also
+    // mslWave64LaneLocal and mslNanTestElimination (D62, D63).
+    const auto macFlag = [&](const char* name) {
+        const auto value = reader.ReadU8();
+        if (value > 1u) throw std::runtime_error(std::string("RequestSerializer: invalid ") + name + " value");
+        return value != 0u;
+    };
+    if (version >= 31u) result.request.target.float32DenormFlushNative = macFlag("float32DenormFlushNative");
+    if (version >= 32u) {
+        result.request.target.mslWave64LaneLocal = macFlag("mslWave64LaneLocal");
+        result.request.target.mslNanTestElimination = macFlag("mslNanTestElimination");
     }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;

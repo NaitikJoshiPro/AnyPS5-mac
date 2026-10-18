@@ -19,3 +19,11 @@ target_link_libraries(agc_metal_native_f32_flush_tests PRIVATE libSceAgcDriver S
 set_target_properties(agc_metal_native_f32_flush_tests PROPERTIES CXX_EXTENSIONS OFF)
 add_test(NAME agc_metal_native_f32_flush COMMAND agc_metal_native_f32_flush_tests)
 set_tests_properties(agc_metal_native_f32_flush PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+# agc_metal_nan_test_elimination (DECISIONS D63): NaN tests of values that cannot be NaNs dropped, bit for bit against
+# the full emulation (GPU).
+add_test_executable(agc_metal_nan_test_elimination_tests ${agcMetalDir}/tests/NanTestElimination.cpp)
+target_include_directories(agc_metal_nan_test_elimination_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_metal_nan_test_elimination_tests PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_metal_nan_test_elimination_tests PROPERTIES CXX_EXTENSIONS OFF)
+add_test(NAME agc_metal_nan_test_elimination COMMAND agc_metal_nan_test_elimination_tests)
+set_tests_properties(agc_metal_nan_test_elimination PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)

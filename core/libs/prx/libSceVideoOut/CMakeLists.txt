@@ -174,6 +174,8 @@ if(BUILD_TESTING)
     # The console display mode (D61): the reported output follows APS5_DISPLAY_MODE.
     add_test(NAME guest_video_out_resolution_status_1440p COMMAND guest_video_out_resolution_status_tests 2560 1440)
     set_tests_properties(guest_video_out_resolution_status_1440p PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0 ENVIRONMENT "APS5_DISPLAY_MODE=1440p")
+    add_test(NAME guest_video_out_resolution_status_hdr COMMAND guest_video_out_resolution_status_tests 1920 1080 hdr)
+    set_tests_properties(guest_video_out_resolution_status_hdr PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0 ENVIRONMENT "APS5_HDR=1")
     add_test(NAME guest_video_out_resolution_status_2160p COMMAND guest_video_out_resolution_status_tests 3840 2160)
     set_tests_properties(guest_video_out_resolution_status_2160p PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0 ENVIRONMENT "APS5_DISPLAY_MODE=2160p")
     if(WIN32)

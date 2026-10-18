@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
+#include "prx/libc/include/ConsoleSettings.hpp"
 
 namespace {
 
@@ -234,6 +236,7 @@ int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAre
  }
  *info = SystemServiceDisplaySafeAreaInfo{};
  info->ratio = 1.0f;
+ SystemQueryTrace("systemservice", "GetDisplaySafeAreaInfo: ratio %.2f", info->ratio);
  return SYSTEM_SERVICE_OK;
 }
 
@@ -241,11 +244,15 @@ int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLumi
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- const auto hdr = AgcDriver::CurrentHostHdr();
- luminance->max_tone_map_luminance = AgcDriver::ToneMapPeakNits(hdr);
- luminance->max_full_frame_tone_map_luminance = hdr.available ? hdr.display.maxFullFrameLuminance : AgcDriver::SdrToneMapLuminanceNits;
- luminance->min_tone_map_luminance = hdr.available ? hdr.display.minLuminance : 0.0f;
+ // An SDR TV (APS5_HDR=0, the default) reports SDR reference white; an HDR TV a 1000-nit panel (D68).
+ constexpr float SdrReferenceWhiteNits = 100.0f;
+ constexpr float HdrPanelPeakNits = 1000.0f;
+ const float peak = ConsoleHdrOutput() ? HdrPanelPeakNits : SdrReferenceWhiteNits;
+ luminance->max_full_frame_tone_map_luminance = peak;
+ luminance->max_tone_map_luminance = peak;
+ luminance->min_tone_map_luminance = 0.0f;
  AgcDriverNoteReportedToneMapPeak_nid_postfix(luminance->max_tone_map_luminance);
+ SystemQueryTrace("systemservice", "GetHdrToneMapLuminance: max full frame %.0f, max %.0f, min %.0f nits", luminance->max_full_frame_tone_map_luminance, luminance->max_tone_map_luminance, luminance->min_tone_map_luminance);
  return SYSTEM_SERVICE_OK;
 }
 
@@ -262,6 +269,10 @@ int APS5_VABI sceSystemServiceGetStatus(SystemServiceStatus* status) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
  *status = SystemServiceStatus{};
+ static std::atomic<bool> traced{false};
+ if (!traced.exchange(true)) {
+  SystemQueryTrace("systemservice", "GetStatus: first call (no overlay, foreground)");
+ }
  return SYSTEM_SERVICE_OK;
 }
 
@@ -284,6 +295,7 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
   case SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN: *value = SYSTEM_SERVICE_PARAM_ENTER_BUTTON_CROSS; break;
   default: *value = 0; break;
  }
+ SystemQueryTrace("systemservice", "ParamGetInt(%d): %d", paramId, *value);
  return SYSTEM_SERVICE_OK;
 }
 

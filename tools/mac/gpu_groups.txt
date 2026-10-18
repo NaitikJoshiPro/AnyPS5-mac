@@ -591,6 +591,7 @@ guest_video_out_output_mode G5
 guest_video_out_resolution_status G5
 guest_video_out_resolution_status_1440p G5
 guest_video_out_resolution_status_2160p G5
+guest_video_out_resolution_status_hdr G5
 guest_video_out_wqhd_detection G5
 pad_input_mapping G5
 pad_keyboard_mouse G5
@@ -686,6 +687,9 @@ agc_metal_msl_tessellation G7
 agc_metal_msl_upstream_parity G7
 agc_metal_msl_wave_lds G7
 agc_metal_native_f32_flush G7
+agc_metal_wave64_lane_local G7
+agc_metal_wave64_lane_local_plan G7
+agc_metal_nan_test_elimination G7
 agc_metal_pipeline_cache G7
 agc_metal_pipeline_cache_background G7
 agc_metal_pipeline_cache_save_race G7

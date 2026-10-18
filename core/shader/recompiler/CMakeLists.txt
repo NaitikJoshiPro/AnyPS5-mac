@@ -113,6 +113,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SharedMemoryBarrierInserter.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DenormalFlushEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/RedundantValueEliminator.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/NanTestEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtAddressArithmetic.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtDiagnostics.cpp
@@ -153,6 +154,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslEmitter.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslEntryPoint.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslFlowEmitter.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslLaneLocal.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslPrelude.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslAluMath.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/src/MslFloat64.cpp

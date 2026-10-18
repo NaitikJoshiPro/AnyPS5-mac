@@ -75,8 +75,9 @@ struct Program {
     // Host subgroup width the request claims instead of the device's (0: the device's). MSL programs
     // are laid out for 32 lanes whatever the claim (Recompiler.cpp HostSubgroupSize).
     std::uint32_t claimedSubgroupSize = 0u;
-    // Text the MSL must contain.
+    // Text the MSL must contain (or `alternative`).
     const char* expect = nullptr;
+    const char* alternative = nullptr;
 };
 
 constexpr std::array<Program, 10> Programs{{
@@ -89,7 +90,9 @@ constexpr std::array<Program, 10> Programs{{
     {"loop_body_wave64", LoopBodyCode, 128u, 2u, 64u, 9u},
     {"shader_clock", ClockCode, 32u, 2u, 32u, 8u, 0u, "aps5_clock_reads"},
     {"shader_clock_wave64", ClockCode, 64u, 2u, 64u, 8u, 0u, "aps5_clock_reads"},
-    {"readlane63_wave64_claimed_64_lanes", Lane63Code, 64u, 1u, 64u, 4u, 64u, "simd_shuffle"},
+    // A lane read: a SIMD-group shuffle at two lanes per invocation, a threadgroup exchange at one
+    // lane per invocation (DECISIONS D62).
+    {"readlane63_wave64_claimed_64_lanes", Lane63Code, 64u, 1u, 64u, 4u, 64u, "simd_shuffle", "aps5_wx["},
 }};
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t count) {
@@ -136,13 +139,16 @@ void CompileCheck(id<MTLDevice> device, const Program& program, const ShaderReco
     Require(reflection.abiVersion == ShaderRecompiler::MslAbi::Version, std::string(program.name) + ": unexpected MslAbi version");
     Require(reflection.stage == ShaderRecompiler::MslAbi::Stage::Kernel, std::string(program.name) + ": a compute program must reflect a kernel");
     // A wave64 program runs two guest lanes per host invocation: 32 host invocations per guest wave,
-    // in a one-dimensional threadgroup.
-    const std::array<std::uint32_t, 3> threads = program.waveSize == 64u ? std::array<std::uint32_t, 3>{(program.threads + 63u) / 64u * 32u, 1u, 1u} : std::array<std::uint32_t, 3>{program.threads, 1u, 1u};
-    Require(reflection.threadsPerThreadgroup == threads, std::string(program.name) + ": threadgroup size does not match the workgroup and its lane mapping");
+    // in a one-dimensional threadgroup; or, without cross-lane dependences (DECISIONS D62, wave64
+    // lane-local), one lane per invocation like wave32.
+    const std::array<std::uint32_t, 3> perLane{program.threads, 1u, 1u};
+    const std::array<std::uint32_t, 3> threads = program.waveSize == 64u ? std::array<std::uint32_t, 3>{(program.threads + 63u) / 64u * 32u, 1u, 1u} : perLane;
+    const bool laneLocal = program.waveSize == 64u && reflection.threadsPerThreadgroup == perLane;
+    Require(reflection.threadsPerThreadgroup == threads || laneLocal, std::string(program.name) + ": threadgroup size does not match the workgroup and its lane mapping");
     const auto* buffers = reflection.table.Find(ShaderRecompiler::RuntimeAbi::Binding::Buffers);
     Require(buffers != nullptr && buffers->count == program.buffers && buffers->offset == 0u, std::string(program.name) + ": the descriptor table lacks the guest buffers");
     Require(reflection.table.bytes == program.buffers * sizeof(ShaderRecompiler::MslAbi::BufferEntry), std::string(program.name) + ": unexpected descriptor table size");
-    if (program.expect != nullptr) Require(result.msl.Source().find(program.expect) != std::string::npos, std::string(program.name) + ": the MSL lacks " + program.expect);
+    if (program.expect != nullptr) Require(result.msl.Source().find(program.expect) != std::string::npos || (program.alternative != nullptr && result.msl.Source().find(program.alternative) != std::string::npos), std::string(program.name) + ": the MSL lacks " + program.expect);
     id<MTLLibrary> library = CompileLibrary(device, program.name, result.msl.Source());
     MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
     for (const auto& constant : result.specialization) {

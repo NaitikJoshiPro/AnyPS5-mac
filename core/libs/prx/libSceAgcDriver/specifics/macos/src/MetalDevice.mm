@@ -939,6 +939,20 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
         return value == nullptr || value[0] != '0';
     }();
     target.float32DenormFlushNative = nativeF32Flush;
+    // DECISIONS D62: wave64 compute programs without cross-lane dependences run at one guest lane per
+    // invocation (MslLaneLocal.cpp). APS5_MSL_WAVE64_LANE_LOCAL=0 keeps the two-half layout.
+    static const bool wave64LaneLocal = [] {
+        const char* value = std::getenv("APS5_MSL_WAVE64_LANE_LOCAL");
+        return value == nullptr || value[0] != '0';
+    }();
+    target.mslWave64LaneLocal = wave64LaneLocal;
+    // DECISIONS D63: NaN tests of values that cannot be a NaN are dropped (NanTestEliminator).
+    // APS5_MSL_NAN_TESTS=1 keeps every NaN test.
+    static const bool nanTestElimination = [] {
+        const char* value = std::getenv("APS5_MSL_NAN_TESTS");
+        return value == nullptr || value[0] != '1';
+    }();
+    target.mslNanTestElimination = nanTestElimination;
     return target;
 }
 

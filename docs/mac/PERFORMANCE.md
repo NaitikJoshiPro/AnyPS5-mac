@@ -44,6 +44,8 @@ Profile of Showcase (base4, `sample` 15 s, guest sampler):
 | D60 | Same, waiting for GPU writes only (no store outside the mutex) | 433 / 493 -> 418 / 517 | 33.4 / 41.6 -> 33.4 / 41.6 (x2, cool) | no |
 | D61 | Console display mode 1080p (reported by VideoOut) instead of 2160p | 203 / 259, 215 / 268 -> 219 / 232, 215 / 233 (2560x1440 target, GPU 1.15-1.20 GHz, ~70% active): fixed 4K title, no change | not applicable (DOOM registers 1080p) | yes (system behaviour; ASTRO 303 / 1598 (load 22), 323 / 437 -> 347 / 438, 336 / 395 ms, P 4.05 GHz, GPU 0.66-0.73 GHz: no change, its scene is already 1920x1080 / 2432x1368) |
 | D61 | MetalFX spatial upscale in the present (1080p -> 2560x1440) instead of bilinear | not applicable (4K source, downscale) | 33.38 / 41.62, 33.37 / 41.63 -> 33.36 / 41.63, 33.37 / 41.60 (P 3.97-4.0 GHz, cool; paced 30 fps); Present 10.2-10.3 -> 10.7 ms per frame, GPU 420 -> 482 MHz | yes (image quality; ~0.5 ms per present) |
+| D66 | Display buffer decoded on the GPU from its host import, no CPU wait under the GPU mutex (vs the CPU decode) | 616 / 1579, 562 / 621 -> 279 / 557, 524 / 572 (Heavy thermal pressure: P 0-3.1 GHz, GPU 350-680 MHz); present_display_buffer 130, 92 -> 4.1, 3.8 ms per frame | 33.37 / 38.5, 39.1 / 45.4 -> 33.36 / 37.1, 33.37 / 37.5 (paced; throttled GPU 338-660 MHz); Present 9.2, 38.6 -> 3.6, 5.8 ms per frame | yes (ASTRO 412 / 1044 (P 3.4 GHz, load 2), 499 / 1059, 951 / 1988 (load 12-17) -> 333 / 502 (P 3.7 GHz, load 7), 436 / 806 (P 2.0 GHz); present_display_buffer 41-94 -> 3.7-4.4 ms, queue 0 GPU-mutex wait 51-99 -> 12-14 ms per frame) |
+| D68 | Game preset "Performance Mode" (GetGamePresets priority 1) instead of Game Default (0); system answers from one set of console settings | not applicable (Showcase does not read presets) | not applicable (DOOM does not import GetGamePresets) | yes (system behaviour; ASTRO A/B/B/A 308.6 / 424.1, 435.3 / 883.9, 328.9 / 388.2, 394.3 / 1232.2 ms with P 3.7, 1.8, 3.3, 2.2 GHz and GPU 0.6-0.87 GHz: frame time follows the P-cluster clock, not the preset; display buffers 3840x2160 and scene 1920x1080 / 2432x1368 in every run) |
 
 ## Display resolution and upscaling (D61, PERF2, 2026-10-15)
 
@@ -53,3 +55,22 @@ What the 3D workloads render at (`APS5_TRACE_VIDEOOUT=1`):
 - **DOOM** registers 1920x1080 display buffers. A 1080p source in a 16:9 output larger than 1080p is where MetalFX applies.
 
 Headless runs present into `APS5_PRESENT_SIZE=2560x1440` (the user's 2560x1664 panel letterboxed to 16:9). Without it, title_run's offscreen drawable is 614x345.
+
+## ASTRO BOT: what `Driver.Packet.memory_wait` is (PERF3, 2026-10-15)
+
+`top_phases_ms_per_frame` sums every worker thread. In PERF2's aA4 trace (60 s), memory_wait was 50.0 s on async compute queue 0x40 and 57.3 s on 0x48, but only 4.5 s on graphics queue 0. The async queues sleep in WAIT_REG_MEM most of the frame, waiting for queue 0's labels: that is idle time, not a cost. Queue 0 is the critical path (100% busy). Its memory_wait (24-34 ms per frame) waits for queue 0x40's dispatches: about 45 ms of CPU recording, which contends with queue 0 for the GPU mutex. The label handoff itself (the last 0x40 dispatch to queue 0 waking) takes about 5 ms, so commit and label latency is not the lever.
+Queue 0's real costs per frame (aB3, after D66): Recorder.Sync about 70 ms, WaitSerial about 20 ms, GPU-mutex waits about 16 ms. Before D66 the present's mutex hold (41-94 ms) added to these.
+A host `sample` of queue 0 (asamp1, during a pipeline-compile stretch) shows recording at about 68% of samples:
+- memcmp and copies of guest memory for StorageTexture revalidation (`compareUntracked`, `captureGuestBytes`)
+- CMASK materialisation (`ColorTargetLayout::Offset`)
+- `Residency::Commit` from `TryWrap`
+- pipeline-key string building in `PipelineCache::PrepareCompute`
+
+GPU waits are about 10% of samples. Two thirds of those are `StorageTexture::Refresh` -> `upload` -> `captureGuestBytes` -> the flush hook's SyncThrough.
+
+## What ASTRO BOT asks before it sizes its output (D68, PERF4, 2026-10-15)
+
+- Before RegisterBuffers2 it calls only `sceSystemServiceParamGetInt(1)` (language), `sceSystemServiceGetStatus` and `sceVideoOutGetOutputStatus` once. It imports no GetResolutionStatus, IsOutputSupported, GetDeviceCapabilityInfo or ConfigureOutput.
+- It uses the output status's dynamic range: an HDR answer (`APS5_HDR=1`) makes it register 3840x2160 with pixel format 0x8100070400000000 instead of 0x8100000000000000 (not decoded yet). It ignores the resolution class: 3840x2160 under class 1 and 2. Its 4K display buffers are its scan-out size on any TV; the scene renders at 1920x1080 / 2432x1368.
+- After registering it polls GetOutputStatus, GetHdrToneMapLuminance and GetGamePresets every frame. The "Performance Mode" preset (now the default, `APS5_GAME_PRESET=default` for Game Default) changed neither its render sizes nor its frame time in four interleaved runs; frame time tracked the P-cluster clock (1.7-3.7 GHz on a shared machine).
+- What would lower ASTRO's cost: the per-present `Driver.Packet.memory_wait` (560-800 ms) and the driver waits PERF3 is working on (D66 already moved the 4K display-buffer decode to the GPU), not the system answers.

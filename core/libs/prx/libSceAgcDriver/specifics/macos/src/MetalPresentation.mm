@@ -4,9 +4,9 @@
 // window's drawable size: the headless mode, which runs every presentation step but the display.
 // A device without a window is not presentable, as upstream.
 //
-// Bring-up path: the source image is the display buffer decoded on the CPU (ReadDisplayBuffer: the
-// flush hook first waits for recorded GPU writes over it), or the pixels PresentPixels gets; it is
-// uploaded into a BGRA8 texture and drawn aspect-fit (AspectFit.hpp) over an opaque black clear by
+// The source image is the display buffer decoded on the GPU (D66, below) or on the CPU
+// (ReadDisplayBuffer: the flush hook first waits for recorded GPU writes over it), or the pixels
+// PresentPixels gets; it is copied into a BGRA8 texture and drawn aspect-fit (AspectFit.hpp) over an opaque black clear by
 // a small scaler pipeline, recorded into the recorder's open batch, which the present submits.
 // Slots: each present remembers its batch serial (and drawable); RetirePresents(keep) waits for the
 // oldest beyond `keep` (FlipInFlight). Frame dumps (APS5_DUMP_FRAMES, _EVERY, APS5_DUMP_SCALE) are
@@ -17,14 +17,24 @@
 // rectangle's size and the scaler pipeline copies that 1:1 into the target; downscales and equal
 // sizes keep the bilinear scaler. APS5_METALFX=0 always uses the bilinear scaler. Headless targets
 // take the window's drawable size, or APS5_PRESENT_SIZE=<w>x<h> (measurements of a 16:9 output).
+// GPU decode (D66): a display buffer inside a host import is detiled and converted on the GPU by
+// aps5_display_decode, reading the guest memory in place, in the batch the present submits. The
+// flush hook records what must land first (queued labels, storage image stores) and waits for
+// nothing: the recorded GPU writes precede the decode in queue order, and the flip is reported
+// done only once the present's batch finished (Driver::Present), so the guest cannot overwrite the
+// buffer under the decode. Frame dumps, memory outside every import, and a pending CPU write-back
+// keep the CPU decode. APS5_PRESENT_GPU_DECODE=0 always decodes on the CPU.
 
 #include "MetalDeviceState.h"
 #include "MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HalfFloatScanout.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "MetalResidency.h"
@@ -71,7 +81,100 @@ vertex ScalerOut aps5_scaler_vertex(uint id [[vertex_id]], constant float4& rect
 fragment float4 aps5_scaler_fragment(ScalerOut in [[stage_in]], texture2d<float> source [[texture(0)]], sampler filter [[sampler(0)]]) {
     return float4(source.sample(filter, in.uv).rgb, 1.0f);
 }
+// The display buffer decode (D66), DisplayBuffer.cpp's DecodeDisplayBuffer on the GPU: one thread
+// per pixel, BGRA8 out. mode: 1 tiled (64 KiB R_X), 2 R8G8B8A8, 4 10-bit, 8 16-bit float, 16 red low.
+struct DecodeParameters {
+    uint width;
+    uint height;
+    uint pitch;
+    uint mode;
+    uint blocksPerRow;
+    uint unused;
+    device const uint* source;
+    device uint* destination;
+    device const uint* thresholds;
+};
+static uint scanoutCode(device const uint* thresholds, uint bits, uint base) {
+    if (bits > 0x7c00u) return 0u;
+    uint code = 0u;
+    for (uint step = 128u; step != 0u; step >>= 1u) {
+        if (code + step <= 255u && thresholds[base + code + step - 1u] <= bits) code += step;
+    }
+    return code;
+}
+kernel void aps5_display_decode(constant DecodeParameters& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]) {
+    const uint x = id.x;
+    const uint y = id.y;
+    if (x >= p.width || y >= p.height) return;
+    const bool tiled = (p.mode & 1u) != 0u;
+    uint pixel;
+    if ((p.mode & 8u) != 0u) {
+        uint offset;
+        if (tiled) {
+            offset = ((y / 64u) * p.blocksPerRow + x / 128u) * 65536u + (((x << 3u) & 0x0008u) ^ ((x << 4u) & 0x0460u) ^ ((x << 5u) & 0x0300u) ^ ((x << 6u) & 0x0800u) ^ ((x << 9u) & 0x8000u) ^ ((x << 10u) & 0x2000u)
+                ^ ((y << 4u) & 0x0010u) ^ ((y << 6u) & 0x0080u) ^ ((y << 5u) & 0x0f00u) ^ ((y << 10u) & 0x5000u));
+        } else {
+            offset = (y * p.pitch + x) * 8u;
+        }
+        const uint first = p.source[offset / 4u];
+        const uint second = p.source[offset / 4u + 1u];
+        const bool redLow = (p.mode & 16u) != 0u;
+        const uint red = redLow ? (second & 0xffffu) : (first & 0xffffu);
+        const uint blue = redLow ? (first & 0xffffu) : (second & 0xffffu);
+        pixel = scanoutCode(p.thresholds, red, 0u) | (scanoutCode(p.thresholds, first >> 16u, 0u) << 8u) | (scanoutCode(p.thresholds, blue, 0u) << 16u) | (scanoutCode(p.thresholds, second >> 16u, 255u) << 24u);
+    } else {
+        uint offset;
+        if (tiled) {
+            offset = ((y / 128u) * p.blocksPerRow + x / 128u) * 65536u + (((y << 4u) & 0x0070u) ^ ((y << 5u) & 0x0f00u) ^ ((y << 9u) & 0x1000u) ^ ((y << 8u) & 0x4000u)
+                ^ ((x << 2u) & 0x000cu) ^ ((x << 5u) & 0x0380u) ^ ((x << 4u) & 0x0400u) ^ ((x << 6u) & 0x0800u) ^ ((x << 9u) & 0xa000u));
+        } else {
+            offset = (y * p.pitch + x) * 4u;
+        }
+        const uint word = p.source[offset / 4u];
+        const bool rgba = (p.mode & 2u) != 0u;
+        if ((p.mode & 4u) != 0u) {
+            const uint r = (word >> 2u) & 0xffu;
+            const uint g = (word >> 12u) & 0xffu;
+            const uint b = (word >> 22u) & 0xffu;
+            pixel = (rgba ? b : r) | (g << 8u) | ((rgba ? r : b) << 16u) | 0xff000000u;
+        } else {
+            pixel = rgba ? ((word & 0xff00ff00u) | ((word & 0xffu) << 16u) | ((word >> 16u) & 0xffu)) : word;
+        }
+    }
+    p.destination[y * p.width + x] = pixel;
+}
 )";
+
+struct DecodeParameters {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t pitch;
+    std::uint32_t mode;
+    std::uint32_t blocksPerRow;
+    std::uint32_t unused;
+    std::uint64_t source;
+    std::uint64_t destination;
+    std::uint64_t thresholds;
+};
+
+// APS5_PRESENT_GPU_DECODE=0: every display buffer is decoded on the CPU (ReadDisplayBuffer).
+bool GpuDecodeRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_PRESENT_GPU_DECODE");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        Fail(std::string("APS5_PRESENT_GPU_DECODE must be 0 or 1, not '") + value + "'");
+    }();
+    return requested;
+}
+
+// The display buffer the next present() decodes on the GPU (set by PresentDisplayBuffer around the call).
+struct GpuSource {
+    const DisplayBuffer* buffer;
+    id<MTLBuffer> import;
+    std::uint64_t offset;
+};
+thread_local const GpuSource* pendingGpuSource = nullptr;
 
 std::uint32_t DumpScale() {
     static const std::uint32_t scale = [] {
@@ -263,6 +366,16 @@ std::atomic<std::uint64_t>& UpscaledPresents() {
     return count;
 }
 
+std::atomic<std::uint64_t>& GpuDecodes() {
+    static std::atomic<std::uint64_t> count {0};
+    return count;
+}
+
+std::atomic<std::uint64_t>& CpuDecodes() {
+    static std::atomic<std::uint64_t> count {0};
+    return count;
+}
+
 }
 
 namespace Metal {
@@ -274,6 +387,14 @@ PresentedFrame LastPresentedFrame() {
 
 std::uint64_t MetalFxPresents() {
     return UpscaledPresents().load();
+}
+
+std::uint64_t GpuDecodedPresents() {
+    return GpuDecodes().load();
+}
+
+std::uint64_t CpuDecodedPresents() {
+    return CpuDecodes().load();
 }
 
 // The device's presentation state (made by AttachPresentation, destroyed by Teardown once the
@@ -299,6 +420,11 @@ struct Presenter {
     id<MTLSamplerState> filter = nil;
     id<MTL4ArgumentTable> arguments = nil;
     id<MTLTexture> source = nil;
+    // The GPU display decode (D66): its pipeline, the BGRA8 rows it writes (copied into `source`)
+    // and the 16-bit float scanout thresholds.
+    id<MTLComputePipelineState> decode = nil;
+    id<MTLBuffer> decoded = nil;
+    id<MTLBuffer> thresholds = nil;
     // The MetalFX upscale (D61): the scaler of one input and output size, its output (the size of the
     // aspect-fit rectangle) and the fence that orders it after the source upload. `fxUnavailable`:
     // the device or the scaler refused, the bilinear scaler presents from then on.
@@ -367,6 +493,26 @@ struct Presenter {
         if (fxFence == nil) Fail("cannot create the MetalFX fence");
         if (PresentTrace()) std::fprintf(stderr, "[metal] MetalFX spatial scaler %ux%u to %ux%u\n", width, height, outputWidth, outputHeight);
         return true;
+    }
+
+    // The decode's output rows for a `width` x `height` display buffer and the thresholds table.
+    void PrepareDecode(std::uint32_t width, std::uint32_t height, const std::function<void()>& retire) {
+        if (thresholds == nil) {
+            const auto& table = Graphics::HalfFloatScanoutThresholds();
+            thresholds = [device newBufferWithBytes:table.data() length:sizeof(table) options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            if (thresholds == nil) Fail("cannot create the display decode thresholds");
+            Resident(thresholds);
+        }
+        const auto bytes = static_cast<NSUInteger>(width) * height * 4u;
+        if (decoded != nil && decoded.length == bytes) return;
+        if (decoded != nil) {
+            // Earlier presents decode into the old rows: they finish first.
+            retire();
+            ::AgcDriver::Metal::Residency::Remove(residency, decoded);
+        }
+        decoded = [device newBufferWithLength:bytes options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
+        if (decoded == nil) Fail("cannot create the display decode rows");
+        Resident(decoded);
     }
 
     void MakeOffscreen() {
@@ -443,6 +589,8 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     presenter->scaler = [device newRenderPipelineStateWithDescriptor:pipeline error:&error];
     if (presenter->scaler == nil) Fail("the scaler has no pipeline: " + Metal::Describe(error));
+    presenter->decode = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"aps5_display_decode"] error:&error];
+    if (presenter->decode == nil) Fail("the display decode has no pipeline: " + Metal::Describe(error));
     MTLSamplerDescriptor* sampler = [MTLSamplerDescriptor new];
     sampler.minFilter = MTLSamplerMinMagFilterLinear;
     sampler.magFilter = MTLSamplerMinMagFilterLinear;
@@ -568,8 +716,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     if (!AcquireImage()) return false;
     auto& recorder = *state->recorder;
     @autoreleasepool {
-        const bool hasSource = !pixels.empty();
-        if (hasSource && (width == 0u || height == 0u || width > 16384u || height > 16384u || pixels.size() != static_cast<std::size_t>(width) * height * 4u)) Fail("invalid source image for the present");
+        const auto* gpuSource = std::exchange(pendingGpuSource, nullptr);
+        const bool hasSource = !pixels.empty() || gpuSource != nullptr;
+        if (!pixels.empty() && (width == 0u || height == 0u || width > 16384u || height > 16384u || pixels.size() != static_cast<std::size_t>(width) * height * 4u)) Fail("invalid source image for the present");
         const auto targetWidth = static_cast<std::uint32_t>(presenter->target.width);
         const auto targetHeight = static_cast<std::uint32_t>(presenter->target.height);
         const AspectFitRect rect = hasSource ? ComputeContainRect_nid_postfix(width, height, targetWidth, targetHeight) : AspectFitRect{};
@@ -591,11 +740,32 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                 presenter->Resident(presenter->source);
             }
         }
+        if (gpuSource != nullptr) presenter->PrepareDecode(width, height, [this] { RetirePresents(0); });
         auto& stream = recorder.Stream();
         if (hasSource) {
-            auto upload = stream.Write(pixels, 256u);
-            id<MTL4ComputeCommandEncoder> copy = stream.Compute();
-            [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:static_cast<NSUInteger>(width) * 4u sourceBytesPerImage:pixels.size() sourceSize:MTLSizeMake(width, height, 1) toTexture:presenter->source destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            const auto rowBytes = static_cast<NSUInteger>(width) * 4u;
+            const auto imageBytes = rowBytes * height;
+            id<MTL4ComputeCommandEncoder> copy = nil;
+            if (gpuSource != nullptr) {
+                const auto& buffer = *gpuSource->buffer;
+                const bool halfFloat = DisplayHalfFloat(buffer.pixelFormat);
+                const bool rgba = (buffer.pixelFormat & ~0x0100000000000000ull) == 0x8000000022000000ull;
+                const std::uint32_t mode = (buffer.tilingMode == 0 ? 1u : 0u) | (!halfFloat && rgba ? 2u : 0u) | (!halfFloat && (buffer.pixelFormat & 0x0100000000000000ull) != 0 ? 4u : 0u)
+                    | (halfFloat ? 8u : 0u) | (halfFloat && DisplayRedLow(buffer.pixelFormat) ? 16u : 0u);
+                const DecodeParameters parameters{width, height, buffer.pitchInPixel == 0 ? width : buffer.pitchInPixel, mode, (width + 127u) / 128u, 0u,
+                                                  gpuSource->import.gpuAddress + gpuSource->offset, presenter->decoded.gpuAddress, presenter->thresholds.gpuAddress};
+                // A new encoder: its queue barrier orders the decode after every write recorded or
+                // committed before it (the scene, the stores the flush hook just recorded).
+                stream.EndEncoder();
+                stream.DispatchHelper(presenter->decode, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake((width + 15u) / 16u, (height + 15u) / 16u, 1), MTLSizeMake(16, 16, 1));
+                stream.Barrier(MTLStageDispatch, MTLStageBlit);
+                copy = stream.Compute();
+                [copy copyFromBuffer:presenter->decoded sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(width, height, 1) toTexture:presenter->source destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            } else {
+                auto upload = stream.Write(pixels, 256u);
+                copy = stream.Compute();
+                [copy copyFromBuffer:upload.buffer sourceOffset:upload.offset sourceBytesPerRow:rowBytes sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(width, height, 1) toTexture:presenter->source destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            }
             stream.CountCommand();
             if (upscale) {
                 // MetalFX encodes its own passes into the batch: it waits for the fence the upload
@@ -691,12 +861,34 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
-    // The bring-up source: the display buffer decoded on the CPU (linear or tiled, the formats
-    // DisplayBuffer.cpp decodes); the read waits for recorded GPU writes over it.
-    const auto pixels = ReadDisplayBuffer(buffer);
     auto& dumps = Dumps();
     int dumpIndex = -1;
     if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0u) dumpIndex = dumps.dumped++;
+    // D66: decoded on the GPU from the host import; a dump frame needs the pixels on the CPU.
+    if (dumpIndex < 0 && GpuDecodeRequested()) {
+        const auto size = DisplayBufferSize(buffer);
+        std::uint64_t offset = 0;
+        if (id<MTLBuffer> import = state->ImportOf(buffer.address, size, &offset); import != nil) {
+            PerformanceTimer timing("DisplayBuffer.GpuDecode");
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
+            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Scanout);
+            Graphics::Metal::FlushForGpuRead(buffer.address, size);
+            timing.Mark("flush");
+            const GpuSource source{&buffer, import, offset};
+            struct Pending {
+                explicit Pending(const GpuSource* source) { pendingGpuSource = source; }
+                ~Pending() { pendingGpuSource = nullptr; }
+            } pending(&source);
+            const bool presented = present(buffer.width, buffer.height, true, {});
+            timing.Mark("encode");
+            if (presented) GpuDecodes().fetch_add(1u);
+            return presented;
+        }
+    }
+    // The CPU decode (linear or tiled, the formats DisplayBuffer.cpp decodes); the read waits for
+    // recorded GPU writes over it.
+    const auto pixels = ReadDisplayBuffer(buffer);
+    CpuDecodes().fetch_add(1u);
     if (!present(buffer.width, buffer.height, true, pixels)) {
         // A dropped frame keeps the dump numbering contiguous.
         if (dumpIndex >= 0) --dumps.dumped;

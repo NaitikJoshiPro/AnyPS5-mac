@@ -17,3 +17,6 @@ set_tests_properties(agc_metal_offscreen_frames PROPERTIES ENVIRONMENT "ANYPS5_N
 # D61: upscaling presents go through the MetalFX spatial scaler (the default).
 add_test(NAME agc_metal_metalfx_present COMMAND agc_metal_draw_tests metalfx)
 set_tests_properties(agc_metal_metalfx_present PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)
+# D66: display buffers decoded on the GPU in the present (a 1:1 target, the bilinear scaler).
+add_test(NAME agc_metal_present_gpu_decode COMMAND agc_metal_draw_tests decode)
+set_tests_properties(agc_metal_present_gpu_decode PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_METAL_PRESENT_READBACK=1;APS5_METALFX=0;APS5_PRESENT_SIZE=300x260" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS gpu)

@@ -99,7 +99,13 @@ namespace ShaderRecompiler::MslAbi {
 //   corners' per-vertex values in the primitive record (user(aps5_pv<L>_<j>)). A mesh holds at most
 //   MeshTriangleVerticesPrimitives(maxPrimitives) triangles, so the driver draws the grid (mesh
 //   groups, instances, MeshTriangleVerticesSplits(maxPrimitives)); WorkgroupId z reads 0.
-// Version 15 (upstream sync to 5d9dcc42d2):
+// Version 14: vertex functions in the triangle-vertices mode take PrimitiveVerticesMacro (1 for
+//   points, 2 for lines, default 3): per-vertex fragment inputs of points and lines (DECISIONS D69).
+// Version 16: mesh functions take PrimitiveVerticesMacro too (DECISIONS D75): point and line draws
+//   output metal::topology::point / line with the primitive export's first one or two indices, in
+//   the plain and the triangle-vertices mode (N unshared vertices per primitive).
+// Version 17: reserved for DRV-D (D76-D78, not landed at the sync).
+// Version 18 (upstream sync UPSYNC3, DECISIONS D72; was 15 on branch sync3):
 // - fragment: APS5_SAMPLE_MASK (SampleMaskMacro), the uniform PA_SC_AA_MASK in guest sample bits
 //   (upstream 1ffc5f672 HostSampleMask, the Vulkan pipeline's pSampleMask): the function ANDs its
 //   [[sample_mask]] with it before the APS5_SAMPLE_BASE shift, and a function with other outputs
@@ -129,7 +135,7 @@ namespace ShaderRecompiler::MslAbi {
 //   front end's cubeFaceCompatible runtime mode Dim2DArray + cube) reads face 0: the missing face
 //   coordinate is 0 instead of a "too few coordinate components" failure. Direct 2D images whose
 //   accesses allow it gain that mode in their ImageBase selector switch.
-inline constexpr std::uint32_t Version = 15u;
+inline constexpr std::uint32_t Version = 18u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
@@ -205,7 +211,7 @@ enum class EntryKind : std::uint32_t {
     Sampler
 };
 
-// Version 15: the ImageTable range holds one Aps5TableArray entry per sampled heap binding
+// Version 18: the ImageTable range holds one Aps5TableArray entry per sampled heap binding
 // (FirstImageBinding .. FirstStorageImageBinding - 1), all pointing at the same texture array.
 inline constexpr std::uint32_t ImageTableSlots = RuntimeAbi::FirstStorageImageBinding - RuntimeAbi::FirstImageBinding;
 
@@ -337,12 +343,12 @@ inline constexpr const char* SampleBaseMacro = "APS5_SAMPLE_BASE";
 // (an emulated count, DECISIONS D28; default: the pass's get_num_samples()), for the alpha-to-
 // coverage mask.
 inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
-// Version 15: fragment: the guest samples a uniform PA_SC_AA_MASK keeps (decimal with a u suffix,
+// Version 18: fragment: the guest samples a uniform PA_SC_AA_MASK keeps (decimal with a u suffix,
 // guest sample bits; unset when every sample is kept): the function ANDs its [[sample_mask]] with
 // it (MTLRenderPipelineDescriptor has no sample mask). The driver refuses it for a function without
 // outputs when the draw writes depth or stencil.
 inline constexpr const char* SampleMaskMacro = "APS5_SAMPLE_MASK";
-// Version 15: the stage function's discard of pixels without samples left by APS5_SAMPLE_MASK
+// Version 18: the stage function's discard of pixels without samples left by APS5_SAMPLE_MASK
 // (before the guest body; the host coverage bits are guest samples APS5_SAMPLE_BASE and up).
 inline constexpr const char* SampleMaskDiscardText = "#if defined(APS5_SAMPLE_MASK)\n    if (((aps5_sample_mask_in << APS5_SAMPLE_BASE) & (APS5_SAMPLE_MASK)) == 0u) discard_fragment();\n#endif\n";
 // Version 5: the triangle-vertices expansion, shared by conservative rasterization and the per-vertex
@@ -354,6 +360,16 @@ inline constexpr const char* SampleMaskDiscardText = "#if defined(APS5_SAMPLE_MA
 //   unshared vertices per output triangle, MeshTriangleVerticesSplits threadgroups per subgroup);
 //   no buffer: the corners come from the guest's own primitive export;
 inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
+// Version 14: vertex (with TriangleVerticesMacro): the guest vertices per primitive when the draw is
+// a point (1) or line (2) list: host vertex v runs the guest program for guestVertex[N * (v / N) +
+// 0..N-1] and emits corner v % N; corners N..2 repeat the primitive's last vertex. Unset: 3.
+// Version 16: mesh (any mode): the draw's topology class, 1 for points, 2 for lines (the output
+// topology and the indices read from each primitive export).
+inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
+// Version 16: vertex and mesh: 1 when the draw is a point list (DECISIONS D75). A function whose guest
+// program exports no point size then writes [[point_size]] 1.0 (Metal leaves an unwritten size
+// undefined; Vulkan's maintenance5 default is 1.0; PA_SU_POINT_SIZE is not applied).
+inline constexpr const char* PointsMacro = "APS5_POINTS";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
 // - vertex and mesh (with TriangleVerticesMacro): the fragment function's

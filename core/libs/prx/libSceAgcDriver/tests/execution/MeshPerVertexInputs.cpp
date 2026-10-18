@@ -19,6 +19,9 @@
 // with the last-vertex rotation is the vertex path's (i + 2, i + 1, i); under the first-vertex
 // convention the vertex path uses Vulkan's (i, i + 2, i + 1) and the mesh path the guest's export
 // order (i + 1, i, i + 2) (TechnicalDebt metal-mesh-per-vertex).
+// Line and point lists (DECISIONS D75, MslAbi Version 16): the mesh function outputs lines and points
+// from the primitive export's first two or one indices, and must match the vertex path's lines and
+// points (D69) bit for bit.
 // Metal only: the Vulkan device's mesh path has its own barycentric emulation (upstream).
 
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -209,6 +212,8 @@ AgcDriver::Graphics::State BaseState(VkPrimitiveTopology topology, bool last) {
 }
 
 VkPrimitiveTopology TopologyOf(const Case& test) {
+    if (test.mesh.inputPrimitive == 1u) return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    if (test.mesh.inputPrimitive == 2u) return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     return test.mesh.inputPrimitive == 6u ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
@@ -317,7 +322,7 @@ int main() {
         const auto stripDraw = AgcDriver::Pm4::DrawParameters{0, static_cast<std::uint32_t>(Strip.size()), 0, 1, 0, false};
         // {input primitive, primitives and vertices per group, max vertices, max primitives,
         // threads, LDS dwords, provoking vertex, ESGS item size}, as tests/Mesh.cpp.
-        const std::array<Case, 8> cases{{
+        const std::array<Case, 11> cases{{
             {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
             {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 32u, false},
@@ -329,6 +334,11 @@ int main() {
             {"triangle list, two splits, last vertex provoking", {4u, 64u, 192u, 192u, 96u, 192u, 4096u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, true},
             // Strips with the last vertex provoking (OpenGL's default, radeonsi's): see the header.
             {"triangle strip, last vertex provoking", {6u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u}, stripDraw, BufferDescriptor(Strip.data(), static_cast<std::uint32_t>(Strip.size())), 64u, true},
+            // Points and lines (MslAbi Version 16, DECISIONS D75): the program still exports three
+            // vertices per primitive; a line takes the export's first two indices, a point its first.
+            {"line list", {2u, 4u, 8u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
+            {"line list, last vertex provoking", {2u, 4u, 8u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, true},
+            {"point list", {1u, 4u, 4u, 12u, 4u, 64u, 1024u, 0u, 4u}, listDraw, BufferDescriptor(List.data(), static_cast<std::uint32_t>(List.size())), 64u, false},
         }};
         std::vector<float> reference(Pixels.size());
         std::uint32_t compared = 0;
@@ -354,7 +364,8 @@ int main() {
                     drawn += index % 4u == 0u && Pixels[index] != Unwritten ? 1u : 0u;
                 }
                 Require(differing == 0u, what + ": " + std::to_string(differing) + " channels differ (x " + std::to_string(low) + " to " + std::to_string(high) + "), first pixel " + At(first / 4u) + " channel " + std::to_string(first % 4u) + " is " + std::to_string(Pixels[first]) + " on the mesh path, " + std::to_string(reference[first]) + " on the vertex path");
-                Require(drawn > 400u, what + ": only " + std::to_string(drawn) + " pixels were drawn");
+                const std::uint32_t least = test.mesh.inputPrimitive == 1u ? 150u : 400u;
+                Require(drawn > least, what + ": only " + std::to_string(drawn) + " pixels were drawn");
                 if (program.code.data() == PerVertexPixelCode.data() && test.mesh.inputPrimitive == 4u) CheckListValues(what, test.last);
                 std::printf("%s: %u pixels identical on the mesh and vertex paths\n", what.c_str(), drawn);
                 ++compared;

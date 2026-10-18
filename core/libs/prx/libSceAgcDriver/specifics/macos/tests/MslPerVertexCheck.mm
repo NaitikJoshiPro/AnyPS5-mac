@@ -8,6 +8,8 @@
 // APS5_PER_VERTEX_LOCATIONS, APS5_BARYCENTRICS from the fragment reflection, APS5_CONSERVATIVE off
 // and on) into a render pipeline, which checks that the user() outputs and inputs match. The
 // rendering itself is checked by agc_driver_pixel_barycentric_emulation and agc_driver_interpolation_f16.
+// MslAbi Version 14 (DECISIONS D69): the vertex function also links for points and lines
+// (APS5_PRIMITIVE_VERTICES 1 and 2).
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -197,23 +199,26 @@ NSString* Decimal(std::uint64_t value) {
     return [NSString stringWithFormat:@"%llu", static_cast<unsigned long long>(value)];
 }
 
-void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, std::uint32_t conservative, MTLPixelFormat format, NSString* sampleMask = nil) {
+void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, std::uint32_t conservative, MTLPixelFormat format, std::uint32_t primitiveVertices = 3u, NSString* sampleMask = nil) {
     const auto& fragment = pixel.msl.Reflection();
     const auto& vertexReflection = vertex.msl.Reflection();
-    const auto what = name + (conservative != 0u ? " (conservative)" : "") + (sampleMask != nil ? " (APS5_SAMPLE_MASK)" : "");
-    id<MTLFunction> vertexFunction = Compile(device, what + " vertex", vertex, @{
+    const auto what = name + (conservative != 0u ? " (conservative)" : "") + (primitiveVertices == 1u ? " (points)" : primitiveVertices == 2u ? " (lines)" : "") + (sampleMask != nil ? " (APS5_SAMPLE_MASK)" : "");
+    NSMutableDictionary<NSString*, NSObject*>* vertexMacros = [@{
         @(Abi::TriangleVerticesMacro): @"1",
         @(Abi::PerVertexLocationsMacro): Decimal(fragment.perVertexLocations & 0xffffffffu),
         @(Abi::PerVertexLocationsHighMacro): Decimal(fragment.perVertexLocations >> 32u),
         @(Abi::BarycentricsMacro): Decimal(fragment.emulatedBarycentrics),
         @(Abi::ConservativeMacro): Decimal(conservative),
-    });
+    } mutableCopy];
+    // MslAbi Version 14 (DECISIONS D69): points and lines take one or two guest vertices per primitive.
+    if (primitiveVertices != 3u) vertexMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
+    id<MTLFunction> vertexFunction = Compile(device, what + " vertex", vertex, vertexMacros);
     NSMutableDictionary<NSString*, NSObject*>* fragmentMacros = [@{
         @(Abi::VertexOutputsMacro): Decimal(vertexReflection.outputLocations & 0xffffffffu),
         @(Abi::VertexOutputsHighMacro): Decimal(vertexReflection.outputLocations >> 32u),
         @(Abi::ConservativeMacro): Decimal(conservative),
     } mutableCopy];
-    // MslAbi Version 15: the uniform PA_SC_AA_MASK as MetalDraw passes it (guest sample bits).
+    // MslAbi Version 18: the uniform PA_SC_AA_MASK as MetalDraw passes it (guest sample bits).
     if (sampleMask != nil) fragmentMacros[@(Abi::SampleMaskMacro)] = sampleMask;
     id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, fragmentMacros);
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
@@ -278,15 +283,17 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
     const auto format = test.outputMode == 7u ? MTLPixelFormatRGBA32Uint : MTLPixelFormatRGBA32Float;
     Link(device, name, vertex, pixel, 0u, format);
     Link(device, name, vertex, pixel, 1u, format);
-    // MslAbi Version 15 (upstream 1ffc5f672): a function with outputs takes the uniform sample mask
+    // MslAbi Version 18 (upstream 1ffc5f672): a function with outputs takes the uniform sample mask
     // (APS5_SAMPLE_MASK): its mask export is ANDed with it, or it gains a [[sample_mask]] member.
     if (reflection.colorOutputs != 0u || reflection.exportsSampleMask) {
         Require(Has(source, "#if defined(APS5_SAMPLE_MASK)"), name + ": the fragment function does not take the uniform sample mask");
         // Pixels whose covered samples the mask removes run no guest body (Vulkan runs no invocation).
         Require(Has(source, "uint aps5_sample_mask_in [[sample_mask]]") && Has(source, Abi::SampleMaskDiscardText), name + ": pixels the uniform sample mask removes are not discarded before the body");
         Require(Has(source, "aps5_out.aps5_sample_mask &= APS5_SAMPLE_MASK;") == reflection.exportsSampleMask && Has(source, "aps5_out.aps5_sample_mask = APS5_SAMPLE_MASK;") == !reflection.exportsSampleMask, name + ": the uniform sample mask is not applied to the function's coverage");
-        Link(device, name, vertex, pixel, 0u, format, @"5u");
+        Link(device, name, vertex, pixel, 0u, format, 3u, @"5u");
     }
+    Link(device, name, vertex, pixel, 0u, format, 1u);
+    Link(device, name, vertex, pixel, 0u, format, 2u);
     std::printf("%s: per-vertex locations 0x%llx, barycentrics %u, linked in the triangle-vertices mode\n", test.name, static_cast<unsigned long long>(reflection.perVertexLocations), reflection.emulatedBarycentrics);
 }
 
@@ -306,6 +313,7 @@ int main() {
             const auto vertex = RecompileVertex(target);
             const auto& vertexSource = vertex.msl.Source();
             Require(Has(std::string(vertexSource), "#elif defined(APS5_TRIANGLE_VERTICES) && APS5_TRIANGLE_VERTICES") && Has(std::string(vertexSource), "[[buffer(" + std::to_string(Abi::Index(Abi::BufferIndex::TriangleVertices)) + ")]]"), "the vertex function has no triangle-vertices mode");
+            Require(Has(std::string(vertexSource), std::string("#ifndef ") + Abi::PrimitiveVerticesMacro) && Has(std::string(vertexSource), std::string("aps5_vertex_id / ") + Abi::PrimitiveVerticesMacro), "the triangle-vertices mode does not take the primitive's vertex count (points and lines)");
             const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
             const auto linear = PixelInputBit(PixelInput::LinearCenter);
             const auto position = PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY);

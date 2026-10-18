@@ -58,7 +58,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t st
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs) {
+ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs, VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, std::uint32_t vertices = 3u) {
     Pixels.fill(Unwritten);
     auto target = device.Target();
     target.fragmentShaderBarycentricEnabled = false;
@@ -112,7 +112,7 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.renderExtent = {Width, Height};
-    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.topology = topology;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
     state.negativeOneToOne = false;
     state.scissor = {{0, 0}, {Width, Height}};
@@ -121,7 +121,7 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
-    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(positions.size()), 0, 1, 0, false};
+    const AgcDriver::Pm4::DrawParameters draw{0, vertices, 0, 1, 0, false};
     device.Draw(state, draw, shaders);
     device.WaitIdle();
     return pixelResult;
@@ -234,6 +234,62 @@ void CheckInterpolated() {
     Require(checked > 200u, "v_interp_p1/p2: too few interior pixels were checked");
 }
 
+
+// Points and lines (DECISIONS D69, MslAbi Version 14): per-vertex values and emulated barycentrics of
+// the primitive's own vertices. Corners past a primitive's vertices repeat its last vertex: a line's
+// P20 equals its P10, a point's P10 and P20 are 0. The barycentric weights are (1, 0, 0) at a point
+// and run from vertex 0 to vertex 1 along a line, with J = 0. (The RDNA2 parameter-cache contents for
+// P20 of a line are not documented; this is the emulation's definition.)
+void CheckPointsAndLines(AgcDriver::VulkanDevice& device) {
+    const auto positions = ClipPositions();
+    const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
+    // Lines: the edge from corner 0 to corner 1.
+    auto result = Draw(device, VertexValuePixelCode, perspective, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 2u);
+    Require(result.barycentricEmulation.active, "a line's v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
+    const std::array<float, 3> lineValues{positions[1][0] - positions[0][0], positions[1][0] - positions[0][0], positions[0][0]};
+    std::uint32_t linePixels = 0;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            if (Pixel(x, y, 3) == Unwritten) continue;
+            for (std::uint32_t channel = 0; channel < 3; ++channel) {
+                Require(Pixel(x, y, channel) == lineValues[channel], "line v_interp_mov: pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") channel " + std::to_string(channel) + " is " + std::to_string(Pixel(x, y, channel)) + ", expected " + std::to_string(lineValues[channel]));
+            }
+            ++linePixels;
+        }
+    }
+    Require(linePixels >= 20u, "the line covered " + std::to_string(linePixels) + " pixels");
+    result = Draw(device, BarycentricPixelCode, perspective, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 2u);
+    std::uint32_t lineWeights = 0;
+    float lowest = 2.0f;
+    float highest = -1.0f;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            if (Pixel(x, y, 3) == Unwritten) continue;
+            const auto i = Pixel(x, y, 0);
+            const auto j = Pixel(x, y, 1);
+            Require(j == 0.0f && i >= -0.01f && i <= 1.01f, "line barycentrics: pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") has I " + std::to_string(i) + " J " + std::to_string(j) + ", expected I in [0, 1] and J 0");
+            lowest = std::min(lowest, i);
+            highest = std::max(highest, i);
+            ++lineWeights;
+        }
+    }
+    Require(lineWeights >= 20u && lowest < 0.1f && highest > 0.9f, "line barycentrics do not run along the line (I from " + std::to_string(lowest) + " to " + std::to_string(highest) + ")");
+    // Points: the three corners as single-pixel points.
+    result = Draw(device, VertexValuePixelCode, perspective, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 3u);
+    Require(result.barycentricEmulation.active, "a point's v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
+    std::uint32_t points = 0;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            if (Pixel(x, y, 3) == Unwritten) continue;
+            const bool own = std::any_of(positions.begin(), positions.end(), [&](const auto& position) { return Pixel(x, y, 2) == position[0]; });
+            Require(own && Pixel(x, y, 0) == 0.0f && Pixel(x, y, 1) == 0.0f, "point v_interp_mov: pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") reads P10 " + std::to_string(Pixel(x, y, 0)) + " P20 " + std::to_string(Pixel(x, y, 1)) + " P0 " + std::to_string(Pixel(x, y, 2)) + ", expected 0, 0 and its own vertex");
+            ++points;
+        }
+    }
+    Require(points == 3u, "the three points wrote " + std::to_string(points) + " pixels");
+    std::printf("points and lines: %u line pixels with per-vertex values, %u with barycentrics, 3 points\n", linePixels, lineWeights);
+}
+
 }
 
 int main() {
@@ -258,6 +314,7 @@ int main() {
         result = Draw(*device, InterpolatedPixelCode, perspective);
         Require(!result.barycentricEmulation.active, "plain v_interp_p1/p2 needed a geometry stage");
         CheckInterpolated();
+        CheckPointsAndLines(*device);
         std::printf("barycentric emulation tests passed: %u perspective and %u linear I/J pixels, raw vertex values and host interpolation\n", smooth, noPerspective);
         return 0;
     } catch (const std::exception& error) {

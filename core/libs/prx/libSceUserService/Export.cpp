@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 #include "prx/libSceUserService/UserService.hpp"
+#include "prx/libc/include/ConsoleSettings.hpp"
 
 static std::atomic<bool> initialized{false};
 static std::atomic<bool> loginReported{false};
@@ -77,20 +78,36 @@ int APS5_VABI sceUserServiceGetEvent(SceUserServiceEvent* event) {
 }
 
 int APS5_VABI sceUserServiceGetGamePresets(int user_id, UserServiceGamePresets* presets) {
- // System-wide game presets (difficulty, view inversion, subtitles, audio language) of the user's
- // profile. A fresh console has none set: every field is 0, "not specified", and the title falls
- // back to its own defaults. this_size is the caller's.
+ // System-wide game presets of the user's profile (Settings > Saved Data and Game/App Settings > Game Presets).
+ // Difficulty, view inversion, subtitles and audio language are "not specified" (0): the title keeps its own
+ // defaults. priority is the "Performance Mode or Resolution Mode" preset, APS5_GAME_PRESET (performance by
+ // default, D68). this_size is the caller's: only the fields inside it are written (Ghost of Yotei passes 48).
  if (presets == nullptr || user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- GuestArena::HostPointer(presets)->difficulty = 0;
- GuestArena::HostPointer(presets)->priority = 0;
- GuestArena::HostPointer(presets)->invert_vertical_view_for_1st_person_view = 0;
- GuestArena::HostPointer(presets)->invert_horizontal_view_for_1st_person_view = 0;
- GuestArena::HostPointer(presets)->invert_vertical_view_for_3rd_person_view = 0;
- GuestArena::HostPointer(presets)->invert_horizontal_view_for_3rd_person_view = 0;
- GuestArena::HostPointer(presets)->display_sub_titles = 0;
- GuestArena::HostPointer(presets)->audio_language = 0;
+ auto* host = GuestArena::HostPointer(presets);
+ const std::size_t extent = host->this_size;
+ if (extent < offsetof(UserServiceGamePresets, difficulty)) {
+  return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+ }
+ const std::uint32_t priority = ConsoleGamePresetPriority();
+ const struct {
+  std::size_t offset;
+  std::uint32_t value;
+ } fields[] = {
+  {offsetof(UserServiceGamePresets, difficulty), 0},
+  {offsetof(UserServiceGamePresets, priority), priority},
+  {offsetof(UserServiceGamePresets, invert_vertical_view_for_1st_person_view), 0},
+  {offsetof(UserServiceGamePresets, invert_horizontal_view_for_1st_person_view), 0},
+  {offsetof(UserServiceGamePresets, invert_vertical_view_for_3rd_person_view), 0},
+  {offsetof(UserServiceGamePresets, invert_horizontal_view_for_3rd_person_view), 0},
+  {offsetof(UserServiceGamePresets, display_sub_titles), 0},
+  {offsetof(UserServiceGamePresets, audio_language), 0},
+ };
+ for (const auto& field : fields) {
+  if (field.offset + sizeof(std::uint32_t) <= extent) std::memcpy(reinterpret_cast<std::byte*>(host) + field.offset, &field.value, sizeof(field.value));
+ }
+ SystemQueryTrace("userservice", "GetGamePresets(user %d, this_size %zu): priority %u (%s)", user_id, extent, priority, priority == ConsoleGamePresetPriorityPerformance ? "performance" : "game default");
  return USER_SERVICE_OK;
 }
 
