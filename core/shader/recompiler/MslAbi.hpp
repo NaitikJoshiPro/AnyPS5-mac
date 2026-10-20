@@ -156,7 +156,26 @@ namespace ShaderRecompiler::MslAbi {
 //   has no conversionFormat and the Float numeric class: the function samples the driver's repacked
 //   RG11B10Float view (channel order fixed by the view's BGRA swizzle) as a plain float texture,
 //   then applies the T# dst_sel as for any texture. Storage and packed accesses keep the conversion.
-inline constexpr std::uint32_t Version = 18u;
+// Version 19 (upstream sync UPSYNC4, 0d078f75d..661f8b717; the SpirvBackend changes mirrored):
+// - compute: WorkgroupId (and through it GlobalInvocationId) adds function constants
+//   PipelineSpecialization::WorkgroupOffsetBase + axis (8241-8243, default 0; upstream 11a7b61d7),
+//   which RecompileResult::specialization lists for every compute program.
+// - vertex: the all-zero position clip distance is present only while the guest clip distances and
+//   the emulated cull distance leave one of the eight free (upstream 5c29d125e); the cull verdict's
+//   clip slot (MslCullClipSlot) follows.
+// - fragment: SAMPLE_COVERAGE reads [[sample_mask]] (aps5_sample_mask_in << APS5_SAMPLE_BASE,
+//   upstream 03b0db052); with DB_SHADER_CONTROL.STENCIL_OP_VAL_EXPORT_ENABLE the [[stencil]] output
+//   is bits 8-15 of the second MRTZ channel (upstream 7563b4a48). The stage function's sample-mask
+//   discard sets aps5_demoted (branch commit 55d7d4298).
+// - BdaAbi::Fault word 7 (otherFaults) is or-ed with 1 for every recorded fault that is not
+//   Unaligned (upstream fcb48b774).
+// - address reads through a user-data base with two or more read sites search the page-table range
+//   once in the prologue (aps5_bda_anchor, upstream d422c760c/3265cb6d7) and load directly inside it.
+// - 32-bit buffer atomics off a dword boundary act on the containing dword (upstream 7e4ce1ab3); the
+//   LDS lock is set free by one invocation and released with an exchange (upstream 4864a7480,
+//   317a323ee); ds_ordered_count swap (upstream b0558ce95) and the ordered count's operand from the
+//   first active lane's half (upstream fcc426b6a).
+inline constexpr std::uint32_t Version = 19u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;

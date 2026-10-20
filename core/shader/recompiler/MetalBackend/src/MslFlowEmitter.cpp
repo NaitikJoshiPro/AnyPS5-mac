@@ -436,6 +436,27 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
     return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
 }
 
+// Upstream 7092dde6e (SpirvFlowEmitter PrecedesEveryMemoryAccess): an s_barrier on the straight
+// path from the entry before any load, store, atomic, image or LDS access has nothing to order.
+bool AccessesMemory(IrOpcode opcode) {
+    return opcode == IrOpcode::ReadConst || opcode == IrOpcode::ReadConstBuffer || SharedAccessOf(opcode) != SharedAccess::None || BufferAccessOf(opcode) != BufferAccess::None || AddressOpcodeInfoOf(opcode).access != AddressAccess::None || ImageOpcodeInfoOf(opcode).access != ImageAccess::None;
+}
+
+bool PrecedesEveryMemoryAccess(const IrProgram& program, const IrValue& barrier) {
+    const auto& blocks = program.BlockOrder();
+    const IrBlock* block = blocks.empty() ? nullptr : blocks.front();
+    for (std::size_t steps = 0; block != nullptr && steps < blocks.size(); ++steps) {
+        for (const auto* instruction : block->Instructions()) {
+            if (instruction == &barrier) return true;
+            if (AccessesMemory(instruction->Opcode())) return false;
+        }
+        if (block->Successors().size() != 1u) return false;
+        block = block->Successors().front();
+        if (block->Predecessors().size() != 1u) return false;
+    }
+    return false;
+}
+
 // s_memtime / s_memrealtime: MSL has no shader or device clock, so both read an emulated clock,
 // the 64-bit count of clock reads in the driver's table (MslAbi::ClockCounterWord, low then high
 // word). One elected invocation per SIMD group takes the next count and broadcasts it, so the value
@@ -472,6 +493,7 @@ void EmitBarrier(MslEmitterState& state, const IrValue& instruction) {
     if (stage == IrShaderStage::Vertex || stage == IrShaderStage::Local || stage == IrShaderStage::TessellationEvaluation) {
         // One guest wave per primitive group on the SPIR-V path too: an s_barrier between vertex
         // invocations orders nothing unless they communicate through memory.
+        if (PrecedesEveryMemoryAccess(state.program, instruction)) return;
         for (const auto* block : state.program.BlockOrder()) {
             for (const auto* other : block->Instructions()) {
                 if (CommunicatesThroughMemory(other->Opcode())) state.Fail(instruction, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");

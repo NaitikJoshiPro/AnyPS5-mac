@@ -5,10 +5,14 @@
 
 #include "MslBufferShared.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -77,6 +81,105 @@ std::int32_t Immediate(const MemoryInfo& memory) {
     auto immediate = static_cast<std::int32_t>(memory.offset);
     if (memory.kind == ResourceKind::ScalarAddress) immediate = static_cast<std::int32_t>(static_cast<std::uint32_t>(immediate) & ~3u);
     return immediate;
+}
+
+// Upstream d422c760c/3265cb6d7 (SpirvBdaRead.cpp CollectBdaAnchors, EmitAnchoredBdaRead): reads
+// whose 64-bit base is a pair of user-data registers search the BDA table at every read although
+// the base is one value for the whole dispatch or draw. For the (at most four) bases with two or
+// more read sites, the range holding the base is searched once at entry (by the SIMD group's first
+// lane in compute and pixel programs), and each read loads directly when that range holds all its
+// bytes (dwords: at a 4-aligned device address); otherwise it takes the lookup path unchanged, so
+// data, faults, stops and wraparound are the same.
+constexpr std::size_t MaxBdaAnchors = 4u;
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>> UserDataBase(const MslEmitterState& state, const IrValue& instruction) {
+    if (AddressOpcodeInfoOf(instruction.Opcode()).access != AddressAccess::Read || instruction.ArgumentCount() < 2u) return std::nullopt;
+    const auto index = instruction.Flags<MemoryFlags>().index;
+    const auto& memory = state.program.Resources().memoryInfo;
+    if (index >= memory.size()) return std::nullopt;
+    const auto& info = memory[index];
+    if (info.kind != ResourceKind::ScalarAddress && info.kind != ResourceKind::Flat && info.kind != ResourceKind::Global) return std::nullopt;
+    if (info.planningOnly || info.addressIsFull || RoutesApertures(state, info)) return std::nullopt;
+    const IrValue* handle = instruction.Argument(0) != nullptr ? instruction.Argument(0)->Resolve() : nullptr;
+    if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) return std::nullopt;
+    const auto userData = [](const IrValue* value) -> std::optional<std::uint32_t> {
+        value = value != nullptr ? value->Resolve() : nullptr;
+        if (value == nullptr || value->Opcode() != IrOpcode::GetUserData || value->ArgumentCount() == 0u || value->Argument(0) == nullptr) return std::nullopt;
+        return value->Argument(0)->Register().index;
+    };
+    const auto low = userData(handle->Argument(0));
+    const auto high = userData(handle->Argument(1));
+    if (!low || !high) return std::nullopt;
+    return std::pair {*low, *high};
+}
+
+void CollectBdaAnchors(MslEmitterState& state) {
+    state.bdaAnchors.emplace();
+    if (!state.program.Info().usesDma) return;
+    std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> bases;
+    for (const IrBlock* block : state.program.BlockOrder()) {
+        for (const IrValue* instruction : block->Instructions()) {
+            const auto base = UserDataBase(state, *instruction);
+            if (!base) continue;
+            const auto found = std::find_if(bases.begin(), bases.end(), [&](const auto& entry) { return entry.first == *base; });
+            if (found != bases.end()) ++found->second;
+            else bases.push_back({*base, 1u});
+        }
+    }
+    std::stable_sort(bases.begin(), bases.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+    for (const auto& [base, reads] : bases) {
+        if (reads < 2u || state.bdaAnchors->size() == MaxBdaAnchors) break;
+        state.bdaAnchors->push_back({base.first, base.second, {}});
+    }
+}
+
+std::string UserDataWord(MslEmitterState& state, std::uint32_t registerIndex) {
+    const auto& registers = state.program.Metadata().bindings.userDataRegisters;
+    const auto found = std::lower_bound(registers.begin(), registers.end(), registerIndex);
+    if (found == registers.end() || *found != registerIndex) return "0u";
+    return state.ShaderDataDword(static_cast<std::uint32_t>(found - registers.begin()));
+}
+
+// The anchor of the instruction's base (its prologue search emitted on first use), or empty.
+std::string FindBdaAnchor(MslEmitterState& state, const IrValue& instruction, const std::string& bda) {
+    if (!state.bdaAnchors) CollectBdaAnchors(state);
+    if (state.bdaAnchors->empty()) return {};
+    const auto base = UserDataBase(state, instruction);
+    if (!base) return {};
+    for (std::size_t index = 0; index < state.bdaAnchors->size(); ++index) {
+        auto& anchor = (*state.bdaAnchors)[index];
+        if (anchor.lowRegister != base->first || anchor.highRegister != base->second) continue;
+        if (anchor.name.empty()) {
+            anchor.name = "aps5_anc" + std::to_string(index);
+            const auto address = "(ulong(" + UserDataWord(state, anchor.lowRegister) + ") | (ulong(" + UserDataWord(state, anchor.highRegister) + ") << 32u))";
+            const auto stage = state.program.Resources().stage;
+            if (state.ThreadgroupStage() || stage == IrShaderStage::Pixel) {
+                state.AddPrologue("ulong3 " + anchor.name + " = ulong3(0ul);");
+                state.AddPrologue("if (simd_is_first()) " + anchor.name + " = aps5_bda_anchor(" + bda + ", " + address + ");");
+                state.AddPrologue(anchor.name + " = ulong3(as_type<ulong>(simd_broadcast_first(as_type<uint2>(" + anchor.name + ".x))), as_type<ulong>(simd_broadcast_first(as_type<uint2>(" + anchor.name + ".y))), as_type<ulong>(simd_broadcast_first(as_type<uint2>(" + anchor.name + ".z))));");
+            } else {
+                state.AddPrologue("const ulong3 " + anchor.name + " = aps5_bda_anchor(" + bda + ", " + address + ");");
+            }
+        }
+        return anchor.name;
+    }
+    return {};
+}
+
+// BdaAnchorHolds: whether the anchor's range holds [low + immediate, + bytes) (its device address in
+// `translated`, a new local).
+std::string AnchorHolds(MslEmitterState& state, const std::string& anchor, const std::string& low, std::int32_t immediate, std::uint32_t bytes, std::string& translated) {
+    const auto offset = state.Temporary("aps5_ao");
+    state.Line("const ulong " + offset + " = " + anchor + ".z + ulong(" + low + ")" + (immediate != 0 ? " + " + MslHex(static_cast<std::uint64_t>(static_cast<std::int64_t>(immediate))) + "ul" : std::string()) + ";");
+    translated = state.Temporary("aps5_ad");
+    state.Line("const ulong " + translated + " = " + anchor + ".y + " + offset + ";");
+    return "(" + anchor + ".x >= " + std::to_string(bytes) + "ul && " + offset + " <= " + anchor + ".x - " + std::to_string(bytes) + "ul)";
+}
+
+std::string AnchorLow(MslEmitterState& state, const IrValue& instruction, const MemoryInfo& memory) {
+    auto low = state.Arg(instruction, 1u);
+    if (memory.kind == ResourceKind::ScalarAddress) low = "(" + low + " & ~3u)";
+    return low;
 }
 
 // GuestAddress: GuestAddressBase plus the instruction's immediate offset.
@@ -181,6 +284,35 @@ void LoadAddress(MslEmitterState& state, const IrValue& instruction, std::uint32
     state.Line("if (" + Active(state, instruction) + ") {");
     state.Indent();
     const auto access = Prepare(state, instruction, memory);
+    // A sub-dword coherent read keeps the lookup path (its byte loads are not atomic).
+    if (const auto anchor = memory.coherent && bits != 32u ? std::string() : FindBdaAnchor(state, instruction, access.bda); !anchor.empty()) {
+        std::string translated;
+        auto direct = AnchorHolds(state, anchor, AnchorLow(state, instruction, memory), Immediate(memory), bits / 8u, translated);
+        if (bits == 32u) direct = "(" + direct + " && (" + translated + " & 3ul) == 0ul)";
+        state.Line("if (" + direct + ") {");
+        state.Indent();
+        if (bits == 32u) {
+            state.Line(result + " = " + (memory.coherent ? "atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + translated + "), memory_order_relaxed)" : "*reinterpret_cast<device const uint*>(" + translated + ")") + ";");
+        } else {
+            std::string value = "0u";
+            for (std::uint32_t byte = 0; byte < bits / 8u; ++byte) value += " | (uint(reinterpret_cast<device const uchar*>(" + translated + ")[" + std::to_string(byte) + "]) << " + std::to_string(byte * 8u) + "u)";
+            state.Line(result + " = " + type + "(" + value + ");");
+        }
+        state.Outdent();
+        state.Line("} else {");
+        state.Indent();
+        const auto address = GuestAddress(state, instruction, memory, access);
+        const auto stop = state.Temporary("aps5_st");
+        state.Line("bool " + stop + " = false;");
+        if (bits == 32u) state.Line(result + " = aps5_bda_read_span(" + access.bda + ", " + address + ", 0u, 1u, " + access.pc + ", " + access.coherent + ", " + access.stops + ", " + stop + ").x;");
+        else state.Line(result + " = " + type + "(aps5_bda_read_small(" + access.bda + ", " + address + ", " + std::to_string(bits) + "u, " + access.pc + ", " + access.stops + ", " + stop + "));");
+        MslB5StopIf(state, stop);
+        state.Outdent();
+        state.Line("}");
+        state.Outdent();
+        state.Line("}");
+        return;
+    }
     const auto address = GuestAddress(state, instruction, memory, access);
     const auto global = [&] {
         const auto stop = state.Temporary("aps5_st");
@@ -212,8 +344,34 @@ void LoadAddressWide(MslEmitterState& state, const IrValue& instruction, std::ui
     state.Line("if (" + Active(state, instruction) + ") {");
     state.Indent();
     const auto access = Prepare(state, instruction, memory);
-    const auto base = GuestAddressBase(state, instruction, memory, access);
     const auto used = MslUsedDwords(instruction, components);
+    if (const auto anchor = used == 0u ? std::string() : FindBdaAnchor(state, instruction, access.bda); !anchor.empty()) {
+        const auto first = static_cast<std::uint32_t>(std::countr_zero(used));
+        const auto last = 31u - static_cast<std::uint32_t>(std::countl_zero(used));
+        std::string translated;
+        const auto holds = AnchorHolds(state, anchor, AnchorLow(state, instruction, memory), static_cast<std::int32_t>(memory.offset + first * 4u), (last - first + 1u) * 4u, translated);
+        state.Line("if (" + holds + " && (" + translated + " & 3ul) == 0ul) {");
+        state.Indent();
+        for (std::uint32_t dword = first; dword <= last; ++dword) {
+            if ((used & (1u << dword)) == 0u) continue;
+            const auto element = "(" + translated + " + " + std::to_string((dword - first) * 4u) + "ul)";
+            state.Line(result + "[" + std::to_string(dword) + "] = " + (memory.coherent ? "atomic_load_explicit(reinterpret_cast<device atomic_uint*>" + element + ", memory_order_relaxed)" : "*reinterpret_cast<device const uint*>" + element) + ";");
+        }
+        state.Outdent();
+        state.Line("} else {");
+        state.Indent();
+        const auto base = GuestAddressBase(state, instruction, memory, access);
+        const auto stop = state.Temporary("aps5_st");
+        state.Line("bool " + stop + " = false;");
+        state.Line(result + " = aps5_bda_read_span(" + access.bda + ", " + base + ", " + MslHex(memory.offset) + "u, " + MslHex(used) + "u, " + access.pc + ", " + access.coherent + ", " + access.stops + ", " + stop + ")" + Components(components) + ";");
+        MslB5StopIf(state, stop);
+        state.Outdent();
+        state.Line("}");
+        state.Outdent();
+        state.Line("}");
+        return;
+    }
+    const auto base = GuestAddressBase(state, instruction, memory, access);
     const auto global = [&] {
         const auto stop = state.Temporary("aps5_st");
         state.Line("bool " + stop + " = false;");

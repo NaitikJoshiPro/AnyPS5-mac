@@ -28,6 +28,9 @@ struct Aps5DriverData {
 constexpr std::string_view FaultRecordText = R"(static void aps5_record_fault(ulong faultBuffer, uint reason, ulong address, uint bytes, uint stage, uint instruction) {
     if (faultBuffer == 0ul) return;
     device atomic_uint* state = reinterpret_cast<device atomic_uint*>(faultBuffer);
+    // BdaAbi::Fault::otherFaults (upstream fcb48b774): sticky for every fault that is not Unaligned,
+    // so a first unaligned record cannot hide a later access fault.
+    if (reason != 7u) atomic_fetch_or_explicit(state + 7, 1u, memory_order_relaxed);
     uint expected = 0u;
     if (!atomic_compare_exchange_weak_explicit(state, &expected, 1u, memory_order_relaxed, memory_order_relaxed)) return;
     device uint* words = reinterpret_cast<device uint*>(faultBuffer);

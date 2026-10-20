@@ -21,6 +21,9 @@
 //   hardware does (aps5_lds_fadd32);
 // - #5176 (46a1cc0fc, 3a7e82a17): ds_ordered_count adds the first active lane's operand to the GDS
 //   counter at offset0 (no M0 base).
+// Upstream sync UPSYNC4 (MslAbi Version 19):
+// - b0558ce95: ds_ordered_count with offset1 bit 4 exchanges the first active lane's operand into
+//   the counter.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -106,6 +109,8 @@ alignas(256) constexpr std::array<std::uint32_t, 9> GdsCode{0x34000082u, 0xbefc0
 alignas(256) constexpr std::array<std::uint32_t, 8> GdsAddF32Code{0x34000082u, 0xbefc03ffu, 0x0000ffffu, 0x7e0202f2u, 0xd8560000u, 0x00000100u, 0xbf8cc07fu, 0xbf810000u};
 // tests/execution/GdsAppendConsume.cpp OrderedCode: ds_ordered_count v5, v1 offset0:16 offset1:3 gds.
 alignas(256) constexpr std::array<std::uint32_t, 10> OrderedCountCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe0310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
+// The same with offset1 bit 4 set: ds_ordered_count swap (upstream b0558ce95, offset1:0x13).
+alignas(256) constexpr std::array<std::uint32_t, 10> OrderedSwapCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe1310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
 
 alignas(256) std::array<std::uint32_t, 64> Backing{};
 
@@ -379,6 +384,14 @@ void OrderedCount(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& tar
     std::puts("ds_ordered_count: first active lane's operand added to the GDS counter");
 }
 
+void OrderedSwap(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto result = RecompileCompute(target, OrderedSwapCode);
+    const std::string source(result.msl.Source());
+    Require(Has(source, "aps5_amt") && Has(source, "atomic_exchange_explicit(") && !Has(source, "atomic_fetch_add_explicit(") && Has(source, " = 4u;"), "ds_ordered_count swap: the first lane's operand is not exchanged into the counter at offset0 / 4");
+    static_cast<void>(MustCompile(device, "ds_ordered_count swap", result, @{}));
+    std::puts("ds_ordered_count swap: first active lane's operand exchanged into the GDS counter");
+}
+
 }
 
 int main() {
@@ -403,6 +416,7 @@ int main() {
             CoherentGds(metal, target);
             GdsAddF32(metal, target);
             OrderedCount(metal, target);
+            OrderedSwap(metal, target);
         }
         std::puts("msl upstream parity check passed");
         return 0;

@@ -523,7 +523,11 @@ std::string MslEmitterState::WorkgroupId(std::uint32_t component) {
     // dimension splits a group's primitives in the triangle-vertices mode (MslAbi Version 13).
     if (program.Resources().stage == IrShaderStage::Mesh) return component == 2u ? std::string("0u") : Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component);
     usesDriverData = true;
-    return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "])";
+    // Upstream 11a7b61d7: compute programs add the WorkgroupOffset function constants (default 0),
+    // which RecompileResult::specialization lists for every compute program; GuestGlobalInvocationId
+    // takes them through this id.
+    const auto offset = program.Resources().stage == IrShaderStage::Compute ? " + " + FunctionConstant(PipelineSpecialization::WorkgroupOffsetBase + component, 0u) : std::string();
+    return "(" + Component(Builtin(MslBuiltin::ThreadgroupPositionInGrid), component) + " + aps5_driver.workgroupBase[" + std::to_string(component) + "]" + offset + ")";
 }
 
 // Graphics stages (no threadgroups): a wave64 program runs at one lane per invocation and its guest
@@ -750,6 +754,10 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     }
     ValidateProgram(program, true);
     if ((program.Info().usesFaultBuffer || program.Info().usesDma) && target.bdaAbiVersion != BdaAbi::Version) throw std::runtime_error("MSL emission failed: the program needs the BDA ABI, which the target lacks");
+    // Upstream 53212b18a/5db206aba remap a viewport depth range the Vulkan device cannot express in the
+    // vertex shader (SpirvTarget::depthRangeRemap). The Metal device keeps it false (its viewport
+    // carries the depth range, MetalDraw.mm) and the MSL backend has no remap.
+    if (target.depthRangeRemap) throw std::runtime_error("MSL emission failed: the target asks for the vertex-shader depth range remap (SpirvTarget::depthRangeRemap), which the MSL backend does not implement");
     MslEmitterState state(program, inputInfo, bindings, target);
     state.reflection.stage = ReflectedStage(stage);
     state.reflection.group = StageGroup(stage);

@@ -232,7 +232,7 @@ std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& ou
             text += "            aps5_v3." + field + " = aps5_r[0]." + field + " * aps5_weight[0] + aps5_r[1]." + field + " * aps5_weight[1] + aps5_r[2]." + field + " * aps5_weight[2];\n";
         }
         // Clip distances (upstream f7a2903ed) are linear over the rect like the parameters.
-        if (const auto clips = MslCullClipSlot(state) - 1u; clips != 0u) {
+        if (const auto clips = MslGuestClipDistanceCount(state); clips != 0u) {
             text += "            for (uint c = 0u; c < " + std::to_string(clips) + "u; ++c) aps5_v3.aps5_clip[c] = aps5_r[0].aps5_clip[c] * aps5_weight[0] + aps5_r[1].aps5_clip[c] * aps5_weight[1] + aps5_r[2].aps5_clip[c] * aps5_weight[2];\n";
         }
         text += "            const float aps5_w = aps5_r[0].aps5_position.w;\n";

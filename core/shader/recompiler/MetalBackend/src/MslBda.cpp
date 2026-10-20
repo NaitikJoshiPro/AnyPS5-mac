@@ -79,6 +79,33 @@ static ulong aps5_bda_lookup(Aps5Bda bda, ulong address, uint bytes, uint pc, ui
     return 0ul;
 }
 
+// Upstream d422c760c/3265cb6d7 (bda_anchor_range): for the range a read lookup of `base` selects,
+// (usable size, device address, offset of base in the range), where the range ends at the next
+// range's begin when that comes first (ranges ascend by begin but may overlap). Size 0 when nothing
+// maps base, the device addresses wrap, the range ends above 0xffffffff00000000 (base plus a 32-bit
+// offset could wrap) or is longer than 2^62 bytes.
+static ulong3 aps5_bda_anchor(Aps5Bda bda, ulong base) {
+    ulong mapped = 0ul;
+    if (aps5_bda_find(bda, base, 1u, 1u, mapped) != 0u) return ulong3(0ul);
+    device const uint* words = reinterpret_cast<device const uint*>(bda.table.address);
+    const uint count = words[1];
+    uint low = 0u;
+    uint high = count;
+    for (uint step = 0u; step < 33u && low < high; ++step) {
+        const uint middle = low + ((high - low) >> 1u);
+        if (base < aps5_bda_word64(words, 4u + middle * 8u)) high = middle;
+        else low = middle + 1u;
+    }
+    const uint entry = 4u + (low - 1u) * 8u;
+    const ulong begin = aps5_bda_word64(words, entry);
+    ulong bound = aps5_bda_word64(words, entry + 2u);
+    if (low < count) bound = min(bound, aps5_bda_word64(words, 4u + low * 8u));
+    const ulong device = aps5_bda_word64(words, entry + 4u);
+    const ulong span = bound - begin;
+    const bool usable = device != 0ul && device + span > device && bound <= 0xffffffff00000000ul && span <= (1ul << 62u);
+    return ulong3(usable ? span : 0ul, device, base - begin);
+}
+
 // address + offset (or - offset) with an Overflow fault when it wraps (AddBdaAddress).
 static inline ulong aps5_bda_add(Aps5Bda bda, ulong address, ulong offset, bool subtract, uint pc, thread bool& overflow) {
     const ulong result = subtract ? address - offset : address + offset;

@@ -57,12 +57,23 @@ std::string PerVertexField(std::uint32_t location, std::uint32_t vertex) {
     return "pv" + std::to_string(location) + "_" + std::to_string(vertex);
 }
 
-std::uint32_t MslCullClipSlot(const MslEmitterState& state) {
+std::uint32_t MslGuestClipDistanceCount(const MslEmitterState& state) {
     std::uint32_t count = 0u;
     for (const auto& output : state.program.Info().outputs) {
         if (output.kind == StageOutputKind::ClipDistance) count = std::max(count, output.index + 1u);
     }
-    return count + 1u;
+    return count;
+}
+
+// Upstream 5c29d125e: the all-zero position distance only while the guest clip distances and the
+// emulated cull distance leave one of the eight free; otherwise a primitive with a vertex at clip
+// position (0,0,0,0) is not removed (TechnicalDebt, as upstream's EmitSetAttribute entry).
+bool MslZeroPositionDistance(const MslEmitterState& state) {
+    return MslGuestClipDistanceCount(state) + (MslCullDistanceCount(state) != 0u ? 1u : 0u) < 8u;
+}
+
+std::uint32_t MslCullClipSlot(const MslEmitterState& state) {
+    return MslGuestClipDistanceCount(state) + (MslZeroPositionDistance(state) ? 1u : 0u);
 }
 
 namespace {
@@ -322,6 +333,21 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             // (Recompiler.hpp RasterPrimitive), PipelineSpecialization::RasterPrimitive, default
             // Triangle; the ancillary word's bits 0-1 (ConstantFolder::ComposePackedAncillary).
             return state.FunctionConstant(PipelineSpecialization::RasterPrimitive, static_cast<std::uint32_t>(RasterPrimitive::Triangle));
+        case StageInputKind::SampleMask:
+            // Upstream 03b0db052: SAMPLE_COVERAGE (SPI_PS_INPUT_ENA bit 14) from the coverage input
+            // every fragment function declares (EmitMslEntryPoint); host sample 0 is guest sample
+            // APS5_SAMPLE_BASE (DECISIONS D28). The driver refuses the per-sample case, as upstream.
+            state.AddParameter("uint aps5_sample_mask_in [[sample_mask]]");
+            return "(aps5_sample_mask_in << APS5_SAMPLE_BASE)";
+        case StageInputKind::BaryCoordSmoothCenter:
+        case StageInputKind::BaryCoordSmoothSample:
+        case StageInputKind::BaryCoordNoPerspectiveCenter:
+        case StageInputKind::BaryCoordNoPerspectiveSample:
+            // Upstream's offset barycentrics (InterpolateAtOffset at the pixel center or the guest
+            // sample location) come only from targets with InterpolationFunction, which the Metal
+            // device does not advertise; the read's location flag (center or sample, DECISIONS D38)
+            // selects the same host interpolation as the plain kinds. Custom guest sample locations
+            // are the host's only when the driver programs them.
         case StageInputKind::BaryCoordSmooth:
         case StageInputKind::BaryCoordNoPerspective:
             // Exact barycentrics only exist in programs the recompiler translated for the emulated
@@ -329,7 +355,7 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             // function emits one-hot corner weights, interpolated as the hardware interpolates the
             // guest's I/J (EmulatedBarycentric).
             if (component > 1u) state.Fail(instruction, "barycentric component is out of range");
-            return "as_type<uint>(" + EmulatedBarycentric(state, kind == StageInputKind::BaryCoordNoPerspective, ReadLocation(state, instruction, std::nullopt)) + "[" + std::to_string(component + 1u) + "])";
+            return "as_type<uint>(" + EmulatedBarycentric(state, BarycentricInputOf(kind) == StageInputKind::BaryCoordNoPerspective, ReadLocation(state, instruction, std::nullopt)) + "[" + std::to_string(component + 1u) + "])";
         default:
             break;
         }
@@ -672,7 +698,13 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
         AuxPositionExport(state, data, exp);
     } else if (exp.kind == ExportTargetKind::MrtZ) {
         if ((exp.en & 1u) != 0u && HasOutput(state, StageOutputKind::Depth)) state.Line("aps5_out.aps5_depth = as_type<float>(" + data + ".x);");
-        if ((exp.en & 2u) != 0u && HasOutput(state, StageOutputKind::StencilRef)) state.Line("aps5_out.aps5_stencil = " + data + ".y;");
+        if ((exp.en & 2u) != 0u && HasOutput(state, StageOutputKind::StencilRef)) {
+            // Upstream 7563b4a48: with STENCIL_OP_VAL_EXPORT_ENABLE the exported operation value is
+            // bits 8-15 of the second MRTZ channel (the driver turns the reachable REPLACE_OP into
+            // REPLACE with it).
+            const bool operationValue = PixelInfo(state).psStencilOperationValueExport;
+            state.Line("aps5_out.aps5_stencil = " + (operationValue ? "((" + data + ".y >> 8u) & 0xffu)" : data + ".y") + ";");
+        }
         if ((exp.en & 4u) != 0u && HasOutput(state, StageOutputKind::SampleMask)) state.Line("aps5_out.aps5_sample_mask = " + data + ".z;");
     } else if (exp.kind == ExportTargetKind::Position) {
         auto position = "as_type<float4>(" + ExportVector(state, data, exp, false) + ")";
@@ -689,7 +721,7 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
         }
         state.Line(record + ".aps5_position = " + position + ";");
         // The all-zero position cull distance (StoreZeroPositionClipDistance; not on mesh outputs).
-        if (stage != IrShaderStage::Mesh) state.Line("aps5_out.aps5_clip[" + std::to_string(ClipDistanceCount(state)) + "] = ((as_type<uint4>(aps5_out.aps5_position).x | as_type<uint4>(aps5_out.aps5_position).y | as_type<uint4>(aps5_out.aps5_position).z | as_type<uint4>(aps5_out.aps5_position).w) & 0x7fffffffu) == 0u ? -1.0f : 0.0f;");
+        if (stage != IrShaderStage::Mesh && MslZeroPositionDistance(state)) state.Line("aps5_out.aps5_clip[" + std::to_string(ClipDistanceCount(state)) + "] = ((as_type<uint4>(aps5_out.aps5_position).x | as_type<uint4>(aps5_out.aps5_position).y | as_type<uint4>(aps5_out.aps5_position).z | as_type<uint4>(aps5_out.aps5_position).w) & 0x7fffffffu) == 0u ? -1.0f : 0.0f;");
     } else {
         const auto kind = exp.kind == ExportTargetKind::Mrt ? StageOutputKind::Mrt : StageOutputKind::Parameter;
         const auto* output = FindOutput(state, kind, exp.index);
@@ -833,8 +865,8 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         const auto culls = MslCullDistanceCount(state);
         if (culls != 0u && stage == IrShaderStage::TessellationEvaluation) state.Fail("domain programs that write cull distances (the tessellation mesh function has no cull distance emulation; TechnicalDebt metal-tessellation)");
         if (culls > MaxClipDistances) state.Fail("more than 8 guest cull distances");
-        const auto clips = ClipDistanceCount(state) + 1u + (culls != 0u ? 1u : 0u);
-        if (clips > MaxClipDistances) state.Fail(culls != 0u ? "guest clip distances plus the all-zero clip position distance and the emulated cull distance exceed 8 clip distances" : "guest clip distances plus the all-zero clip position distance exceed 8 clip distances");
+        const auto clips = ClipDistanceCount(state) + (MslZeroPositionDistance(state) ? 1u : 0u) + (culls != 0u ? 1u : 0u);
+        if (clips > MaxClipDistances) state.Fail("guest clip distances plus the emulated cull distance exceed 8 clip distances");
         state.reflection.cullDistances = culls;
         text += "struct Aps5VertexOut {\n    float4 aps5_position [[position]];\n";
         std::uint32_t scalars = 4u;
@@ -927,7 +959,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         }
         // Upstream f7a2903ed: guest clip distances per mesh vertex (no all-zero-position distance on
         // mesh outputs, as the SPIR-V path).
-        if (const auto clips = MslCullClipSlot(state) - 1u; clips != 0u) {
+        if (const auto clips = MslGuestClipDistanceCount(state); clips != 0u) {
             if (clips > MaxClipDistances) state.Fail("more than 8 guest clip distances");
             text += "    float aps5_clip [[clip_distance]] [" + std::to_string(clips) + "];\n";
             scalars += clips;

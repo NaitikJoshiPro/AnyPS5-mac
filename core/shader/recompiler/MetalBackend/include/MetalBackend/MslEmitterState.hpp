@@ -128,6 +128,16 @@ public:
     std::uint32_t hostSubgroupSize = 32u;
     const ShaderWorkgroupInputInfo* workgroup = nullptr;
     std::unordered_set<const IrValue*> waveUniform;
+    // Upstream d422c760c/3265cb6d7 (SpirvBdaRead.cpp BdaAnchor): the user-data register pairs whose
+    // BDA range the program searches once at entry (MslAddress.cpp), collected at the first address
+    // read; `name` is the prologue's ulong3 (usable size, device address, offset of the base in the
+    // range), empty until a read uses the anchor.
+    struct BdaAnchor {
+        std::uint32_t lowRegister = 0;
+        std::uint32_t highRegister = 0;
+        std::string name;
+    };
+    std::optional<std::vector<BdaAnchor>> bdaAnchors;
     // True when `instruction` is computed once for both halves (always true when laneCount is 1).
     [[nodiscard]] bool SharedAcrossHalves(const IrValue& instruction) const;
 
@@ -332,8 +342,10 @@ struct MslGraphicsInterface {
 // The guest cull distances a vertex program writes (highest index + 1; MslAbi Version 10).
 [[nodiscard]] std::uint32_t MslCullDistanceCount(const MslEmitterState& state);
 // The clip distance that carries the emulated cull verdict: after the guest clip distances and the
-// all-zero position distance.
+// all-zero position distance (when there is room for it, MslZeroPositionDistance).
 [[nodiscard]] std::uint32_t MslCullClipSlot(const MslEmitterState& state);
+[[nodiscard]] std::uint32_t MslGuestClipDistanceCount(const MslEmitterState& state);
+[[nodiscard]] bool MslZeroPositionDistance(const MslEmitterState& state);
 // Upstream 72518f64f/1ffc5f672: a pixel function's PA_SC_AA_MASK coverage of its quad pixel, for
 // quad-masked programs (ShaderPixelInputInfo::QuadMasked): the guest samples the pixel covers
 // (MslQuadCoverage, 16 bits; all ones without a partial sample mask) and whether the pixel is

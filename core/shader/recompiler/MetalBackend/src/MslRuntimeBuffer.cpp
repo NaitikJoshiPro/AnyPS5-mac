@@ -1066,17 +1066,23 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         // A descriptor-table buffer, bound from the V# base rounded down to a dword (the base's misalignment is a
         // function constant): the element is base + offset, so an unaligned base with an offset that brings the
         // element back to a dword boundary runs, and an element off a dword boundary records an Unaligned fault and
-        // does nothing (RDNA2 stops the wave).
+        // does nothing (RDNA2 stops the wave). Upstream 7e4ce1ab3: a 32-bit atomic ignores the two low address bits
+        // (RDNA2 ISA 8.1.7, alignment mode DWORD) and acts on the dword holding its address; only 64-bit atomics
+        // off an 8-byte boundary fault.
         const auto element = state.DescriptorElement(DescriptorBindingKind::Buffers, memory.resource);
         const auto buffer = state.TableBuffer(DescriptorBindingKind::Buffers, element);
         const auto byte = state.Temporary("aps5_ab");
         state.Line("const uint " + byte + " = " + access + ".byte + " + state.MemoryByteOffset(element) + " + " + descriptor.memory + ".misalignment;");
-        state.Line("if ((" + byte + " & " + mask + ") != 0u) {");
-        state.Indent();
-        state.Line(MslRecordFault(state, 7u, descriptor.base + " + ulong(" + access + ".byte)", std::to_string(bytes) + "u", MslB5Pc(instruction)));
-        if (MslBdaStops(state)) state.Line(MslBdaStopStatement(state));
-        state.Outdent();
-        state.Line("} else if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
+        if (wide) {
+            state.Line("if ((" + byte + " & " + mask + ") != 0u) {");
+            state.Indent();
+            state.Line(MslRecordFault(state, 7u, descriptor.base + " + ulong(" + access + ".byte)", std::to_string(bytes) + "u", MslB5Pc(instruction)));
+            if (MslBdaStops(state)) state.Line(MslBdaStopStatement(state));
+            state.Outdent();
+            state.Line("} else if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
+        } else {
+            state.Line("if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
+        }
         state.Indent();
         if (wide) apply("(" + buffer + ".address + ulong(" + byte + "))");
         else apply("(reinterpret_cast<device atomic_uint*>(" + buffer + ".address) + (" + byte + " >> 2u))");
@@ -1088,14 +1094,20 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         const auto address = state.Temporary("aps5_aa");
         const auto physical = state.Temporary("aps5_pa");
         state.Line("bool " + overflow + " = false;");
-        state.Line("const ulong " + address + " = aps5_bda_add(" + descriptor.bda + ", " + descriptor.base + ", ulong(" + access + ".byte), false, " + descriptor.pc + ", " + overflow + ");");
+        state.Line(std::string(wide ? "const " : "") + "ulong " + address + " = aps5_bda_add(" + descriptor.bda + ", " + descriptor.base + ", ulong(" + access + ".byte), false, " + descriptor.pc + ", " + overflow + ");");
         MslB5StopIf(state, overflow);
-        state.Line("if ((" + address + " & " + mask + "l) != 0ul) {");
-        state.Indent();
-        state.Line("aps5_bda_fault(" + descriptor.bda + ", 7u, " + address + ", " + std::to_string(bytes) + "u, " + descriptor.pc + ");");
-        if (descriptor.stops) state.Line(MslBdaStopStatement(state));
-        state.Outdent();
-        state.Line("} else {");
+        if (wide) {
+            state.Line("if ((" + address + " & " + mask + "l) != 0ul) {");
+            state.Indent();
+            state.Line("aps5_bda_fault(" + descriptor.bda + ", 7u, " + address + ", " + std::to_string(bytes) + "u, " + descriptor.pc + ");");
+            if (descriptor.stops) state.Line(MslBdaStopStatement(state));
+            state.Outdent();
+            state.Line("} else {");
+        } else {
+            // Upstream 7e4ce1ab3: the dword holding the address.
+            state.Line(address + " &= ~3ul;");
+            state.Line("{");
+        }
         state.Indent();
         state.Line("const ulong " + physical + " = aps5_bda_lookup(" + descriptor.bda + ", " + address + ", " + std::to_string(bytes) + "u, " + descriptor.pc + ", 3u, true);");
         state.Line("if (" + physical + " != 0ul) {");

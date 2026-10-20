@@ -203,6 +203,8 @@ function(add_shader_recompiler target runtimeTarget)
     list(APPEND shaderCacheRecompilerSources ${shaderCacheCompiledSources})
     list(REMOVE_DUPLICATES shaderCacheRecompilerSources)
     set(shaderCacheKeySources "${PROJECT_SOURCE_DIR}/core/libs/prx/libc/include/HostThreadLocal.hpp")
+    # MetalBackend's tessellator includes its shared core as a .inc (UPSYNC4: upstream's include check).
+    list(APPEND shaderCacheKeySources "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MetalBackend/include/MetalBackend/MslTessellatorCore.inc")
     foreach(source IN LISTS shaderCacheKeySources)
         if(NOT EXISTS "${source}")
             message(FATAL_ERROR "Shader disk cache key source does not exist: ${source}")

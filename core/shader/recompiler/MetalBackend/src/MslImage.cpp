@@ -1543,11 +1543,8 @@ void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& 
     const auto info = ImageOpcodeInfoOf(inst.Opcode());
     const auto& address = ImageAddress(state, inst, inst.Argument(info.needsSampler ? 2 : 1));
     const Access access{inst, mem, mode, address};
-    if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) {
-        if (inst.Opcode() != IrOpcode::ImageRead || mem.dataBits != 32u) state.Fail(inst, "FMASK requires a 32-bit image read");
-        state.Define(inst, state.Arg(inst, 2) + " ? uint4(0x76543210u, 0xfedcba98u, 0u, 0u) : uint4(0u)");
-        return;
-    }
+    // Upstream caae92c12: FMASK images are uint images read from guest memory (Fmask32_S8_F8); the
+    // identity Fmask8_S2_F1 mode is gone.
     if (mode.depthBits && mem.dataBits == 16u) state.Fail(inst, "depth bits require a 32-bit image result");
     if (info.access == ImageAccess::Atomic) {
         EmitAtomic(state, access);
