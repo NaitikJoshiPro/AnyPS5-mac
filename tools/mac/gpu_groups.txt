@@ -649,6 +649,7 @@ agc_driver_skip_shader G4
 agc_driver_stencil_ref_export_unused G4
 agc_driver_storage_write_back_overhang G4
 agc_driver_store_idle_results G4
+agc_driver_storage_gpu_snapshot G4
 agc_driver_store_over_untracked G4
 agc_driver_store_pending_identity G4
 agc_driver_stream_copy G4

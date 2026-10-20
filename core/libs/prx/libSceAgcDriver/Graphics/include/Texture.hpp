@@ -280,6 +280,17 @@ public:
         std::uint64_t flushedAfterSkipSameSite;
     };
     static HookSkipCounts TakeHookSkipCounts();
+    // `original` snapshots (D82, Metal), cumulative: copied on the GPU because recorded work writes
+    // the bytes (they land in `original` through the stored-save path at their batch's completion),
+    // and readers of `original` that had to wait for one first (a recorder sync).
+    struct SnapshotCounts {
+        std::uint64_t gpu;
+        std::uint64_t settled;
+        // Upload captures over recorded writes kept on the CPU: shadowed unit, CPU write-back, no
+        // host import.
+        std::array<std::uint64_t, 3> refused;
+    };
+    static SnapshotCounts TakeSnapshotCounts();
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
@@ -379,7 +390,15 @@ private:
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
-    void captureGuestBytes(const std::vector<bool>* layers);
+    // readByUpload: the direct upload's detile reads the content from the host import next (D82).
+    void captureGuestBytes(const std::vector<bool>* layers, bool readByUpload = false);
+    // D82 (Metal): the snapshot of the selected units by a recorded GPU copy when recorded work
+    // writes them, into `savedBytes` under a stored-save ticket (the bytes reach `original` when the
+    // batch completes, applyStoredSave); false: read them now.
+    bool captureOnGpu(const std::vector<bool>& selected);
+    // Readers of `original` over [address, address + bytes) whose units hold it (layerOriginal) but
+    // still wait for a GPU snapshot (D82): lets those batches complete first.
+    void settleSavedOver(std::uint64_t address, std::size_t bytes) const;
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in

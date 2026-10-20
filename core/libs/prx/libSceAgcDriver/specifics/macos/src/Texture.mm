@@ -45,6 +45,11 @@
 #include <unordered_map>
 #include <utility>
 
+namespace AgcDriver::Graphics::Metal {
+// Recorder.mm (D66): readies guest memory for GPU work recorded next; false when it waited.
+bool FlushForGpuRead(std::uint64_t address, std::size_t bytes);
+}
+
 namespace AgcDriver::Graphics {
 
 namespace {
@@ -2145,6 +2150,7 @@ bool StorageTexture::Refresh() {
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+            settleSavedOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
             return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
         };
         const auto scanBlocks = [&] {
@@ -2459,11 +2465,12 @@ void StorageTexture::keepComparable() {
     if (any) captureGuestBytes(&missing);
 }
 
-void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+void StorageTexture::captureGuestBytes(const std::vector<bool>* layers, bool readByUpload) {
     original.resize(static_cast<std::size_t>(guestBytes));
     comparedGuestBytes = {};
     std::vector<bool> selected(trackedLayers, true);
     if (layers != nullptr) selected = *layers;
+    if (readByUpload && captureOnGpu(selected)) return;
     for (const auto& [begin, end] : unitRuns(selected)) GuestMemory::FlushGpuWrites(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!selected[layer]) continue;
@@ -2472,6 +2479,120 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
         layerOriginal[layer] = true;
         cancelStoredSave(layer);
     }
+}
+
+namespace {
+
+std::atomic<std::uint64_t> snapshotsOnGpu{0};
+std::atomic<std::uint64_t> snapshotsSettled{0};
+// Why an upload's capture over recorded writes kept the CPU read (APS5_PROFILE_DRAW [cpuwaits]): a
+// shadowed unit, a CPU write-back (FlushForGpuRead waited), no host import.
+std::array<std::atomic<std::uint64_t>, 3> snapshotRefusals{};
+
+bool GpuSnapshots() {
+    static const bool enabled = std::getenv("APS5_CPU_TEXTURE_SNAPSHOT") == nullptr;
+    return enabled;
+}
+
+}
+
+StorageTexture::SnapshotCounts StorageTexture::TakeSnapshotCounts() {
+    SnapshotCounts counts{snapshotsOnGpu.load(std::memory_order_relaxed), snapshotsSettled.load(std::memory_order_relaxed), {}};
+    for (std::size_t reason = 0; reason < counts.refused.size(); ++reason) counts.refused[reason] = snapshotRefusals[reason].load(std::memory_order_relaxed);
+    return counts;
+}
+
+// D82 (W1): the snapshot behind the untracked comparison (`original`) was read on the CPU, which
+// waited for every recorded batch when recorded work writes the surface (a dispatch writing a
+// buffer, or another image's write-back, before this image samples the memory). For the direct
+// upload, whose detile reads the image content from the host import at its place in the queue, a
+// GPU copy recorded at the same place, into host-visible memory, takes the same snapshot as the
+// content: the comparison stays consistent with what the image holds whatever the CPU writes
+// around it. The copy goes through upstream's stored-save path (69702ef105, written for GPU-side
+// write-backs): it lands in `savedBytes` under a per-unit ticket and applyStoredSave moves it into
+// `original` at the batch's completion; anything that replaces or drops a unit's bytes cancels the
+// ticket, so an older copy never lands over newer bytes. Unlike a write-back's save, the units keep
+// layerOriginal (they hold the snapshot, just not yet on the CPU): readers of `original` wait for
+// the batch first (settleSavedOver, rare: the GPU's stamps make the next Refresh re-upload without
+// a comparison). Captures whose image content does not come from that read (a GPU clear, a fill, an
+// image copy: keepComparable and the clear path) keep the CPU read and its wait: their snapshot
+// must predate CPU writes made after the call (agc_driver_store_over_untracked). So do shadowed
+// units (the upload reads the slabs), a pending CPU write-back (FlushForGpuRead waited) and memory
+// without a host import. APS5_CPU_TEXTURE_SNAPSHOT=1 always reads on the CPU.
+bool StorageTexture::captureOnGpu(const std::vector<bool>& selected) {
+    if (!GpuSnapshots()) return false;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || original.size() != guestBytes || savedTicket.size() != trackedLayers) return false;
+    const auto runs = unitRuns(selected);
+    if (runs.empty()) return false;
+    const bool written = std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return recorder->PendingWriteOverlaps(descriptor.baseAddress + run.first, static_cast<std::size_t>(run.second - run.first)); });
+    if (!written) return false;
+    const auto refuse = [](std::size_t reason) {
+        snapshotRefusals[reason].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    // Units another image's results shadow are read by the upload from the slabs: kept on the CPU.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& [begin, end] : runs) ranges.emplace_back(descriptor.baseAddress + begin, descriptor.baseAddress + end);
+    if (AnyShadowedOverlaps(ranges)) return refuse(0);
+    const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (import == nullptr) return refuse(2);
+    // What a GPU reader needs first (queued labels and other images' stores over the units) is
+    // recorded; a pending CPU write-back made it wait like a CPU read, so the bytes are final.
+    for (const auto& [begin, end] : runs) {
+        if (!Metal::FlushForGpuRead(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin))) return refuse(1);
+    }
+    // Recording may have reaped or replaced the import (the stores above): look it up again.
+    import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (import == nullptr) return false;
+    recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    const auto units = prepareStoredSave(selected, std::vector<bool>(trackedLayers, false));
+    if (units.empty() || !savedBytes) return false;
+    const auto commands = recorder->Commands();
+    // After earlier writers of the units and of `savedBytes` (an earlier save's copy there).
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto importOffset = descriptor.baseAddress - import->base;
+    // `savedBytes` has the surface's layout: each unit at its offset in the surface.
+    for (const auto& [begin, end] : runs) {
+        CopyBuffer(context, commands, import->buffer, importOffset + begin, savedBytes->Handle(), begin, end - begin);
+        recorder->NotePendingRead(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::GpuCopy);
+    }
+    // Later writers of the units wait for the copy's reads.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    comparedGuestBytes = {};
+    for (const auto unit : units) layerOriginal[unit] = true;
+    commitStoredSave(units);
+    snapshotsOnGpu.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void StorageTexture::settleSavedOver(std::uint64_t address, std::size_t bytes) const {
+    if (savedTicket.empty() || bytes == 0 || trackedLayerBytes == 0 || address + bytes <= descriptor.baseAddress) return;
+    const auto from = address > descriptor.baseAddress ? address - descriptor.baseAddress : 0;
+    const auto to = std::min<std::uint64_t>(address + bytes - descriptor.baseAddress, guestBytes);
+    std::uint64_t first = guestBytes;
+    std::uint64_t last = 0;
+    for (auto layer = static_cast<std::uint32_t>(from / trackedLayerBytes); layer < trackedLayers && layer * trackedLayerBytes < to; ++layer) {
+        // Units without layerOriginal are a write-back's save: their readers never use `original`.
+        if (savedTicket[layer] == 0 || !layerOriginal[layer]) continue;
+        first = std::min<std::uint64_t>(first, layerBegin(layer) - descriptor.baseAddress);
+        last = std::max<std::uint64_t>(last, layerBegin(layer) - descriptor.baseAddress + layerBytes(layer));
+    }
+    if (last <= first) return;
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "a GPU snapshot of a storage image is pending without a recorder");
+    // The copy's batch completes and lands it (applyStoredSave runs in its completion).
+    Recorder::CountSync(4);
+    recorder->SyncThrough(descriptor.baseAddress + first, static_cast<std::size_t>(last - first));
+    const auto outstanding = [&] {
+        for (auto layer = static_cast<std::uint32_t>(first / trackedLayerBytes); layer < trackedLayers && layer * trackedLayerBytes < last; ++layer) {
+            if (savedTicket[layer] != 0 && layerOriginal[layer]) return true;
+        }
+        return false;
+    };
+    if (outstanding()) recorder->Sync();
+    snapshotsSettled.fetch_add(1, std::memory_order_relaxed);
+    Require(!outstanding(), "a GPU snapshot of a storage image did not land with its batch");
 }
 
 bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) const {
@@ -2483,6 +2604,7 @@ bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) con
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalHolds(address, bytes)) return false;
+    settleSavedOver(address, bytes);
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -2621,7 +2743,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             cancelStoredSaves();
             originalDroppedBy = "upload #2";
         } else {
-            captureGuestBytes(layers);
+            captureGuestBytes(layers, true);
         }
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
@@ -5095,7 +5217,9 @@ bool StorageTexture::guestBytesSettled() const {
 }
 
 bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const {
-    const auto& baseline = originalHolds(from, static_cast<std::size_t>(to - from)) ? original : generationBaseline;
+    const bool saved = originalHolds(from, static_cast<std::size_t>(to - from));
+    if (saved) settleSavedOver(from, static_cast<std::size_t>(to - from));
+    const auto& baseline = saved ? original : generationBaseline;
     if (baseline.size() != guestBytes) return false;
     const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
     return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
@@ -5443,6 +5567,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             static_cast<unsigned>(std::find_if(layerOriginal.begin(), layerOriginal.end(), [](bool saved) { return !saved; }) - layerOriginal.begin()));
         Require(false, std::string("storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented") + where + " (saved bytes last dropped at " + (originalDroppedBy != nullptr ? originalDroppedBy : "none: never saved") + ")");
     }
+    // The whole of `original` is read below (the host copy): a GPU snapshot lands first.
+    settleSavedOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
     for (const auto& [begin, end] : unitRuns(unsaved)) {
