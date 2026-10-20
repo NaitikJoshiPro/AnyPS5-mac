@@ -113,16 +113,6 @@ int APS5_VABI sceKeyboardPadEmulateOpen(void) {
     return 0;
 }
 
-int APS5_VABI sceKeyboardSetProcessFocus(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceKeyboardSetProcessPrivilege(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceDbgKeyboardClose() {
     NotImplemented_nid_no_patch(__func__);
     return 0;

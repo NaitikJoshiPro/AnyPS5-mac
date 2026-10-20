@@ -7,7 +7,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 find_package(Threads REQUIRED)
-add_executable(guest_arena_tests ../GuestArenaHost.cpp ../../prx/libc/src/GuestArena.cpp ../../prx/libc/src/GuestWriteWatch.cpp)
+add_executable(guest_arena_tests ../GuestArenaHost.cpp ../../prx/libc/src/GuestArena.cpp ../../prx/libc/src/GuestWriteWatch.cpp ../../prx/libc/src/GuestDisplaced.cpp)
 target_include_directories(guest_arena_tests PRIVATE ../..)
 target_compile_features(guest_arena_tests PRIVATE cxx_std_20)
 target_link_libraries(guest_arena_tests PRIVATE Threads::Threads)

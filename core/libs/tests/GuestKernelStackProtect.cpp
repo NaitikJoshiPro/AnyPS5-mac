@@ -473,7 +473,7 @@ static void ProtectHostStacks() {
     for (void* partial : {static_cast<void*>(nullptr), reinterpret_cast<void*>(1)}) RunOnReservedStack(ProtectReservedStack, partial);
     RunOnReservedStack(ProtectStackBottom, nullptr);
 }
-#else
+#elif defined(__linux__)
 static int ProtectUnlimitedStack() {
     int local = 0;
     void* start = nullptr;
@@ -552,10 +552,15 @@ int main(int argc, char** argv) {
     (void)argv;
     ProtectHostStacks();
 #else
+#ifdef __linux__
     if (argc > 1 && std::strcmp(argv[1], "--unlimited-stack") == 0) return ProtectUnlimitedStack();
     if (argc > 1 && std::strcmp(argv[1], "--read-only-bottom") == 0) return ProtectMainStackBottom({1}, 3);
     if (argc > 1 && std::strcmp(argv[1], "--reprotect-bottom") == 0) return ProtectMainStackBottom({0, 3}, 7);
     ProtectMainStacks();
+#else
+    (void)argc;
+    (void)argv;
+#endif
     ProtectStack(0);
 #endif
     std::atomic<bool> passed{false};

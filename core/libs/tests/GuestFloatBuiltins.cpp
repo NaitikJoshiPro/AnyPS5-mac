@@ -4,7 +4,19 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#if defined(__x86_64__)
 #include <xmmintrin.h>
+static unsigned HostControl() { return HostControl(); }
+static void SetHostControl(unsigned value) { SetHostControl(value); }
+#else
+// arm64 host: FPCR stands for MXCSR (the builtins must not depend on either).
+static unsigned HostControl() {
+    std::uint64_t value = 0;
+    asm volatile("mrs %0, fpcr" : "=r"(value));
+    return static_cast<unsigned>(value);
+}
+static void SetHostControl(unsigned value) { asm volatile("msr fpcr, %0" : : "r"(static_cast<std::uint64_t>(value))); }
+#endif
 
 using Int128 = __int128;
 using Uint128 = unsigned __int128;
@@ -83,7 +95,11 @@ static double Double(std::uint64_t bits) { return std::bit_cast<double>(bits); }
 static float Float(std::uint32_t bits) { return std::bit_cast<float>(bits); }
 static Uint128 Make(std::uint64_t high, std::uint64_t low) { return (static_cast<Uint128>(high) << 64) | low; }
 
+#if defined(__x86_64__)
 static constexpr unsigned GuestMxcsr = 0x1f80 | 0x6000 | 0x8040;
+#else
+static constexpr unsigned GuestMxcsr = (3u << 22) | (1u << 24); // FPCR: round toward zero, flush to zero
+#endif
 
 static void CheckArithmetic() {
     Require(__adddf3_nid_postfix(1., 2.) == 3. && __subsf3_nid_postfix(1.f, 2.f) == -1.f);
@@ -103,13 +119,13 @@ static void CheckArithmetic() {
     Require(Bits(__divsf3_nid_postfix(0x1p-120f, 0x1p10f)) == 0u);
     Require(Bits(__divdf3_nid_postfix(0x1p-1022, 0x1.0000000000001p0)) == 0u);
     Require(__divdf3_nid_postfix(0x1p-1000, 0x1p-22) == 0x1p-978 && __divsf3_nid_postfix(1.f, 3.f) == 1.f / 3.f);
-    const unsigned saved = _mm_getcsr();
-    _mm_setcsr(GuestMxcsr);
+    const unsigned saved = HostControl();
+    SetHostControl(GuestMxcsr);
     const double sum = __adddf3_nid_postfix(1., 0x1.8p-53);
     const float denormal = __mulsf3_nid_postfix(0x1p-126f, .5f);
     const double quotient = __divdf3_nid_postfix(1., 3.);
-    const unsigned after = _mm_getcsr();
-    _mm_setcsr(saved);
+    const unsigned after = HostControl();
+    SetHostControl(saved);
     Require(sum == 1. + 0x1p-52);
     Require(Bits(denormal) == 0x00400000u);
     Require(Bits(quotient) == 0x3fd5555555555555ull);
@@ -135,11 +151,11 @@ static void CheckFloatConversions() {
     Require(__extendsfdf2_nid_postfix(1.5f) == 1.5 && __extendsfdf2_nid_postfix(-INFINITY) == -INFINITY);
     Require(Bits(__truncdfsf2_nid_postfix(Double(0x7ff0000020000001ull))) == 0x7fc00001u);
     Require(Bits(__truncdfsf2_nid_postfix(Double(0xfff4000000123456ull))) == 0xffd23456u);
-    const unsigned saved = _mm_getcsr();
-    _mm_setcsr(GuestMxcsr);
+    const unsigned saved = HostControl();
+    SetHostControl(GuestMxcsr);
     const float third = __truncdfsf2_nid_postfix(1. / 3.);
     const float tiny = __truncdfsf2_nid_postfix(0x1p-140);
-    _mm_setcsr(saved);
+    SetHostControl(saved);
     Require(Bits(third) == 0x3eaaaaabu && Bits(tiny) == 0x00000200u);
 }
 
@@ -170,13 +186,13 @@ static void CheckIntegerToFloat() {
     Require(__floatdidf_nid_postfix(-3) == -3. && __floatdisf_nid_postfix(1ll << 40) == 0x1p40f);
     Require(__floatundidf_nid_postfix(~0ull) == 0x1p64 && __floatundisf_nid_postfix(~0ull) == 0x1p64f);
     Require(__floatdixf_nid_postfix(INT64_MIN) == -0x1p63L && __floatundixf_nid_postfix(~0ull) == 18446744073709551615.L);
-    const unsigned saved = _mm_getcsr();
-    _mm_setcsr(GuestMxcsr);
+    const unsigned saved = HostControl();
+    SetHostControl(GuestMxcsr);
     const float tie = __floatsisf_nid_postfix(16777217);
     const float up = __floatunsisf_nid_postfix(16777219u);
     const float negative = __floatsisf_nid_postfix(-16777219);
     const double wide = __floattidf_nid_postfix(static_cast<Int128>(Make(0, (1ull << 63) | 0x601)));
-    _mm_setcsr(saved);
+    SetHostControl(saved);
     Require(tie == 16777216.f && up == 16777220.f && negative == -16777220.f);
     Require(wide == 0x1p63 + 0x800);
     Require(__floattidf_nid_postfix(static_cast<Int128>(Make(1, 1))) == 0x1p64);

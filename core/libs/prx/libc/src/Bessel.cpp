@@ -2,7 +2,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 #include <limits>
 
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -102,6 +104,7 @@ double Signed(std::uint32_t value) {
     return static_cast<double>(static_cast<std::int32_t>(value));
 }
 
+#if defined(__x86_64__)
 double SquareRoot(double x) {
     return _mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(x)));
 }
@@ -118,6 +121,16 @@ const bool HardwareFma = [] {
 double Fused(double a, double b, double c) {
     return HardwareFma ? HardwareFused(a, b, c) : std::fma(a, b, c);
 }
+#else
+// arm64 host: fsqrt and fmadd are IEEE exact, as sqrtsd and vfmadd are (FMA is part of ARMv8).
+double SquareRoot(double x) {
+    return std::sqrt(x);
+}
+
+double Fused(double a, double b, double c) {
+    return std::fma(a, b, c);
+}
+#endif
 
 template <std::size_t Count>
 double Horner(double z, const double (&coefficients)[Count]) {

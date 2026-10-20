@@ -5,11 +5,16 @@
 #include <iphlpapi.h>
 #else
 #include <ifaddrs.h>
+#ifdef __linux__
 #include <linux/if_link.h>
-#include <net/if.h>
 #include <net/if_arp.h>
-#include <netinet/in.h>
 #include <netpacket/packet.h>
+#elif defined(__APPLE__)
+#include <net/if_dl.h>
+#include <net/if_types.h>
+#endif
+#include <net/if.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -200,12 +205,15 @@ std::vector<std::uint8_t> GuestLinkAddress(const std::string& name, std::uint16_
     return guest;
 }
 
+#ifdef __linux__
 std::optional<std::uint64_t> ReadSysfsCounter(const std::string& name, const char* file) {
     std::ifstream input("/sys/class/net/" + name + "/" + file);
     long long value = 0;
     if (!(input >> value)) return std::nullopt;
     return static_cast<std::uint64_t>(value);
 }
+
+#endif
 
 std::uint32_t HostMtu(const std::string& name) {
     const int probe = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -219,6 +227,7 @@ std::uint32_t HostMtu(const std::string& name) {
     return static_cast<std::uint32_t>(request.ifr_mtu);
 }
 
+#ifdef __linux__
 std::vector<std::uint8_t> GuestInterfaceData(const std::string& name, unsigned int hostFlags, const void* hostStats, std::uint8_t type, std::uint8_t hardwareLength) {
     std::vector<std::uint8_t> data(guestInterfaceDataSize, 0);
     data[0] = type;
@@ -253,6 +262,30 @@ std::vector<std::uint8_t> GuestInterfaceData(const std::string& name, unsigned i
     }
     return data;
 }
+#else
+// macOS: the counters come from the link entry's if_data (no sysfs); IFF_RUNNING stands for the link state
+// (the host's link-state field is not public) and if_data has no transmit drop counter.
+std::vector<std::uint8_t> GuestInterfaceData(const std::string& name, unsigned int hostFlags, const void* hostStats, std::uint8_t type, std::uint8_t hardwareLength) {
+    if (!hostStats) throw std::runtime_error("getifaddrs: no counters for " + name + " in the host list");
+    if_data stats{};
+    std::memcpy(&stats, hostStats, sizeof(stats));
+    std::vector<std::uint8_t> data(guestInterfaceDataSize, 0);
+    data[0] = type;
+    data[2] = hardwareLength;
+    data[3] = type == guestTypeEthernet ? 14 : 0;
+    if (type == guestTypeLoopback) data[4] = (hostFlags & IFF_UP) ? guestLinkStateUp : guestLinkStateDown;
+    else data[4] = (hostFlags & IFF_RUNNING) ? guestLinkStateUp : guestLinkStateDown;
+    Store(data, 6, static_cast<std::uint16_t>(guestInterfaceDataSize));
+    Store(data, 8, HostMtu(name));
+    if (stats.ifi_baudrate != 0) Store(data, 16, static_cast<std::uint64_t>(stats.ifi_baudrate));
+    const std::pair<std::uint64_t, std::size_t> counters[] = {
+        {stats.ifi_ipackets, 24}, {stats.ifi_ierrors, 32}, {stats.ifi_opackets, 40}, {stats.ifi_oerrors, 48}, {stats.ifi_collisions, 56},
+        {stats.ifi_ibytes, 64}, {stats.ifi_obytes, 72}, {stats.ifi_imcasts, 80}, {stats.ifi_iqdrops, 96},
+    };
+    for (const auto& [value, offset] : counters) Store(data, offset, value);
+    return data;
+}
+#endif
 
 std::uint32_t InterfaceFlags(unsigned int host) {
     constexpr std::pair<unsigned int, std::uint32_t> flags[] = {
@@ -288,6 +321,23 @@ int HostEntries(std::vector<Entry>& entries) {
     try {
         for (auto* item = host; item; item = item->ifa_next) {
             if (!item->ifa_addr) continue;
+#ifdef __APPLE__
+            if (item->ifa_addr->sa_family == AF_LINK) {
+                const auto& link = *reinterpret_cast<const sockaddr_dl*>(item->ifa_addr);
+                HostInterface& owner = interfaceFor(CheckedName(item->ifa_name));
+                if (owner.linked) throw std::runtime_error("getifaddrs: two link-level entries for " + owner.name);
+                if (link.sdl_index == 0) throw std::runtime_error("getifaddrs: interface index of " + owner.name + " does not fit sockaddr_dl");
+                // macOS and the console share the BSD interface type numbers (IFT_ETHER, IFT_LOOP, IFT_PPP).
+                const std::uint8_t type = link.sdl_type == IFT_ETHER ? guestTypeEthernet : link.sdl_type == IFT_LOOP ? guestTypeLoopback
+                    : link.sdl_type == IFT_PPP ? guestTypePpp : guestTypeOther;
+                const std::uint8_t hardwareLength = type == guestTypeLoopback ? 0 : link.sdl_alen;
+                owner.link = Entry{owner.name, InterfaceFlags(item->ifa_flags),
+                    GuestLinkAddress(owner.name, link.sdl_index, type, reinterpret_cast<const std::uint8_t*>(LLADDR(&link)), hardwareLength), {}, {},
+                    GuestInterfaceData(owner.name, item->ifa_flags, item->ifa_data, type, hardwareLength)};
+                owner.linked = true;
+                continue;
+            }
+#else
             if (item->ifa_addr->sa_family == AF_PACKET) {
                 const auto& link = *reinterpret_cast<const sockaddr_ll*>(item->ifa_addr);
                 HostInterface& owner = interfaceFor(CheckedName(item->ifa_name));
@@ -302,6 +352,7 @@ int HostEntries(std::vector<Entry>& entries) {
                 owner.linked = true;
                 continue;
             }
+#endif
             if (item->ifa_addr->sa_family != AF_INET && item->ifa_addr->sa_family != AF_INET6) continue;
             if (!item->ifa_netmask) throw std::runtime_error(std::string("getifaddrs: host address without a netmask on ") + item->ifa_name);
             Entry entry{CheckedName(item->ifa_name), InterfaceFlags(item->ifa_flags), GuestAddress(item->ifa_addr), GuestAddress(item->ifa_netmask), {}};

@@ -7,9 +7,14 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <net/if_arp.h>
 #include <netinet/in.h>
+#ifdef __linux__
+#include <net/if_arp.h>
 #include <netpacket/packet.h>
+#else
+#include <net/if_dl.h>
+#include <net/if_types.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,7 +22,13 @@
 #include <string>
 #endif
 #include "prx/libc/include/ApplicationHeap.hpp"
+#if defined(__linux__)
+constexpr int HostLinkFamily = AF_PACKET;
+#elif !defined(_WIN32)
+constexpr int HostLinkFamily = AF_LINK;
+#endif
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -77,12 +88,33 @@ static HostInterfaceAddress HostAddress(const sockaddr* address) {
 }
 
 #ifndef _WIN32
+#ifdef __linux__
 static std::uint64_t SysfsCounter(const char* name, const char* file) {
     std::ifstream input(std::string("/sys/class/net/") + name + "/statistics/" + file);
     unsigned long long value = 0;
     Require(static_cast<bool>(input >> value));
     return value;
 }
+#else
+// macOS: the same counters from the link entry's if_data (no sysfs).
+static std::uint64_t SysfsCounter(const char* name, const char* file) {
+    ifaddrs* host = nullptr;
+    Require(::getifaddrs(&host) == 0);
+    std::uint64_t value = 0;
+    bool found = false;
+    for (auto* item = host; item && !found; item = item->ifa_next) {
+        if (!item->ifa_addr || item->ifa_addr->sa_family != AF_LINK || std::strcmp(item->ifa_name, name) != 0 || !item->ifa_data) continue;
+        const auto* data = static_cast<const if_data*>(item->ifa_data);
+        const std::string counter = file;
+        value = counter == "rx_packets" ? data->ifi_ipackets : counter == "tx_packets" ? data->ifi_opackets
+            : counter == "rx_bytes" ? data->ifi_ibytes : data->ifi_obytes;
+        found = true;
+    }
+    ::freeifaddrs(host);
+    Require(found);
+    return value;
+}
+#endif
 
 static std::uint32_t HostMtu(const char* name) {
     const int probe = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -151,6 +183,7 @@ static std::vector<HostInterfaceAddress> HostSnapshot() {
     try {
         for (auto* item = host; item; item = item->ifa_next) {
             if (!item->ifa_addr) continue;
+#ifdef __linux__
             if (item->ifa_addr->sa_family == AF_PACKET) {
                 const auto& link = *reinterpret_cast<const sockaddr_ll*>(item->ifa_addr);
                 HostInterfaceAddress entry{};
@@ -160,6 +193,17 @@ static std::vector<HostInterfaceAddress> HostSnapshot() {
                 entry.type = link.sll_hatype == ARPHRD_ETHER ? 0x6 : link.sll_hatype == ARPHRD_LOOPBACK ? 0x18 : link.sll_hatype == ARPHRD_PPP ? 0x17 : 0x1;
                 entry.hardwareLength = entry.type == 0x18 ? 0 : link.sll_halen;
                 std::memcpy(entry.hardware, link.sll_addr, entry.hardwareLength);
+#else
+            if (item->ifa_addr->sa_family == AF_LINK) {
+                const auto& link = *reinterpret_cast<const sockaddr_dl*>(item->ifa_addr);
+                HostInterfaceAddress entry{};
+                entry.family = HostLinkFamily;
+                std::strncpy(entry.name, item->ifa_name, sizeof(entry.name) - 1);
+                entry.index = link.sdl_index;
+                entry.type = link.sdl_type == IFT_ETHER ? 0x6 : link.sdl_type == IFT_LOOP ? 0x18 : link.sdl_type == IFT_PPP ? 0x17 : 0x1;
+                entry.hardwareLength = entry.type == 0x18 ? 0 : static_cast<std::uint8_t>(std::min<std::size_t>(link.sdl_alen, sizeof(entry.hardware)));
+                std::memcpy(entry.hardware, LLADDR(&link), entry.hardwareLength);
+#endif
                 entry.loopbackUp = (item->ifa_flags & IFF_UP) != 0;
                 auto& members = group(item->ifa_name);
                 members.insert(members.begin(), entry);
@@ -234,7 +278,7 @@ int main() {
                 Require(counters[5] <= SysfsCounter(item->name, "rx_bytes") && counters[6] <= SysfsCounter(item->name, "tx_bytes"));
                 if (entries <= host.size()) {
                     const HostInterfaceAddress& expected = host[entries - 1];
-                    equal = equal && expected.family == AF_PACKET && std::strcmp(expected.name, item->name) == 0 && expected.index == index &&
+                    equal = equal && expected.family == HostLinkFamily && std::strcmp(expected.name, item->name) == 0 && expected.index == index &&
                         expected.type == address[4] && expected.hardwareLength == address[6] &&
                         std::memcmp(expected.hardware, address + 8 + nameLength, expected.hardwareLength) == 0;
                     if (expected.type == 0x18) {

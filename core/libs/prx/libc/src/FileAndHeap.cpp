@@ -459,6 +459,7 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
     const auto bytes = size * count;
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - reinterpret_cast<std::uintptr_t>(buffer)) throw std::overflow_error("fwrite: buffer address overflow");
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buffer, bytes);
+    const auto result = std::fwrite(GuestArena::HostRange(buffer, bytes), size, count, handle);
     stream->SyncStatus();
     return result;
 }

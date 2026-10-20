@@ -342,7 +342,6 @@ private:
                     static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(end - cursor));
                 throw std::system_error(failed, std::system_category(), message);
             }
-#endif
             occupied.emplace_back(cursor, end);
         }
     }

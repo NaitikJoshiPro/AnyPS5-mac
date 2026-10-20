@@ -12,6 +12,11 @@ using Int128 = __int128;
 using Uint128 = unsigned __int128;
 
 constexpr std::uint32_t DefaultMxcsr = 0x1f80;
+#if !defined(__x86_64__)
+// FPCR equivalents of DefaultMxcsr and TowardZeroMxcsr: round to nearest (or toward zero), no flush, no default NaN.
+constexpr std::uint64_t DefaultFpcr = 0;
+constexpr std::uint64_t TowardZeroFpcr = 3ull << 22;
+#endif
 
 template<typename TFloat>
 struct FloatFormat;
@@ -216,60 +221,116 @@ TFloat GeneratedNan(TFloat result, TFloat a, TFloat b) {
 }
 
 double AddDouble(double a, double b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\taddsd %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(DefaultMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfadd %d[a], %d[a], %d[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(DefaultFpcr));
+#endif
     return a;
 }
 
 double MultiplyDouble(double a, double b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tmulsd %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(DefaultMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfmul %d[a], %d[a], %d[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(DefaultFpcr));
+#endif
     return a;
 }
 
 double DivideDouble(double a, double b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tdivsd %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(DefaultMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfdiv %d[a], %d[a], %d[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(DefaultFpcr));
+#endif
     return a;
 }
 
 float AddFloat(float a, float b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\taddss %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(DefaultMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfadd %s[a], %s[a], %s[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(DefaultFpcr));
+#endif
     return a;
 }
 
 float MultiplyFloat(float a, float b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tmulss %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(DefaultMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfmul %s[a], %s[a], %s[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(DefaultFpcr));
+#endif
     return a;
 }
 
 float DivideFloat(float a, float b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tdivss %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(DefaultMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfdiv %s[a], %s[a], %s[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(DefaultFpcr));
+#endif
     return a;
 }
 
 constexpr std::uint32_t TowardZeroMxcsr = DefaultMxcsr | 0x6000;
 
 double DivideDoubleTowardZero(double a, double b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tdivsd %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(TowardZeroMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfdiv %d[a], %d[a], %d[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(TowardZeroFpcr));
+#endif
     return a;
 }
 
 float DivideFloatTowardZero(float a, float b) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tdivss %[b], %[a]\n\tldmxcsr %[saved]"
                  : [a] "+x"(a), [saved] "+m"(saved) : [b] "x"(b), [standard] "m"(TowardZeroMxcsr));
+#else
+    // arm64 host: the same operation under the default FPCR (round to nearest, no flush) or round toward zero.
+    std::uint64_t saved = 0;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfdiv %s[a], %s[a], %s[b]\n\tmsr fpcr, %[saved]"
+                 : [a] "+w"(a), [saved] "=&r"(saved) : [b] "w"(b), [standard] "r"(TowardZeroFpcr));
+#endif
     return a;
 }
 
@@ -284,10 +345,17 @@ TFloat FlushSubnormalQuotient(TFloat quotient, TFloat truncated) {
 }
 
 float TruncateDouble(double value) {
+#if defined(__x86_64__)
     std::uint32_t saved = 0;
     float result;
     asm volatile("stmxcsr %[saved]\n\tldmxcsr %[standard]\n\tcvtsd2ss %[value], %[result]\n\tldmxcsr %[saved]"
                  : [result] "=x"(result), [saved] "+m"(saved) : [value] "x"(value), [standard] "m"(DefaultMxcsr));
+#else
+    std::uint64_t saved = 0;
+    float result;
+    asm volatile("mrs %[saved], fpcr\n\tmsr fpcr, %[standard]\n\tfcvt %s[result], %d[value]\n\tmsr fpcr, %[saved]"
+                 : [result] "=w"(result), [saved] "=&r"(saved) : [value] "w"(value), [standard] "r"(DefaultFpcr));
+#endif
     return result;
 }
 

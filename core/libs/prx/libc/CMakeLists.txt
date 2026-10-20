@@ -53,7 +53,6 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostErrno.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileLock.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/SortSecure.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StandardStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
@@ -99,7 +98,9 @@ target_link_libraries(libc PRIVATE zarchive)
 
 target_sources(libc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/FloatingPoint.cpp)
 
-if(BUILD_TESTING)
+# The test drives the host x87/MXCSR state directly; on the arm64 host the guest's floating-point environment
+# lives in the translator (FloatingPoint.cpp reads it through LibcGuestControl; TechnicalDebt arm64-guest-fenv-writes).
+if(BUILD_TESTING AND NOT (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
     add_test_executable(guest_floating_point_tests ${LIBS_INCLUDE_DIR}/tests/GuestFloatingPoint.cpp)
     target_include_directories(guest_floating_point_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_floating_point_tests PRIVATE libc)
