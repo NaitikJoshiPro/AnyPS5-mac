@@ -165,8 +165,8 @@ void DisplayWindow::UpdateTitle() {
 #ifdef __APPLE__
     // macOS: a title change is an AppKit call on the main thread (the presenter waits for it):
     // once a second is enough for the FPS readout.
-    static std::uint64_t lastTitle = 0;
-    if (lastTitle != 0 && now - lastTitle < frequency) return;
+    static std::chrono::steady_clock::time_point lastTitle{};
+    if (lastTitle != std::chrono::steady_clock::time_point{} && now - lastTitle < std::chrono::seconds(1)) return;
     lastTitle = now;
 #endif
     char text[160];

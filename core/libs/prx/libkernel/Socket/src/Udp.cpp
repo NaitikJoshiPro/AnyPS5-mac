@@ -1021,20 +1021,7 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
     socket->options.nonblocking = enabled != 0;
     return 0;
 }
-int APS5_VABI _fcntl_nid_postfix(int descriptor, int command, ...) {
-#ifdef _WIN32
-    __builtin_sysv_va_list arguments;
-    __builtin_sysv_va_start(arguments, command);
-    const auto argument = __builtin_va_arg(arguments, std::uint64_t);
-    __builtin_sysv_va_end(arguments);
-#else
-    std::va_list arguments;
-    va_start(arguments, command);
-    const auto argument = va_arg(arguments, std::uint64_t);
-    va_end(arguments);
-#endif
-    return fcntl_nid_postfix(descriptor, command, argument);
-}
+// _fcntl lives in File/src/FcntlAlias.cpp (reads the guest va_list on the arm64 host too).
 int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
                                     const void* value, std::uint32_t length) {
     int netError = 0;

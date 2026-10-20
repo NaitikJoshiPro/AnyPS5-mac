@@ -1827,11 +1827,6 @@ int APS5_VABI sceSystemServiceGetLocalProcessStatusList() {
     return 0;
 }
 
-int APS5_VABI sceSystemServiceGetMainAppTitleId() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceSystemServiceGetPSButtonEvent() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -1918,11 +1913,6 @@ int APS5_VABI sceSystemServiceInitializeForShellCore() {
 }
 
 int APS5_VABI sceSystemServiceInvokeAppLaunchLink() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceSystemServiceIsAppSuspended() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -2018,11 +2008,6 @@ int APS5_VABI sceSystemServiceNavigateToGoBack() {
 }
 
 int APS5_VABI sceSystemServiceNavigateToGoBackWithValue() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceSystemServiceNavigateToGoHome() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
