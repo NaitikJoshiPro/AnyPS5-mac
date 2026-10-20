@@ -205,6 +205,16 @@ Step Since(const AgcDriver::Graphics::ImageTableReuseCounts& before) {
 }
 
 void ExpectWrites(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t kept, std::uint64_t made, const std::string& what) {
+#ifdef __APPLE__
+    // Metal has no kept descriptor sets and no table descriptor writes: an image table is written
+    // into the batch's upload ring as MslAbi entries, so both counters stay 0 (ShaderResources.hpp
+    // overlay, TechnicalDebt metal-vulkan-internal-tests). The reuse/resolution counts and the sampled
+    // values are still checked by Expect and the dispatches.
+    (void)kept;
+    (void)made;
+    const auto counts = AgcDriver::Graphics::ImageTableReuses();
+    Require(counts.writesKept == before.writesKept && counts.writesMade == before.writesMade, "image table reuse: " + what + ": the Metal device counted Vulkan table descriptor writes");
+#else
     static const bool keptSets = std::getenv("APS5_KEPT_DESCRIPTOR_SETS") == nullptr || std::string(std::getenv("APS5_KEPT_DESCRIPTOR_SETS")) != "0";
     const auto now = AgcDriver::Graphics::ImageTableReuses();
     const auto keptNow = now.writesKept - before.writesKept;
@@ -214,6 +224,7 @@ void ExpectWrites(const AgcDriver::Graphics::ImageTableReuseCounts& before, std:
         return;
     }
     Require(keptNow == kept && madeNow == made, "image table reuse: " + what + ": " + std::to_string(keptNow) + " table descriptor writes kept and " + std::to_string(madeNow) + " made, expected " + std::to_string(kept) + " and " + std::to_string(made));
+#endif
 }
 
 void Expect(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t reused, std::uint64_t resolved, const std::string& what) {
