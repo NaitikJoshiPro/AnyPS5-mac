@@ -573,6 +573,7 @@ Measured (profile_title, ASTRO, build-perf5; per-thread P/E time from PROC_PIDTH
 - When the P cluster is throttled to 1.4 GHz, E cores at 2.3 GHz match it per thread (P IPC 3.2-3.5 against E IPC 2.0), so placement matters less than the clock.
 Choice: (c). The names have no cost and make every profile readable: guest threads appear as `g:<guest name>`, plus `queue 0x.. worker`, `presenter`, `vblank`, `pipeline compile/prewarm/saver`, `release thread` and `mirror refresh`. The QoS keeps the frame path on P cores when something else loads the machine and costs nothing otherwise. APS5_WORKER_QOS=off|default|user-initiated|utility selects another class. Guest threads stay at the default (APS5_FEX_QOS still opts in).
 Evidence: tests agc_thread_priority (APS5_WORKER_QOS parsing; a worker thread gets its name and user-interactive QoS) and fex_fixtures. Logs .mac-work/logs/perf5/ab.
+- Rebased onto sync4 (branch land5, REBASE5, 2026-10-20): unchanged in substance; built, untested.
 
 ## D71: aps5-fex reports FEX's translation statistics and keeps FEX's L2 lookup table (2026-10-16)
 Context: M4 asks for translation overhead: JIT compile time, code-cache misses, block linking. FEXCore keeps per-thread SHMStats counters, but only FEX's Linux and Windows frontends attach them, so aps5-fex had none.
@@ -587,12 +588,14 @@ Measured (ASTRO, warm caches):
 - Cold disk cache: 28,730 blocks in the first 30 s at 122 us each. Warm: 0 compiled.
 - APS5_FEX_CONFIG=TSOEnabled=0 deadlocks ASTRO about 35 s in. TSO emulation stays.
 Evidence: fex fixture fex-stats; profile_title_tool (FexStatsTests, sampler kinds).
+- Rebased onto sync4 (branch land5, REBASE5, 2026-10-20): unchanged in substance; built, untested.
 
 ## D73: Guest yield loops back off to short sleeps (2026-10-16)
 Context: macOS sched_yield returns at once when no other thread wants the core. A guest that waits by yielding in a loop therefore holds a core. In ASTRO run cq1 its three TBB worker threads each spent 247-264 of 3,271 samples in scePthreadYield: 0.26 core of busy-spinning.
 Options: (a) leave yields as host yields; (b) map a yield to a fixed short sleep, which would slow legitimate one-off yields; (c) adaptive: plain yields first, then sleeps that grow while the streak lasts.
 Choice: (c). YieldBackoff (libkernel Pthread/include/YieldBackoff.hpp) gives 64 plain yields per streak, then sleeps of 50 us doubling to 400 us. A gap of more than 1 ms between yields ends the streak. It applies to scePthreadYield, sched_yield and pthread_yield.
 Evidence: test guest_yield_backoff. Title measurements pending (PERF5's measurement turn).
+- Rebased onto sync4 (branch land5, REBASE5, 2026-10-20): unchanged in substance; built, untested.
 
 ## D79: Audio pushes sleep until the output takes a grain (2026-10-16)
 Context: the user order "go after the top 4 wastes", item W3: ASTRO BOT's audio thread (SceSndzAudioOutMain) looked like it ran at 100% of a core, with the hypothesis that sceAudioOut2ContextPush returns before the hardware consumes the grain.
@@ -606,6 +609,7 @@ Choice:
 - The read delay sleeps instead of spinning.
 - AudioOut v1 sleeps for as long as the excess takes to play, at least 1 ms.
 Evidence: test audio_out2_timing, new TestBlockingPushWakesOnConsumption: 60 pushes at real time with at most two wake-ups per full wait. Title measurements of ASTRO and DOOM (an --audio-file capture with no underruns or drift) are pending PERF5's landing turn.
+- Rebased onto sync4 (branch land5, REBASE5, 2026-10-20): unchanged in substance; built, untested.
 
 ## D80: Event-driven completion and label waits (2026-10-16)
 Context: W4. Nothing told a waiting thread that the GPU had finished. Queue workers polled completions every 1 ms. WAIT_REG_MEM spun for 1.5 ms on queue 0 (100 us elsewhere) and then slept in 200 us steps, reading the timeline on each tick. ASTRO's async queues 0x40 and 0x48 sit in these waits for most of each frame.
@@ -619,3 +623,8 @@ Choice:
 - Queue workers waiting for completions are woken through the driver's condition variable by the hook, with a 4 ms fallback for a lost wake-up (APS5_COMPLETION_POLL_US).
 - The epoch is read before each check, so an event between the check and the wait is never lost.
 Evidence: test agc_progress (a wake on an event, a timeout without one, no lost wake-up, the hook, the counters). `[progress]` lines (APS5_PROFILE_GPU) count events, waits, wake-ups and timeouts. profile_title now reports context switches per second and the queue workers' CPU. ASTRO and Showcase before/after are pending PERF5's landing turn.
+- Rebased onto sync4 (branch land5, REBASE5, 2026-10-20; built, untested). Reconciled with upstream's wait-path changes:
+  - d59934a67c (WAIT_REG_MEM addresses masked to the awaited width; a wait that the queue-0 draw pipeline cannot satisfy and memory already satisfies skips the drain) and d934a0dce3 (a satisfied wait keeps the draw pipeline): kept as upstream wrote them. They cut how many waits block at all; D80 only changes how a wait that does block sleeps, so both apply.
+  - aee27c0be7 (a blocked wait stores held results on demand, `FlushGpuWrites` every 32 polls after the spin): kept. With D80 a poll after the spin is one progress wait of up to 500 us (was a 200 us sleep), so the worst-case interval between those flushes grows from about 6 ms to 16 ms when no event arrives. Measure with ASTRO before landing; if it shows, flush on a time basis.
+  - Dropped as redundant: D80's 4 ms bounded wait in queue 0's idle-results loop. Upstream's #5750 version of that loop (the one sync4 carries) waits on the condition variable unless results are pending or the idle epoch moved, so the D80 change to that hunk had nothing left to replace. The hook still wakes it (the dormant wait now also wakes on completionsPending()).
+  - Kept: the progress event, the Metal timeline listener, the notifies on reaped labels, finished packets and recorded writes, the 250 us queue-0 spin, the 500 us fallback, and the completion poll's 4 ms fallback (sync4 still polled every 1 ms there).
