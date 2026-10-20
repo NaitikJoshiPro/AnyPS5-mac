@@ -30,6 +30,10 @@ inline constexpr std::uint32_t RasterPrimitive = 8233u;
 inline constexpr std::uint32_t LayerExported = 8234u;
 inline constexpr std::uint32_t StencilReferenceOffset = 8235u;
 inline constexpr std::uint32_t ReversedBlend = 8236u;
+inline constexpr std::uint32_t DepthRemapBase = 8240u;
+inline constexpr std::uint32_t DepthRemapWords = 1u;
+inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
+inline constexpr std::uint32_t WorkgroupOffsetWords = 3u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 // Multisampled storage images on MSL backends (MslAbi Version 6): Metal shaders cannot write
@@ -53,6 +57,10 @@ inline constexpr std::uint32_t ReductionWords = 2u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;
+}
+
+inline constexpr bool IsWorkgroupOffset(std::uint32_t id) {
+    return id >= WorkgroupOffsetBase && id < WorkgroupOffsetBase + WorkgroupOffsetWords;
 }
 
 }

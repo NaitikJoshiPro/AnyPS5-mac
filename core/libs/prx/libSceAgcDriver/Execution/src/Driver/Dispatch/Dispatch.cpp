@@ -5,11 +5,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -102,11 +104,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         resolved = ahead.packet;
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
-    } else if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
-
-        recordQueuedLabelsBeforeRead(submission.queue);
+    } else if (indirectArguments != 0 && !resolving && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
+        indirectSource().path = IndirectFillKernel;
         const auto readStart = std::chrono::steady_clock::now();
-        resolved = Pm4::ReadDispatchArguments(indirectArguments, packet[4]);
+        resolved = readDispatchArguments(submission.queue, indirectArguments, packet[4]);
         countIndirect(IndirectFillKernel, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         packet = resolved;
         indirectArguments = 0;
@@ -326,19 +327,19 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
     } else if (!fromAhead) {
-        shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+        shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
-            const auto invocation = InvocationFor(snapshot, codeOffset, request);
+            auto invocation = InvocationFor(snapshot, codeOffset, request);
             timing.Mark("prepared_invocation");
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
-                return shaderMemory->Capture(invocation);
+                return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
             }();
             captured = shaderMemory->Regions();
             request.context.memory = captured;
@@ -424,7 +425,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx groups %ux%ux%u threads %ux%ux%u indirect 0x%llx%s\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], compute.numThreads[0], compute.numThreads[1], compute.numThreads[2],
+        std::fprintf(stderr, "[dispatch-io] queue=0x%x submission=%llu shader 0x%llx groups %ux%ux%u threads %ux%ux%u indirect 0x%llx%s\n", submission.queue, static_cast<unsigned long long>(submission.serial), static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], compute.numThreads[0], compute.numThreads[1], compute.numThreads[2],
             static_cast<unsigned long long>(indirectArguments), words.c_str());
     }
 
@@ -436,7 +437,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
-        throw std::runtime_error(where + std::string(error.what()));
+        throw std::runtime_error(where + std::string(error.what()) + describeIndirectSource());
     };
     phaseTiming.Phase(PhaseSnapshots);
 
@@ -508,6 +509,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+    const auto keysFill = indirectArguments == 0 && !partialLastGroup ? MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) : std::nullopt;
+    const auto filledKeys = keysFill ? KeysFillMemo(keysFill->pattern, false, true) : std::nullopt;
 
     std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
     if (indirectArguments == 0 && !partialLastGroup) {
@@ -559,6 +562,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             writersNoted = true;
         }
         phaseTiming.Phase(PhaseNoteWriters);
+        auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
+        const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
@@ -578,6 +583,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
+        }
+        if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
+            const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
+            if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
         }
         if (builtRecipe != nullptr) {
             if (dataHit) {

@@ -8,6 +8,9 @@ namespace AgcDriver {
 // The driver queue a handle from sceAgcDriverCreateQueue submits to. Throws for a handle
 // that sceAgcDriverCreateQueue did not return or that was destroyed.
 std::uint32_t QueueFromHandle(const void* handle, const char* function);
+// True for a live handle from sceAgcDriverCreateQueue (sceAgcDriverSubmitCommandBuffer also takes
+// upstream's guest queue contexts, whose queue id is the dword at offset 4).
+bool IsQueueHandle(const void* handle);
 
 }
 

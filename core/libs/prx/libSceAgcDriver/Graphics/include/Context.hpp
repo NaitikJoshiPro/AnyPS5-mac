@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -76,6 +77,11 @@ inline void Require(bool condition, const char* reason) {
 
 struct DescriptorRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+struct BdaUnalignedAccess : std::runtime_error {
+    BdaUnalignedAccess(const std::string& message, std::uint32_t instruction) : std::runtime_error(message), instruction(instruction) {}
+    std::uint32_t instruction;
 };
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the
@@ -160,6 +166,7 @@ struct Context {
     bool depthClamp = false;
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
+    bool drawInputsInPlace = true;
     bool dmaBufImport = false;
     bool sparseBinding = false;
     std::uint32_t queueFamily = 0;
@@ -192,6 +199,7 @@ struct Context {
     bool dualSrcBlend = false;
     bool samplerFilterMinmax = false;
     bool nonSeamlessCubeMap = false;
+    VkSampleCountFlags mergedCoverageSampleCounts = 0;
     bool conservativeRasterization = false;
     bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
@@ -209,9 +217,12 @@ struct Context {
     bool runtimeDescriptorArray = false;
     bool partiallyBound = false;
     bool variableDescriptorCount = false;
+    bool sampledImageUpdateAfterBind = false;
     std::uint32_t imageTableCapacity = 0;
     std::uint32_t samplerTableCapacity = 0;
     bool individuallyFreeDescriptorSets = false;
+    bool imageTableUpdateAfterBind = false;
+    bool samplerTableUpdateAfterBind = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool storageImageMultisample = false;
@@ -229,6 +240,7 @@ struct Context {
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
+    std::uint32_t srgbCopyFormats = 0;
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
@@ -303,15 +315,25 @@ struct Context {
         const auto budget = reported.heapBudget[heap];
         const auto usage = reported.heapUsage[heap];
         if (budget == 0 || (usage < budget && bytes <= budget - usage)) return type;
+        const auto host = HostMemoryType(mask);
+        if (!host) return type;
+        static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+        const auto count = placements.fetch_add(1) + 1;
+        const auto total = placedBytes.fetch_add(bytes) + bytes;
+        if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), *host, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+        return *host;
+    }
+
+    std::optional<std::uint32_t> HostMemoryType(std::uint32_t mask) const {
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-            if ((mask & (1u << i)) == 0 || (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
-            static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
-            const auto count = placements.fetch_add(1) + 1;
-            const auto total = placedBytes.fetch_add(bytes) + bytes;
-            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
-            return i;
+            if ((mask & (1u << i)) != 0 && (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return i;
         }
-        return type;
+        return std::nullopt;
+    }
+
+    std::optional<std::uint32_t> RefusedDeviceMemoryFallback(std::uint32_t mask, std::uint32_t refused) const {
+        if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
+        return HostMemoryType(mask);
     }
 };
 
@@ -323,6 +345,8 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
 std::uint32_t ImageTableCapacity(const Context& context);
 std::uint32_t StorageTableCapacity(const Context& context);
 std::uint32_t SamplerTableCapacity(const Context& context);
+bool ImageTableUpdateAfterBind(const Context& context);
+bool SamplerTableUpdateAfterBind(const Context& context);
 
 }
 

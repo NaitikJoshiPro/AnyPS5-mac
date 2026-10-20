@@ -9,11 +9,18 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 extern "C" {
 int APS5_VABI socket_nid_postfix(int, int, int);
+int APS5_VABI __sys_socketex_nid_postfix(const char*, int, int, int);
 int APS5_VABI close_nid_postfix(int);
 int APS5_VABI pipe_nid_postfix(int*);
 int APS5_VABI fcntl_nid_postfix(int, int, ...);
+int APS5_VABI _fcntl_nid_postfix(int, int, ...);
 int APS5_VABI ioctl_nid_postfix(int, std::uint64_t, void*);
 std::int64_t APS5_VABI read_nid_postfix(int, void*, std::uint64_t);
 std::int64_t APS5_VABI write_nid_postfix(int, const char*, std::int64_t);
@@ -65,6 +72,9 @@ static constexpr std::uint64_t WindowSizeRequest = 0x40087468;
 static constexpr std::uint64_t AsyncRequest = 0x8004667d;
 static constexpr std::uint64_t CloseOnExecRequest = 0x20006601;
 static constexpr std::uint64_t KeepOnExecRequest = 0x20006602;
+static constexpr std::uint64_t MalformedRequests[] = {0, 123, 0x5401, 0x5413, 0x40007468, 0x20087468, 0x00087468};
+static constexpr std::uint64_t IntegerArgumentRequest = 0x20046601;
+static constexpr std::uint64_t EmptyInputRequest = 0x80006601;
 static constexpr int SceEbadf = static_cast<int>(0x80020009u);
 static constexpr int SceEinval = static_cast<int>(0x80020016u);
 static constexpr int SceEnotsup = static_cast<int>(0x8002002du);
@@ -92,6 +102,14 @@ template <typename TCall> static bool ThrowsWith(TCall call, const std::string& 
     return false;
 }
 
+static void RequireMalformedRequestsFail(int descriptor) {
+    char buffer[16] = {};
+    for (const std::uint64_t request : MalformedRequests) {
+        RequireFailure(ioctl_nid_postfix(descriptor, request, buffer), GuestEnotty);
+        RequireFailure(ioctl_nid_postfix(descriptor, request, nullptr), GuestEnotty);
+    }
+}
+
 static void SocketsKeepTheirPath() {
     const int socket = socket_nid_postfix(2, 2, 0);
     Require(socket >= 0);
@@ -106,10 +124,15 @@ static void SocketsKeepTheirPath() {
     Require(sceKernelFcntl(socket + 4096, GetFlags) == SceEbadf);
     int queued = -1;
     Require(ioctl_nid_postfix(socket, ReadableRequest, &queued) == 0 && queued == 0);
+    RequireMalformedRequestsFail(socket);
+    RequireFailure(ioctl_nid_postfix(socket, IntegerArgumentRequest, nullptr), GuestEfault);
+    RequireFailure(ioctl_nid_postfix(socket, EmptyInputRequest, nullptr), GuestEfault);
     Require(close_nid_postfix(socket) == 0);
     Require(sceKernelFcntl(socket, GetFlags) == SceEbadf);
     Require(sceKernelFcntl(-1, GetFlags) == SceEbadf);
     Require(sceKernelFcntl(12345, GetFlags) == SceEbadf);
+    const int named = __sys_socketex_nid_postfix("probe", 2, 1, 0);
+    Require(named >= 0 && sceKernelFcntl(named, GetFlags) == ReadWrite && close_nid_postfix(named) == 0);
 }
 
 static void FileFlagsRoundTrip() {
@@ -155,6 +178,7 @@ static void FileFlagsRoundTrip() {
     Require(ioctl_nid_postfix(file, ReadableRequest, &readable) == 0 && readable == 3);
     char size[8] = {};
     RequireFailure(ioctl_nid_postfix(file, WindowSizeRequest, size), GuestEnotty);
+    RequireMalformedRequestsFail(file);
     RequireFailure(ioctl_nid_postfix(file, NonblockingRequest, nullptr), GuestEfault);
     Require(ThrowsWith([file] { int on = 1; ioctl_nid_postfix(file, AsyncRequest, &on); }, "ioctl: request 0x8004667D on a file is not implemented"));
 
@@ -166,6 +190,10 @@ static void FileFlagsRoundTrip() {
     Require(fcntl_nid_postfix(file, SetLock, &lock) == 0);
     GuestLock probe{0, 0, 0, 1, 0, 0};
     Require(fcntl_nid_postfix(file, GetLock, &probe) == 0 && probe.type == 2);
+    static GuestLock imageProbe{0, 0, 0, 1, 0, 0};
+    Require(_fcntl_nid_postfix(file, GetLock, &imageProbe) == 0 && imageProbe.type == 2);
+    Require(_fcntl_nid_postfix(file, SetDescriptorFlags, 1) == 0 && _fcntl_nid_postfix(file, GetDescriptorFlags) == 1);
+    Require(_fcntl_nid_postfix(file, SetDescriptorFlags, 0) == 0);
     lock.type = 2;
     Require(fcntl_nid_postfix(file, SetLock, &lock) == 0);
     lock.type = 7;
@@ -175,6 +203,8 @@ static void FileFlagsRoundTrip() {
     RequireFailure(fcntl_nid_postfix(file, GetDescriptorFlags), GuestEbadf);
     RequireFailure(fcntl_nid_postfix(file, DuplicateCommand, 0), GuestEbadf);
     RequireFailure(ioctl_nid_postfix(file, ReadableRequest, &readable), GuestEbadf);
+    RequireMalformedRequestsFail(file);
+    RequireMalformedRequestsFail(-1);
     Require(sceKernelFcntl(file, GetFlags) == SceEbadf);
 
     const int appending = sceKernelOpen("kernel_fcntl_probe.bin", CreateWriteAppend, 0644);
@@ -373,9 +403,31 @@ static void PipeFlagsRoundTrip() {
     RequireFailure(fcntl_nid_postfix(pipe[1], SetLock, &lock), GuestEbadf);
     char size[8] = {};
     RequireFailure(ioctl_nid_postfix(pipe[0], WindowSizeRequest, size), GuestEnotty);
+    RequireMalformedRequestsFail(pipe[0]);
     Require(ThrowsWith([&pipe] { fcntl_nid_postfix(pipe[0], SetFlags, NonBlocking | 0x40); }, "fcntl: O_ASYNC on a pipe is not implemented"));
     for (const int descriptor : pipe) Require(close_nid_postfix(descriptor) == 0);
 }
+
+#ifndef _WIN32
+static void HostSocketFlags() {
+    int sockets[2] = {-1, -1};
+    Require(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    Require(fcntl_nid_postfix(sockets[0], GetFlags) == ReadWrite);
+    Require(fcntl_nid_postfix(sockets[0], SetFlags, NonBlocking) == 0);
+    Require(fcntl_nid_postfix(sockets[0], GetFlags) == (ReadWrite | NonBlocking));
+    Require((::fcntl(sockets[0], F_GETFL) & O_NONBLOCK) != 0);
+    Require(fcntl_nid_postfix(sockets[0], SetDescriptorFlags, 1) == 0);
+    Require(fcntl_nid_postfix(sockets[0], GetDescriptorFlags) == 1);
+    Require(::write(sockets[1], "abc", 3) == 3);
+    int available = 0;
+    Require(ioctl_nid_postfix(sockets[0], ReadableRequest, &available) == 0 && available == 3);
+    GuestLock lock{0, 0, 0, WriteLock, FromStart, 0};
+    RequireFailure(fcntl_nid_postfix(sockets[0], SetLock, &lock), GuestEbadf);
+    RequireFailure(fcntl_nid_postfix(sockets[0], DarwinReadAhead, 1), GuestEbadf);
+    Require(ThrowsWith([&sockets] { fcntl_nid_postfix(sockets[0], SetFlags, NonBlocking | 0x40); }, "fcntl: O_ASYNC on a socket is not implemented"));
+    for (const int socket : sockets) Require(close_nid_postfix(socket) == 0);
+}
+#endif
 
 static void StandardInputFlags() {
     const int flags = fcntl_nid_postfix(0, GetFlags);
@@ -394,6 +446,9 @@ int main() {
     FileFlagsRoundTrip();
     RecordLocksBelongToTheProcess();
     PipeFlagsRoundTrip();
+#ifndef _WIN32
+    HostSocketFlags();
+#endif
     StandardInputFlags();
     return 0;
 }

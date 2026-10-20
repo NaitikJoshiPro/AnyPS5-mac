@@ -21,7 +21,8 @@ std::invoke_result_t<TFunction, TArguments...> CallProgram(TFunction function, T
     using Result = std::invoke_result_t<TFunction, TArguments...>;
 #if defined(__APPLE__) && defined(__aarch64__)
     static_assert(sizeof...(TArguments) <= 6, "a program call takes at most six arguments");
-    if (LibcGuestBridged()) {
+    // Only a function pointer is guest code; a host callable (a lambda that wraps a guest call) runs as is.
+    if constexpr (std::is_pointer_v<TFunction>) if (LibcGuestBridged()) {
         const std::uint64_t integers[6] = {ProgramCallInteger(arguments)...};
         const std::uint64_t result = LibcCallGuest(reinterpret_cast<const void*>(function), integers);
         if constexpr (std::is_void_v<Result>) return;

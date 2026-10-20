@@ -248,11 +248,24 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.nonConstantImageOffsets = target.nonConstantImageOffsets;
     state.narrowSubgroupClock = target.narrowSubgroupClock;
     state.float64DenormPreserve = target.float64DenormPreserve;
+    state.depthRangeRemap = target.depthRangeRemap;
     state.registrationModules = target.registrationModules;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
+    state.meshBarycentricPixel = target.meshBarycentricPixel;
+    state.meshBarycentricVertex = target.meshBarycentricVertex;
+    state.barycentricSmoothLocation = target.barycentricSmoothLocation;
+    state.barycentricLinearLocation = target.barycentricLinearLocation;
+    state.barycentricPositionsLocation = target.barycentricPositionsLocation;
+    state.meshExportedLocations = target.meshExportedLocations;
+    state.meshPerVertexLocations = target.meshPerVertexLocations;
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.robustBufferAccess2 = target.robustBufferAccess2;
+    state.float32FlushToZero = target.float32FlushToZero;
     state.hostSubgroupSize = target.subgroupSize;
+    if (state.requirements.ldsLock && LdsInDeviceMemory(state) && std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) != target.supportedCapabilities.end()) {
+        state.requirements.ldsLock = false;
+        state.requirements.ldsBufferInt64Atomics = true;
+    }
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;
         state.requirements.subgroupShuffle = false;

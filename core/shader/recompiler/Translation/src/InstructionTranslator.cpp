@@ -345,13 +345,22 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto* ps = options.inputInfo.pixel;
         const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
         const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
+        const bool iterated = ps->psIteratesSamples;
+        program.Metadata().pixelIteratesSamples = iterated;
+        const bool offsets = options.interpolationFunctions && options.fragmentShaderBarycentricEnabled;
+        const bool centers = iterated && offsets;
+        const bool sampleOffsets = offsets && ps->SampleLocationsOffCenter();
+        const auto smoothSample = sampleOffsets ? StageInputKind::BaryCoordSmoothSample : StageInputKind::BaryCoordSmooth;
+        const auto linearSample = sampleOffsets ? StageInputKind::BaryCoordNoPerspectiveSample : StageInputKind::BaryCoordNoPerspective;
+        const auto smoothCenter = centers ? StageInputKind::BaryCoordSmoothCenter : StageInputKind::BaryCoordSmooth;
+        const auto linearCenter = centers ? StageInputKind::BaryCoordNoPerspectiveCenter : StageInputKind::BaryCoordNoPerspective;
         // The centroid and sample pairs (PERSP/LINEAR_CENTROID, _SAMPLE) carry the same host
         // barycentrics, flagged with their location (DECISIONS D38): v_interp reads of them are
         // host-interpolated there (AttributeInstructions), and the emulated barycentrics of exact or
         // 16-bit reads are interpolated there too.
-        for (const auto [input, kind, location] : {std::tuple{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth, InterpolationLocation::Center}, std::tuple{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth, InterpolationLocation::Centroid},
-                                                   std::tuple{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Center}, std::tuple{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Centroid},
-                                                   std::tuple{PixelInput::PerspectiveSample, StageInputKind::BaryCoordSmooth, InterpolationLocation::Sample}, std::tuple{PixelInput::LinearSample, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Sample}}) {
+        for (const auto [input, kind, location] : {std::tuple{PixelInput::PerspectiveCenter, smoothCenter, InterpolationLocation::Center}, std::tuple{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth, InterpolationLocation::Centroid},
+                                                   std::tuple{PixelInput::LinearCenter, linearCenter, InterpolationLocation::Center}, std::tuple{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective, InterpolationLocation::Centroid},
+                                                   std::tuple{PixelInput::PerspectiveSample, smoothSample, InterpolationLocation::Sample}, std::tuple{PixelInput::LinearSample, linearSample, InterpolationLocation::Sample}}) {
             if (!loaded(input)) continue;
             for (std::uint32_t component = 0u; component < 2u; ++component) {
                 IrValue& value = builtin(kind, component);
@@ -359,11 +368,37 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
                 setVector(static_cast<VectorReg>(vgpr(input) + component), value);
             }
         }
+        const auto firstSampleOffset = [&](std::uint32_t component) -> IrValue& {
+            const auto& locations = ps->sampleLocations;
+            if (!ps->SampleLocationsVary()) return entryIr.ConstantF32(SampleLocationOffset(locations[0], component));
+            IrValue& x = entryIr.Emit(IrOpcode::ConvertU32F32, IrType::U32, {&entryIr.BitCastF32(builtin(StageInputKind::FragCoord, 0u))});
+            IrValue& y = entryIr.Emit(IrOpcode::ConvertU32F32, IrType::U32, {&entryIr.BitCastF32(builtin(StageInputKind::FragCoord, 1u))});
+            IrValue& quadPixel = entryIr.BitwiseOr(entryIr.BitwiseAnd(x, entryIr.Constant(1u)), entryIr.ShiftLeftLogical(entryIr.BitwiseAnd(y, entryIr.Constant(1u)), entryIr.Constant(1u)));
+            IrValue* offset = &entryIr.ConstantF32(SampleLocationOffset(locations[24], component));
+            for (std::uint32_t pixel = 3u; pixel-- > 0u;) {
+                offset = &entryIr.Select(entryIr.IEqual(quadPixel, entryIr.Constant(pixel)), entryIr.ConstantF32(SampleLocationOffset(locations[pixel * 8u], component)), *offset);
+            }
+            return *offset;
+        };
+        const auto position = [&](std::uint32_t component) -> IrValue& {
+            IrValue& coordinate = builtin(StageInputKind::FragCoord, component);
+            const auto location = ps->psPositionLocation;
+            if (location == PixelPositionLocation::Centroid || (location == PixelPositionLocation::Center && !iterated) || (location == PixelPositionLocation::Sample && (iterated || !ps->SampleLocationsOffCenter()))) {
+                return coordinate;
+            }
+            IrValue& value = entryIr.BitCastF32(coordinate);
+            if (location == PixelPositionLocation::Sample) {
+                return entryIr.BitCastU32(entryIr.Emit(IrOpcode::FPAdd32, IrOpcodeType(IrOpcode::FPAdd32), {&value, &firstSampleOffset(component)}));
+            }
+            IrValue& corner = entryIr.Emit(IrOpcode::FPFloor32, IrOpcodeType(IrOpcode::FPFloor32), {&value});
+            if (location == PixelPositionLocation::UpperLeft) return entryIr.BitCastU32(corner);
+            return entryIr.BitCastU32(entryIr.Emit(IrOpcode::FPAdd32, IrOpcodeType(IrOpcode::FPAdd32), {&corner, &entryIr.ConstantF32(0.5f)}));
+        };
         if (loaded(PixelInput::PositionX)) {
-            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionX)), builtin(StageInputKind::FragCoord, 0u));
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionX)), position(0u));
         }
         if (loaded(PixelInput::PositionY)) {
-            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionY)), builtin(StageInputKind::FragCoord, 1u));
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionY)), position(1u));
         }
         if (loaded(PixelInput::PositionZ)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionZ)), builtin(StageInputKind::FragCoord, 2u));
@@ -381,6 +416,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         }
         if (loaded(PixelInput::Ancillary)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::Ancillary)), builtin(StageInputKind::PackedAncillary));
+        }
+        if (loaded(PixelInput::SampleCoverage)) {
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::SampleCoverage)), builtin(StageInputKind::SampleMask));
         }
         if (loaded(PixelInput::LineStipple)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::LineStipple)), entryIr.Constant(0u));
@@ -540,6 +578,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
         context.SetNativeF32Flush(options.nativeF32Flush);
+        context.SetFloat32FlushToZero(options.float32FlushToZero);
         context.SetEntryRounding(entryRounding.at(cfgBlock.id));
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];

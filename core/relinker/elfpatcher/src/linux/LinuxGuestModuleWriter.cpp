@@ -24,7 +24,13 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     }
     if (std::none_of(headers.begin(), headers.end(), [&](const auto& header) { return header.Type == PT_GNU_STACK; }))
         headers.push_back({PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0, 16});
-    if (end > std::numeric_limits<std::uint64_t>::max() - 0x4000) throw Domain::RelinkerException("Guest virtual address overflow");
+    std::vector<Domain::ProgramHeader> loads;
+    for (const auto& header : headers)
+        if (header.Type == 1) loads.push_back(header);
+    std::stable_sort(loads.begin(), loads.end(), [](const auto& left, const auto& right) { return left.MappedAddress < right.MappedAddress; });
+    for (std::size_t index = 0, next = 0; index < headers.size(); ++index)
+        if (headers[index].Type == 1) headers[index] = loads[next++];
+    if (end >std::numeric_limits<std::uint64_t>::max() - 0x4000) throw Domain::RelinkerException("Guest virtual address overflow");
     Io::AlignBuffer(bytes, 0x4000);
     const auto extraOffset = bytes.size();
     const auto extraAddress = Io::AlignUp64(end, 0x4000);
@@ -179,7 +185,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     if (!image.FiniArray.empty()) { tag(26, image.FiniArray.front()); tag(28, image.FiniArray.size() * 8); }
     if (init != 0) tag(12, init);
     if (fini != 0) tag(13, fini);
-    tag(30, 8);
+    tag(30, DF_BIND_NOW | (image.Symbolic ? DF_SYMBOLIC : 0));
     tag(0, 0);
     const auto dynamicSize = bytes.size() - dynamicOffset;
     using namespace Codegen::Amd64OnlySubstitutionTable;

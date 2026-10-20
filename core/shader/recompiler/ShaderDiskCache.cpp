@@ -84,10 +84,10 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 240, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 472, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 280, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(ShaderInvocation) == 208, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 520, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -108,8 +108,8 @@ static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update Enc
 static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource) == 168, "DescriptorSource changed: update the plan encoder");
-static_assert(sizeof(TableColumn) == 88, "TableColumn changed: update the plan encoder");
+static_assert(sizeof(DescriptorSource) == 192, "DescriptorSource changed: update the plan encoder");
+static_assert(sizeof(TableColumn) == 112, "TableColumn changed: update the plan encoder");
 static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 80, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
@@ -140,7 +140,7 @@ constexpr std::size_t fieldCount() {
 
 static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
-static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
+static_assert(fieldCount<ImageResource>() == 40, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
@@ -149,7 +149,7 @@ static_assert(fieldCount<IrResourcePlan>() == 24, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 17, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 18, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -427,8 +427,10 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageUnnormalized);
     writer.Flags(binding.imageUnnormalizedBaseLevel);
     writer.Flags(binding.samplerIntegerBorder);
+    writer.Flags(binding.samplerCoordinatesIgnored);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
+    writer.Values(std::span<const std::uint32_t>(binding.bufferExtent));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -454,8 +456,10 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.imageUnnormalized);
     reader.Flags(binding.imageUnnormalizedBaseLevel);
     reader.Flags(binding.samplerIntegerBorder);
+    reader.Flags(binding.samplerCoordinatesIgnored);
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
+    reader.Values(binding.bufferExtent);
 }
 
 void encodeMsl(Writer& writer, const SharedMsl& msl) {
@@ -583,6 +587,17 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
     writer.Value(result.barycentricEmulation.linear);
+    writer.Value(result.meshBarycentrics.has_value());
+    if (result.meshBarycentrics) {
+        writer.Value(result.meshBarycentrics->emulation.active);
+        writer.Value(result.meshBarycentrics->emulation.smooth);
+        writer.Value(result.meshBarycentrics->emulation.linear);
+        writer.List(result.meshBarycentrics->parameters, [](Writer& out, const FragmentParameter& parameter) {
+            out.Value(parameter.location);
+            out.Value(parameter.sourceLocation);
+            out.Value(parameter.perVertex);
+        });
+    }
     writer.Values(std::span<const std::uint32_t>(result.stencilReferences));
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.stencilReferenceDword);
@@ -631,6 +646,21 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
     reader.Value(result.barycentricEmulation.linear);
+    bool hasMeshBarycentrics = false;
+    reader.Value(hasMeshBarycentrics);
+    result.meshBarycentrics.reset();
+    if (hasMeshBarycentrics) {
+        MeshBarycentricLayout layout;
+        reader.Value(layout.emulation.active);
+        reader.Value(layout.emulation.smooth);
+        reader.Value(layout.emulation.linear);
+        reader.List(layout.parameters, 9, [](Reader& in, FragmentParameter& parameter) {
+            in.Value(parameter.location);
+            in.Value(parameter.sourceLocation);
+            in.Value(parameter.perVertex);
+        });
+        result.meshBarycentrics = std::move(layout);
+    }
     reader.Values(result.stencilReferences);
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.stencilReferenceDword);
@@ -645,6 +675,7 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     writer.List(invocation.bindings, encodeBinding);
     writer.Value<std::uint64_t>(invocation.pushConstants.size());
     for (const auto byte : invocation.pushConstants) writer.Value(static_cast<std::uint8_t>(byte));
+    writer.Value(invocation.readsDepthRemapPush);
     writer.List(invocation.vertexAttributes, [](Writer& out, const VertexAttribute& attribute) {
         out.Value(attribute.location);
         out.Value(attribute.components);
@@ -684,6 +715,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.Values(pushConstants);
     invocation.pushConstants.resize(pushConstants.size());
     if (!pushConstants.empty()) std::memcpy(invocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
+    reader.Value(invocation.readsDepthRemapPush);
     reader.List(invocation.vertexAttributes, 32, [](Reader& in, VertexAttribute& attribute) {
         in.Value(attribute.location);
         in.Value(attribute.components);
@@ -789,9 +821,11 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.cubeFaceCompatible);
         out.Value(image.flatVolumeCompatible);
         out.Value(image.singleMipPlaneBiasCompatible);
+        out.Value(image.volumeArraySampleCompatible);
         out.Value(image.flatLineCompatible);
         out.Value(image.flatVolumeLineCompatible);
         out.Value(image.foldTexelOffsetsOnly);
+        out.Value(image.convertedSamples);
         out.Value(image.byElements);
         out.Value(image.byComponents);
         out.Value(image.packedFormat);
@@ -891,9 +925,11 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.cubeFaceCompatible);
         in.Value(image.flatVolumeCompatible);
         in.Value(image.singleMipPlaneBiasCompatible);
+        in.Value(image.volumeArraySampleCompatible);
         in.Value(image.flatLineCompatible);
         in.Value(image.flatVolumeLineCompatible);
         in.Value(image.foldTexelOffsetsOnly);
+        in.Value(image.convertedSamples);
         in.Value(image.byElements);
         in.Value(image.byComponents);
         in.Value(image.packedFormat);
@@ -1129,6 +1165,10 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(column.indirect);
         out.Value(column.indirectOffset);
         out.Value(column.indirectImmediate);
+        out.List(column.pointerHops, [](Writer& hops, const PointerHop& hop) {
+            hops.Value(hop.offset);
+            hops.Value(hop.immediate);
+        });
         out.Value(column.foldedAddend);
         out.Value(column.foldedCarry);
         out.Value(column.selected);
@@ -1286,6 +1326,10 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.indirect);
         in.Value(column.indirectOffset);
         in.Value(column.indirectImmediate);
+        in.List(column.pointerHops, 8, [](Reader& hops, PointerHop& hop) {
+            hops.Value(hop.offset);
+            hops.Value(hop.immediate);
+        });
         in.Value(column.foldedAddend);
         in.Value(column.foldedCarry);
         in.Value(column.selected);
@@ -1348,6 +1392,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
+    "APS5_NO_TABLE_RESOLUTION_REUSE",
+    "APS5_NO_TABLE_SNAPSHOT_REUSE",
 };
 
 const std::vector<std::byte>& switchKey() {

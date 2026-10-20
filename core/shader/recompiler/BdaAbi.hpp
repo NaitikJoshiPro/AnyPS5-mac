@@ -27,6 +27,13 @@ struct Range {
     std::uint32_t reserved;
 };
 
+inline bool RangesOrdered(const Range* ranges, std::size_t count) {
+    for (std::size_t index = 1; index < count; ++index) {
+        if (ranges[index].begin < ranges[index - 1].begin) return false;
+    }
+    return true;
+}
+
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
 enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall };
 
@@ -37,14 +44,14 @@ struct Fault {
     std::uint32_t bytes;
     std::uint32_t stage;
     std::uint32_t instruction;
-    std::uint32_t reserved;
+    std::uint32_t otherFaults;
 };
 
 static_assert(std::is_standard_layout_v<Header> && std::is_trivially_copyable_v<Header> && sizeof(Header) == 16);
 static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<Range> && sizeof(Range) == 32);
 static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24);
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
-static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24);
+static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24 && offsetof(Fault, otherFaults) == 28);
 
 inline constexpr std::uint32_t WrittenPageShift = 12;
 inline constexpr std::uint32_t WrittenChunkShift = 17;

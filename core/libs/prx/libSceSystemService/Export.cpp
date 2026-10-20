@@ -17,6 +17,9 @@
 #include <windows.h>
 #elif defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <unistd.h>
 #endif
 #include "prx/libc/include/Shutdown.hpp"
 #ifdef __APPLE__
@@ -176,17 +179,29 @@ struct HostLaunch {
     std::vector<std::string> arguments;
 };
 
+std::filesystem::path OwnExecutable() {
+    std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> executable(size);
+    std::filesystem::path own;
+    if (_NSGetExecutablePath(executable.data(), &size) == 0) own = std::filesystem::canonical(executable.data(), error);
+    if (own.empty()) throw std::runtime_error("sceSystemServiceLoadExec: cannot locate the executable");
+#else
+    const auto own = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error) throw std::runtime_error("sceSystemServiceLoadExec: cannot read /proc/self/exe: " + error.message());
+#endif
+    return own;
+}
+
 HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
 #ifdef __APPLE__
     // Under the arm64 runner the process image is the runner, not the converted title: starting the next
     // title would have to go through the runner's command line, which is not wired up yet.
     if (LibcHasMachineState_nid_no_patch()) UnconvertedExecutable("starting an executable under the arm64 runner");
-    const auto own = MacOsExecutablePath();
-#else
-    std::error_code error;
-    const auto own = std::filesystem::read_symlink("/proc/self/exe", error);
-    if (error) throw std::runtime_error("sceSystemServiceLoadExec: cannot read /proc/self/exe: " + error.message());
 #endif
+    const auto own = OwnExecutable();
     HostLaunch launch;
     if (std::strcmp(path, MainExecutable) == 0) {
         const char* main = std::getenv(MainExecutableVariable);
@@ -235,7 +250,7 @@ int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* argu
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
     if (std::strcmp(path, "exit") == 0) LibcExitWithoutHandlers_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     LoadConvertedExecutable_nid_no_patch(std::filesystem::path(launch.executable), arguments);
 #endif
     LibcStartExit_nid_postfix();
@@ -394,6 +409,16 @@ int APS5_VABI sceSystemServiceOpenChallengeActivity(void) {
 }
 
 int APS5_VABI sceSystemServiceOpenTournamentOccurrence(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceAddLocalProcessForPsmKit(const char*, const char* const*, const void*) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceKillLocalProcessForPsmKit(int) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }

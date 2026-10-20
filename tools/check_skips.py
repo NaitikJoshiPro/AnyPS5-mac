@@ -11,6 +11,8 @@ NO_DISPLAY = re.compile(r"skipped,.*no display", re.IGNORECASE)
 # What ctest itself writes into <skipped message=...>; the test's own "skipped, <reason>" line says more.
 CTEST_MESSAGE = re.compile(r"skipped, (?:SKIP_RETURN_CODE=\d+|SKIP_REGULAR_EXPRESSION_MATCHED|Disabled)$")
 
+NO_VULKAN_DEVICE = re.compile(r"skipped,.*no usable Vulkan device", re.IGNORECASE)
+
 HIGH_REFRESH_LIMITATION = re.compile(r"current display does not provide 120 Hz", re.IGNORECASE)
 
 WINDOWS_PREFIX = "agc"
@@ -167,7 +169,7 @@ if __name__ == "__main__":
         print(f"{len(found)} test(s) skipped, all allowlisted ({args.allowlist})")
         raise SystemExit
     if args.job == "windows":
-        unexpected = [name for name, output in found if not name.startswith(WINDOWS_PREFIX) and not NO_DISPLAY.search(output) and not high_refresh_limitation(output)]
+        unexpected = [name for name, output in found if not name.startswith(WINDOWS_PREFIX) and not NO_DISPLAY.search(output) and not NO_VULKAN_DEVICE.search(output) and not high_refresh_limitation(output)]
         expected = f"any {WINDOWS_PREFIX}* test, which the runner has no Vulkan driver for, or a test that reports no display or Vulkan device or a display without a 120 Hz mode"
     else:
         unexpected = [name for name, output in found if not DEVICE_LIMITATION.search(output) and not high_refresh_limitation(output)]

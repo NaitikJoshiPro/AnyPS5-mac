@@ -37,9 +37,11 @@ struct TranslateOptions {
     // the program (ProgramMetadata::barycentricEmulation) for the barycentric re-translation, as a
     // host-interpolation failure does (devices that emulate per-vertex values: the MSL backend).
     bool barycentricFallback = false;
+    bool interpolationFunctions = false;
     bool nativeFloat16 = false;
     // SpirvTarget::float32DenormFlushNative.
     bool nativeF32Flush = false;
+    bool float32FlushToZero = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;

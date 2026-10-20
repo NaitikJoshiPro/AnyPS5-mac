@@ -3,6 +3,7 @@
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/AppArchive.hpp"
 #include <dirent.h>
+#include <unistd.h>
 #include <cerrno>
 #include <cstring>
 #include <memory>
@@ -31,6 +32,8 @@ using NativeDirectory = _WDIR;
 NativeDirectory* OpenNative(const std::filesystem::path& path) { return ::_wopendir(path.c_str()); }
 int CloseNative(NativeDirectory* native) { return ::_wclosedir(native); }
 void RewindNative(NativeDirectory* native) { ::_wrewinddir(native); }
+long TellNative(NativeDirectory* native) { return ::_wtelldir(native); }
+void SeekNative(NativeDirectory* native, long location) { ::_wseekdir(native, location); }
 bool ReadNative(NativeDirectory* native, std::filesystem::path& component, std::string& name, std::uint64_t& inode) {
     auto* entry = ::_wreaddir(native);
     if (!entry) return false;
@@ -45,6 +48,8 @@ using NativeDirectory = DIR;
 NativeDirectory* OpenNative(const std::filesystem::path& path) { return ::opendir(path.c_str()); }
 int CloseNative(NativeDirectory* native) { return ::closedir(native); }
 void RewindNative(NativeDirectory* native) { ::rewinddir(native); }
+long TellNative(NativeDirectory* native) { return ::telldir(native); }
+void SeekNative(NativeDirectory* native, long location) { ::seekdir(native, location); }
 bool ReadNative(NativeDirectory* native, std::filesystem::path& component, std::string& name, std::uint64_t& inode) {
     auto* entry = ::readdir(native);
     if (!entry) return false;
@@ -112,7 +117,11 @@ void* APS5_VABI opendir_nid_postfix(const char* path) {
         if (const int error = ResolvePathError_nid_no_patch(path, directory->path)) { errno = error; return nullptr; }
         AppArchiveRefuseMergedListing_nid_no_patch(directory->path, path);
         directory->native = OpenNative(directory->path);
-        if (!directory->native) { errno = DirectoryError(errno); return nullptr; }
+        if (!directory->native) {
+            errno = DirectoryError(errno);
+            if (errno == 2) errno = NotFoundError_nid_no_patch(directory->path);
+            return nullptr;
+        }
         return directory.release();
     } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
       catch (const std::filesystem::filesystem_error&) { errno = 5; return nullptr; }
@@ -160,12 +169,40 @@ void APS5_VABI rewinddir_nid_postfix(void* handle) {
     RewindNative(directory.native);
 }
 
-void* APS5_VABI OpenDescriptorDirectory_nid_no_patch(const char* hostPath, int descriptor, int (APS5_VABI* closeDescriptor)(int)) {
+std::int64_t APS5_VABI telldir_nid_postfix(void* handle) {
+    if (!handle) { errno = 9; return -1; }
+    auto& directory = *static_cast<Directory*>(handle);
+    std::lock_guard lock(directory.mutex);
+    return TellNative(directory.native);
+}
+
+void APS5_VABI seekdir_nid_postfix(void* handle, std::int64_t location) {
+    if (!handle) { errno = 9; return; }
+    auto& directory = *static_cast<Directory*>(handle);
+    std::lock_guard lock(directory.mutex);
+    SeekNative(directory.native, static_cast<long>(location));
+}
+
+void* APS5_VABI OpenDescriptorDirectory_nid_no_patch(const char* hostPath, int descriptor, int (APS5_VABI* closeDescriptor)(int), std::uint64_t position) {
     try {
         auto directory = std::make_unique<Directory>();
         directory->path = std::filesystem::path(reinterpret_cast<const char8_t*>(hostPath));
+#ifdef _WIN32
         directory->native = OpenNative(directory->path);
         if (!directory->native) { errno = DirectoryError(errno); return nullptr; }
+        std::filesystem::path component;
+        std::string name;
+        std::uint64_t inode = 0;
+        for (std::uint64_t skipped = 0; skipped < position; ++skipped) {
+            if (!ReadNative(directory->native, component, name, inode)) break;
+        }
+#else
+        (void)position;
+        const int duplicate = ::dup(descriptor);
+        if (duplicate < 0) { errno = DirectoryError(errno); return nullptr; }
+        directory->native = ::fdopendir(duplicate);
+        if (!directory->native) { const int error = errno; ::close(duplicate); errno = DirectoryError(error); return nullptr; }
+#endif
         directory->descriptor = descriptor;
         directory->closeDescriptor = closeDescriptor;
         return directory.release();

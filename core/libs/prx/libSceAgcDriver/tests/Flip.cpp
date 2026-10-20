@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Queue.hpp"
 #include <array>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -137,7 +138,6 @@ void testFlipAndBoundary() {
     expectFailure([&] { AgcDriverRegisterVideoOutput_nid_postfix(7, output); });
     std::array<std::uint32_t, 6> words{0xc004105c, 7, 0xfffffffeu, 1, 0, 0};
     Packet packet{words.data(), 6, 0, {}};
-    expectFailure([&] { sceAgcDriverSubmitAcb(0x20, &packet); });
     words[0] = 0xc004105d;
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
     words[0] = 0xc004105c;
@@ -323,6 +323,18 @@ void testComputeRenderingWait() {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+void testComputeFlip() {
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    std::array<std::uint32_t, 6> words{0xc004105c, 7, 0xfffffffeu, 1, 0x76543211u, 0xfedcba98u};
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitAcb(0x20, &packet) == 0, "compute flip submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(output->state->ready == 1 && output->state->failed == 0, "a flip submitted on a compute queue was not handed to its output");
+    check(output->state->last.argument == -0x123456789abcdefLL && output->state->last.index == -2 && output->state->last.mode == 1, "decoded compute flip arguments changed");
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
 void testFailure() {
     auto output = std::make_shared<Output>();
     output->state->fail = true;
@@ -431,9 +443,10 @@ void testQueues() {
         std::lock_guard lock(output->state->mutex);
         check(output->state->last.handle == 9 && output->state->last.argument == 0x2468ace013572468LL, "command buffer flip did not reach the video output");
     }
-    int bogus = 0;
-    check(expectFailure([&] { sceAgcDriverSubmitCommandBuffer(&bogus, &packet); }).find("not created by sceAgcDriverCreateQueue") != std::string::npos, "unknown queue handle accepted");
-    expectFailure([&] { sceAgcDriverSubmitCommandBuffer(nullptr, &packet); });
+    // Anything else is upstream's guest queue context (queue id at offset 4); a null context is EINVAL.
+    std::array<std::uint32_t, 2> bogus{0, 7};
+    check(expectFailure([&] { sceAgcDriverSubmitCommandBuffer(bogus.data(), &packet); }).find("unsupported queue") != std::string::npos, "unknown queue context accepted");
+    check(sceAgcDriverSubmitCommandBuffer(nullptr, &packet) == EINVAL, "null queue context was not EINVAL");
     check(sceAgcDriverDestroyQueue(direct) == 0, "queue destruction failed");
     expectFailure([&] { sceAgcDriverDestroyQueue(direct); });
     expectFailure([&] { sceAgcDriverSubmitCommandBuffer(direct, &packet); });
@@ -456,7 +469,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2) testReset(std::string(argv[1]) == "compute");
-        else { testQueues(); testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testFailure(); }
+        else { testQueues(); testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testComputeFlip(); testFailure(); }
         const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
         check(shutdown.find(argc == 2 ? (std::string(argv[1]) == "compute" ? "not readable" : "required shader register") : "intentional flip failure") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC flip and suspend tests passed");

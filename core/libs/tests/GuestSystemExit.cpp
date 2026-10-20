@@ -21,6 +21,7 @@
 #ifdef __APPLE__
 #include <cstdint>
 #include <mach-o/dyld.h>
+#include <vector>
 #endif
 extern "C" int APS5_VABI sceSystemServiceLoadExec(const char*, const char* const*);
 extern "C" int APS5_VABI __cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*), void* arg, void* dsoHandle);
@@ -86,10 +87,9 @@ std::filesystem::path OwnExecutable() {
 #elif defined(__APPLE__)
     std::uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
-    std::string path(size, '\0');
-    Require(_NSGetExecutablePath(path.data(), &size) == 0);
-    path.resize(std::strlen(path.c_str()));
-    return std::filesystem::canonical(path);
+    std::vector<char> executable(size);
+    Require(_NSGetExecutablePath(executable.data(), &size) == 0);
+    return std::filesystem::canonical(executable.data());
 #else
     return std::filesystem::read_symlink("/proc/self/exe");
 #endif

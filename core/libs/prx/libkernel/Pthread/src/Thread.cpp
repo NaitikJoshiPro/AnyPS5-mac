@@ -7,6 +7,7 @@
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <algorithm>
 #include <cstddef>
@@ -188,12 +189,32 @@ static void FreeGuestStack(PthreadPrivate*) {}
 static void RetireGuestStack(PthreadPrivate*) {}
 #endif
 
+#ifdef _WIN32
+static bool CommittedReadWrite(std::uintptr_t begin, std::uintptr_t end) {
+    for (auto cursor = begin; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.RegionSize == 0)
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Querying the host thread stack");
+        if (memory.State != MEM_COMMIT || memory.Protect != PAGE_READWRITE) return false;
+        cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    }
+    return true;
+}
+
+static std::uintptr_t PrecommittedStackStart(std::uintptr_t low, std::uintptr_t high) {
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::uintptr_t start = low + system.dwAllocationGranularity;
+    return start < high && CommittedReadWrite(start, high) ? start : low;
+}
+#endif
+
 static bool HostStackLimits(std::uintptr_t* low, std::uintptr_t* high) {
 #ifdef _WIN32
     ULONG_PTR lowLimit = 0;
     ULONG_PTR highLimit = 0;
     GetCurrentThreadStackLimits(&lowLimit, &highLimit);
-    *low = lowLimit;
+    *low = PrecommittedStackStart(lowLimit, highLimit);
     *high = highLimit;
 #elif defined(__APPLE__)
     const pthread_t self = pthread_self();
@@ -203,17 +224,23 @@ static bool HostStackLimits(std::uintptr_t* low, std::uintptr_t* high) {
     *low = reinterpret_cast<std::uintptr_t>(top - size);
     *high = reinterpret_cast<std::uintptr_t>(top);
 #else
-    pthread_attr_t attr;
-    if (pthread_getattr_np(pthread_self(), &attr) != 0)
-        return false;
-    void* address = nullptr;
-    std::size_t size = 0;
-    const bool queried = pthread_attr_getstack(&attr, &address, &size) == 0;
-    pthread_attr_destroy(&attr);
-    if (!queried)
-        return false;
-    *low = reinterpret_cast<std::uintptr_t>(address);
-    *high = *low + size;
+    static thread_local std::uintptr_t stackLow = 0;
+    static thread_local std::uintptr_t stackHigh = 0;
+    if (stackHigh == 0) {
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) != 0)
+            return false;
+        void* address = nullptr;
+        std::size_t size = 0;
+        const bool queried = pthread_attr_getstack(&attr, &address, &size) == 0;
+        pthread_attr_destroy(&attr);
+        if (!queried || size == 0)
+            return false;
+        stackLow = reinterpret_cast<std::uintptr_t>(address);
+        stackHigh = stackLow + size;
+    }
+    *low = stackLow;
+    *high = stackHigh;
 #endif
     return *high > *low;
 }
@@ -247,20 +274,66 @@ static void RegisterStack(PthreadPrivate* self) {
 static void RestoreStackPages(std::uintptr_t start, std::size_t bytes) noexcept {
 #ifdef _WIN32
     DWORD previous = 0;
-    const bool restored = VirtualProtect(reinterpret_cast<void*>(start), bytes, PAGE_READWRITE, &previous) != 0;
+    const bool restored = VirtualAlloc(reinterpret_cast<void*>(start), bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr &&
+        VirtualProtect(reinterpret_cast<void*>(start), bytes, PAGE_READWRITE, &previous) != 0;
 #else
     const bool restored = ::mprotect(reinterpret_cast<void*>(start), bytes, PROT_READ | PROT_WRITE) == 0;
 #endif
     if (!restored) std::fprintf(stderr, "[thread] cannot restore the protection of guest stack pages 0x%llx+0x%zx at thread exit\n", static_cast<unsigned long long>(start), bytes);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(start, bytes);
+}
+
+static void ReplaceStackProtection(std::map<std::uintptr_t, std::size_t>& ranges, std::uintptr_t start, std::size_t bytes, bool readWrite) {
+    const auto end = start + bytes;
+    auto it = ranges.upper_bound(start);
+    if (it != ranges.begin() && std::prev(it)->first + std::prev(it)->second > start) --it;
+    while (it != ranges.end() && it->first < end) {
+        const auto previousStart = it->first;
+        const auto previousEnd = previousStart + it->second;
+        it = ranges.erase(it);
+        if (previousStart < start) ranges.emplace(previousStart, start - previousStart);
+        if (previousEnd > end) {
+            ranges.emplace(end, previousEnd - end);
+            break;
+        }
+    }
+    if (!readWrite) ranges[start] = bytes;
 }
 
 void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool readWrite) {
     std::lock_guard lock(stackLock);
-    auto it = protectedStackPages.upper_bound(start);
-    if (it != protectedStackPages.begin() && std::prev(it)->first + std::prev(it)->second > start) --it;
-    while (it != protectedStackPages.end() && it->first < start + bytes) it = protectedStackPages.erase(it);
-    if (!readWrite) protectedStackPages[start] = bytes;
+    auto replacement = protectedStackPages;
+    ReplaceStackProtection(replacement, start, bytes, readWrite);
+    protectedStackPages.swap(replacement);
 }
+
+#ifdef _WIN32
+bool ReplaceGuestThreadStack(std::uintptr_t start, std::size_t bytes, bool readWrite, const std::function<bool()>& replace) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - start) return false;
+    std::uintptr_t low = 0;
+    std::uintptr_t high = 0;
+    const bool current = CurrentStack(&low, &high) && start >= low && start + bytes <= high;
+    constexpr std::uintptr_t HostFrameReserve = 64 * 1024;
+    const auto frame = reinterpret_cast<std::uintptr_t>(&low);
+    if (current && (frame < HostFrameReserve || start + bytes > frame - HostFrameReserve)) return false;
+    std::lock_guard lock(stackLock);
+    if (!current && std::none_of(liveStacks.begin(), liveStacks.end(), [&](const auto& entry) {
+            return start >= entry.second.first && start + bytes <= entry.second.second;
+        })) return false;
+    auto replacement = protectedStackPages;
+    ReplaceStackProtection(replacement, start, bytes, readWrite);
+    auto failure = protectedStackPages;
+    ReplaceStackProtection(failure, start, bytes, false);
+    try {
+        if (!replace()) return false;
+    } catch (...) {
+        protectedStackPages.swap(failure);
+        throw;
+    }
+    protectedStackPages.swap(replacement);
+    return true;
+}
+#endif
 
 static void UnregisterStack(PthreadPrivate* self) {
     std::lock_guard lock(stackLock);
@@ -394,14 +467,17 @@ KernelCpumask LiveGuestThreadsAffinity() {
     return mask;
 }
 
-bool GuestThreadIsLive(const PthreadPrivate* thread) {
+std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread) {
     auto& registry = CpuClocks();
-    std::lock_guard lock(registry.lock);
+    std::unique_lock lock(registry.lock);
     for (const auto& [id, live] : registry.threads) {
-        if (live != thread) continue;
-        return !live->_finished.load(std::memory_order_acquire);
+        if (live == thread && !live->_finished.load(std::memory_order_acquire)) return lock;
     }
-    return false;
+    return {};
+}
+
+bool GuestThreadIsLive(const PthreadPrivate* thread) {
+    return LockLiveGuestThread(thread).owns_lock();
 }
 
 bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& mask) {
@@ -744,12 +820,8 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
         if (high <= low || high - low < self->stackSize)
             throw std::runtime_error("Cannot query guest thread stack");
         self->stackAddress = reinterpret_cast<void*>(high - self->stackSize);
-        for (auto cursor = high - self->stackSize; cursor < high;) {
-            MEMORY_BASIC_INFORMATION memory{};
-            if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT || memory.Protect != PAGE_READWRITE || memory.RegionSize == 0)
-                throw std::runtime_error("Guest thread stack is not fully committed");
-            cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
-        }
+        if (!CommittedReadWrite(high - self->stackSize, high))
+            throw std::runtime_error("Guest thread stack is not fully committed");
         self->threadId = std::this_thread::get_id();
         CurrentGuestState().current = self;
         if (!self->name.empty()) {
@@ -932,9 +1004,22 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
     ThreadCancel::Check();
     {
         std::unique_lock lock(thread->_join_mtx);
-        ThreadCancel::WaitUntil(thread->_join_cv, lock, std::nullopt, [&] { return thread->_finished.load(); });
+        if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
+        if (thread->_joining) return SCE_KERNEL_ERROR_EOPNOTSUPP;
+        thread->_joining = true;
+        while (!thread->_finished.load()) {
+            ThreadCancel::Wait(thread->_join_cv, lock, std::nullopt);
+            if (ThreadCancel::Requested()) {
+                thread->_joining = false;
+                lock.unlock();
+                ThreadCancel::Check();
+                lock.lock();
+                thread->_joining = true;
+            }
+        }
+        thread->_joining = false;
+        if (thread->_joined.exchange(true, std::memory_order_acq_rel)) return SCE_KERNEL_ERROR_ESRCH;
     }
-    if (thread->_joined.exchange(true, std::memory_order_acq_rel)) return SCE_KERNEL_ERROR_ESRCH;
 #ifdef _WIN32
     if (WaitForSingleObject(thread->nativeHandle, INFINITE) != WAIT_OBJECT_0)
         throw std::system_error(GetLastError(), std::system_category(), "Joining guest thread");
@@ -951,9 +1036,11 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
 
 int APS5_VABI scePthreadDetach(Pthread thread) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
-    if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
-    if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_EINVAL;
-    thread->_detached = true;
+    {
+        std::lock_guard lock(thread->_join_mtx);
+        if (thread->_detached || thread->_joining || thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_EINVAL;
+        thread->_detached = true;
+    }
 #ifdef _WIN32
     ReleaseThread(thread);
 #else

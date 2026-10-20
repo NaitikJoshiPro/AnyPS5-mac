@@ -49,6 +49,11 @@ enum class StageInputKind {
     RasterPrimitive,
     LayerExported,
     BaseInstance,
+    BaryCoordSmoothCenter,
+    BaryCoordNoPerspectiveCenter,
+    BaryCoordSmoothSample,
+    BaryCoordNoPerspectiveSample,
+    SampleMask,
 };
 
 // The I/J pair (SPI_PS_INPUT_ADDR PERSP/LINEAR_CENTER, _CENTROID, _SAMPLE) one interpolated pixel
@@ -65,6 +70,24 @@ inline constexpr std::uint32_t InterpolationLocationFlag = 0x100u;
 
 inline constexpr std::uint32_t InterpolationLocationFlags(InterpolationLocation location) {
     return InterpolationLocationFlag | static_cast<std::uint32_t>(location);
+}
+
+constexpr StageInputKind BarycentricInputOf(StageInputKind kind) {
+    switch (kind) {
+    case StageInputKind::BaryCoordSmoothCenter:
+    case StageInputKind::BaryCoordSmoothSample:
+        return StageInputKind::BaryCoordSmooth;
+    case StageInputKind::BaryCoordNoPerspectiveCenter:
+    case StageInputKind::BaryCoordNoPerspectiveSample:
+        return StageInputKind::BaryCoordNoPerspective;
+    default:
+        return kind;
+    }
+}
+
+constexpr bool IsBarycentricInput(StageInputKind kind) {
+    const auto input = BarycentricInputOf(kind);
+    return input == StageInputKind::BaryCoordSmooth || input == StageInputKind::BaryCoordNoPerspective;
 }
 
 enum class StageOutputKind {

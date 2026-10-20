@@ -22,6 +22,7 @@ void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi
     const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
     require(userCount <= 32, "graphics user SGPR count exceeds the register bank");
     program.userData.clear();
+    program.userData.reserve(userCount + 8u);
     for (std::uint32_t i = 0; i < userCount; ++i) {
         Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.userDataBase + i);
         program.userData.push_back(staticAbi ? ReadGraphicsRegister(queue.shader, program.userDataBase + i) : readUserData(queue.shader, program.userDataBase + i));
@@ -121,7 +122,7 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
     }
 }
 
-std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
+std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission, const Graphics::Context& context) {
     auto product = std::make_shared<DrawDecode>();
     // The target's tessellation features gate the decoded VGT_TF_PARAM (DECISIONS D26).
     const auto localDevice = device.Load();
@@ -129,6 +130,8 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders), tessellation ? tessellation->features : ShaderRecompiler::TessellationFeatures{});
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
     product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
+    Graphics::NormalizeUnusedViewportDepth(product->state, product->pixel);
+    Graphics::ApplyDepthRemap(context, product->state);
     product->pixel.targetExportPacking = Graphics::ExportPackings(product->state);
     product->pixel.dualSourceBlend = product->state.dualSourceBlend;
     product->pixel.reversedBlend = product->state.reversedBlend;
@@ -143,14 +146,16 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     if (product->pixel.ancillary) product->pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(product->state);
     if (product->pixel.ancillary) product->pixel.layerExported = product->state.layerExports != 0;
     product->pixel.ditheredAlphaToCoverage = product->state.ditheredAlphaToCoverage;
+    product->pixel.iteratesSamples = product->state.perSampleShading;
+    product->pixel.sampleLocations = Graphics::PixelSampleLocations(product->state, product->pixel);
     return product;
 }
 
-void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
+void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, const Graphics::Context& context, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
         const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
-        auto fresh = decodeDraw(queue, submission);
+        auto fresh = decodeDraw(queue, submission, context);
         if (verifyDrawRecipe() && registerKey) {
             std::uint64_t facadeMismatches = 0;
             for (const auto read : readLog) {

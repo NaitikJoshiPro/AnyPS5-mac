@@ -3,6 +3,7 @@
 #include <bit>
 #include <cerrno>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -72,6 +73,17 @@ double APS5_VABI asin_nid_postfix(double);
 float APS5_VABI atan2f_nid_postfix(float, float);
 float APS5_VABI hypotf_nid_postfix(float, float);
 double APS5_VABI hypot_nid_postfix(double, double);
+double APS5_VABI fdim_nid_postfix(double, double);
+float APS5_VABI fdimf_nid_postfix(float, float);
+float APS5_VABI fabsf_nid_postfix(float);
+long double APS5_VABI fabsl_nid_postfix(long double);
+double APS5_VABI copysign_nid_postfix(double, double);
+float APS5_VABI copysignf_nid_postfix(float, float);
+double APS5_VABI remquo_nid_postfix(double, double, int*);
+float APS5_VABI remquof_nid_postfix(float, float, int*);
+float APS5_VABI fmaf_nid_postfix(float, float, float);
+long double APS5_VABI ceill_nid_postfix(long double);
+long double APS5_VABI floorl_nid_postfix(long double);
 float APS5_VABI tanf_nid_postfix(float);
 int APS5_VABI rand_nid_postfix();
 void APS5_VABI srand_nid_postfix(unsigned int);
@@ -83,9 +95,14 @@ float APS5_VABI log1pf_nid_postfix(float);
 double APS5_VABI expm1_nid_postfix(double);
 float APS5_VABI expm1f_nid_postfix(float);
 float APS5_VABI erff_nid_postfix(float);
+double APS5_VABI erf_nid_postfix(double);
+double APS5_VABI erfc_nid_postfix(double);
+float APS5_VABI erfcf_nid_postfix(float);
 double APS5_VABI lgamma_nid_postfix(double);
 extern int signgam_nid_postfix;
 float APS5_VABI logbf_nid_postfix(float);
+int APS5_VABI ilogb_nid_postfix(double);
+int APS5_VABI ilogbf_nid_postfix(float);
 double APS5_VABI exp2_nid_postfix(double);
 float APS5_VABI __powisf2_nid_postfix(float, int);
 double APS5_VABI __powidf2_nid_postfix(double, int);
@@ -93,6 +110,7 @@ double APS5_VABI ldexp_nid_postfix(double, int);
 double APS5_VABI scalbn_nid_postfix(double, int);
 float APS5_VABI scalbnf_nid_postfix(float, int);
 float APS5_VABI nextafterf_nid_postfix(float, float);
+double APS5_VABI nextafter_nid_postfix(double, double);
 double APS5_VABI frexp_nid_postfix(double, int*);
 float APS5_VABI frexpf_nid_postfix(float, int*);
 std::int64_t APS5_VABI lround_nid_postfix(double);
@@ -138,6 +156,7 @@ long double APS5_VABI log1pl_nid_postfix(long double);
 long double APS5_VABI log2l_nid_postfix(long double);
 long double APS5_VABI lgammal_nid_postfix(long double);
 long double APS5_VABI tgammal_nid_postfix(long double);
+float APS5_VABI tgammaf_nid_postfix(float);
 long double APS5_VABI hypotl_nid_postfix(long double, long double);
 float APS5_VABI hypot3f_nid_postfix(float, float, float);
 double APS5_VABI hypot3_nid_postfix(double, double, double);
@@ -187,6 +206,11 @@ static void CheckExactOperations() {
     Require(fabs_nid_postfix(-3.5) == 3.5 && fabs_nid_postfix(-INFINITY) == INFINITY);
     Require(std::bit_cast<std::uint64_t>(fabs_nid_postfix(-0.)) == 0);
     Require(std::isnan(fabs_nid_postfix(-nan)) && !std::signbit(fabs_nid_postfix(-nan)));
+    Require(fabsf_nid_postfix(-3.5f) == 3.5f && fabsf_nid_postfix(-INFINITY) == INFINITY);
+    Require(std::bit_cast<std::uint32_t>(fabsf_nid_postfix(-0.f)) == 0);
+    Require(std::isnan(fabsf_nid_postfix(-static_cast<float>(nan))) && !std::signbit(fabsf_nid_postfix(-static_cast<float>(nan))));
+    Require(fabsl_nid_postfix(-3.5L) == 3.5L && fabsl_nid_postfix(-INFINITY) == INFINITY);
+    Require(std::isnan(fabsl_nid_postfix(-static_cast<long double>(nan))) && !std::signbit(fabsl_nid_postfix(-static_cast<long double>(nan))));
     Require(trunc_nid_postfix(2.7) == 2. && trunc_nid_postfix(-2.7) == -2.);
     Require(std::bit_cast<std::uint64_t>(trunc_nid_postfix(-0.5)) == 0x8000000000000000ull);
     Require(trunc_nid_postfix(4503599627370497.) == 4503599627370497. && trunc_nid_postfix(-1e300) == -1e300);
@@ -213,6 +237,17 @@ static void CheckExactOperations() {
     Require(fma_nid_postfix(tenth, 10., -1.) == 0x1p-54);
     Require(fma_nid_postfix(0x1p1023, 2., -0x1p1023) == 0x1p1023);
     Require(std::isnan(fma_nid_postfix(INFINITY, 0., 1.)));
+    Require(fdim_nid_postfix(4.0, 1.0) == 3.0 && fdim_nid_postfix(1.0, 4.0) == 0.0);
+    Require(fdim_nid_postfix(4.0, 4.0) == 0.0 && !std::signbit(fdim_nid_postfix(1.0, 4.0)));
+    Require(std::isnan(fdim_nid_postfix(std::numeric_limits<double>::quiet_NaN(), 1.0)));
+    Require(std::isnan(fdim_nid_postfix(1.0, std::numeric_limits<double>::quiet_NaN())));
+    Require(fdimf_nid_postfix(4.0f, 1.0f) == 3.0f && fdimf_nid_postfix(1.0f, 4.0f) == 0.0f);
+    Require(fdimf_nid_postfix(4.0f, 4.0f) == 0.0f && !std::signbit(fdimf_nid_postfix(1.0f, 4.0f)));
+    Require(std::isnan(fdimf_nid_postfix(std::numeric_limits<float>::quiet_NaN(), 1.0f)));
+    Require(fmaf_nid_postfix(2.f, 3.f, 4.f) == 10.f);
+    volatile float tenthFloat = 0.1f;
+    Require(fmaf_nid_postfix(tenthFloat, 10.f, -1.f) != 0.f);
+    Require(std::isnan(fmaf_nid_postfix(INFINITY, 0.f, 1.f)));
 }
 
 static void CheckNearbyint() {
@@ -393,6 +428,10 @@ static void CheckLongDouble() {
     Require(frexpl_nid_postfix(INFINITY, &exponent) == INFINITY && exponent == 77);
     Require(frexpl_nid_postfix(-INFINITY, &exponent) == -INFINITY && exponent == 77);
     Require(std::isnan(frexpl_nid_postfix(NAN, &exponent)) && exponent == 77);
+    Require(ceill_nid_postfix(2.2L) == 3.0L && ceill_nid_postfix(-2.7L) == -2.0L);
+    Require(floorl_nid_postfix(2.7L) == 2.0L && floorl_nid_postfix(-2.2L) == -3.0L);
+    Require(ceill_nid_postfix(2.0L) == 2.0L && floorl_nid_postfix(-2.0L) == -2.0L);
+    Require(std::isnan(ceill_nid_postfix(NAN)) && std::isnan(floorl_nid_postfix(NAN)));
 }
 
 static void CheckNearbyintl() {
@@ -870,6 +909,9 @@ static void CheckLongDoubleFunctions() {
 #endif
     Require(lgammal_nid_postfix(1.0L) == 0.0L && lgammal_nid_postfix(2.0L) == 0.0L && lgammal_nid_postfix(0.0L) == infinity);
     Require(tgammal_nid_postfix(5.0L) == 24.0L && Near(tgammal_nid_postfix(0.5L), 1.7724538509055160272981675L));
+    Require(tgammaf_nid_postfix(5.0f) == 24.0f && std::abs(tgammaf_nid_postfix(0.5f) - 1.77245385f) < 1e-6f);
+    Require(tgammaf_nid_postfix(1.0f) == 1.0f && tgammaf_nid_postfix(2.0f) == 1.0f && tgammaf_nid_postfix(3.0f) == 2.0f);
+    Require(std::isinf(tgammaf_nid_postfix(0.0f)) && std::isnan(tgammaf_nid_postfix(-1.0f)));
     Require(hypotl_nid_postfix(3.0L, -4.0L) == 5.0L && hypotl_nid_postfix(nan, -infinity) == infinity);
 
     Require(hypot3f_nid_postfix(3.0f, -4.0f, 12.0f) == 13.0f && hypot3f_nid_postfix(0.0f, 3.0f, -4.0f) == 5.0f);
@@ -886,6 +928,7 @@ static void CheckLongDoubleFunctions() {
     Require(std::fabs(j0f_nid_postfix(2.5f) - static_cast<float>(ReferenceBesselJ(0, 2.5))) < 1e-6f);
     Require(std::fabs(jnf_nid_postfix(3, 4.0f) - static_cast<float>(ReferenceBesselJ(3, 4.0))) < 1e-6f);
     Require(y0f_nid_postfix(0.0f) == -std::numeric_limits<float>::infinity() && y1f_nid_postfix(0.0f) == -std::numeric_limits<float>::infinity());
+    Require(ynf_nid_postfix(2, 0.0f) == -std::numeric_limits<float>::infinity());
     Require(std::fabs(ynf_nid_postfix(2, 3.0f) - static_cast<float>(ReferenceBesselY(2, 3.0))) < 1e-6f);
     Require(std::isnan(y0f_nid_postfix(-1.0f)));
 }
@@ -1019,6 +1062,12 @@ int main() {
     Require(fmodf_nid_postfix(-5.5f, 2.f) == -1.5f);
     Require(std::signbit(fmodf_nid_postfix(-4.f, 2.f)));
     Require(std::isnan(fmodf_nid_postfix(1.f, 0.f)));
+    int quo = 0;
+    Require(remquo_nid_postfix(7.0, 3.0, &quo) == 1.0 && (quo & 7) == 2);
+    Require(remquo_nid_postfix(-7.0, 3.0, &quo) == -1.0 && (quo & 7) == ((-2) & 7));
+    int quof = 0;
+    Require(remquof_nid_postfix(7.0f, 3.0f, &quof) == 1.0f && (quof & 7) == 2);
+    Require(remquof_nid_postfix(-7.0f, 3.0f, &quof) == -1.0f && (quof & 7) == ((-2) & 7));
     Require(std::bit_cast<std::uint32_t>(nanf_nid_postfix(nullptr)) == 0x7fc00000u);
     Require(std::bit_cast<std::uint32_t>(nanf_nid_postfix("")) == 0x7fc00000u);
     Require(std::bit_cast<std::uint32_t>(nanf_nid_postfix("123")) == 0x7fc00000u);
@@ -1044,6 +1093,16 @@ int main() {
     try { rand_r_nid_postfix(nullptr); } catch (...) { threw = true; }
     Require(threw);
     Require(hypot_nid_postfix(3.0, 4.0) == 5.0 && hypot_nid_postfix(-3.0, -4.0) == 5.0 && hypotf_nid_postfix(3.f, -4.f) == 5.f);
+    Require(copysign_nid_postfix(1.0, 2.0) == 1.0 && copysign_nid_postfix(1.0, -2.0) == -1.0);
+    Require(copysign_nid_postfix(-1.0, 2.0) == 1.0 && copysign_nid_postfix(-1.0, -2.0) == -1.0);
+    Require(std::bit_cast<std::uint64_t>(copysign_nid_postfix(0.0, -1.0)) == 0x8000000000000000ull);
+    Require(std::bit_cast<std::uint64_t>(copysign_nid_postfix(-0.0, 1.0)) == 0);
+    Require(copysign_nid_postfix(INFINITY, -1.0) == -INFINITY && copysign_nid_postfix(-INFINITY, 1.0) == INFINITY);
+    Require(std::isnan(copysign_nid_postfix(std::numeric_limits<double>::quiet_NaN(), -1.0)) && std::signbit(copysign_nid_postfix(std::numeric_limits<double>::quiet_NaN(), -1.0)));
+    Require(std::isnan(copysign_nid_postfix(std::numeric_limits<double>::quiet_NaN(), 1.0)) && !std::signbit(copysign_nid_postfix(std::numeric_limits<double>::quiet_NaN(), 1.0)));
+    Require(copysignf_nid_postfix(1.0f, 2.0f) == 1.0f && copysignf_nid_postfix(1.0f, -2.0f) == -1.0f);
+    Require(std::bit_cast<std::uint32_t>(copysignf_nid_postfix(0.0f, -1.0f)) == 0x80000000u);
+    Require(std::bit_cast<std::uint32_t>(copysignf_nid_postfix(-0.0f, 1.0f)) == 0);
     Require(std::abs(hypot_nid_postfix(1e308, 1e308) / 1.4142135623730951e308 - 1.0) < 1e-15);
     Require(std::abs(hypotf_nid_postfix(2e38f, 2e38f) / 2.8284271e38f - 1.f) < 1e-6f);
     Require(std::isinf(hypot_nid_postfix(std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN())));
@@ -1073,6 +1132,12 @@ int main() {
     Require(std::abs(expm1f_nid_postfix(1.f) - 1.7182818f) < 1e-6f && std::isinf(expm1f_nid_postfix(std::numeric_limits<float>::infinity())));
     Require(erff_nid_postfix(0.f) == 0.f && std::signbit(erff_nid_postfix(-0.f)) && erff_nid_postfix(10.f) == 1.f && erff_nid_postfix(-10.f) == -1.f);
     Require(std::abs(erff_nid_postfix(0.5f) - 0.5204999f) < 1e-6f && std::isnan(erff_nid_postfix(std::numeric_limits<float>::quiet_NaN())));
+    Require(erf_nid_postfix(0.) == 0. && std::signbit(erf_nid_postfix(-0.)) && erf_nid_postfix(10.) == 1. && erf_nid_postfix(-10.) == -1.);
+    Require(std::abs(erf_nid_postfix(0.5) - 0.5204998778130465) < 1e-15 && std::isnan(erf_nid_postfix(std::numeric_limits<double>::quiet_NaN())));
+    Require(erfc_nid_postfix(0.) == 1. && erfc_nid_postfix(100.) == 0. && erfc_nid_postfix(-100.) == 2.);
+    Require(std::abs(erfc_nid_postfix(0.5) - 0.47950012218695346) < 1e-15 && std::isnan(erfc_nid_postfix(std::numeric_limits<double>::quiet_NaN())));
+    Require(erfcf_nid_postfix(0.f) == 1.f && erfcf_nid_postfix(100.f) == 0.f && erfcf_nid_postfix(-100.f) == 2.f);
+    Require(std::abs(erfcf_nid_postfix(0.5f) - 0.47950012f) < 1e-6f && std::isnan(erfcf_nid_postfix(std::numeric_limits<float>::quiet_NaN())));
     Require(lgamma_nid_postfix(1.) == 0. && lgamma_nid_postfix(2.) == 0. && std::isinf(lgamma_nid_postfix(0.)));
     Require(std::abs(lgamma_nid_postfix(0.5) - 0.5723649429247001) < 1e-15 && std::abs(lgamma_nid_postfix(10.) - 12.801827480081469) < 1e-13);
     Require(std::abs(lgamma_nid_postfix(-0.5) - 1.2655121234846454) < 1e-15);
@@ -1123,6 +1188,18 @@ int main() {
     Require(logbf_nid_postfix(0.f) == -std::numeric_limits<float>::infinity());
     Require(logbf_nid_postfix(-std::numeric_limits<float>::infinity()) == std::numeric_limits<float>::infinity());
     Require(std::isnan(logbf_nid_postfix(std::numeric_limits<float>::quiet_NaN())));
+    Require(ilogb_nid_postfix(8.0) == 3 && ilogb_nid_postfix(-0.75) == -1 && ilogb_nid_postfix(1.0) == 0);
+    Require(ilogb_nid_postfix(1024.0) == 10 && ilogb_nid_postfix(0.125) == -3);
+    Require(ilogbf_nid_postfix(8.f) == 3 && ilogbf_nid_postfix(-0.75f) == -1 && ilogbf_nid_postfix(1.f) == 0);
+    Require(ilogbf_nid_postfix(1024.f) == 10 && ilogbf_nid_postfix(0.125f) == -3);
+    Require(ilogb_nid_postfix(0.0) == INT_MIN && ilogb_nid_postfix(-0.0) == INT_MIN);
+    Require(ilogb_nid_postfix(std::numeric_limits<double>::infinity()) == INT_MAX);
+    Require(ilogb_nid_postfix(-std::numeric_limits<double>::infinity()) == INT_MAX);
+    Require(ilogb_nid_postfix(std::numeric_limits<double>::quiet_NaN()) == INT_MAX);
+    Require(ilogbf_nid_postfix(0.f) == INT_MIN && ilogbf_nid_postfix(-0.f) == INT_MIN);
+    Require(ilogbf_nid_postfix(std::numeric_limits<float>::infinity()) == INT_MAX);
+    Require(ilogbf_nid_postfix(std::numeric_limits<float>::quiet_NaN()) == INT_MAX);
+    Require(ilogbf_nid_postfix(std::numeric_limits<float>::denorm_min()) == -149);
     Require(exp2_nid_postfix(-3.) == 0.125);
     Require(ldexp_nid_postfix(0.75, 4) == 12.);
     CheckSquareRoot();
@@ -1144,6 +1221,13 @@ int main() {
     Require(nextafterf_nid_postfix(1.f, 1.f) == 1.f && !std::signbit(nextafterf_nid_postfix(-0.f, 0.f)));
     Require(nextafterf_nid_postfix(std::numeric_limits<float>::max(), std::numeric_limits<float>::infinity()) == std::numeric_limits<float>::infinity());
     Require(std::isnan(nextafterf_nid_postfix(std::numeric_limits<float>::quiet_NaN(), 1.f)) && std::isnan(nextafterf_nid_postfix(1.f, std::numeric_limits<float>::quiet_NaN())));
+    Require(nextafter_nid_postfix(1.0, 2.0) == 0x1.0000000000001p0 && nextafter_nid_postfix(1.0, 0.0) == 0x1.fffffffffffffp-1);
+    Require(nextafter_nid_postfix(0.0, 1.0) == std::numeric_limits<double>::denorm_min());
+    Require(nextafter_nid_postfix(0.0, -1.0) == -std::numeric_limits<double>::denorm_min());
+    Require(nextafter_nid_postfix(std::numeric_limits<double>::denorm_min(), -1.0) == 0.0);
+    Require(nextafter_nid_postfix(1.0, 1.0) == 1.0 && !std::signbit(nextafter_nid_postfix(-0.0, 0.0)));
+    Require(nextafter_nid_postfix(std::numeric_limits<double>::max(), std::numeric_limits<double>::infinity()) == std::numeric_limits<double>::infinity());
+    Require(std::isnan(nextafter_nid_postfix(std::numeric_limits<double>::quiet_NaN(), 1.0)) && std::isnan(nextafter_nid_postfix(1.0, std::numeric_limits<double>::quiet_NaN())));
     int exponent = 0;
     Require(frexp_nid_postfix(12., &exponent) == 0.75 && exponent == 4);
     Require(frexpf_nid_postfix(-12.f, &exponent) == -0.75f && exponent == 4);

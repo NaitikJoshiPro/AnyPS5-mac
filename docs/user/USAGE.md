@@ -6,6 +6,10 @@
 
 The online converter can save Linux output as an uncompressed folder in supported browsers. It does not overwrite an existing destination folder. If conversion fails or is cancelled, it aborts the active file and attempts to remove the newly created output folder. If the browser prevents cleanup, the error names the folder that may contain incomplete files.
 
+### Browser batch conversion
+
+Select or drop multiple app ZIP archives to convert them into one ZIP bundle. The converter inspects each app separately and puts its executable, libraries and `app0/` files in a numbered folder, so archives with the same filename remain separate. Batch output uses ZIP mode; saving to an uncompressed folder remains available for one Linux app at a time. The 256 MiB memory-download limit applies to the whole bundle, so use **Save ZIP to disk** for larger batches. If a batch is cancelled or any app fails, the converter aborts the incomplete bundle; any cleanup failure is reported instead of offering it as a completed result.
+
 ## Input and conversion
 
 Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. Only files directly inside the module directories are processed. SELF/fSELF containers are skipped with a warning; unwrap them before relinking if they need to be included. `tools/unwrap_self.py <input.self> <output.elf>` does that for a decrypted container: it places the segments at the offsets of the SELF segment records and restores `p_offset % p_align == p_vaddr % p_align`, and it refuses a container whose load segments all look encrypted. The command-line relinker skips an ELF module as a backup copy, with a message, when its file name extends the name of another ELF module in the same directory and both have the same SONAME, such as a dumper's `libX.prx.esbak` or `libX.prxbak` beside an ELF `libX.prx`; a single backup beside a SELF container is still relinked. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present is an error. All three absent is an error unless an explicit `--module-dir` is supplied.
@@ -71,8 +75,9 @@ All switches are disabled by default. `unused-filter` defaults to `0`; `--rpath`
 | `--windows-fixed-base <address>` | Map the lowest ELF load page at this fixed Windows address, given in decimal or hexadecimal (`0x`). Requires `--windows`, a 64 KiB-aligned address from `0x20000` through `0x7fffffff0000`, and a complete image fitting in the user address space. The main executable has no ASLR or base relocations; an occupied address fails to load. Bundled modules keep their normal placement. |
 | `--trace-imports`             | Pass each function import through the libc.prx call tracer, see [tracing system library calls](#tracing-system-library-calls). Requires `--windows`; conflicts with `--lazy-binding`.                                                                                                                                                                                                                                                                                       |
 | `--linux-fixed-base <address>` | Load the Linux executable at this fixed address, given in decimal or hexadecimal (`0x`): every virtual address of the image is offset by it, so virtual address 0 is placed at the address, as the console places an executable. Requires a 64 KiB-aligned address from `0x10000` through `0x7fffffff0000` that is a multiple of every `PT_LOAD` alignment, and an image that ends in the user address space. The executable is written as `ET_EXEC`, without ASLR. Bundled modules keep their normal placement. Conflicts with `--windows`, `--macos` and `--lazy-binding`. |
+| `--macos-fixed-base <address>` | Map the lowest ELF load page of the macOS executable at this fixed address, given in decimal or hexadecimal (`0x`). Requires `--macos`, a 64 KiB-aligned address from `0x20000` through `0x7fffffff0000`, and an image that ends in the macOS user address space. `__PAGEZERO` ends 64 KiB below the address and the Mach-O header occupies those 64 KiB. The executable has no ASLR; an address the process cannot map fails to load. Bundled modules keep their normal placement. |
 | `--to-intel`                  | Convert supported AMD-only instructions in the executable and bundled modules. Unsupported instructions or unreachable conversion stubs cause an error.                                                                                                                                                                                                                                                                                                                     |
-| `--to-rosetta`                | Convert as `--to-intel` does and also lower what Rosetta lacks: ANDN becomes scalar NOT/AND, RDSEED becomes RDRAND, CLWB a NOP, and RDPID returns processor 0. Implies `--to-intel`. Independent of `--macos`: `--macos` alone leaves these instructions as they are. Conflicts with `--windows`.                                                    |
+| `--to-rosetta`                | Convert as `--to-intel` does and also lower what Rosetta lacks: ANDN becomes scalar NOT/AND, RDSEED becomes RDRAND, CLWB a NOP, and RDPID and the ECX of RDTSCP return processor 0. Implies `--to-intel`. Independent of `--macos`: `--macos` alone leaves these instructions as they are. Conflicts with `--windows`.                                                    |
 | `unused-filter=0`             | Keep all imported NID references.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `unused-filter=1`             | Filter unused non-PLT imports using control-flow and GOT access analysis, treating address-taken code as reachable; preserve PLT imports.                                                                                                                                                                                                                                                                                                                                   |
 | `unused-filter=2`             | Apply strict unused-import analysis and compact the PLT. Unsupported analysis cases cause an error.                                                                                                                                                                                                                                                                                                                                                                         |
@@ -82,6 +87,10 @@ All switches are disabled by default. `unused-filter` defaults to `0`; `--rpath`
 | `--sce-module-path <path>`    | Parent of the module directories, not the module directory itself. Default: input ELF parent; relative input paths resolve from the process working directory. Explicit absolute path: used directly. Explicit relative path (including `.` and `..`): relative to the process working directory. Output path has no effect. Requires one nonempty value; repeats, nonexistent or nondirectory paths, access failures, and combination with `--skip-sce-module` are errors. |
 | `--module-dir <dir>`          | Relink the ELF modules of a directory under the module parent directory, besides `sce_module`/`sce_modules`/`prx`; outputs keep the relative path. A module the executable or another module needs is initialized at startup, any other when the title loads it with `sceKernelLoadStartModule`, with its start arguments (for example Unity plugins in `Media/Plugins`). Repeatable; `.` is the parent itself, without the input ELF. Conflicts with `--skip-sce-module`.  |
 | `--executable <path>`         | Also convert another executable of the title, which it starts with `sceSystemServiceLoadExec`; the path is relative to the module parent directory, for example `picker/picker.bin`. It is written beside the output, named after the path with `/` replaced by `.` and given the output's extension (`picker.picker.bin.exe`), and uses the same `libs/`, `app0/` and guest modules. It is an error if a guest module converts differently for it. Repeatable. Conflicts with `--skip-sce-module`. |
+| `--patches <file>`            | Apply the byte patches of this file during conversion, see [game patches](#game-patches). Overrides `relinker-patches.toml` discovery. Conflicts with `--no-patches`. |
+| `--no-patches`                | Do not apply patches, and do not load `relinker-patches.toml` from the input directory. |
+| `--verify-patches <file>`     | Check a patch file against `<path>` without writing anything, see [game patches](#game-patches). Takes one path and no output path. |
+| `--verify-output`             | With `--verify-patches`, treat `<path>` as a converted Linux output instead of an input executable. |
 | `--skip-sce-module`           | Deprecated. Disable bundled module processing and module directory checks. Conflicts with explicit `--sce-module-path`.                                                                                                                                                                                                                                                                                                                                                     |
 | `--exclude-sce-module <file>` | Deprecated. Exclude a bundled module by exact filename, not path. Repeat for multiple files; a missing filename is an error. Conflicts with `--skip-sce-module`.                                                                                                                                                                                                                                                                                                            |
 | `--skip-syscall-check`        | Deprecated. Disable syscall scanning in the executable and bundled modules.                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -94,11 +103,63 @@ The `--skip-sce-module`, `--exclude-sce-module <file>`, `--skip-syscall-check`, 
 
 `--trap-sdk-syscall-stubs` is also for debugging. It preserves a runtime failure if a syscall wrapper is called; it does not implement FreeBSD syscalls or make these applications generally safe to run.
 
+## Game patches
+
+A patch file changes bytes of the input executable or of a bundled module before conversion, for a title that hard-codes a value the host cannot meet. The relinker checks the bytes it replaces, so a patch for another version of the title fails instead of corrupting it. With no patch file the output is unchanged.
+
+`relinker-patches.toml` in the directory of the input executable is loaded automatically and announced as `Patches: <path>`. `--patches <file>` names another file, and `--no-patches` loads none. Each applied patch is reported:
+
+```
+Patch: <target> [<name>] va=0x<address> off=0x<offset> <old> -> <new> (<description>)
+```
+
+The file is a subset of TOML; any other TOML syntax is an error that names the line. It is UTF-8, with blank lines, `#` comments outside strings, `[[patch]]` entries and `key = value` lines. Integers are decimal or `0x` hexadecimal, strings are double-quoted without escapes, and keys match `[A-Za-z0-9_]+`.
+
+```toml
+format = 1
+
+[[patch]]
+name        = "pool_size"
+target      = "eboot.elf"
+va          = 0x1234
+type        = "i32"
+expected    = 0x10000000
+value       = 0x18000000
+max         = 0x7f000000
+align       = 0x1000
+description = "pool size"
+```
+
+`format = 1` is required. The top-level keys `relinker_version`, `relinker_commit`, `config`, `config_sha256`, `main_target`, `settings` and `settings_sha256` are accepted in any file; only `main_target` is used, by `--verify-output`. Any other top-level key is an error.
+
+| Entry key | Meaning |
+|-----------|---------|
+| `name` | Optional. A setting name of `[a-z0-9_]`, unique within the file and not one of the reserved top-level key names (`format` and the seven keys above), used by a later `--set` option. Shown in the progress line, the manifest and the verify report. |
+| `target` | Required. The main executable's file name, or for `--executable` files and bundled modules the path relative to the module parent directory, for example `sce_module/libc.prx`. |
+| `va` | Required. The virtual address of the ELF as a disassembler shows it. |
+| `type` | Optional: `u8 u16 u32 u64 i8 i16 i32 i64`. Then `expected`, `value`, `min`, `max` and `align` are integers, range-checked and written little-endian. Without it, `expected` and `value` are hexadecimal byte strings of the same length. |
+| `expected` | Required. The bytes the input must hold. |
+| `value` | Required. The bytes to write. |
+| `min`, `max`, `align` | Optional, typed entries only; checked against `value`. |
+| `description` | Optional. Reported and copied to the manifest. |
+
+x86 `mov r/m64, imm32` and `add`/`sub`/`cmp r/m64, imm32` sign-extend their immediate. To patch a 64-bit field through an imm32 use `type = "i32"`, and add `min` to keep negative values out.
+
+Entries apply in file order. A patch range must lie in the file bytes of one `PT_LOAD` and outside the ELF header and program header table. The conversion fails before writing any output if bytes differ from `expected`, a range is not valid, two entries overlap, a target matches no file or more than one file, or a range overlaps bytes the relinker itself rewrites (`--to-intel` replacements and trampolines, relinker patches, syscall traps) or the 8-byte target of a relocation of the file.
+
+When at least one patch is applied, `<output-stem>.patches.toml` is written beside the output. It lists every applied entry for every converted file, with `main_target` and `config` (the patch file path in forward-slash form, reduced to its file name when the path holds a `"`, backslash or control character; the conversion fails before writing any output when even that cannot be held); typed entries keep their `type`, integers and `min`, `max` and `align`, and `--patches` accepts it to reproduce the conversion. The manifest must not replace the patch file it was read from.
+
+`--verify-patches <file> <path>` writes nothing and exits `0` when no entry is a mismatch. Without `--verify-output`, `<path>` is the input executable of any type, modules are found as in a conversion (module options and `--executable` apply), and each entry is `applicable` (the input holds `expected`) or `mismatch`. A target that matches nothing is an error that suggests `--verify-output`.
+
+With `--verify-output`, `<path>` is a converted Linux ELF (`ET_DYN`); `ET_EXEC` output from `--linux-fixed-base`, PE and Mach-O outputs are refused. The file must have `main_target`, so verify the generated manifest, not a hand-written file. The entry whose target is `main_target` is checked against `<path>`, and entries for the `--executable` strings given are checked against the output file derived as in a conversion; an entry holding `value` is `applied`. Every other entry is `not-checked (module, or executable not named with --executable)`, including a mistyped module target. Two targets with the same name, such as an `--executable` equal to `main_target`, are an `ambiguous patch target` error. Module discovery options are rejected with `--verify-output`.
+
+Verify mode rejects the conversion options (`--windows`, `--macos`, `--to-intel`, `--rpath`, `--patches`, `--no-patches` and the like) and a second path.
+
 ## Runtime layout
 
 For an executable that assumes its image starts at `0x400000`, use `relinker --windows --windows-fixed-base 0x400000 source/input.elf app.exe`. This maps its lowest ELF load page there; the PE headers occupy the preceding 64 KiB. Use this option only when the executable requires an exact address. Without it, the Windows executable has no `DYNAMIC_BASE` and loads at its preferred base `0x140000000`; relocations are kept, so Windows relocates it if that range is taken. Modules keep `DYNAMIC_BASE`. This option does not change macOS output.
 
-For an executable that assumes its image starts at `0x400000`, as Ruffle (PPSA68091), VLC (PPSA85300) and XPSemu (PPSA97358) do when they read their `app0/imports.txt`, use `relinker --linux-fixed-base 0x400000 source/input.elf app.elf` on Linux. Use this option only when the executable requires a fixed address. Without it, Linux output is a position-independent executable as before.
+For an executable that assumes its image starts at `0x400000`, as Ruffle (PPSA68091), VLC (PPSA85300) and XPSemu (PPSA97358) do when they read their `app0/imports.txt`, use `relinker --linux-fixed-base 0x400000 source/input.elf app.elf` on Linux, or `relinker --macos --macos-fixed-base 0x400000 source/input.elf app` on macOS. Use these options only when the executable requires a fixed address. Without them, Linux output is a position-independent executable as before, and macOS output places the lowest ELF load page at `0x140010000`.
 
 The same base is applied to executables selected with `--executable`; bundled PRX modules are not rebased.
 
@@ -115,7 +176,7 @@ app0/
         <converted modules>
 ```
 
-Use `sce_modules/` or `prx/` instead of `sce_module/` if that is the input directory name. Relinker preserves each module's directory under `app0/` and prints its exact path. Place app resources in `app0/` separately, including the title's original `eboot.bin`: titles test `/app0/eboot.bin` to find their own directory, as it is always present on the console (ProsperoTV, ProsperoRadio, ProsperoLight and ProsperoLichess fall back to an empty `/data/homebrew/<title id>` and fail to load their fonts without it). Only the converted executable runs. Copy the built system libraries from `build/core/libs/libs/*.prx` into `libs/`; use libraries built for the target OS. A custom `--rpath` changes the system library location.
+Use `sce_modules/` or `prx/` instead of `sce_module/` if that is the input directory name. Relinker preserves each module's directory under `app0/` and prints its exact path. Place app resources in `app0/` separately, including the title's original `eboot.bin`: titles test `/app0/eboot.bin` to find their own directory, as it is always present on the console (ProsperoTV, ProsperoRadio, ProsperoLight and ProsperoLichess fall back to an empty `/data/homebrew/<title id>` and fail to load their fonts without it). Only the converted executable runs. On Linux, `app0/` must not contain symbolic links: a directory listing gives the title the link's own type, not the type of the file or directory it points to, so a title that walks its directories skips a linked directory. Use copies or hard links. Copy the built system libraries from `build/core/libs/libs/*.prx` into `libs/`; use libraries built for the target OS. A custom `--rpath` changes the system library location.
 
 Some applications also need their original `app0/sce_sys/param.json` at runtime. AnyPS5 reads this file for the title ID and display name; it must contain a non-empty `titleId` string and a non-empty `localizedParameters` object with a language entry that has a non-empty `titleName`. It selects the entry named by `defaultLanguage` (inside `localizedParameters`, or at the top level); if that entry is absent, it tries `en-US`, then the first object-valued language entry. Preserve the values from the title's own metadata and place the file under the same `app0/` directory as the other app resources. At startup, its presence in the working directory creates `data/`; a non-zero `downloadDataSize` also creates `download0/`. Without the file, neither directory is created. If it is missing or invalid, metadata calls such as title/window setup can fail with a `param.json` error.
 
@@ -145,6 +206,14 @@ Windows PowerShell:
 
 A Windows executable started without a standard output or error handle, such as a `--windows-gui` build started from Explorer, writes that output to `anyps5.log` beside it, replacing the previous run's file. Without write access to that directory it runs without the log.
 
+### Display resolution and window size
+
+The game chooses its video-output resolution; AnyPS5 uses that mode for rendering. The display window can be resized or switched to fullscreen, which scales the presented image to fit the window. Changing the window size does not change the game's render resolution. AnyPS5 does not currently provide a global render-resolution override; use a game's own display setting when it offers one.
+
+### VR compatibility
+
+AnyPS5 does not currently support PS VR2 headsets or PC VR headsets connected through an OpenXR runtime. It does not provide headset tracking, stereoscopic output or reprojection. A VR title may skip its headset setup when no device is detected, but that does not mean its VR gameplay is supported.
+
 ### Controller input for test runs
 
 Set `APS5_PAD_INPUT_FILE` to an absolute path before launching the application to enable controller pulses from a local command file. Once the application is reading controller input, send a button with the helper from the repository root:
@@ -161,9 +230,13 @@ python3 tools/pad_input.py /tmp/anyps5-pad touch-right
 
 Run the helper in a second terminal. Commands are polled at most every 100 ms during controller reads, and their buttons add to physical controller input. A press lasts 300 ms by default, starting when the application reads it, and releases automatically; `--hold-ms` accepts 1–5000 ms. `--left-stick X Y` and `--right-stick X Y` hold the sticks for the same time: each axis is 0-255, 128 is the centre, X grows to the right and Y grows downward. While such a command is active both sticks come from it instead of the physical controller, and a stick that was not named stays centred. `touch-left` and `touch-right` press the touchpad with a finger on its left or right half, as the `TouchLeft` and `TouchRight` keys do; in the command file they are bits `0x200000` and `0x400000` of the button field. Wait for the application to observe a release before sending another press. The file holds only the latest command; rapid commands can replace one another. On POSIX, replacing an existing command file retains its permission mode; a privileged helper also retains its owner and group so the game user can still read it. Commands left over when the application first reads the controller are ignored. Without the environment variable, file input is disabled.
 
+### Video-out and pad telemetry
+
+Set `APS5_VIDEOOUT_TELEMETRY_DIR` to a directory before launching the application to write the run's presents and pad changes to `<directory>/videoout.jsonl`, one JSON object per line, appended when the file already exists. Every line starts with `"v":1`, the host's steady-clock nanoseconds in `t_ns` and the event name in `ev`. A run starts with a `contract` line, `{"v":1,"t_ns":<ns>,"ev":"contract","contract":"v1-pad","commit":"<12 hex>","pid":<pid>,"prx":"libSceVideoOut"}`: `commit` is the source commit the libraries were built from (`unknown` when Git was not found at configuration) and `pid` tells apart the runs that appended to the same file. A `pad` line is written when the pad state the title reads changes in its buttons, sticks or triggers, `{"v":1,"t_ns":<ns>,"ev":"pad","n":<present>,"buttons":<bits>,"sticks":[<left x>,<left y>,<right x>,<right y>],"triggers":[<L2>,<R2>]}`, where `n` is the number of presents completed when the change was published, the count the window title shows. `buttons` is the button bit field in decimal, stick axes run 0-255 with 128 at the centre, and both triggers run 0-255. Motion, touch and the device kind are not compared, so a run that only moves the controller writes no `pad` line. The state a `pad` line reports is the controller and keyboard/mouse input read through SDL; input fed by `APS5_PAD_INPUT_FILE` is applied later, in `libScePad`, so a scripted run writes no `pad` line. A `present` line is written after the first present and every 30 presents after that, `{"v":1,"t_ns":<ns>,"ev":"present","n":<present>,"fps":<rate>}`, with the count and rate the window title shows. A background thread writes the lines and the title is not waited for: when it falls behind, the line is dropped and a `drops` line with the number dropped so far, `{"v":1,"t_ns":<ns>,"ev":"drops","dropped":<count>}`, is written every ten seconds while the count grows, and once at a normal exit, only when lines were dropped; an exit that skips static destructors writes no last line. A pad line the full queue refused counts as dropped even though a later publish writes the change. Without the variable no file is opened and no thread is started; an empty value is the same as an unset one, and a directory that cannot be written stops the title when video output starts, with an error naming the file.
+
 ### System fonts
 
-Games that open the console's system font sets (`sceFontOpenFontSet`) need font files in an `anyps5-fonts/` directory beside the output executable; set `ANYPS5_SYSTEM_FONTS` to use another directory. Files dumped from the console are used under their own names (`SST-Roman.otf`, `SST-Bold.otf`, `SSTJpPro-Regular.otf`, ...). Without them, these openly licensed substitutes are used when present: `NotoSans-{Light,Regular,Medium,Bold}.ttf` and `NotoSans-{LightItalic,Italic,MediumItalic,BoldItalic}.ttf` (Latin and Vietnamese), `NotoSansMono-{Light,Regular,Medium,Bold}.ttf` (typewriter), `NotoSansThai-{Light,Regular,Medium,Bold}.ttf` (Thai) and `NotoSansCJK-{Light,Regular,Medium,Bold}.ttc` (Japanese and Chinese). Without either, opening a system font set fails and the game shows no text in those fonts.
+Games that open the console's system font sets (`sceFontOpenFontSet`) need font files in an `anyps5-fonts/` directory beside the output executable; set `ANYPS5_SYSTEM_FONTS` to use another directory. Files dumped from the console are used under their own names (`SST-Roman.otf`, `SST-Bold.otf`, `SSTJpPro-Regular.otf`, ...). Without them, these openly licensed substitutes are used when present: `NotoSans-{Light,Regular,Medium,Bold}.ttf` and `NotoSans-{LightItalic,Italic,MediumItalic,BoldItalic}.ttf` (Latin and Vietnamese), `NotoSansMono-{Light,Regular,Medium,Bold}.ttf` (typewriter), `NotoSansThai-{Light,Regular,Medium,Bold}.ttf` (Thai) and `NotoSansCJK-{Light,Regular,Medium,Bold}.ttc` (Japanese and Chinese). Without either, opening a system font set fails (the log shows `sceFontOpenFontSet` with `file=(none)`), and what happens next depends on the game: some show no text in those fonts, and others stop at start-up because they assert that the open succeeded. The substitutes come from the [Noto project](https://github.com/notofonts/notofonts.github.io) under the SIL Open Font License (the Noto Sans files are in `fonts/NotoSans/full/ttf`); copy the files named above into `anyps5-fonts/`.
 
 ### Console language
 
@@ -233,6 +306,10 @@ GPU results in storage images and render targets stay on the GPU until something
 
 A title's own CPU reads of that memory are not seen, so a title that waits for a GPU label and then reads the results reads stale memory. `APS5_STORE_AT_LABEL=1` stores every pending result before each label the GPU writes (`RELEASE_MEM`, `WRITE_DATA`, `DMA_DATA`), at the cost of a write-back of every pending image per label. Any other value stops the title at its first label.
 
+### Benchmark reports
+
+To measure how a title runs on a machine, start it with `APS5_TRACE_SUMMARY_EVERY=30 APS5_TRACE_BENCH=1`, play the scene for a few minutes and quit. Every 30 seconds the runtime rewrites `aps5-bench-<commit>-<pid>.json.gz` in `APS5_TRACE_DIR` or the working directory and appends a line to `aps5-summary.jsonl`. The file holds the time between every two presents, the commit, GPU, driver, OS, CPU name, thread count and physical memory, and, when `app0/sce_sys/param.json` is present, the title ID, name and content version. It holds no game data. The first interval includes shader compilation; compare later intervals. The interval still open when the title exits is not written. The fields are described under [summaries for a long session](../dev/BUILD.md#summaries-for-a-long-session).
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.
@@ -246,11 +323,34 @@ most called traced imports (1 calls in total):
 
 Limits are listed in the [libc](../dev/debt/libc.md) and [relinker](../dev/debt/relinker.md) technical debt.
 
+### Performance overlay
+
+F10 shows or hides a performance overlay over the presented image; `ANYPS5_OVERLAY=1` shows it from the first frame. `ANYPS5_OVERLAY_POS` puts it in a corner of the window: `tl` (top left, the default), `tr`, `bl` or `br`. For either variable an empty value is the same as an unset one, and any other value stops the game at its first frame with an error that names the variable. The key can be moved with `TogglePerformanceOverlay` in the [input mapping](INPUT_MAPPING.md). The text scales with the window height, at a whole multiple of its 5x7 pixel font; on an HDR10 swapchain the overlay is drawn at 203 nits.
+
+| Line | Meaning |
+|------|---------|
+| `PROFILED` | The first line while `APS5_PROFILE_GPU=1` or `APS5_PROFILE_DRAW=1` is set. Those switches add timestamp queries to every batch and timers to every packet, so the numbers of such a run aren't comparable with an unprofiled one. |
+| `FPS` | Frames presented per second, over the last second. When the last second holds fewer than two presents (below 1 fps), the rate of the last frame instead, 1000 divided by its time in ms: a frame every 2 s shows `0.50`. Every present counts, including frames a title presents cleared, for example while it loads. |
+| `FRAME` | Time between the last two presented frames, in ms. |
+| graph | The last 120 frame times, the newest on the right. The full height is the longest of them or twice their average, whichever is larger. |
+| `MIN/AVG/MAX` | The shortest, average and longest of the 120 frame times, in ms. |
+| `GPU` | GPU time per frame over the last second, or of the last frame below 1 fps, in ms: the span of each recorded batch from its first to its last command, from the timestamp queries of `APS5_PROFILE_GPU=1`. Shown only with that variable. Batches are counted when they complete, so the line trails a sudden change by up to a second, or by a frame below 1 fps. Batches that overlap on different queues each count in full, so the line can exceed `FRAME`. |
+| `DRIVER` | CPU time per frame over the last second, or of the last frame below 1 fps, in ms, that the packet workers spent in dispatch and draw packets (the `dispatch` and `draw` time of the `[gpu] worker` line of `APS5_PROFILE_DRAW=1`). Shown only with that variable. Every worker's time counts in full, so with several workers busy at once the line can exceed `FRAME`. |
+| `DRAWS` | Draw packets per frame over the last second, or of the last frame below 1 fps, then dispatch packets per frame (`DISPATCH`), as the packet workers execute them; packets that predication skips are not counted. Shown once the title has submitted either. |
+| `SHADERS` | Pipelines created in the last second, or during the last frame below 1 fps, then since the start (`TOTAL`): a graphics pipeline for each draw state the pipeline cache had not seen and a compute pipeline for each new dispatch shader. A rise while the game stutters points at pipeline compilation. Shown once a pipeline was created. |
+| `VRAM` | Usage and budget of the GPU's largest device-local memory heap from `VK_EXT_memory_budget`, read once a second. Not shown when the driver lacks the extension. |
+| `RAM` | The process's private memory, read once a second: `PrivateUsage` of `GetProcessMemoryInfo` on Windows, `RssAnon` plus `VmSwap` of `/proc/self/status` on Linux. The title's direct memory is shared memory on both systems and is not included. |
+| `RES` | The display buffer's size, then the window's swapchain size, for example `RES: 1920X1080 / 2560X1440`. Not shown for frames without a display buffer. |
+
+Times are shown with one decimal below 100 and as whole numbers above; anything above 9999 shows as 9999, so `FRAME` and `MIN/AVG/MAX` read 9999 for frames of 10 s or more. `FPS` has the same format, with two decimals below 1. Counts are whole numbers, in thousands (`12K`) from 10000 and in millions (`3M`) from a million. Memory is in GB of 2^30 bytes. While the overlay is hidden the presentation records nothing for it and the presented image is unchanged; while it is shown, one small render pass draws it over each presented frame. Each draw and dispatch packet and each pipeline creation is counted also while the overlay is hidden, with one increment of a counter that belongs to the packet worker or, for pipelines, a shared one; the memory and the counters are read only while the overlay is shown.
+
 ### Windows crash diagnostics
 
 When a register points at readable memory that starts with at least four printable ASCII characters, either as UTF-16LE or as single bytes, the crash report prints that text after the register memory dump, as `[r13] u"..."` for UTF-16LE or `[rdi] "..."` for single bytes. The text ends at a NUL, at the first character that is not printable ASCII, a tab, a line feed or a carriage return, after 512 characters or at the end of readable memory. Tabs, line breaks, quotes and backslashes are escaped, and `...` after the closing quote means that no NUL ended the text within those limits.
 
 Set `APS5_CRASH_INDIRECT_MEMORY=1` before launching the executable to include up to 64 bytes from each pointer found in the register memory dump. The report labels each block with its register, pointer offset and target address. Inaccessible, incomplete and executable targets are skipped. This additional dump is disabled when the variable is unset or empty.
+
+Set `APS5_CRASH_STACK_BYTES=<n>` to print, after the stack return address candidates, the faulting thread's stack words from `rsp` for `n` bytes (at most 1048576, decimal or `0x` hexadecimal), four words per line with their offset from `rsp`. Below them the report prints eight words at every distinct stack word that points at readable, non-executable memory outside the thread's stack, labelled with the word's offset and the address it holds, up to 256 addresses. This shows the objects the caller frames kept, such as the `this` of a destructor or the buffer of a container. The dump stops at the first unreadable stack page, and nothing is printed when the variable is unset, empty or 0.
 
 ### GPU submission rings and stall dumps
 
@@ -260,7 +360,7 @@ With `APS5_STALL_WATCHDOG_SECS=<n>`, a queue that has waited `n` seconds without
 
 ## Exit codes
 
-`0`: conversion succeeded or help was displayed. `1`: invalid arguments. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.
+`0`: conversion succeeded or help was displayed. `1`: invalid arguments, or a `--verify-patches` entry that is a mismatch. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.
 
 ## Import audit
 
@@ -279,6 +379,8 @@ python3 tools/import_audit.py app.registry.json app.libc.prx.guest.prx.registry.
 | `stub` | Exported, but the whole function calls `NotImplemented_nid_no_patch`: the game loads and throws when it calls it. |
 | `absent` | No built library exports the NID: the loader fails. |
 | `module` | The import names a file found in `--modules` (the title's own library), which is trusted to provide it. |
+
+Module registries mark ELF weak imports with `"weak": true`, allowing the audit's current-stop selection to skip them. Strong imports omit the field. Older module registries do not preserve weak bindings; regenerate them to distinguish optional imports.
 
 ELF modules in `--modules` are audited regardless of filename: their undefined symbols are classified against the built libraries and the other modules' exports, with the module file named in the report, and the libraries they need must have a file in `--libs` or `--modules`. Ordinary non-module sidecars are ignored; malformed ELF, PE/SELF containers and non-ELF files with module extensions remain errors. The audit reads dynamic tables from ELF section headers or, for sectionless files, from `PT_DYNAMIC` and a SysV or GNU hash table.
 

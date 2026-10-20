@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -42,9 +43,22 @@
 extern "C" int* APS5_VABI __error_nid_postfix();
 
 namespace {
+#ifdef _WIN32
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+static int GuestFstat(int fd) {
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+    struct _stat64 status{};
+    const int result = ::_fstat64(fd, &status);
+    _set_thread_local_invalid_parameter_handler(previous);
+    return result;
+}
+#endif
+
 constexpr int GuestEnoent = 2;
 constexpr int GuestEperm = 1;
 constexpr int GuestEio = 5;
+constexpr int GuestEbadf = 9;
 constexpr int GuestEfault = 14;
 constexpr int GuestEnotdir = 20;
 constexpr int GuestEisdir = 21;
@@ -375,9 +389,16 @@ int APS5_VABI chroot_nid_postfix(const char* path) {
 int APS5_VABI symlink_nid_postfix(const char* target, const char* created) {
     if (target == nullptr || created == nullptr) return static_cast<int>(Fail(GuestEfault));
     if (*target == '\0' || *created == '\0') return static_cast<int>(Fail(GuestEnoent));
-    if (*target == '/') {
+    const std::filesystem::path contents(target);
+    if (contents.has_root_name() || contents.has_root_directory()) {
         NotImplemented_nid_no_patch("symlink: absolute targets");
         return -1;
+    }
+    for (const auto& part : contents) {
+        if (part == "..") {
+            NotImplemented_nid_no_patch("symlink: parent-directory targets");
+            return -1;
+        }
     }
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(created, native)) return static_cast<int>(Fail(error));
@@ -388,7 +409,6 @@ int APS5_VABI symlink_nid_postfix(const char* target, const char* created) {
     if (std::filesystem::exists(std::filesystem::symlink_status(native, error))) return static_cast<int>(Fail(GuestEexist));
 #endif
     if (!std::filesystem::is_directory(native.parent_path(), error)) return static_cast<int>(Fail(GuestEnoent));
-    const std::filesystem::path contents(target);
     const bool directory = std::filesystem::is_directory(native.parent_path() / contents, error);
 #ifdef _WIN32
     DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
@@ -427,6 +447,7 @@ int APS5_VABI openat_nid_postfix(int fd, const char* path, int flags, ...) {
         va_end(arguments);
 #endif
     }
+    if (File::InvalidOpenFlags(flags)) return static_cast<int>(Fail(GuestEinval));
     if (path == nullptr) return static_cast<int>(Fail(GuestEfault));
     if (*path == '\0') return static_cast<int>(Fail(GuestEnoent));
     if (fd == GuestAtFdcwd || *path == '/') return open_nid_postfix(path, flags, mode);
@@ -509,6 +530,19 @@ int APS5_VABI fchmodat_nid_postfix(int fd, const char* path, int mode, int flag)
     if (::chmod(native.c_str(), static_cast<mode_t>(mode & 07777)) != 0) return static_cast<int>(Fail(GuestFileError(errno)));
 #endif
     RecordWrittenPath_nid_no_patch(native);
+    return 0;
+}
+
+int APS5_VABI fchown_nid_postfix(int fd, std::uint32_t uid, std::uint32_t gid) {
+    constexpr std::uint32_t Unchanged = 0xFFFFFFFFu;
+    if (uid != 0 && uid != Unchanged) NotImplemented_nid_no_patch("fchown: an owner other than the guest user");
+    if (gid != 0 && gid != Unchanged) NotImplemented_nid_no_patch("fchown: a group other than the guest group");
+#ifdef _WIN32
+    if (GuestFstat(fd) != 0) return static_cast<int>(Fail(GuestEbadf));
+#else
+    struct stat status{};
+    if (::fstat(fd, &status) != 0) return static_cast<int>(Fail(GuestEbadf));
+#endif
     return 0;
 }
 
