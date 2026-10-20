@@ -861,6 +861,14 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    // Upstream 537bbcc96c: the presenter takes the newest collect epoch, so the flush of the display
+    // range below (GPU decode: FlushForGpuRead; CPU decode: ReadDisplayBuffer's FlushGpuWrites) keeps
+    // an untracked display image's comparison memo (StorageTexture::compareUntracked caches only at a
+    // nonzero epoch). The write-back path collects the range uncached before it compares, so CPU
+    // writes since the last present still change the memo's stamp. APS5_NO_PRESENT_EPOCH=1 compares
+    // the display surface at every present as before.
+    static const bool noAdopt = std::getenv("APS5_NO_PRESENT_EPOCH") != nullptr;
+    if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
     auto& dumps = Dumps();
     int dumpIndex = -1;
     if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0u) dumpIndex = dumps.dumped++;
