@@ -197,7 +197,11 @@ public:
     // archives as lookup archives (no compile), keeping each written archive a superset of the
     // last. Requested after every new pipeline and run by the saver thread, coalesced and spaced
     // (SaveSpacing); also at destruction. Never throws.
-    void Save();
+    // `waitForPipelines` false (the saver thread; upstream 1d8acd1eda SaveUnlessBusy): when a
+    // pipeline creation holds serializerGate, the save is skipped instead of queueing an exclusive
+    // lock that would hold every later creation behind that compile; returns false and the saver
+    // asks again after the spacing. True (destruction, tests) waits for the gate.
+    bool Save(bool waitForPipelines = true);
     // Waits until no background task runs.
     void Drain();
 

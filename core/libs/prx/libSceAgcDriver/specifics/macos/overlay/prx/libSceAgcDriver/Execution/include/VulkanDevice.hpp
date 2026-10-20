@@ -171,6 +171,9 @@ public:
     };
     using CopyWriterNote = std::function<void(std::span<const std::byte> value, std::uint64_t generation)>;
     CopyOutcome CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter);
+    // Upstream e04111bb5: whether CopyBuffer would record this copy on the GPU (path 1) rather than
+    // wait for a completion store over either range (PacketMemory's DMA copy behind a pending source).
+    bool GpuCopyPossible(std::uint64_t destination, std::uint64_t source, std::size_t bytes) const;
     // APS5_COPY_VERIFY=1 totals: CPU copies verified, whose source bytes changed over the sync (a
     // producer the rule missed), whose destination bytes were overwritten (a store the rule
     // missed), and whose destination an unsignaled batch read in place (the rule's own answer
@@ -342,14 +345,20 @@ public:
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
 
+    // Public as upstream (tests call graphicsContext() directly): the device's Graphics::Context
+    // (MetalDevice.mm); a compile-only device has none and throws.
+    Graphics::Context graphicsContext() const;
+    // A store a batch's completion makes on the CPU over the range, and whether a copy touching the
+    // range must wait for that batch (a pending write whose completion stores over it).
+    bool completionStoresOver(std::uint64_t address, std::size_t bytes) const;
+    bool copyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const;
+
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
     // Records and submits one frame into the next present slot (MetalPresentation.mm): `pixels`
     // (BGRA8, width x height) drawn aspect-fit over a clear, or the clear alone when empty.
     bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels);
-    // Vulkan-only test hook (tests/execution/PipelineOptimizedReadback.cpp); throws on Metal.
-    Graphics::Context graphicsContext() const;
     // The Metal state (MTLDevice, queue, compiler, pipelines, guest-memory wrappers, in-flight
     // command buffers), defined in specifics/macos/src/MetalDevice.mm.
     struct State;

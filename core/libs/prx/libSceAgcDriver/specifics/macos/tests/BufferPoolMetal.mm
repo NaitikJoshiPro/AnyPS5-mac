@@ -15,6 +15,9 @@
 // maxBufferLength. SlabMetadataFailure, SlabMapFailure (a4485bd82: slabs) and DeviceBindingFailures (432fe5cf9:
 // vkBindBufferMemory) have no Metal counterpart: the pool has no slabs and a Metal buffer is created with its memory
 // in one call, so there is no separate mapping or binding to fail.
+// Upstream 0d078f75d3..661f8b7171: AllocationFailureReportsHeapBudgets (e6a78f41bf, 415dcab140, c5f8a3ff22) is
+// ported for the one Metal heap. The slab return case (5001f87bc9) has no counterpart (no slabs), nor have the host
+// placements of refused device-local memory (ad11cb1b3e, 9b2339e735, cfde713e10): unified memory, one heap.
 
 #include "MetalTestDevice.h"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -286,6 +289,22 @@ void CacheReclaimRecovery(const Context& device, std::uint64_t maxBufferLength) 
     }
 }
 
+// Upstream e6a78f41bf (AllocationFailureReportsHeapBudgets): a refused allocation reports each heap's usage against
+// its budget. Metal has one heap (the device's allocated bytes against recommendedMaxWorkingSetSize) and always
+// knows both, so upstream's second case (no VK_EXT_memory_budget, no heap data) has no counterpart.
+void AllocationFailureReportsHeapBudgets(const Context& device, std::uint64_t maxBufferLength, std::uint64_t workingSet) {
+    const auto context = Fresh(device);
+    std::string failure;
+    try {
+        DeviceBuffer buffer(context, static_cast<std::size_t>(maxBufferLength) + MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    Expect(!failure.empty(), "Metal allocated a buffer over maxBufferLength");
+    Expect(failure.find("; heap 0 ") != std::string::npos && failure.find("/" + std::to_string(workingSet >> 20u) + " MiB") != std::string::npos, "allocation failure omitted the heap's usage against its budget: " + failure);
+    Expect(failure.find("heap 1") == std::string::npos, "allocation failure reported a second heap on unified memory: " + failure);
+}
+
 // Metal: pooled buffers are resident on the queue (a GPU copy into them lands), and every
 // allocation alive or retained is in the pool's residency set.
 void ResidentForTheGpu(const Context& device) {
@@ -341,6 +360,7 @@ int main(int argc, char** argv) {
             AddressAndHostUnchanged(device.context);
             SmallDeviceClasses(device.context);
             CacheReclaimRecovery(device.context, static_cast<std::uint64_t>(device.device.maxBufferLength));
+            AllocationFailureReportsHeapBudgets(device.context, static_cast<std::uint64_t>(device.device.maxBufferLength), static_cast<std::uint64_t>(device.device.recommendedMaxWorkingSetSize));
             ResidentForTheGpu(device.context);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "%s\n", error.what());

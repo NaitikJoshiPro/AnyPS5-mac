@@ -2,7 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_SPECIFICS_MACOS_SRC_RECORDERKERNELS_H
 
 // MSL twins of the driver's helper compute shaders (work package D2): the GLSL originals live in
-// Graphics/shaders (MeshArguments.comp, SampleCounter.comp, SampleDumps.comp) and the parameter
+// Graphics/shaders (MeshArguments.comp, DispatchArguments.comp, SampleCounter.comp, SampleDumps.comp) and the parameter
 // blocks keep their push-constant layouts, now uploaded and bound at buffer index 0 (Metal 4 has
 // no push constants). FillPattern is new: Metal fills bytes only, so dword and 16-byte pattern
 // fills (vkCmdFillBuffer, the device's pattern fills) run it. Every kernel runs as one threadgroup
@@ -61,6 +61,28 @@ kernel void MeshArguments(constant MeshArgumentParameters& p [[buffer(0)]]) {
     p.arguments[2] = groups != 0u ? 1u : 0u;
     p.arguments[3] = effective;
     p.arguments[4] = first;
+}
+
+// e54d2f35fe: the MSL twin of DispatchArguments.comp. An indirect dispatch's group counts copied
+// into a 12-byte argument buffer, all three 0 when one exceeds the device limit (a count a skipped
+// producer never wrote, 0xffffffff, would otherwise launch up to 2^32 groups and hang the GPU).
+struct DispatchArgumentParameters {
+    device const uint* source;
+    device uint* arguments;
+    uint maxX;
+    uint maxY;
+    uint maxZ;
+    uint unused;
+};
+
+kernel void DispatchArguments(constant DispatchArgumentParameters& p [[buffer(0)]]) {
+    const uint x = p.source[0];
+    const uint y = p.source[1];
+    const uint z = p.source[2];
+    const bool valid = x <= p.maxX && y <= p.maxY && z <= p.maxZ;
+    p.arguments[0] = valid ? x : 0u;
+    p.arguments[1] = valid ? y : 0u;
+    p.arguments[2] = valid ? z : 0u;
 }
 
 struct SampleCounterParameters {

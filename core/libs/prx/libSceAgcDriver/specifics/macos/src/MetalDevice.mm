@@ -852,6 +852,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.shaderClipDistance = true;
             context.shaderCullDistance = true;
             context.viewportIndexLayer = true;
+            // Upstream 53212b18a remaps a viewport depth range outside [0, 1] into the vertex shader
+            // (Graphics::ApplyDepthRemap) when the device lacks VK_EXT_depth_range_unrestricted; the MSL
+            // backend has no remap, so the Metal device keeps passing the guest range to MTLViewport as it
+            // did before (MetalDraw.mm) and Target().depthRangeRemap stays false.
+            context.depthRangeUnrestricted = true;
             // The color sample counts the GPU renders (the twins' harness reports the same), and
             // multisampled storage images: Metal shaders cannot write texture2d_ms, so guest MSAA
             // storage goes through the target's storage shadow (DECISIONS D22/D28,
@@ -1012,6 +1017,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
         return value == nullptr || value[0] != '0';
     }();
     target.float32DenormFlushNative = nativeF32Flush;
+    // Upstream ac14d6317's float32FlushToZero (a SPIR-V DenormFlushToZero mode its startup probe vouches
+    // for) stays false: the MSL backend's native flush is float32DenormFlushNative above (D54).
     // DECISIONS D62: wave64 compute programs without cross-lane dependences run at one guest lane per
     // invocation (MslLaneLocal.cpp). APS5_MSL_WAVE64_LANE_LOCAL=0 keeps the two-half layout.
     static const bool wave64LaneLocal = [] {
@@ -1122,6 +1129,9 @@ void VulkanDevice::StoreIdleResults(bool reapFirst) {
     if (!Graphics::StorageTexture::AnyPending()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    // Upstream e3ce9bac0: the store holds a guest allocation lease (under the GPU mutex, the order of
+    // the other lease holders), so an unmap waits for it and a store during an unmap drops its results.
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     Graphics::StorageTexture::FlushAllPending("idle");
     SubmitRecorded(reapFirst);
 }
@@ -1256,8 +1266,9 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, AnyStage);
         Recorder::CountBarriers(Recorder::CommandClass::Fill);
         recorder.MarkCovered(TransferredAccess);
-        if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) {
-            recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
+        // Upstream fac197954: any uniform word fill is noted with its word (HTILE words pending fills leave).
+        if (uniform) {
+            recorder.NotePendingWordFill(address, bytes, pattern[0]);
         } else {
             recorder.NotePendingWrite(address, bytes);
         }
@@ -1271,6 +1282,30 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t) {
     return false;
 }
 
+// Upstream 396b5189a (#4496): only a label a completion will store counts here; a label stored by
+// the GPU stream is ordered by the copy's barrier. APS5_COPY_SYNC=1 (upstream's debug aid) treats every
+// range as stored by a completion. Upstream also counts its copied writers' write-backs (D5, not on Metal).
+bool VulkanDevice::completionStoresOver(std::uint64_t address, std::size_t bytes) const {
+    static const bool alwaysSync = std::getenv("APS5_COPY_SYNC") != nullptr;
+    if (alwaysSync) return true;
+    return Recorder::PendingCompletionLabels() != 0 && state->recorder->CompletionLabelIn(address, bytes);
+}
+
+bool VulkanDevice::copyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const {
+    return state->recorder->PendingWriteOverlaps(address, bytes) && completionStoresOver(address, bytes);
+}
+
+// Upstream e04111bb5: CopyBuffer records the copy without waiting (path 1) when neither range waits
+// on a completion and both have host imports (upstream also takes a copy between live storage images,
+// path 3, which the Metal CopyBuffer does not; it flushes their pending results instead).
+bool VulkanDevice::GpuCopyPossible(std::uint64_t destination, std::uint64_t source, std::size_t bytes) const {
+    if (state->recorder == nullptr || bytes == 0u || copyWaitsOnCompletions(source, bytes) || copyWaitsOnCompletions(destination, bytes)) return false;
+    @autoreleasepool {
+        std::uint64_t offset = 0;
+        return state->ImportOf(destination, bytes, &offset) != nil && state->ImportOf(source, bytes, &offset) != nil;
+    }
+}
+
 // Upstream's rule over the recorder (VulkanDevice.cpp CopyBuffer) without the parts other
 // packages own (storage images D4, unit shadows D3, copied writers D5): path 0 copies on the CPU
 // when neither range has an unsettled recorded write, a pending label or an in-place reader;
@@ -1279,9 +1314,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     CopyOutcome outcome {2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (state->recorder == nullptr || bytes == 0u) return outcome;
     auto& recorder = *state->recorder;
-    // Upstream 396b5189a (#4496): only a label a completion will store counts here; a label stored by
-    // the GPU stream is ordered by the copy's barrier.
-    const auto completionStoreOverlaps = [&](std::uint64_t address) { return Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes); };
+    const auto completionStoreOverlaps = [&](std::uint64_t address) { return completionStoresOver(address, bytes); };
     bool settledBySignal = false;
     // Pending resident-image results over either range are stored first (upstream copies between
     // the storage images instead, CopyOutcome path 3; not ported: TechnicalDebt metal-d6-bring-up-draws).
@@ -1318,8 +1351,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     @autoreleasepool {
         std::uint64_t probeOffset = 0;
         if (state->ImportOf(destination, bytes, &probeOffset) == nil || state->ImportOf(source, bytes, &probeOffset) == nil) return outcome;
-        const bool waitSource = recorder.PendingWriteOverlaps(source, bytes) && completionStoreOverlaps(source);
-        const bool waitDestination = recorder.PendingWriteOverlaps(destination, bytes) && completionStoreOverlaps(destination);
+        const bool waitSource = copyWaitsOnCompletions(source, bytes);
+        const bool waitDestination = copyWaitsOnCompletions(destination, bytes);
         if (waitSource || waitDestination) {
             outcome.synced = true;
             const auto start = std::chrono::steady_clock::now();
@@ -1908,6 +1941,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
             return outcome;
         }
         const auto start = std::chrono::steady_clock::now();
+        // Upstream f6c8e8474: an address-based producer of the counts is not a noted pending write;
+        // the recorder first finishes up to the newest batch recorded with a lease.
+        Graphics::FinishLeaseWork();
         std::array<std::uint32_t, 3> groups {};
         GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4u);
         outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

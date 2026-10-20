@@ -120,7 +120,13 @@ BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags u
         }
     }
     if (buffer != nil && attempts > 1) std::fprintf(stderr, "[bufferpool] buffer allocation recovered: allocation=%zu reclaimed=%llu released=%llu attempts=%u\n", length, static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), attempts);
-    if (buffer == nil) Metal::Fail("cannot allocate a " + std::to_string(length) + "-byte " + (host ? "shared" : "private") + " buffer (reclaimed " + std::to_string(reclaimed) + " bytes and released " + std::to_string(released) + " cache bytes first, attempts " + std::to_string(attempts) + ")");
+    if (buffer == nil) {
+        // Upstream e6a78f41bf: the failure reports the heap budgets. Metal has one heap (unified memory):
+        // the device's allocated bytes against its recommended working set, the budget DeviceBudget uses.
+        const auto used = static_cast<unsigned long long>(metal->device.currentAllocatedSize) >> 20u;
+        const auto heapBudget = static_cast<unsigned long long>(metal->device.recommendedMaxWorkingSetSize) >> 20u;
+        Metal::Fail("cannot allocate a " + std::to_string(length) + "-byte " + (host ? "shared" : "private") + " buffer (reclaimed " + std::to_string(reclaimed) + " bytes and released " + std::to_string(released) + " cache bytes first, attempts " + std::to_string(attempts) + "); heap 0 " + std::to_string(used) + "/" + std::to_string(heapBudget) + " MiB");
+    }
     {
         std::lock_guard lock(metal->residencyMutex);
         ::AgcDriver::Metal::Residency::Add(metal->residency, buffer);

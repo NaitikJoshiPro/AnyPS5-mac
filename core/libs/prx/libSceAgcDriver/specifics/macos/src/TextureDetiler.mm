@@ -578,7 +578,9 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
         std::memset(cmaskErrors->Bytes().data(), 0, 4);
     }
     auto& stream = Metal::Stream(commands);
-    stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    // Upstream 04eff348aa: the host stage is in both outer barriers (CPU-written CMASK/target bytes
+    // before the clear, CPU readers after it). Metal's stage mapping has no host stage; kept for parity.
+    stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     const std::uint32_t mask = elementBytes >= 4 ? 0xffffffffu : (1u << (elementBytes * 8u)) - 1u;
     CmaskParams params{};
     params.base = 0;
@@ -594,7 +596,7 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
     stream.DispatchHelper(PipelineOf(cmaskPipeline), std::as_bytes(std::span(&params, 1)), MTLSizeMake((width + 7u) / 8u, (height + 7u) / 8u, 1), MTLSizeMake(8, 8, 1));
     stream.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     stream.FillBuffer(Metal::BufferOf(cmask), cmaskOffset, cmaskBytes, 0xffffffffu);
-    stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT);
 }
 
 }

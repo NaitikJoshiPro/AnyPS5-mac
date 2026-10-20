@@ -71,6 +71,10 @@ void MapDriverMemory() {
 #ifdef _WIN32
     mapped = reinterpret_cast<void*>(DriverMemoryAddress);
     GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PAGE_READWRITE, DriverMemoryBytes);
+#elif defined(__APPLE__)
+    // macOS has no MAP_FIXED_NOREPLACE; the guest arena already reserves the range, so commit it there.
+    mapped = reinterpret_cast<void*>(DriverMemoryAddress);
+    GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PROT_READ | PROT_WRITE, DriverMemoryBytes);
 #else
     mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");

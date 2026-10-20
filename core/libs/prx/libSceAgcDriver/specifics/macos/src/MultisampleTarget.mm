@@ -16,6 +16,11 @@
 // image writes to a multisampled target (5c42e97f47, MultisampleTargetStorageView) are the D22/D28
 // storage shadow here (MultisampleStorageTexture): Metal cannot write a multisampled texture from a
 // shader, so MultisampleTargetStorageView refuses and no target is ever storable.
+// Upstream sync 6 (661f8b7171): commands recorded on the target's own device (c83a7531e2 65f6549e0f),
+// retired targets reclaimed once the recorder no longer keeps them (785f8f7bcf), CMASK codes read as
+// MSAA codes (12b20e17f6), a full DCC fill of a resident target taken as its fast clear (74a6bdaa01),
+// watched-range checks before writes and named DCC ranges (3738088b1a 4b674a72ba 58f0e89ca3), and
+// sampling undrawn Z/D 64 KiB swizzle textures and Z ones whose HTILE is cleared (69afb0569f 24bc68375d).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -27,6 +32,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -52,6 +58,25 @@
 
 namespace AgcDriver::Graphics {
 namespace {
+
+// Upstream 69afb0569f: the swizzle block of a multisampled color footprint (0: not modeled).
+std::uint32_t MultisampledBlockLog2(ColorTileMode mode) {
+    switch (mode) {
+        case ColorTileMode::Standard4KB: return 12u;
+        case ColorTileMode::Standard64KB: case ColorTileMode::Z64KBX: case ColorTileMode::D64KBX: case ColorTileMode::RenderTarget: return 16u;
+        default: return 0u;
+    }
+}
+
+// Upstream 58f0e89ca3: the write generation of the aligned 64 KiB blocks around a range (an aligned
+// block import watches whole blocks), else of the range itself.
+std::uint64_t collectBlocks(std::uint64_t address, std::size_t bytes) {
+    constexpr std::uint64_t block = 65536;
+    const auto first = address & ~(block - 1);
+    const auto stop = (address + bytes + block - 1) & ~(block - 1);
+    const auto generation = GuestMemory::CollectWritesUncached(first, static_cast<std::size_t>(stop - first));
+    return generation != 0 ? generation : GuestMemory::CollectWritesUncached(address, bytes);
+}
 
 // Upstream 90c3b61c6c: a target read through a format differing only in red/blue order.
 bool redBlueSwapped(VkFormat rendered, VkFormat sampled) {
@@ -87,13 +112,15 @@ VkClearColorValue fastClearColor(const ColorTarget& target) {
 template<typename Record>
 void recordCommands(const Context& context, Record&& record) {
     auto* recorder = Recorder::Active();
+    // Upstream c83a7531e2: only the target's own device's recorder records its commands.
+    if (recorder != nullptr && recorder->Device() != context.device) recorder = nullptr;
     std::unique_ptr<CommandBatch> batch;
     if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
     record(recorder != nullptr ? recorder->Commands() : batch->Handle(), recorder);
     if (batch) batch->SubmitAndWait();
 }
 
-class MultisampleTarget {
+class MultisampleTarget : public std::enable_shared_from_this<MultisampleTarget> {
 public:
     MultisampleTarget(const Context& context, const ColorTarget& target) : context(context), target(target), cmask(target.cmaskAddress, target.cmaskBytes), colorFill(target) {
         this->context.bufferPool.reset();
@@ -104,6 +131,8 @@ public:
         // Sample counts the device cannot render are slices of a 2D multisample array (DECISIONS D28:
         // 8x on Apple9 is two 4x halves).
         host = Metal::HostSamplesOf(device, target.samples);
+        // The host image's size for the recorder's kept-byte budget (upstream allocationBytes).
+        allocationBytes = static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * host.samples * host.slices;
         const auto format = Metal::PixelFormatOf(target.format);
         Require(format.format != MTLPixelFormatInvalid && format.blockWidth == 1u, "multisampled render-target format cannot be a color attachment");
         Require(target.extent.width <= 16384u && target.extent.height <= 16384u, "multisampled render target exceeds device image limits");
@@ -146,12 +175,24 @@ public:
     MultisampleTarget(const MultisampleTarget&) = delete;
     MultisampleTarget& operator=(const MultisampleTarget&) = delete;
 
+    // Upstream 785f8f7bcf: the device's recorder keeps the target (and its bytes) until the batch using
+    // it completes, so a retired target is destroyed only after its last recorded use.
+    void Keep() {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
+            recorder->Keep(shared_from_this());
+            recorder->KeepBytes(this, static_cast<std::size_t>(allocationBytes));
+        }
+    }
+
     void ApplyFastClear(const ColorTarget& use) {
-        // A CMASK fast clear, or a uniform fill of the target's color memory (upstream 1baf077a7):
-        // either clears every sample of every host slice (DECISIONS D28).
-        checkDccCurrent(use);
+        // A CMASK fast clear, a uniform fill of the target's color memory (upstream 1baf077a7), or a
+        // full fill of its DCC keys (upstream 74a6bdaa01): each clears every sample of every host
+        // slice (DECISIONS D28).
         VkClearColorValue clear{};
-        if (!TakeMultisampledClear(cmask, colorFill, use, clear)) return;
+        const bool refilled = absorbDccFill(use, clear);
+        checkDccCurrent(use, refilled);
+        if (!refilled && !TakeMultisampledClear(cmask, colorFill, use, clear)) return;
+        Keep();
         recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, host.slices};
@@ -182,13 +223,28 @@ public:
     // The sampled view of the host image (upstream 4b71846fa; on Metal the D27 view the MSL reads as
     // texture2d_ms_array), after a pending fast clear or color memory fill (upstream 6e6334e7e) and the
     // storage shadow's writes. Called with targetsMutex held.
+    // The texture shares the target's ownership (upstream 785f8f7bcf), so a reclaimed target outlives
+    // its users. Upstream 729558cc66's view type needs no key: the D27 view is a multisample array view
+    // (texture2d_ms_array) for 2D MSAA and 2D MSAA array T#s alike.
     std::shared_ptr<Texture> Sampled(VkComponentMapping components) {
+        Require(htileRefusal.empty(), htileRefusal);
+        Keep();
         ApplyFastClear(target);
         SyncHost();
         const std::array<std::uint32_t, 4> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)};
         auto& texture = sampled[key];
         if (texture == nullptr) texture = std::make_shared<Texture>(context, image, target.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
-        return texture;
+        return {shared_from_this(), texture.get()};
+    }
+
+    // Upstream 74a6bdaa01: the last fill over the whole DCC or CMASK range (nullopt after a partial one).
+    void NoteMetadataFill(std::uint64_t fillAddress, std::size_t fillBytes, std::uint32_t pattern) {
+        const auto note = [&](std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t>& filled) {
+            if (address == 0 || fillAddress >= address + bytes || address >= fillAddress + fillBytes) return;
+            filled = fillAddress <= address && fillAddress + fillBytes >= address + bytes ? std::optional<std::uint32_t>(pattern) : std::nullopt;
+        };
+        note(target.dccAddress, MultisampledDccBytes(target), dccFill);
+        note(target.cmaskAddress, target.cmaskBytes, cmaskFill);
     }
 
     void SyncShadow() {
@@ -205,6 +261,7 @@ public:
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             Check(Metal::Vk::CreateImage(context.device, &info, nullptr, &shadow), "vkCreateImage multisample storage shadow");
+            allocationBytes += static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * target.samples;
             shadowView = std::make_shared<Texture>(context, shadow, target.format, VK_IMAGE_ASPECT_COLOR_BIT, VkComponentMapping{});
             hostNewer = true;
         }
@@ -234,6 +291,13 @@ public:
     std::shared_ptr<std::atomic<bool>> metadataValid;
     // Made over a filled texture (createFilled): its first draw's CMASK replaces the empty one.
     bool fromTexture = false;
+    // Upstream 69afb0569f 24bc68375d: the HTILE of a Z 64 KiB swizzle texture made by createFilled, and
+    // why it is no longer modeled (a fill over it other than a whole clear to 0.0).
+    std::uint64_t htileAddress = 0;
+    std::uint64_t htileBytes = 0;
+    std::string htileRefusal;
+    // The host image's (and shadow's) bytes, kept with the target in the recorder's budget.
+    std::uint64_t allocationBytes = 0;
     // Sampled views for guest MSAA T#s (DECISIONS D27), by component mapping.
     std::map<std::array<std::uint32_t, 4>, std::shared_ptr<Texture>> sampled;
     // The storage shadow (made at the first guest storage use) and which side holds the newest
@@ -247,6 +311,46 @@ public:
 
 private:
     std::vector<GuestMemory::UnchangedQuery> dccRanges;
+    std::optional<std::uint32_t> dccFill;
+    std::optional<std::uint32_t> cmaskFill;
+
+    // Upstream 74a6bdaa01: a fill of the whole DCC range with the uniform key byte its memory now holds
+    // (and, with a CMASK, a CMASK that holds one uniform byte, filled when it was written) is the target's
+    // fast clear; the metadata ranges then take their new write generations.
+    bool absorbDccFill(const ColorTarget& use, VkClearColorValue& clear) {
+        const auto dcc = std::exchange(dccFill, std::nullopt);
+        const auto cmaskPattern = std::exchange(cmaskFill, std::nullopt);
+        if (dccRanges.size() < 2 || !dcc || use.dccAddress != target.dccAddress || use.cmaskAddress != target.cmaskAddress || use.cmaskBytes != target.cmaskBytes) return false;
+        const auto keys = LandedUniformMetadataByte(dccRanges[1].address, dccRanges[1].bytes);
+        if (!keys || *dcc != *keys * 0x01010101u) return false;
+        std::uint8_t cmaskKeys = 0;
+        if (dccRanges.size() > 2) {
+            const auto& range = dccRanges[2];
+            auto* recorder = Recorder::Active();
+            const bool written = !GuestMemory::UnchangedSince(range.address, range.bytes, range.generation) || (recorder != nullptr && recorder->PendingWriteOverlaps(range.address, range.bytes));
+            const auto landed = LandedUniformMetadataByte(range.address, range.bytes);
+            if (!landed || (written && (!cmaskPattern || *cmaskPattern != *landed * 0x01010101u))) return false;
+            cmaskKeys = *landed;
+        }
+        std::vector<GuestMemory::UnchangedQuery> metadata(dccRanges.begin() + 1, dccRanges.end());
+        for (auto& range : metadata) {
+            if (!GuestMemory::Watched(range.address, range.bytes)) return false;
+            range.generation = collectBlocks(range.address, range.bytes);
+            if (range.generation == 0) return false;
+        }
+        clear = MultisampledDccClear(use, std::vector<std::byte>(dccRanges[1].bytes, std::byte{*keys}), std::vector<std::byte>(use.cmaskBytes, std::byte{cmaskKeys}));
+        std::copy(metadata.begin(), metadata.end(), dccRanges.begin() + 1);
+        return true;
+    }
+
+    // Upstream 4b674a72ba: a refusal naming the color, DCC or CMASK range.
+    void requireDccRange(bool valid, const GuestMemory::UnchangedQuery& range, const char* reason) const {
+        if (valid) return;
+        const auto* plane = range.address == target.address ? "color" : range.address == target.dccAddress ? "DCC" : "CMASK";
+        char text[384];
+        std::snprintf(text, sizeof(text), "%s (%s range 0x%llx+0x%zx, %u samples)", reason, plane, static_cast<unsigned long long>(range.address), range.bytes, target.samples);
+        Require(false, text);
+    }
 
     VkClearColorValue initialDccClear(const ColorTarget& use) {
         if (use.dccAddress == 0) return {};
@@ -261,7 +365,7 @@ private:
         for (auto& range : dccRanges) {
             GuestMemory::CheckRange(reinterpret_cast<const void*>(range.address), range.bytes, 256);
             Require(GuestMemory::Watched(range.address, range.bytes), "initial multisampled DCC contents require watched guest memory");
-            range.generation = GuestMemory::CollectWritesUncached(range.address, range.bytes);
+            range.generation = collectBlocks(range.address, range.bytes);
             Require(range.generation != 0, "initial multisampled DCC contents have no write generation");
         }
         for (std::size_t first = 0; first < dccRanges.size(); ++first) {
@@ -280,7 +384,8 @@ private:
         return clear;
     }
 
-    void checkDccCurrent(const ColorTarget& use) const {
+    // `metadataRefilled`: absorbDccFill took a fill of the metadata, so only the color range is checked.
+    void checkDccCurrent(const ColorTarget& use, bool metadataRefilled) const {
         if (dccRanges.empty()) {
             Require(use.dccAddress == 0, "adding DCC to a resident multisampled color target is not implemented");
             return;
@@ -288,16 +393,19 @@ private:
         Require(metadataValid->load(std::memory_order_acquire), "multisampled DCC metadata was released while its color target remains resident");
         static_cast<void>(MultisampledDccBytes(use));
         Require(use.address == target.address && use.dccAddress == target.dccAddress && use.dccControl == target.dccControl && use.dccAlphaOnMsb == target.dccAlphaOnMsb && use.dccPipeAligned == target.dccPipeAligned && use.cmaskAddress == target.cmaskAddress && use.cmaskBytes == target.cmaskBytes && use.tileMode == target.tileMode && use.elementBytes == target.elementBytes && use.pipeBankXor == target.pipeBankXor, "multisampled DCC target layout or metadata changed");
-        for (const auto& range : dccRanges) {
-            Require(GuestMemory::Watched(range.address, range.bytes), "multisampled DCC target reuse requires watched guest memory");
+        // Upstream 3738088b1a: every range is checked watched before any is checked for writes.
+        const auto ranges = std::span(dccRanges).first(metadataRefilled ? 1u : dccRanges.size());
+        for (const auto& range : ranges) requireDccRange(GuestMemory::Watched(range.address, range.bytes), range, "multisampled DCC target reuse requires watched guest memory");
+        for (const auto& range : ranges) {
             GuestMemory::CollectWritesUncached(range.address, range.bytes);
-            Require(GuestMemory::UnchangedSince(range.address, range.bytes, range.generation) || !GuestMemory::StoredOver(range.address, range.bytes, range.generation), "writes to a resident multisampled DCC target or its metadata are not implemented");
-            if (auto* recorder = Recorder::Active(); recorder != nullptr) Require(!recorder->PendingWriteOverlaps(range.address, range.bytes), "pending writes to a resident multisampled DCC target or its metadata are not implemented");
+            requireDccRange(GuestMemory::UnchangedSince(range.address, range.bytes, range.generation) || !GuestMemory::StoredOver(range.address, range.bytes, range.generation), range, "writes to a resident multisampled DCC target or its metadata are not implemented");
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) requireDccRange(!recorder->PendingWriteOverlaps(range.address, range.bytes), range, "pending writes to a resident multisampled DCC target or its metadata are not implemented");
         }
     }
 
-    // The image may still be in use by recorded work only at device teardown (targets live for the
-    // device's lifetime, ClearMultisampleTargets), after the device has drained its batches.
+    // A retired target is destroyed once no recorder keeps it (Keep) and no sampled texture shares it
+    // (upstream 785f8f7bcf); the device's targets go at teardown (ClearMultisampleTargets), after the
+    // device has drained its batches.
     void release() noexcept {
         sampled.clear();
         shadowView.reset();
@@ -363,7 +471,7 @@ void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
 
 void guard(const Context& context, const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<std::atomic<bool>>& metadataValid) {
     auto bytes = std::max<std::uint64_t>(target.bytes * target.samples, static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * target.samples);
-    if (target.tileMode == ColorTileMode::RenderTarget && std::has_single_bit(target.elementBytes) && std::has_single_bit(target.samples)) {
+    if (MultisampledBlockLog2(target.tileMode) == 16u && target.tileMode != ColorTileMode::Standard64KB && std::has_single_bit(target.elementBytes) && std::has_single_bit(target.samples)) {
         const auto log2Samples = std::countr_zero(target.samples);
         const auto log2Pixels = 16u - std::countr_zero(target.elementBytes) - log2Samples;
         const auto log2Width = (log2Pixels + ((log2Samples & 1u) == 0u ? 1u : 0u)) / 2u;
@@ -387,12 +495,19 @@ std::mutex& targetsMutex() {
     return mutex;
 }
 
-std::vector<std::unique_ptr<MultisampleTarget>>& targets() {
-    static std::vector<std::unique_ptr<MultisampleTarget>> list;
+std::vector<std::shared_ptr<MultisampleTarget>>& targets() {
+    static std::vector<std::shared_ptr<MultisampleTarget>> list;
     return list;
 }
 
+// Upstream 785f8f7bcf: retired targets leave the list (a recorder or a sampled texture may still keep
+// one alive until its last use).
+void discardRetiredTargets() {
+    std::erase_if(targets(), [](const auto& target) { return !target->active->load(std::memory_order_acquire); });
+}
+
 MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
+    discardRetiredTargets();
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || !sameTarget(target->target, use)) continue;
@@ -401,14 +516,18 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
             target->cmask = MultisampledCmask(use.cmaskAddress, use.cmaskBytes);
         }
         target->cmask.CheckAddress(use.cmaskAddress);
+        target->Keep();
         target->ApplyFastClear(use);
         target->SyncHost();
         return *target;
     }
-    targets().push_back(std::make_unique<MultisampleTarget>(context, use));
+    auto target = std::make_shared<MultisampleTarget>(context, use);
+    target->Keep();
+    targets().push_back(std::move(target));
     auto& created = *targets().back();
     guard(context, use, created.active, created.metadataValid);
-    if (use.cmaskFastClear && use.dccAddress == 0) created.cmask.SeedKeys(CurrentDccKeys(use.cmaskAddress, static_cast<std::uint64_t>(use.cmaskBytes) * 256u));
+    // Upstream 12b20e17f6: the CMASK's uniform byte read as an MSAA code.
+    if (use.cmaskFastClear && use.dccAddress == 0) created.cmask.SeedCode(CurrentUniformMetadataByte(use.cmaskAddress, static_cast<std::size_t>(use.cmaskBytes)));
     created.ApplyFastClear(use);
     return created;
 }
@@ -426,6 +545,8 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     switch (resource.tileMode) {
         case TextureTileMode::kStandard4KB: use.tileMode = ColorTileMode::Standard4KB; break;
         case TextureTileMode::kStandard64KB: use.tileMode = ColorTileMode::Standard64KB; break;
+        case TextureTileMode::kZ64KBX: use.tileMode = ColorTileMode::Z64KBX; break;
+        case TextureTileMode::kD64KBX: use.tileMode = ColorTileMode::D64KBX; break;
         case TextureTileMode::kR64KBX: use.tileMode = ColorTileMode::RenderTarget; break;
         default: refuse("whose tile mode " + std::to_string(static_cast<int>(resource.tileMode)) + " has no modeled multisampled color footprint");
     }
@@ -445,12 +566,34 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     RequireNoMultisampleTarget(use.address, static_cast<std::size_t>(bytes), "sampling a multisampled texture no draw rendered to");
     GuestMemory::FlushGpuWrites(use.address, static_cast<std::size_t>(bytes));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(use.address), static_cast<std::size_t>(bytes))) refuse(std::string("whose color memory ") + range + " is not mapped");
+    // Upstream 69afb0569f: a Z 64 KiB swizzle texture's metadata (its T#'s compression address) is an
+    // HTILE; all of it cleared (0: depth 0.0) makes the texture read 0, all of it expanded (ZMask 0xf)
+    // leaves the color memory as the texture's contents. Anything else refuses.
+    std::uint64_t htileBytes = 0;
+    bool htileCleared = false;
+    if (resource.dccAddress != 0) {
+        if (use.tileMode != ColorTileMode::Z64KBX) refuse("whose compression metadata over a tile mode " + std::to_string(static_cast<int>(resource.tileMode)) + " surface is not modeled");
+        htileBytes = HtileMetadataBytes(use.extent);
+        char htileRange[64];
+        std::snprintf(htileRange, sizeof(htileRange), "0x%llx+0x%llx", static_cast<unsigned long long>(resource.dccAddress), static_cast<unsigned long long>(htileBytes));
+        GuestMemory::FlushGpuWrites(resource.dccAddress, static_cast<std::size_t>(htileBytes));
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(resource.dccAddress), static_cast<std::size_t>(htileBytes))) refuse(std::string("whose HTILE ") + htileRange + " is not mapped");
+        std::vector<std::uint32_t> words(static_cast<std::size_t>(htileBytes / sizeof(std::uint32_t)));
+        std::memcpy(words.data(), reinterpret_cast<const void*>(resource.dccAddress), words.size() * sizeof(std::uint32_t));
+        htileCleared = words.front() == 0u;
+        const auto mixed = std::find_if(words.begin(), words.end(), [&](std::uint32_t word) { return htileCleared ? word != 0u : (word & 15u) != 15u; });
+        if (mixed != words.end()) {
+            char text[96];
+            std::snprintf(text, sizeof(text), " holds 0x%08x at +0x%llx after 0x%08x", *mixed, static_cast<unsigned long long>((mixed - words.begin()) * sizeof(std::uint32_t)), words.front());
+            refuse(std::string("whose HTILE ") + htileRange + text + ", which is neither all cleared to 0.0 nor all expanded");
+        }
+    }
     const auto* memory = reinterpret_cast<const std::byte*>(use.address);
     std::uint32_t value = 0;
-    std::memcpy(&value, memory, sizeof(value));
+    if (!htileCleared) std::memcpy(&value, memory, sizeof(value));
     char held[16];
     std::snprintf(held, sizeof(held), "0x%08x", value);
-    const auto repeated = std::mismatch(memory + sizeof(value), memory + bytes, memory).first;
+    const auto repeated = htileCleared ? memory + bytes : std::mismatch(memory + sizeof(value), memory + bytes, memory).first;
     if (repeated != memory + bytes) {
         char offset[32];
         std::snprintf(offset, sizeof(offset), "+0x%llx", static_cast<unsigned long long>(repeated - memory));
@@ -458,11 +601,15 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     }
     VkClearColorValue clear{};
     if (!MultisampledFillClearColor(use, value, clear)) refuse(std::string("whose color memory ") + range + " holds " + held + ", which has no exact clear value in its format");
-    targets().push_back(std::make_unique<MultisampleTarget>(context, use));
+    auto target = std::make_shared<MultisampleTarget>(context, use);
+    target->Keep();
+    targets().push_back(std::move(target));
     auto& created = *targets().back();
     guard(context, use, created.active, created.metadataValid);
     created.colorFill.NoteFill(use.address, static_cast<std::size_t>(bytes), value);
     created.fromTexture = true;
+    created.htileAddress = resource.dccAddress;
+    created.htileBytes = htileBytes;
     return created;
 }
 
@@ -480,6 +627,16 @@ void UpdateResidentImageUnmapObserver_nid_no_patch() {
     GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(anyGuarded().load(std::memory_order_acquire) || HasResidentDepthGuards_nid_no_patch() ? &retireUnmapped : nullptr);
 }
 
+// Upstream 12b20e17f6: a CMASK byte holds two 4-bit MSAA tile codes; both 0 is a register color clear,
+// both 0b11xx (0xcc .. 0xff) color-expanded tiles. Other codes are not modeled.
+std::optional<DccKeys> MultisampledCmaskKeys(std::uint8_t code) {
+    const auto tile = code & 0xfu;
+    if ((code >> 4u) != tile) return std::nullopt;
+    if (tile == 0u) return DccKeys::Clear0000;
+    if ((tile >> 2u) == 3u) return DccKeys::Uncompressed;
+    return std::nullopt;
+}
+
 void MultisampledCmask::NoteFill(std::uint64_t fillAddress, std::size_t fillBytes, std::uint32_t pattern) {
     if (address == 0 || fillAddress >= address + bytes || address >= fillAddress + fillBytes) return;
     if (fillAddress > address || fillAddress + fillBytes < address + bytes) {
@@ -489,24 +646,24 @@ void MultisampledCmask::NoteFill(std::uint64_t fillAddress, std::size_t fillByte
         return;
     }
     refusal.clear();
-    if (pattern == 0) {
-        keys = DccKeys::Clear0000;
-    } else if (pattern == 0xffffffffu) {
-        keys = DccKeys::Uncompressed;
+    const auto code = static_cast<std::uint8_t>(pattern);
+    if (const auto filled = MultisampledCmaskKeys(code); filled && pattern == code * 0x01010101u) {
+        keys = *filled;
     } else {
-        char text[192];
-        std::snprintf(text, sizeof(text), "a fill of the CMASK 0x%llx+0x%llx of a multisampled color target with 0x%08x leaves its tiles mixed (neither fast-cleared 0 nor expanded 0xffffffff)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pattern);
+        char text[224];
+        std::snprintf(text, sizeof(text), "a fill of the CMASK 0x%llx+0x%llx of a multisampled color target with 0x%08x leaves its tiles mixed (neither a register color clear 0 nor a color-expanded code such as 0xcc or 0xff)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pattern);
         refusal = text;
     }
 }
 
-void MultisampledCmask::SeedKeys(DccKeys seeded) {
-    if (seeded == DccKeys::Clear0000 || seeded == DccKeys::Uncompressed) {
-        keys = seeded;
+void MultisampledCmask::SeedCode(std::optional<std::uint8_t> code) {
+    if (const auto seeded = code ? MultisampledCmaskKeys(*code) : std::nullopt) {
+        keys = *seeded;
         return;
     }
     char text[192];
-    std::snprintf(text, sizeof(text), "the CMASK 0x%llx of a multisampled color target reads as %s, which is not modeled", static_cast<unsigned long long>(address), DccKeysName(seeded));
+    if (code) std::snprintf(text, sizeof(text), "the CMASK 0x%llx of a multisampled color target reads as code 0x%02x, which is not modeled", static_cast<unsigned long long>(address), *code);
+    else std::snprintf(text, sizeof(text), "the CMASK 0x%llx of a multisampled color target reads as mixed, which is not modeled", static_cast<unsigned long long>(address));
     refusal = text;
 }
 
@@ -525,7 +682,7 @@ bool MultisampledCmask::TakeClear() {
 }
 
 std::uint64_t MultisampledColorBytes(const ColorTarget& target) {
-    const auto blockLog2 = target.tileMode == ColorTileMode::Standard4KB ? 12u : target.tileMode == ColorTileMode::Standard64KB || target.tileMode == ColorTileMode::RenderTarget ? 16u : 0u;
+    const auto blockLog2 = MultisampledBlockLog2(target.tileMode);
     if (blockLog2 == 0 || !std::has_single_bit(target.elementBytes) || !std::has_single_bit(target.samples)) return 0;
     const auto samplesLog2 = static_cast<std::uint32_t>(std::countr_zero(target.samples));
     const auto elementsLog2 = blockLog2 - static_cast<std::uint32_t>(std::countr_zero(target.elementBytes)) - samplesLog2;
@@ -628,18 +785,35 @@ bool TakeMultisampledClear(MultisampledCmask& cmask, MultisampledColorFill& colo
     return true;
 }
 
-VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target) {
+VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, VkImage* image) {
     std::lock_guard lock(targetsMutex());
     // The draw that asks for the view renders into the host image.
     auto& acquired = acquire(context, target);
     acquired.hostNewer = true;
+    if (image != nullptr) *image = acquired.image;
     return acquired.view;
+}
+
+// Upstream 785f8f7bcf: the view with a share of the target's ownership, for a caller that uses it
+// beyond the recorder's keep (KeepMultisampleTarget keeps it in a later batch).
+VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, std::shared_ptr<void>& owner, VkImage* image) {
+    std::lock_guard lock(targetsMutex());
+    auto& acquired = acquire(context, target);
+    acquired.hostNewer = true;
+    owner = acquired.shared_from_this();
+    if (image != nullptr) *image = acquired.image;
+    return acquired.view;
+}
+
+void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner) {
+    std::static_pointer_cast<MultisampleTarget>(owner)->Keep();
 }
 
 // Upstream 4b71846fa's entry for Graphics/src/ShaderResources.cpp, whose Metal twin reaches the same
 // target through Metal::MultisampleSampledTexture (the T# words); kept for shared callers.
-std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
+std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType) {
     std::lock_guard lock(targetsMutex());
+    discardRetiredTargets();
     const auto format = ResolveTextureFormat(resource.format);
     const MultisampleTarget* other = nullptr;
     for (const auto& target : targets()) {
@@ -686,6 +860,7 @@ void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget
 void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView) {
     std::lock_guard lock(targetsMutex());
     auto& target = acquire(context, source);
+    target.Keep();
     id<MTLTexture> samples = Metal::TextureOfView(target.view);
     id<MTLTexture> resolved = Metal::TextureOfView(destinationView);
     Require(resolved != nil, "a CB resolve destination without an attachment view");
@@ -724,6 +899,7 @@ MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const st
     // (MslAbi Version 9); targets have one layer, as upstream's.
     Require(type == 14u || (layers == 1u && baseArray == 0u), std::string("AGC graphics: a 2D MSAA array T# over more than its first layer is not implemented (multisampled color targets have one layer)") + described);
     const auto format = ResolveTextureFormat(guestFormat);
+    discardRetiredTargets();
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         const auto& color = target->target;
@@ -778,10 +954,14 @@ std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::
 std::shared_ptr<Texture> MultisampleStorageTexture(const Context& context, std::span<const std::uint32_t> words) {
     std::lock_guard lock(targetsMutex());
     auto& target = TargetOfDescriptor(context, words, "storage view", true);
+    // Upstream 24bc68375d: a Z texture whose HTILE a fill left unmodeled refuses storage access too.
+    Require(target.htileRefusal.empty(), target.htileRefusal);
+    target.Keep();
     // Brought up to date before the access; the access (recorded after this) writes the shadow.
     target.SyncShadow();
     target.shadowNewer = true;
-    return target.shadowView;
+    // The shadow's image lives as long as the target (upstream 785f8f7bcf's shared ownership).
+    return {target.shared_from_this(), target.shadowView.get()};
 }
 
 MultisampleShadowStatistics MultisampleShadowCounts(std::uint64_t address) {
@@ -810,6 +990,23 @@ void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         target->colorFill.NoteFill(address, bytes, pattern);
+        // Upstream 69afb0569f 24bc68375d: a whole clear of a filled Z texture's HTILE to 0 makes it read
+        // 0.0; any other fill over it is not modeled.
+        if (target->htileBytes != 0 && address < target->htileAddress + target->htileBytes && target->htileAddress < address + bytes) {
+            if (pattern == 0u && address <= target->htileAddress && address + bytes >= target->htileAddress + target->htileBytes) {
+                target->htileRefusal.clear();
+                target->colorFill.NoteFill(target->target.address, static_cast<std::size_t>(MultisampledColorBytes(target->target)), 0u);
+            } else {
+                char text[224];
+                std::snprintf(text, sizeof(text), "a fill of 0x%llx+0x%zx with 0x%08x over the HTILE 0x%llx+0x%llx of a sampled multisampled depth-layout texture is not modeled", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target->htileAddress), static_cast<unsigned long long>(target->htileBytes));
+                target->htileRefusal = text;
+            }
+        }
+        // Upstream 74a6bdaa01: a DCC target notes its metadata fills (ApplyFastClear takes a full DCC fill).
+        if (target->target.dccAddress != 0) {
+            target->NoteMetadataFill(address, bytes, pattern);
+            continue;
+        }
         const auto before = target->cmask.Keys();
         target->cmask.NoteFill(address, bytes, pattern);
         if (before == DccKeys::Clear0000 || target->cmask.Keys() != DccKeys::Clear0000) continue;

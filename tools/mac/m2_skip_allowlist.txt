@@ -35,3 +35,4 @@ agc_driver_pipeline_journal | the pipeline journal is Vulkan-only | metal-pipeli
 agc_driver_draw_cache_relocation | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_command_batch_failure | the device has no Vulkan command batches | metal-vulkan-internal-tests
 agc_descriptor_cache_failure | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests
+agc_driver_indirect_arguments_pending_producer | Recorder::HoldNextSubmit holds a Vulkan timeline-semaphore submit | metal-vulkan-internal-tests

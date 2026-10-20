@@ -33,6 +33,9 @@ constexpr Pending Tests[] = {
      "skipped, the device has no Vulkan command batches: RunCommandBatchFailureTests injects vkEndCommandBuffer/vkQueueSubmit/fence failures through Context.deviceProc, while a Metal CommandBatch records MTL4 command buffers that never call them"},
     {"agc_descriptor_cache_failure_tests", "agc_descriptor_cache_failure", nullptr,
      "skipped, the device has no Vulkan descriptor pools: DescriptorCacheFailure injects vkCreateDescriptorSetLayout/vkCreateDescriptorPool failures, while Metal descriptor layouts and pools are tokens that cannot fail"},
+    // UPSYNC4 (upstream 661f8b7171). Vulkan-only behaviours (allowlisted):
+    {"agc_driver_indirect_arguments_pending_producer_tests", "agc_driver_indirect_arguments_pending_producer*", nullptr,
+     "skipped, Recorder::HoldNextSubmit holds a Vulkan timeline-semaphore submit: Metal command buffers commit through MTL4 queues with no held submit"},
     // Metal driver features not written yet (not allowlisted):
     {"agc_driver_address_passes_tests", "agc_driver_address_passes*", nullptr, nullptr,
      "skipped, the Metal draw path does not report render pass totals (DrawPassTotals): TechnicalDebt metal-draw-pass-totals"},

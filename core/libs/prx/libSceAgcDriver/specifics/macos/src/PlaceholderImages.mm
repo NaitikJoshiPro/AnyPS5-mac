@@ -39,7 +39,11 @@ PlaceholderImages::PlaceholderImages(const Context& context) : context(context) 
     try {
         std::vector<VkImageMemoryBarrier> toClear;
         for (std::uint32_t index = 0; index < images.size(); ++index) {
-            const auto shape = MetalShapeOf(ShaderRecompiler::RuntimeAbi::FirstImageBinding + index);
+            const auto heap = ShaderRecompiler::RuntimeAbi::FirstImageBinding + index;
+            // Upstream fd872264e2: no placeholder for a storage MSAA heap the device cannot back. Metal
+            // emulates multisampled storage (D22/D28: storageImageMultisample is true), so none is omitted.
+            if (!PlaceholderImageShapeForDevice(heap, context.storageImageMultisample)) continue;
+            const auto shape = MetalShapeOf(heap);
             if (!Supported(context, shape)) continue;
             auto& image = images[index];
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};

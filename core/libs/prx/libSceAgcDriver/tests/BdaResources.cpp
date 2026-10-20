@@ -29,6 +29,7 @@
 
 #ifndef _WIN32
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 namespace {
@@ -1108,7 +1109,14 @@ public:
             reserved = mmap(nullptr, 2 * Window, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             Require(reserved != MAP_FAILED, "cannot reserve the block of 16 KiB views");
             block = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(reserved) + Window - 1) / Window * Window);
+#ifdef __APPLE__
+            // macOS has no memfd: an unlinked POSIX shared memory object.
+            const std::string name = "/aps5-views-" + std::to_string(::getpid());
+            file = shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+            if (file >= 0) shm_unlink(name.c_str());
+#else
             file = memfd_create("anyps5-import-block-views", MFD_CLOEXEC);
+#endif
             Require(file >= 0 && ftruncate(file, static_cast<off_t>(Window)) == 0, "cannot create the file behind the 16 KiB views");
             constexpr std::size_t view = 16384;
             constexpr std::size_t count = Window / view;

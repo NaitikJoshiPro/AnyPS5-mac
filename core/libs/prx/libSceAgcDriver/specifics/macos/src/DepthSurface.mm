@@ -61,6 +61,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -101,6 +102,11 @@ constexpr VkImageAspectFlags StencilAspect = VK_IMAGE_ASPECT_STENCIL_BIT;
 
 // Serial of depth surface writes (draws, clears, store-backs), under surfacesMutex.
 std::uint64_t depthWrites = 0;
+
+// The 64 KiB swizzle block of a depth plane of `bytesPerTexel` (upstream a714d1b37's DepthBlockExtent).
+std::pair<std::uint32_t, std::uint32_t> DepthBlockExtent(std::uint32_t bytesPerTexel) {
+    return {bytesPerTexel == 4 ? 128u : 256u, bytesPerTexel == 1 ? 256u : 128u};
+}
 
 // Upstream c05b2567be: a depth plane's UAV clear kernel (MatchStorageImageClear) installs the value it
 // writes for the dispatch (DepthPlaneClear); the plane's storage view then skips the copy in and stores
@@ -244,6 +250,29 @@ struct Surface {
         const auto end = address + bytes;
         if (address < target.address + DepthBytes() && target.address < end) return true;
         return target.stencilAddress != 0 && address < target.stencilAddress + StencilBytes() && target.stencilAddress < end;
+    }
+    // Upstream a714d1b37: whether storage writes cover a whole plane: `written` (sorted, merged ranges)
+    // spans it, or (single-sample) a storage image of the plane's shape and swizzle reaches its extent.
+    bool CoveredBy(std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents) const {
+        const auto reaches = [&](std::uint64_t address, std::uint32_t bytesPerTexel) {
+            const auto [blockWidth, blockHeight] = DepthBlockExtent(bytesPerTexel);
+            const std::array<std::uint32_t, 3> block{65536u, blockWidth, blockHeight};
+            const auto blocksPerRow = (target.extent.width + blockWidth - 1u) / blockWidth;
+            return std::any_of(extents.begin(), extents.end(), [&](const auto& extent) {
+                return extent.address == address && extent.bytesPerElement == bytesPerTexel && extent.block == block && extent.blocksPerRow == blocksPerRow && extent.width >= target.extent.width && extent.height >= target.extent.height;
+            });
+        };
+        const auto covers = [&](std::uint64_t begin, std::uint64_t end) {
+            for (const auto& [writtenBegin, writtenEnd] : written) {
+                if (writtenEnd <= begin) continue;
+                if (writtenBegin > begin) return false;
+                begin = writtenEnd;
+                if (begin >= end) return true;
+            }
+            return false;
+        };
+        if (target.samples == 1u && (reaches(target.address, D16() ? 2u : 4u) || (target.stencilAddress != 0 && reaches(target.stencilAddress, 1u)))) return true;
+        return covers(target.address, target.address + DepthBytes()) || (target.stencilAddress != 0 && covers(target.stencilAddress, target.stencilAddress + StencilBytes()));
     }
     void NoteMemory() {
         depthMemory = GuestMemory::CollectWrites(target.address, static_cast<std::size_t>(DepthBytes()));
@@ -728,23 +757,26 @@ bool CopyAspectFrom(const Context& context, Surface& surface, const Surface& sou
 // Upstream's takePlane / takePlanes (80d8bd06b): a surface binding a plane that another pairing of the
 // same format, sample count and extent bound last takes its contents (its pending clear, or a copy).
 // Without the device's context (no copy can be recorded) the plane is kept as it is.
-void takePlane(const Context* context, Surface& surface, PlaneOwners& owners, std::uint64_t address, bool stencil) {
+// Upstream 3770d5501 6326d05f0: a fresh surface (`created`) whose HTILE cleared the aspect
+// (`clearAspects`) keeps that clear instead of taking the plane; a fresh surface takes an owner's pending
+// clear only with the value of a plane fill (its own pending clear is the target's clear value already).
+void takePlane(const Context* context, Surface& surface, PlaneOwners& owners, std::uint64_t address, bool stencil, bool created, VkImageAspectFlags clearAspects) {
     auto& entry = owners[{surface.device, address}];
     auto* owner = entry.surface;
-    if (owner != nullptr && owner != &surface && owner->target.format == surface.target.format && owner->target.samples == surface.target.samples && owner->target.extent.width == surface.target.extent.width && owner->target.extent.height == surface.target.extent.height) {
-        const VkImageAspectFlags aspect = stencil ? StencilAspect : DepthAspect;
+    const VkImageAspectFlags aspect = stencil ? StencilAspect : DepthAspect;
+    if (owner != nullptr && owner != &surface && owner->target.format == surface.target.format && owner->target.samples == surface.target.samples && owner->target.extent.width == surface.target.extent.width && owner->target.extent.height == surface.target.extent.height && (!created || (clearAspects & aspect) == 0)) {
         if ((owner->pendingClear & aspect) != 0) {
-            surface.pendingClear |= aspect;
             if (stencil) surface.stencilFill = owner->stencilFill;
             else surface.depthFill = owner->depthFill;
+            if (!created || (stencil ? surface.stencilFill.has_value() : surface.depthFill.has_value())) surface.pendingClear |= aspect;
         } else if (context != nullptr) static_cast<void>(CopyAspectFrom(*context, surface, *owner, stencil));
     }
     entry = {&surface, ++planeBinds};
 }
 
-void takePlanes(const Context* context, Surface& surface) {
-    takePlane(context, surface, depthOwners(), surface.target.address, false);
-    if (surface.target.stencilAddress != 0) takePlane(context, surface, stencilOwners(), surface.target.stencilAddress, true);
+void takePlanes(const Context* context, Surface& surface, bool created, VkImageAspectFlags clearAspects) {
+    takePlane(context, surface, depthOwners(), surface.target.address, false, created, clearAspects);
+    if (surface.target.stencilAddress != 0) takePlane(context, surface, stencilOwners(), surface.target.stencilAddress, true, created, clearAspects);
 }
 
 // Upstream's planeSurface (80d8bd06b): the surface that bound the plane at `address` last (the newer of
@@ -1122,24 +1154,107 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
     return std::any_of(depthGuards().begin(), depthGuards().end(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
 }
 
-// Upstream's storeBackClearedHtile (4ddff7c6e5 3e61fcf1f9 cc022df348), run before the bind outside the
-// surfaces lock: when every word of the target's HTILE (written by any kernel) proves a fast clear, the
-// bind takes that clear and the words are stored back expanded. A slice of a depth array (firstSlice
-// != 0) takes it only when its words are uniform. `recorder`: the device's active recorder, if any.
-VkImageAspectFlags storeBackClearedHtile(Recorder* recorder, const DepthTarget& target) {
+// Upstream fac197954: the one word the recorder's pending fills leave over the HTILE when they all
+// fill the same word and the bytes no fill covers already hold it (nullopt otherwise), so the bind
+// need not wait for the batch to read the words.
+std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    auto writes = recorder.PendingWritesOver(address, bytes);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{address, address + bytes}};
+    std::optional<std::uint32_t> landed;
+    for (const auto& write : writes) {
+        if (unwritten.empty()) break;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool covered = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            covered = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        unwritten = std::move(rest);
+        if (!covered) continue;
+        if (write.word < 0 || (landed.has_value() && *landed != static_cast<std::uint32_t>(write.word))) return std::nullopt;
+        landed = static_cast<std::uint32_t>(write.word);
+    }
+    if (!landed.has_value()) return std::nullopt;
+    for (const auto& [from, to] : unwritten) {
+        if (from % 4u != 0 || to % 4u != 0) return std::nullopt;
+        const auto* words = reinterpret_cast<const volatile std::uint32_t*>(from);
+        for (std::uint64_t index = 0; index < (to - from) / 4u; ++index) {
+            if (words[index] != *landed) return std::nullopt;
+        }
+    }
+    return landed;
+}
+
+// Upstream fac197954's storeHtileOnGpu: the expanded word filled over the HTILE's host import behind
+// the recorded work (a Metal blit fill), noted as a pending word fill.
+bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+    if (address % 4u != 0 || bytes % 4u != 0) return false;
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) return false;
+    id<MTLBuffer> buffer = Metal::BufferOf(import->buffer);
+    if (buffer == nil) return false;
+    recorder.FlushKeyStoresOverlapping(address, bytes);
+    recorder.FlushStoresOverlapping(address, bytes);
+    const auto commands = recorder.Commands();
+    const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::Fill);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::Fill);
+    Metal::Stream(commands).FillBuffer(buffer, static_cast<NSUInteger>(address - import->base), static_cast<NSUInteger>(bytes), word);
+    constexpr VkAccessFlags filledAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, filledAccess);
+    Recorder::CountBarriers(Recorder::CommandClass::Fill);
+    recorder.EndGpuTiming(timing, bytes);
+    recorder.MarkCovered(filledAccess);
+    recorder.NotePendingWordFill(address, bytes, word);
+    GuestMemory::MarkWritten(address, bytes);
+    return true;
+}
+
+// Upstream's storeBackClearedHtile (4ddff7c6e5 3e61fcf1f9 cc022df348 ac840ec7d fac197954), run before the
+// bind outside the surfaces lock: when every word of the target's HTILE (written by any kernel) proves a
+// fast clear, the bind takes that clear and the words are stored back expanded (any slice of a depth
+// array: ac840ec7d dropped the uniform-words condition, a later slice's words with ZMask 0 all prove it).
+// Words that pending fills leave are taken from the fills and the expansion filled on the GPU
+// (APS5_NO_PENDING_HTILE_FILLS=1 reads them). `context`: the device's (null: no GPU store);
+// `recorder`: the device's active recorder, if any.
+VkImageAspectFlags storeBackClearedHtile(const Context* context, Recorder* recorder, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
-    if (recorder == nullptr || !recorder->PendingWriteOverlaps(target.htileAddress, bytes)) {
+    const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
+    if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
     }
+    static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
+    if (pending && pendingFills && context != nullptr) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes)) {
+            const VkImageAspectFlags cleared = (DepthAspect | (target.htileStencil ? StencilAspect : 0u)) & HtileFillClears(*landed, target.htileStencil);
+            if (cleared == 0) {
+                std::lock_guard lock(htileReadsMutex());
+                htileReads()[target.htileAddress] = collected;
+                return 0;
+            }
+            if (storeHtileOnGpu(*context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
+                const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
+                std::lock_guard lock(htileReadsMutex());
+                htileReads()[target.htileAddress] = generation;
+                return cleared;
+            }
+        }
+    }
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
-    const bool uniform = std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == words.front(); });
-    VkImageAspectFlags cleared = target.firstSlice == 0 || uniform ? DepthAspect | (target.htileStencil ? StencilAspect : 0u) : 0u;
+    VkImageAspectFlags cleared = DepthAspect | (target.htileStencil ? StencilAspect : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
     auto generation = collected;
     if (cleared != 0) {
@@ -1156,6 +1271,30 @@ VkImageAspectFlags storeBackClearedHtile(Recorder* recorder, const DepthTarget& 
 Recorder* RecorderForDevice(const void* key) {
     auto* recorder = Recorder::Active();
     return recorder != nullptr && reinterpret_cast<const void*>(recorder->Device()) == key ? recorder : nullptr;
+}
+
+std::atomic<std::uint64_t> surfacesReleased{0};
+
+// Upstream 98600b489: a new surface first frees the device's retired single-sample surfaces. Their
+// textures are only ever sampled through plane copies (no view of them is handed out), so none is
+// sampled elsewhere; each stays alive in the recorder until its batch completes (MTL4 command buffers
+// do not retain resources). Only with the device's recorder active: without one nothing is freed.
+void releaseRetired(const void* key) {
+    auto* recorder = RecorderForDevice(key);
+    if (recorder == nullptr) return;
+    auto& list = surfaces();
+    for (auto it = list.begin(); it != list.end();) {
+        const auto& surface = **it;
+        if (!surface.retired || surface.device != key || surface.target.samples != 1u) {
+            ++it;
+            continue;
+        }
+        if (drawnDepth == &surface) drawnDepth = nullptr;
+        std::shared_ptr<Surface> released(std::move(*it));
+        it = list.erase(it);
+        surfacesReleased.fetch_add(1, std::memory_order_release);
+        recorder->Keep(std::move(released));
+    }
 }
 
 // The Metal pixel format of a guest depth target (MetalDraw.mm DepthFormat).
@@ -1218,6 +1357,7 @@ Surface* BindSurface(const Context* context, id<MTLDevice> device, const DepthTa
                 images->MakeResident(textures);
             }
         }
+        releaseRetired(key);
         surfacesSerial.fetch_add(1, std::memory_order_release);
         surfaces().push_back(std::make_unique<Surface>(key, target, format, texture));
         surface = surfaces().back().get();
@@ -1232,12 +1372,17 @@ Surface* BindSurface(const Context* context, id<MTLDevice> device, const DepthTa
     const bool inherits = owner != depthOwners().end() && !owner->second.surface->retired;
     surface->target.clearDepth = target.clearDepth;
     surface->target.clearStencil = target.clearStencil;
-    takePlanes(context, *surface);
+    takePlanes(context, *surface, *created, htileCleared | (cleared ? DepthAspect : 0u));
     if (*created && !inherits && target.htileAddress == 0 && context != nullptr) TakeStorage(*context, *surface);
-    if (cleared && (!*created || inherits)) surface->NoteHtileClear(DepthAspect);
-    surface->NoteHtileClear(htileCleared);
-    // The draw writes it (upstream bumps the serial of a bound surface and names the drawn surface).
-    if (!*created || inherits) surface->written = ++depthWrites;
+    // Upstream 3770d5501: a fresh surface keeps its own clears (it starts with both pending), which
+    // noting the HTILE clear again would reset to the target's value.
+    if (cleared && !*created) surface->NoteHtileClear(DepthAspect);
+    if (!*created) surface->NoteHtileClear(htileCleared);
+    // The draw writes it (upstream bumps the serial of a bound surface and names the drawn surface);
+    // upstream 5a0a00f42 91be80b44 also bump the surface the previous draw attached, whose last writes
+    // its plane copies have not seen while it was the drawn surface.
+    if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
+    surface->written = ++depthWrites;
     surface->NoteMemory();
     drawnDepth = surface;
     return surface;
@@ -1249,9 +1394,12 @@ std::uint64_t DepthSurfacesSerial() {
     return surfacesSerial.load(std::memory_order_acquire);
 }
 
+std::uint64_t DepthSurfacesReleased() {
+    return surfacesReleased.load(std::memory_order_acquire);
+}
+
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
-    const std::uint32_t blockWidth = bytesPerTexel == 4 ? 128u : 256u;
-    const std::uint32_t blockHeight = bytesPerTexel == 1 ? 256u : 128u;
+    const auto [blockWidth, blockHeight] = DepthBlockExtent(bytesPerTexel);
     const auto width = static_cast<std::uint64_t>((extent.width + blockWidth - 1) / blockWidth * blockWidth);
     const auto height = static_cast<std::uint64_t>((extent.height + blockHeight - 1) / blockHeight * blockHeight);
     return width * height * bytesPerTexel;
@@ -1367,7 +1515,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     id<MTLDevice> device = (__bridge id<MTLDevice>)reinterpret_cast<void*>(context.device);
     if (device == nil) Fail("DepthSurfaceView needs the Metal device's context");
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(RecorderFor(context), target);
+    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(&context, RecorderFor(context), target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     bool created = false;
@@ -1514,7 +1662,9 @@ void ClearDepthSurfaces(VkDevice device) {
 
 // Upstream's DepthSurfaceTexture over plane copies (see the file comment): a single plane is a
 // one-layer copy of the surface; several slices and integer views are upstream's DepthPlaneCopy.
-std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+// `multisampleViewType` (upstream 729558cc6, the view of a native multisampled depth image) has no use
+// here: a multisampled surface is refused below.
+std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType) {
     {
         std::lock_guard lock(surfacesMutex());
         if (planeSurface(DeviceKey(context), resource.baseAddress) == nullptr) return nullptr;
@@ -1745,6 +1895,15 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
     }
 }
 
+// Upstream a714d1b37: a storage write retires only the surfaces whose whole plane it covers.
+void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents) {
+    std::lock_guard lock(surfacesMutex());
+    const auto key = reinterpret_cast<const void*>(device);
+    for (const auto& surface : surfaces()) {
+        if (surface->device == key && !surface->retired && surface->CoveredBy(written, extents)) retire(*surface);
+    }
+}
+
 // Upstream f56e3bc467: a draw must not sample the native multisampled depth target it attaches. Metal
 // hands out no view of a multisampled depth surface (DepthSurfaceTexture refuses one; single planes
 // are separate plane copies), so a sampled texture can never be the attachment: nothing to refuse.
@@ -1754,13 +1913,14 @@ namespace Metal {
 
 DepthSurfaceUse AcquireDepthSurface(id<MTLDevice> device, const DepthTarget& target, MTLPixelFormat format, bool* created) {
     // The HTILE fast clear any kernel wrote, read and stored back before the locks (upstream 3e61fcf1f9).
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(RecorderForDevice((__bridge const void*)device), target);
+    // The device's context records the plane copies (pairings, storage writes) before the draw's pass,
+    // and the HTILE store-back's GPU fill.
+    auto* images = ImageCache::For(device);
+    const Context* context = images != nullptr ? images->ImageContext() : nullptr;
+    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, RecorderForDevice((__bridge const void*)device), target);
     // GpuMutex first, as upstream's DepthSurfaceView: taking a plane from storage refreshes a storage image.
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
-    // The device's context records the plane copies (pairings, storage writes) before the draw's pass.
-    auto* images = ImageCache::For(device);
-    const Context* context = images != nullptr ? images->ImageContext() : nullptr;
     auto* surface = BindSurface(context, device, target, format, false, htileCleared, created);
     const VkImageAspectFlags aspects = DepthAspect | (target.stencilAddress != 0 ? StencilAspect : 0u);
     const auto clears = surface->pendingClear & aspects;

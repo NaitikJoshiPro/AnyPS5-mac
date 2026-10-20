@@ -983,14 +983,16 @@ void PipelineCache::saver() {
         saveRequested = false;
         lock.unlock();
         const auto start = std::chrono::steady_clock::now();
-        Save();
+        const bool done = Save(false);
         const auto finished = std::chrono::steady_clock::now();
         lock.lock();
+        // A save skipped behind a pipeline creation is asked again for the next interval.
+        if (!done) saveRequested = true;
         nextSave = finished + std::max<std::chrono::steady_clock::duration>(SaveSpacing, (finished - start) * SaveCostFactor);
     }
 }
 
-void PipelineCache::Save() {
+bool PipelineCache::Save(bool waitForPipelines) {
     // Never destroyed: the first save runs early, so a function-local mutex would be destroyed at
     // exit() before the exit handler tears a live device (and its cache) down.
     static std::mutex* const saveMutex = new std::mutex;
@@ -1000,7 +1002,7 @@ void PipelineCache::Save() {
     std::size_t known = 0;
     {
         std::lock_guard lock(mutex);
-        if (serializer == nil || archivePath.empty() || unsaved == 0) return;
+        if (serializer == nil || archivePath.empty() || unsaved == 0) return true;
         saved = unsaved;
         known = archived.size();
         for (std::size_t index = 0; index < known; ++index) {
@@ -1032,7 +1034,9 @@ void PipelineCache::Save() {
         NSError* failure = nil;
         bool stored = false;
         {
-            std::unique_lock gate(serializerGate);
+            std::unique_lock gate(serializerGate, std::defer_lock);
+            if (waitForPipelines) gate.lock();
+            else if (!gate.try_lock()) return false;
             stored = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];
             // Whatever succeeded or not, the serializer is empty now: everything noted so far must
             // be replayed before the next save (the first `known` entries were replayed above, the
@@ -1045,13 +1049,13 @@ void PipelineCache::Save() {
         if (!stored) {
             std::fprintf(stderr, "[metal-pipelines] cannot write %s: %s\n", temporary.c_str(), Describe(failure).c_str());
             std::filesystem::remove(temporary, error);
-            return;
+            return true;
         }
         std::filesystem::rename(temporary, archivePath, error);
         if (error) {
             std::fprintf(stderr, "[metal-pipelines] cannot rename %s: %s\n", temporary.c_str(), error.message().c_str());
             std::filesystem::remove(temporary, error);
-            return;
+            return true;
         }
         // The pipelines just flushed are replayed from this file at the next save. Opened at its
         // final path: Metal resolves a lookup archive through its file (one opened at the temporary
@@ -1069,6 +1073,7 @@ void PipelineCache::Save() {
     std::lock_guard lock(mutex);
     unsaved -= std::min(unsaved, saved);
     ++statistics.archiveSaves;
+    return true;
 }
 
 PipelineCacheStatistics PipelineCache::Statistics() const {
