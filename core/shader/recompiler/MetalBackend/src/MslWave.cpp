@@ -629,6 +629,26 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
                 }
             }
         }
+        if ((lane & 15u) == 15u && state.hostSubgroupSize != 1u && !state.laneLocal) {
+            // Upstream 859dcae2a's row reduction (RowReduction) in the half-wave view: the matched scan's keys
+            // hold the identity on lanes the wave did not enter with or that are inactive, and the guest lanes
+            // 32-63 of this view are never active (its EXEC masks and ballots hold this SIMD group's lanes
+            // only), so rows 2 and 3 reduce to the identity, as upstream's subgroup reduction of an empty row on
+            // a 32-lane host; rows 0 and 1 reduce over this SIMD group's active lanes of the row.
+            auto scan = MatchRowScan(instruction.Argument(0u), stage, false);
+            if (!scan) scan = MatchRowScan(instruction.Argument(0u), stage, true);
+            if (scan) {
+                if (lane >= 32u) {
+                    state.Define(instruction, MslHex(scan->reduction->identity) + "u");
+                    return;
+                }
+                const auto keys = "((" + state.GuestLane() + " >> 4u) == " + U32(lane >> 4u) + " ? " + state.Value(scan->source) + " : " + MslHex(scan->reduction->identity) + "u)";
+                std::string reduce = scan->reduction->reduce;
+                const bool signedReduce = reduce.find("as_type<int>") != std::string::npos;
+                state.Define(instruction, reduce + keys + (signedReduce ? ")))" : "))"));
+                return;
+            }
+        }
         if (lane >= 32u && UpperLaneWalk{stage}.ZeroValue(instruction.Argument(0u))) {
             state.Define(instruction, "0u");
             return;

@@ -27,6 +27,7 @@
 #include "MetalMesh.h"
 #include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -250,6 +251,9 @@ struct DrawCache {
         id<MTLTexture> texture;
         bool clearDepth = false;
         bool clearStencil = false;
+        // The clear values (AcquireDepthSurface: a plane fill's, else DB_DEPTH_CLEAR/DB_STENCIL_CLEAR).
+        float depthValue = 0.0f;
+        std::uint8_t stencilValue = 0;
     };
 
     // Private textures of tiled color targets. `gpuNewer`: passes whose write-back has not landed
@@ -440,6 +444,45 @@ static void CheckInputsClearOfTarget(Settle settle, const Graphics::State& graph
     }
 }
 
+// Upstream Draw.cpp prepareDrawInputs: the index buffer and the vertex records a draw reads must not
+// overlap a multisampled color target, whose samples are only on the host (RequireNoMultisampleTarget).
+// A vertex descriptor is checked whole first (nothing is guarded, or it is clear of every target);
+// only one that reaches a target is narrowed to the records the draw fetches, as upstream's copy plan.
+template <typename Settle>
+static void CheckInputsClearOfMultisampleTargets(Settle settle, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const ShaderRecompiler::VertexAttribute> attributes, std::uint64_t indexBegin, std::uint64_t indexBytes) {
+    if (draw.indexed) Graphics::RequireNoMultisampleTarget(indexBegin, static_cast<std::size_t>(indexBytes), "an index buffer read");
+    std::optional<std::uint32_t> maxIndex;
+    bool scanned = false;
+    for (const auto& attribute : attributes) {
+        if (Graphics::NullVertexDescriptor(attribute)) continue;
+        const auto& fields = attribute.resource.fields;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        const auto stride = (fields[1] >> 16u) & 0x3fffu;
+        const std::uint64_t extent = stride == 0u ? Graphics::ZeroStrideAvailableBytes(attribute) : static_cast<std::uint64_t>(fields[2]) * stride;
+        if (extent == 0u) continue;
+        try {
+            Graphics::RequireNoMultisampleTarget(address, static_cast<std::size_t>(extent), "a vertex buffer read");
+            continue;
+        } catch (const std::runtime_error&) {
+            if (draw.indirect) throw;
+        }
+        if (attribute.fetchIndex == 0u && !scanned) {
+            scanned = true;
+            if (!draw.indexed) {
+                maxIndex = draw.firstVertex + draw.indexCount - 1u;
+            } else {
+                settle(indexBegin, indexBytes);
+                const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, static_cast<std::size_t>(indexBytes))), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart);
+                if (highest) maxIndex = *highest + draw.firstVertex;
+            }
+        }
+        if (attribute.fetchIndex == 0u && !maxIndex) continue;
+        const auto end = Graphics::VertexBufferReadSize(attribute, maxIndex.value_or(0u), draw.instanceCount, draw.firstInstance);
+        const auto first = Graphics::VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance);
+        if (end > first) Graphics::RequireNoMultisampleTarget(address + first, static_cast<std::size_t>(end - first), "a vertex buffer read");
+    }
+}
+
 void VulkanDevice::State::SettleRange(std::uint64_t address, std::uint64_t bytes) {
     auto& state = *this;
     if (state.recorder->PendingWriteOverlaps(address, bytes) || state.recorder->PendingLabelIn(address, bytes)) {
@@ -572,6 +615,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const auto& vertexResult = *vertex.program;
     // Before the indirect records are read, as upstream validates its inputs first.
     CheckInputsClearOfTarget([&](std::uint64_t begin, std::uint64_t bytes) { state.SettleRange(begin, bytes); }, graphics, draw, (tessellation != nullptr ? *tessellation->local->program : vertexResult).vertexAttributes, draw.indexed ? draw.indexAddress : 0u, draw.indexed ? static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize : 0u);
+    CheckInputsClearOfMultisampleTargets([&](std::uint64_t begin, std::uint64_t bytes) { state.SettleRange(begin, bytes); }, graphics, draw, (tessellation != nullptr ? *tessellation->local->program : vertexResult).vertexAttributes, draw.indexed ? draw.indexAddress : 0u, draw.indexed ? static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize : 0u);
     const auto& vertexReflection = vertexResult.msl.Reflection();
     const auto* fragmentResult = fragment != nullptr ? fragment->program : nullptr;
     const Abi::Reflection* fragmentReflection = fragmentResult != nullptr ? &fragmentResult->msl.Reflection() : nullptr;
@@ -592,16 +636,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const bool tested = graphics.depth.has_value() && (graphics.depthTest || graphics.stencilTest || graphics.depthBoundsTest);
         const bool earlyWithMemoryWrites = tested && Graphics::ShadersWriteMemory(std::span(fragment, 1u));
         if (hostSampleMask) {
-            // Without outputs the function cannot remove the masked samples of a covered pixel from
-            // the depth and stencil writes (colour has no output to write; the discard keeps memory
-            // writes to the pixels Vulkan would run).
-            const bool outputs = fragmentReflection->colorOutputs != 0u || fragmentReflection->exportsDepth || fragmentReflection->exportsStencil || fragmentReflection->exportsSampleMask;
-            const bool keepsStencil = [&] {
-                const auto keeps = [](const VkStencilOpState& face) { return face.writeMask == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
-                return !graphics.stencilTest || (keeps(graphics.stencilFront) && keeps(graphics.stencilBack));
-            }();
-            const bool writesDepthStencil = graphics.depth.has_value() && ((graphics.depthTest && graphics.depthWrite) || !keepsStencil);
-            if (!outputs && writesDepthStencil) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a draw that writes depth or stencil, with a pixel program without outputs: Metal has no pipeline sample mask and the fragment function has no output to carry [[sample_mask]] (TechnicalDebt metal-pipeline-sample-mask)");
+            // Every fragment function carries [[sample_mask]] under the macro, an output-less one in an
+            // otherwise empty output struct (MslStageIo.cpp hostMaskMember), so the mask also keeps the
+            // masked samples of a covered pixel off the depth and stencil writes.
             // The function drops [[early_fragment_tests]] under APS5_SAMPLE_MASK (Metal applies its
             // [[sample_mask]] after early tests); a memory-writing program would then also run for
             // pixels the tests reject.
@@ -789,7 +826,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // Tiled targets are the image cache's resident images (upstream image path): their writes
         // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
         std::shared_ptr<Graphics::StorageTexture> resident;
-        if (target.tileMode != Graphics::ColorTileMode::Linear && state.images->ImageContext() != nullptr && ResidentTargets()) {
+        // Upstream Draw.cpp (linearResident): a linear target over memory that already has a host
+        // import is a resident image too, so the draw is recorded instead of synced (debug aid
+        // APS5_NO_RESIDENT_LINEAR=1 keeps it in place).
+        static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+        const bool linearResident = residentLinear && target.tileMode == Graphics::ColorTileMode::Linear && target.depth <= 1u && target.arrayAddress == 0u && !target.mipTail && state.images->ImageContext() != nullptr && Graphics::ExistingHostImportFor(*state.images->ImageContext(), target.address, Graphics::ColorTargetLayout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor).Bytes()) != nullptr;
+        if ((target.tileMode != Graphics::ColorTileMode::Linear || linearResident) && state.images->ImageContext() != nullptr && ResidentTargets()) {
             const auto& imageContext = *state.images->ImageContext();
             if (Graphics::AttachmentProxyFormat(imageContext, target.format) != VK_FORMAT_UNDEFINED) Fail("color target format " + std::to_string(target.format) + " needs an attachment proxy");
             if (target.arrayLastSlice != 0u) {
@@ -912,7 +954,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             const std::array<id<MTLTexture>, 1> resident {use.texture};
             state.images->MakeResident(resident);
         }
-        depthSurface = DrawCache::DepthSurface{target, format, use.texture, use.clearDepth, use.clearStencil};
+        depthSurface = DrawCache::DepthSurface{target, format, use.texture, use.clearDepth, use.clearStencil, use.depth, use.stencil};
         depth = &*depthSurface;
         passKey = Mix(Mix(passKey, target.address), static_cast<std::uint64_t>(format));
     }
@@ -1348,14 +1390,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     pass.depthAttachment.texture = depth->texture;
                     if (graphics.samples > 1u) pass.depthAttachment.slice = slice;
                     pass.depthAttachment.loadAction = depth->clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
-                    pass.depthAttachment.clearDepth = depth->target.clearDepth;
+                    pass.depthAttachment.clearDepth = depth->depthValue;
                     pass.depthAttachment.storeAction = MTLStoreActionStore;
                 }
                 if (HasStencil(depth->format)) {
                     pass.stencilAttachment.texture = depth->texture;
                     if (graphics.samples > 1u) pass.stencilAttachment.slice = slice;
                     pass.stencilAttachment.loadAction = depth->clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
-                    pass.stencilAttachment.clearStencil = depth->target.clearStencil;
+                    pass.stencilAttachment.clearStencil = depth->stencilValue;
                     pass.stencilAttachment.storeAction = MTLStoreActionStore;
                 }
             }
@@ -1681,7 +1723,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         state.NoteBindings(localPlan);
         state.NoteBindings(hullPlan);
     }
-    state.CheckFaultsOnComplete(true);
+    state.CheckFaultsOnComplete(true, imageBindings.TableRanges());
+    // Upstream 88ee39183 (keepRecordedDraw): a resident linear target's results go back to guest
+    // memory right after the draw with a recorded GPU store, so CPU readers of the import see them
+    // without a wait.
+    for (const auto& attachment : colors) {
+        if (attachment.resident == nullptr || attachment.resident->Descriptor().tileMode != Graphics::TextureTileMode::kLinear) continue;
+        Graphics::StorageTexture::FlushPending(attachment.resident->Descriptor().baseAddress, static_cast<std::size_t>(attachment.resident->GuestBytes()), nullptr, "linear target");
+    }
     // As upstream (Draw.cpp, SyncNotResident): a draw over a colour target that is not a resident
     // image writes guest memory in place, which the CPU may read without a flush hook (a queue
     // reported idle does not wait for the GPU), so it is submitted and waited for here.
@@ -1780,6 +1829,9 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // Mesh draws: the geometry path's NGG primitive shader as a mesh function (MetalMesh.h).
     const bool meshDraw = vertex->stage == ShaderRecompiler::ShaderStage::Mesh;
     if (!tessellated && (meshDraw ? (graphics.stages.path != Graphics::ShaderPath::Geometry || !graphics.stages.mesh) : (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh))) Fail("the geometry shader path without a mesh configuration, or a mesh configuration on the vertex path");
+    // Upstream Draw.cpp prepareDrawInputs: fast-launch subgroups (VGT_SHADER_STAGES_EN bits 19-20) generate
+    // their vertex ids from the draw's vertex range, so an index buffer has no place in them.
+    if (meshDraw && ((graphics.stages.registerValue >> 19u) & 3u) != 0u && draw.indexed) Fail("indexed fast-launch draws are unsupported");
     for (const auto* shader : {vertex, fragment, tessellation.local, tessellation.hull}) {
         if (shader == nullptr) continue;
         if (shader->program->msl.empty()) throw std::runtime_error("Metal device: the shader has no MSL form (recompile it for the device's Target(), whose backend is Msl)");

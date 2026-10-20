@@ -486,7 +486,9 @@ void CheckSampled(AgcDriver::VulkanDevice& device) {
         const auto* texel = MsaaLoadResults.data() + thread * 4u;
         Require(std::fabs(texel[0] - expected) < 1e-6f && texel[1] == 0.0f && texel[2] == 0.0f && texel[3] == 1.0f, "image_load of sample " + std::to_string(sample) + " at pixel (" + std::to_string(thread >> 2u) + ", 5) read " + std::to_string(texel[0]) + " " + std::to_string(texel[1]) + " " + std::to_string(texel[2]) + " " + std::to_string(texel[3]) + ", expected red " + std::to_string(expected));
     }
-    // Memory that is no multisampled target has no modeled sample layout: refused.
+    // Memory that no draw rendered to is modeled only when it holds one repeated value in a tiled
+    // multisampled color layout (upstream d0cd50c82, createFilled); linear (tile mode 0) MSAA memory
+    // has no such footprint on the GPU and is refused.
     GuestBlock plain(Extent * Extent * 4u * Samples);
     const auto other = plain.Address();
     userData[4] = static_cast<std::uint32_t>(other >> 8u);
@@ -498,7 +500,7 @@ void CheckSampled(AgcDriver::VulkanDevice& device) {
     } catch (const std::exception& error) {
         refusal = error.what();
     }
-    Require(refusal.find("no multisampled color target") != std::string::npos, "an MSAA T# over plain memory was not refused: " + refusal);
+    Require(refusal.find("whose tile mode 0 has no modeled multisampled color footprint") != std::string::npos, "an MSAA T# over plain memory was not refused: " + refusal);
     std::puts("sampled: image_load of each sample through a 2D MSAA T#, refusal over plain memory passed");
 }
 

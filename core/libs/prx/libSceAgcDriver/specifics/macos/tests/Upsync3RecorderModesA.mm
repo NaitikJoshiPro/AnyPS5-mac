@@ -109,8 +109,10 @@ void pendingWriteSnapshotTests(const Device& device, Recorder& recorder) {
     recorder.NoteLabel(labelAddress, value, 1, 0);
     expected.emplace_back(labelAddress, labelAddress + value.size());
     check();
-    recorder.Submit();
-    device.WaitQueue();
+    // Upstream's WaitQueue (vkQueueWaitIdle) waits for the GPU and leaves the batch in flight, which
+    // AfterCompletions appends to; the harness's WaitQueue syncs (reaps it), so the GPU wait here is
+    // the timeline's.
+    recorder.WaitSerial(recorder.SubmitAndEpoch());
     recorder.AfterCompletions(labelAddress + 8, value, 2, 0, true);
     expected.emplace_back(labelAddress + 8, labelAddress + 8 + value.size());
     check();

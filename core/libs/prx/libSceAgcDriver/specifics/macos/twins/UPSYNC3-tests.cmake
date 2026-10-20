@@ -26,11 +26,10 @@ list(APPEND agcMetalTwins
         "tests/PresentationPass.cpp=specifics/macos/tests/PresentationPassTwin.mm"
         # Third round: upstream execution tests of Vulkan-only behaviour (DCC key presync and resource cache growth of
         # stage-A dispatch preparation, the pipeline journal) or of Metal driver features not written yet
-        # (render pass totals, GPU indirect draws) or not ported yet (stencil null feedback): PendingTwins.mm skips each with its reason.
+        # (render pass totals, GPU indirect draws): PendingTwins.mm skips each with its reason.
         "tests/execution/DccKeyPresync.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/ResourceCacheGrowth.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/PipelineJournal.cpp=specifics/macos/tests/PendingTwins.mm"
-        "tests/execution/StencilNullFeedback.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/AddressPasses.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/RectListIndirect.cpp=specifics/macos/tests/PendingTwins.mm"
         # Third round: Vulkan fault-injection tests (command batch submit/fence failures, descriptor layout/pool failures).
@@ -46,4 +45,17 @@ list(APPEND agcMetalTwins
         "tests/execution/MeshProvokingVertex.cpp=specifics/macos/tests/MeshProvokingVertexTwin.mm"
         "tests/execution/MeshIndexCache.cpp=specifics/macos/tests/MeshIndexCacheTwin.mm"
         "tests/execution/PipelinedDispatch.cpp=specifics/macos/tests/PipelinedDispatchTwin.mm"
+        # Third round: upstream counts the vector window's slot variables in result.spirv; the twin counts them in
+        # the MSL source (MslAluMath.cpp window narrowing).
+        "tests/execution/VectorWindowNarrowing.cpp=specifics/macos/tests/VectorWindowNarrowingTwin.mm"
+        # Third round: upstream checks tessellation spacing and factor bounds in the SPIR-V of the hull and domain; the
+        # twin checks the linked software tessellator's partitioning (LinkMslTessellation, D24/D26) and the MSL source.
+        "tests/execution/Tessellation.cpp=specifics/macos/tests/TessellationTwin.mm"
+        # Third round: --lock-budget counts the Workgroup-storage bytes of result.spirv upstream; the twin counts the
+        # MSL source's threadgroup arrays (the other modes run upstream's main unchanged).
+        "tests/execution/LdsMixedWidthAtomics.cpp=specifics/macos/tests/LdsMixedWidthAtomicsTwin.mm"
+        # Stencil replay is the Vulkan fallback for devices without stencil export; Metal exports [[stencil]] natively, so
+        # the twin keeps the capability, drops the replay-only bind count and refusals, and runs every stencil result check.
+        "tests/execution/StencilReplay.cpp=specifics/macos/tests/StencilReplayTwin.mm"
+        "tests/execution/StencilNullFeedback.cpp=specifics/macos/tests/StencilNullFeedbackTwin.mm"
 )

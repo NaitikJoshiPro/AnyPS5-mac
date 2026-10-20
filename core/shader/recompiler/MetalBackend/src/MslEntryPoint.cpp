@@ -169,12 +169,27 @@ namespace {
 // one right angle, a w that differs between its vertices or is not positive, or a non-finite fourth
 // position is culled. Vertices are staged raw in threadgroup memory (another invocation's export
 // feeds each rect), then the window-space / depth epilogue runs on every written vertex.
+// Guest cull distances of mesh functions (upstream f7a2903ed; Metal has no cull distance output):
+// the vertices' distances are staged in threadgroup aps5_mcull (AuxPositionExport), and a primitive
+// whose vertices all have a negative distance in one slot is culled, as Vulkan's gl_CullDistance
+// (and the vertex function's D30 emulation). corners is the number of aps5_k entries it uses.
+std::string MeshCullTest(const MslEmitterState& state, const std::string& primitive, const std::string& corners, const std::string& indent) {
+    const auto culls = MslCullDistanceCount(state);
+    if (culls == 0u) return {};
+    const auto count = std::to_string(culls) + "u";
+    std::string text = indent + "for (uint d = 0u; d < " + count + "; ++d) {\n";
+    text += indent + "    bool aps5_negative = true;\n";
+    text += indent + "    for (uint c = 0u; c < " + corners + "; ++c) aps5_negative = aps5_negative && aps5_mcull[aps5_k[c] * " + count + " + d] < 0.0f;\n";
+    text += indent + "    " + primitive + ".aps5_culled = " + primitive + ".aps5_culled || aps5_negative;\n" + indent + "}\n";
+    return text;
+}
+
 std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& output, bool layer, std::uint32_t ldsBytes) {
     const auto& mesh = state.inputInfo.vertex->mesh;
     std::uint32_t parameters = 0u;
     for (const auto& stageOutput : state.program.Info().outputs) parameters += stageOutput.kind == StageOutputKind::Parameter ? 1u : 0u;
     const auto staging = output.guestVertices * 16u * (1u + parameters);
-    const auto total = staging + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u);
+    const auto total = staging + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u) + mesh.maxVertices * MslCullDistanceCount(state) * 4u;
     if (total > state.target.maxThreadgroupMemoryBytes) state.Fail("a rect-list mesh function stages " + std::to_string(output.guestVertices) + " vertices of " + std::to_string(16u * (1u + parameters)) + " bytes in threadgroup memory: " + std::to_string(total) + " bytes with LDS exceed the " + std::to_string(state.target.maxThreadgroupMemoryBytes) + "-byte limit");
     const auto local = state.Builtin(MslBuiltin::ThreadIndexInThreadgroup);
     const auto guestVertices = std::to_string(output.guestVertices) + "u";
@@ -231,7 +246,20 @@ std::string MeshRectListEpilogue(MslEmitterState& state, const MslMeshOutput& ou
         text += "            Aps5MeshPrimitive aps5_prim = {};\n";
         text += "            aps5_prim.aps5_culled = (aps5_packed & 0x80000000u) != 0u || !aps5_valid_rect;\n";
         if (layer) text += "            aps5_prim.aps5_layer = aps5_mlayer[aps5_k[" + std::to_string(std::min(mesh.provokingVertex, 2u)) + "]];\n";
-        text += "            aps5_mesh.set_primitive(aps5_i * 2u, aps5_prim);\n            aps5_mesh.set_primitive(aps5_i * 2u + 1u, aps5_prim);\n        }\n    }\n";
+        if (const auto culls = MslCullDistanceCount(state); culls != 0u) {
+            // The rect's triangles are culled apart: (c, n, p) by its three guest vertices, (p, n, v3)
+            // by p, n and the fourth corner's distances (linear over the rect like the parameters).
+            const auto count = std::to_string(culls) + "u";
+            text += "            Aps5MeshPrimitive aps5_prim2 = aps5_prim;\n";
+            text += MeshCullTest(state, "aps5_prim", "3u", "            ");
+            text += "            for (uint d = 0u; d < " + count + "; ++d) {\n";
+            text += "                const float aps5_d3 = aps5_mcull[aps5_k[0] * " + count + " + d] * aps5_weight[0] + aps5_mcull[aps5_k[1] * " + count + " + d] * aps5_weight[1] + aps5_mcull[aps5_k[2] * " + count + " + d] * aps5_weight[2];\n";
+            text += "                aps5_prim2.aps5_culled = aps5_prim2.aps5_culled || (aps5_mcull[aps5_p * " + count + " + d] < 0.0f && aps5_mcull[aps5_n * " + count + " + d] < 0.0f && aps5_d3 < 0.0f);\n";
+            text += "            }\n";
+            text += "            aps5_mesh.set_primitive(aps5_i * 2u, aps5_prim);\n            aps5_mesh.set_primitive(aps5_i * 2u + 1u, aps5_prim2);\n        }\n    }\n";
+        } else {
+            text += "            aps5_mesh.set_primitive(aps5_i * 2u, aps5_prim);\n            aps5_mesh.set_primitive(aps5_i * 2u + 1u, aps5_prim);\n        }\n    }\n";
+        }
     }
     state.half = 0u;
     return text;
@@ -258,7 +286,7 @@ std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std
     for (const auto& stageOutput : state.program.Info().outputs) parameters += stageOutput.kind == StageOutputKind::Parameter ? 1u : 0u;
     // Aps5MeshVertex: position and parameters, plus at most two float3 weight sets (16 bytes each).
     const auto vertexBytes = 16u * (1u + parameters) + 32u;
-    const auto total = mesh.maxVertices * vertexBytes + mesh.maxPrimitives * 4u + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u);
+    const auto total = mesh.maxVertices * vertexBytes + mesh.maxPrimitives * 4u + ldsBytes + 8u + (layer ? mesh.maxVertices * 4u : 0u) + mesh.maxVertices * MslCullDistanceCount(state) * 4u;
     if (total > state.target.maxThreadgroupMemoryBytes) {
         return "#error \"the triangle-vertices mesh function (per-vertex fragment inputs of a mesh draw) stages " + std::to_string(mesh.maxVertices) + " vertices of " + std::to_string(vertexBytes) + " bytes in threadgroup memory: " + std::to_string(total) + " bytes with LDS exceed the " + std::to_string(state.target.maxThreadgroupMemoryBytes) + "-byte limit\"\n";
     }
@@ -266,7 +294,7 @@ std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std
     const auto group = state.Builtin(MslBuiltin::ThreadgroupPositionInGrid);
     const auto provoking = std::to_string(std::min(mesh.provokingVertex, 2u));
     // The provoking corner: the draw's last-vertex convention (APS5_PROVOKING_LAST, PA_SU_SC_MODE_CNTL
-    // PROVOKING_VTX_LAST; State.cpp leaves the mesh configuration's provokingVertex at 0), else the
+    // PROVOKING_VTX_LAST, which State.cpp also gives as provokingVertex outputSize - 1), else the
     // configuration's.
     std::string text = "#if defined(" + std::string(MslAbi::ProvokingLastMacro) + ") && " + std::string(MslAbi::ProvokingLastMacro) + "\n    constexpr uint aps5_provoking = 2u;\n#else\n    constexpr uint aps5_provoking = " + provoking + "u;\n#endif\n";
     text += "    threadgroup Aps5MeshVertex aps5_tv_v[" + std::to_string(mesh.maxVertices) + "];\n";
@@ -299,6 +327,7 @@ std::string MeshTriangleVerticesEpilogue(MslEmitterState& state, bool layer, std
     text += "        for (uint c = 0u; c < 3u; ++c) aps5_k[c] = min(extract_bits(aps5_packed, ((min(c, aps5_n - 1u) + min(aps5_provoking, aps5_n - 1u)) % aps5_n) * 10u, 9u), aps5_last);\n";
     text += "        Aps5MeshPrimitive aps5_p = {};\n        aps5_p.aps5_culled = (aps5_packed & 0x80000000u) != 0u;\n";
     if (layer) text += "        aps5_p.aps5_layer = aps5_mlayer[aps5_k[0]];\n";
+    text += MeshCullTest(state, "aps5_p", "aps5_n", "        ");
     for (std::uint32_t corner = 0; corner < 3u; ++corner) {
         const auto c = std::to_string(corner);
         const auto weights = std::string("float3(") + (corner == 0u ? "1.0f" : "0.0f") + ", " + (corner == 1u ? "1.0f" : "0.0f") + ", " + (corner == 2u ? "1.0f" : "0.0f") + ")";
@@ -362,6 +391,11 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         helperParameters.push_back("threadgroup uint* aps5_mlayer");
         arguments.push_back("aps5_mlayer");
     }
+    const auto culls = MslCullDistanceCount(state);
+    if (culls != 0u) {
+        helperParameters.push_back("threadgroup float* aps5_mcull");
+        arguments.push_back("aps5_mcull");
+    }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
     text += ")\n{\n" + MslFunctionStatements(state, prologue) + "}\n\n";
@@ -370,6 +404,7 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
     text += ")\n{\n" + hoisted;
     text += "    threadgroup uint aps5_malloc[2];\n";
     if (layer) text += "    threadgroup uint aps5_mlayer[" + std::to_string(mesh.maxVertices) + "];\n";
+    if (culls != 0u) text += "    threadgroup float aps5_mcull[" + std::to_string(mesh.maxVertices * culls) + "];\n";
     text += "    Aps5MeshVertex aps5_mv[" + lanes + "] = {};\n";
     text += "    uint aps5_mprim[" + lanes + "] = {" + (state.laneCount == 2u ? std::string("0x80000000u, 0x80000000u") : std::string("0x80000000u")) + "};\n";
     const auto local = state.Builtin(MslBuiltin::ThreadIndexInThreadgroup);
@@ -397,14 +432,18 @@ std::string EmitMeshFunction(MslEmitterState& state, std::vector<std::string> pa
         text += "            aps5_v.aps5_position.z = (aps5_v.aps5_position.z + aps5_v.aps5_position.w) * 0.5f;\n#endif\n";
         text += "            aps5_mesh.set_vertex(aps5_i, aps5_v);\n        }\n";
         text += "        if (aps5_i < aps5_primitives) {\n            const uint aps5_packed = aps5_mprim[" + h + "];\n";
-        // A line drawn with the last vertex provoking runs from its second vertex (Metal's flat
-        // values come from the first), as the vertex path's expansion draws it (DECISIONS D75).
-        text += "            constexpr bool aps5_reverse = " + std::string(MslAbi::PrimitiveVerticesMacro) + " == 2u && " + "APS5_LINE_PROVOKING_LAST;\n";
+        // Metal's flat values come from a primitive's first vertex, so the provoking vertex is
+        // rotated to corner 0 (a rotation keeps the winding): a line drawn with the last vertex
+        // provoking runs from its second vertex, as the vertex path's expansion draws it (DECISIONS
+        // D75), and a triangle under PROVOKING_VTX_LAST (State.cpp's mesh provokingVertex
+        // outputSize - 1, upstream 8f03282f5) starts at its third.
+        text += "            const uint aps5_rotate = APS5_LINE_PROVOKING_LAST ? " + std::string(MslAbi::PrimitiveVerticesMacro) + " - 1u : min(" + std::to_string(std::min(mesh.provokingVertex, 2u)) + "u, " + std::string(MslAbi::PrimitiveVerticesMacro) + " - 1u);\n";
         text += "            uint aps5_k[3] = {};\n";
-        text += "            for (uint c = 0u; c < " + std::string(MslAbi::PrimitiveVerticesMacro) + "; ++c) {\n                aps5_k[c] = min(extract_bits(aps5_packed, (aps5_reverse ? 1u - c : c) * 10u, 9u), aps5_last);\n";
+        text += "            for (uint c = 0u; c < " + std::string(MslAbi::PrimitiveVerticesMacro) + "; ++c) {\n                aps5_k[c] = min(extract_bits(aps5_packed, ((c + aps5_rotate) % " + std::string(MslAbi::PrimitiveVerticesMacro) + ") * 10u, 9u), aps5_last);\n";
         text += "                aps5_mesh.set_index(aps5_i * " + std::string(MslAbi::PrimitiveVerticesMacro) + " + c, uchar(aps5_k[c]));\n            }\n";
         text += "            Aps5MeshPrimitive aps5_p = {};\n            aps5_p.aps5_culled = (aps5_packed & 0x80000000u) != 0u;\n";
-        if (layer) text += "            aps5_p.aps5_layer = aps5_mlayer[aps5_k[min(" + std::to_string(std::min(mesh.provokingVertex, 2u)) + "u, " + std::string(MslAbi::PrimitiveVerticesMacro) + " - 1u)]];\n";
+        if (layer) text += "            aps5_p.aps5_layer = aps5_mlayer[aps5_k[0]];\n";
+        text += MeshCullTest(state, "aps5_p", std::string(MslAbi::PrimitiveVerticesMacro), "            ");
         text += "            aps5_mesh.set_primitive(aps5_i, aps5_p);\n        }\n    }\n";
     }
     state.half = 0u;
@@ -527,6 +566,13 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         helperParameters.push_back("thread uint& aps5_valid");
         arguments.push_back("aps5_valid");
     }
+    // The stage function's demotions before the body (quad and sample masks, conservative coverage):
+    // Metal's discard_fragment leaves simd_is_helper_thread() false and device writes on, so the body's
+    // helper-invocation test reads this flag too (MslAbi::SampleMaskDiscardText).
+    if (fragment) {
+        helperParameters.push_back("bool aps5_demoted");
+        arguments.push_back("aps5_demoted");
+    }
     // MslAbi Version 10: the guest cull distances of each guest vertex the function runs (rect lists
     // and triangle-vertices draws run three).
     const auto culls = fragment ? 0u : MslCullDistanceCount(state);
@@ -558,13 +604,17 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     // Alpha to coverage starts from full coverage, as the SPIR-V path's StoreCoverage(-1): only a
     // float MRT0 export lowers it, so uint exports keep every sample.
     if (fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) text += "    aps5_out.aps5_sample_mask = 0xffffffffu;\n";
+    if (fragment) {
+        text += "    bool aps5_demoted = false;\n";
+        text += std::string("    const uint aps5_sample_coverage = ") + (state.reflection.perSample ? "(aps5_sample_mask_in & (1u << aps5_sample_id))" : "aps5_sample_mask_in") + ";\n";
+    }
     if (fragment) text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentText() + "#endif\n";
     if (quadMasked) {
         if (quadSamples) {
             text += "    const uint aps5_quad_coverage = " + MslQuadCoverage(state) + ";\n";
             text += "    aps5_out.aps5_sample_mask = 0xffffffffu;\n";
         }
-        text += "    if (" + MslQuadUncovered(state) + ") discard_fragment();\n";
+        text += "    if (" + MslQuadUncovered(state) + ") { discard_fragment(); aps5_demoted = true; }\n";
         state.reflection.usesDiscard = true;
     }
     // MslAbi Version 15: a uniform PA_SC_AA_MASK leaves Vulkan no invocation for a pixel whose

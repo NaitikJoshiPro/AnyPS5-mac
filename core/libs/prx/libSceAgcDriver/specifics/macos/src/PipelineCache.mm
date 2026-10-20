@@ -797,12 +797,14 @@ void PipelineCache::PrepareCompute(const ShaderRecompiler::RecompileResult& shad
         std::lock_guard stats(mutex);
         ++statistics.backgroundTasks;
     }
+    // Counted here, on the requesting thread (upstream 7fae4549e counts the pipeline PrepareDispatch creates before
+    // the GPU mutex): the build itself runs on a worker, and the dispatch that later obtains it creates nothing.
+    NoteGuestComputePipeline();
     submit([this, entry, function = std::move(function)] {
         std::string failure;
         id<MTLComputePipelineState> pipeline = nil;
         try {
             pipeline = buildCompute(function);
-            NoteGuestComputePipeline();
         } catch (const std::exception& error) {
             failure = error.what();
         }

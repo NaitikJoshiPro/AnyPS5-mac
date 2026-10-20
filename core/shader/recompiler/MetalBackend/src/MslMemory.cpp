@@ -236,10 +236,12 @@ void Load(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits
 }
 
 void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits, std::uint32_t components) {
-    const auto lane = MslUniformStoreLane(state, instruction, 0u, 0u);
+    const auto shared = SharedOf(state, instruction);
+    // Per-invocation LDS (upstream 6337c8afb, pixel programs) has a copy per lane: every active lane writes its own, so
+    // a wave-uniform store is not narrowed to the highest active lane there.
+    const auto lane = shared.space == "thread" ? std::string() : MslUniformStoreLane(state, instruction, 0u, 0u);
     state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
-    const auto shared = SharedOf(state, instruction);
     const auto address = ByteAddress(state, instruction);
     if (bits < 32u && shared.space == "thread") {
         const auto index = state.Temporary("aps5_di");

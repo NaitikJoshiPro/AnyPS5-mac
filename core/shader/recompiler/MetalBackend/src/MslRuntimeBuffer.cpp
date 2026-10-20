@@ -1063,12 +1063,14 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
         if (!fence.empty()) state.Line(fence);
     };
     if (!descriptor.gpu) {
-        // A descriptor-table buffer: the binding builder refuses atomics on V#s off a dword boundary,
-        // so only the offsets can make the element unaligned (an Unaligned fault, no operation).
+        // A descriptor-table buffer, bound from the V# base rounded down to a dword (the base's misalignment is a
+        // function constant): the element is base + offset, so an unaligned base with an offset that brings the
+        // element back to a dword boundary runs, and an element off a dword boundary records an Unaligned fault and
+        // does nothing (RDNA2 stops the wave).
         const auto element = state.DescriptorElement(DescriptorBindingKind::Buffers, memory.resource);
         const auto buffer = state.TableBuffer(DescriptorBindingKind::Buffers, element);
         const auto byte = state.Temporary("aps5_ab");
-        state.Line("const uint " + byte + " = " + access + ".byte + " + state.MemoryByteOffset(element) + ";");
+        state.Line("const uint " + byte + " = " + access + ".byte + " + state.MemoryByteOffset(element) + " + " + descriptor.memory + ".misalignment;");
         state.Line("if ((" + byte + " & " + mask + ") != 0u) {");
         state.Indent();
         state.Line(MslRecordFault(state, 7u, descriptor.base + " + ulong(" + access + ".byte)", std::to_string(bytes) + "u", MslB5Pc(instruction)));

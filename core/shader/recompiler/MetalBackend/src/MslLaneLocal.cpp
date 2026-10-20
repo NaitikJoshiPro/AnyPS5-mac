@@ -237,7 +237,7 @@ public:
         for (const auto* block : blocks) {
             for (const auto* instruction : block->Instructions()) {
                 const auto opcode = instruction->Opcode();
-                if (opcode == IrOpcode::DataAppend || opcode == IrOpcode::DataConsume) return Blocked(plan, "cross-lane " + std::string(IrOpcodeName(opcode)));
+                if (opcode == IrOpcode::DataAppend || opcode == IrOpcode::DataConsume || opcode == IrOpcode::DataOrderedCount) return Blocked(plan, "cross-lane " + std::string(IrOpcodeName(opcode)));
                 if (HalfLaneOpcode(opcode) && threads % 64u != 0u) return Blocked(plan, "cross-lane " + std::string(IrOpcodeName(opcode)) + " in a partial wave");
                 if (WaveLaneOpcode(opcode)) {
                     if (!SingleWave()) return Blocked(plan, "cross-lane " + std::string(IrOpcodeName(opcode)) + " outside a one-wave workgroup");

@@ -160,10 +160,14 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     const auto vertexResult = ShaderRecompiler::Recompile(vertex);
     const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
     const auto pixelResult = RecompilePixel(PixelCode, waveSize, Fp16Input, target, vertexPush);
-    Require(pixelResult.barycentricEmulation.active != target.fragmentShaderBarycentricEnabled, "16-bit interpolation must emulate barycentrics exactly when the device lacks them");
+    // The MSL backend's fragmentShaderBarycentricEnabled means per-vertex values are emulated (MslAbi
+    // Version 5 triangle-vertices draws, Recompiler.cpp emulatedPerVertex): 16-bit interpolation always
+    // runs on the emulation there, drawn by the Metal device without a generated geometry stage.
+    const bool msl = target.backend == ShaderRecompiler::ShaderBackend::Msl;
+    Require(pixelResult.barycentricEmulation.active == (msl || !target.fragmentShaderBarycentricEnabled), "16-bit interpolation must emulate barycentrics exactly when the device lacks them");
     std::vector<AgcDriver::Graphics::CompiledShader> shaders{{ShaderStage::Vertex, &vertexResult, 0}};
     ShaderRecompiler::RecompileResult geometry;
-    if (pixelResult.barycentricEmulation.active) {
+    if (pixelResult.barycentricEmulation.active && !msl) {
         geometry = ShaderRecompiler::BuildBarycentricGeometryShader(vertexResult, pixelResult, target, device.GeometryLimits());
         shaders.push_back({ShaderStage::Geometry, &geometry, 0});
     }

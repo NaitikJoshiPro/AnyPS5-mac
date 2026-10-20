@@ -209,6 +209,10 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    // The guest ranges (base, size) of the image tables the build resolved (finishImageTables): the
+    // Metal device's batch-wide written-page record is checked against them (upstream's
+    // BdaResources::markWrittenPages "is written by its own dispatch").
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ImageTableRanges() const { return imageTableRanges; }
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
@@ -398,6 +402,9 @@ private:
     void addSamplerTable(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags, TableStage& table);
     void resolveImageTables();
     void finishImageTables();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
+    // MetalImagesOnly: the written guest buffer ranges the Metal device binds (no allocations).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> metalWrittenBuffers;
 
     // A host-imported buffer region the set reads in place, with its import's identity at build time.
     struct DirectRegion {

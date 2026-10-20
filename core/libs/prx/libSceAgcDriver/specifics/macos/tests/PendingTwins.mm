@@ -38,9 +38,6 @@ constexpr Pending Tests[] = {
      "skipped, the Metal draw path does not report render pass totals (DrawPassTotals): TechnicalDebt metal-draw-pass-totals"},
     {"agc_driver_rect_list_indirect_tests", "agc_driver_rect_list_indirect", nullptr, nullptr,
      "skipped, indirect draws read their records on the CPU on Metal (no GPU indirect path yet): TechnicalDebt metal-d6-indirect"},
-    // Port not written yet (not allowlisted): Metal fragment functions export [[stencil]] directly; the port checks the
-    // stencil results without upstream's vkCmdBindPipeline count and SPIR-V inspection.
-    {"agc_driver_stencil_null_feedback_tests", "agc_driver_stencil_null_feedback", "UPSYNC3 (Metal stencil-export port without the vkCmdBindPipeline count)", nullptr},
 };
 
 }

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -214,6 +215,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     };
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
+    if (std::getenv("H2DBG")) { if (FILE* f = std::fopen((std::string("/Users/naitikjoshi/PS5/.mac-work/logs/sync3/h2-flat-") + std::to_string(waveSize) + ".metal").c_str(), "w")) { std::fputs(std::string(result.msl.Source()).c_str(), f); std::fclose(f); } }
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(codeSpan.data()));
     device.WaitIdle();
     Check(output, waveSize);

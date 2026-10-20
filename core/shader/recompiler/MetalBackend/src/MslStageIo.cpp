@@ -87,7 +87,8 @@ std::string MslQuadCoverage(const MslEmitterState& state) {
 std::string MslQuadUncovered(const MslEmitterState& state) {
     const auto& pixel = *state.inputInfo.pixel;
     // The host mask's bits are guest samples APS5_SAMPLE_BASE and up (DECISIONS D28).
-    if (pixel.QuadSampleMaskPartial()) return "(((aps5_sample_mask_in << APS5_SAMPLE_BASE) & " + MslQuadCoverage(state) + ") == 0u)";
+    // aps5_sample_coverage: the stage function's coverage, a per-sample invocation's own sample (MslAbi::SampleMaskDiscardText).
+    if (pixel.QuadSampleMaskPartial()) return "(((aps5_sample_coverage << APS5_SAMPLE_BASE) & " + MslQuadCoverage(state) + ") == 0u)";
     return "(((" + std::to_string(static_cast<std::uint32_t>(pixel.quadPixelMask)) + "u >> " + QuadPixel() + ") & 1u) == 0u)";
 }
 
@@ -307,10 +308,10 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             state.AddParameter("uint aps5_layer_in [[render_target_array_index]]");
             return "aps5_layer_in";
         case StageInputKind::HelperInvocation:
-            // Upstream 90b20afac: a pixel the quad mask demoted reads as a helper (Metal's
-            // discard_fragment demotes too; the test is explicit, as the SPIR-V path's).
-            if (PixelInfo(state).QuadMasked()) return "((simd_is_helper_thread() || " + MslQuadUncovered(state) + ") ? 1u : 0u)";
-            return "(simd_is_helper_thread() ? 1u : 0u)";
+            // Upstream 90b20afac: a pixel the quad mask demoted reads as a helper. Metal's discard_fragment
+            // demotes, but simd_is_helper_thread() stays false after it, so the stage function's demotions
+            // (quad and sample masks, conservative coverage) reach the body as aps5_demoted.
+            return "((simd_is_helper_thread() || aps5_demoted) ? 1u : 0u)";
         case StageInputKind::LayerExported:
             // Upstream #5097 (EmitBuiltinU32): 1 when the draw's last geometry stage exports a render
             // target index (PipelineSpecialization::LayerExported, default 0); the ancillary word's
@@ -536,8 +537,9 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
         const auto output = DecodePositionExportComponent(vertex.paClVsOutCntl, exp.index, component);
         const auto raw = data + "[" + std::to_string(component) + "]";
         // DefineMeshOutputs: mesh functions output the position, parameters, the layer and (upstream
-        // f7a2903ed) clip distances; cull distances are refused in MslGraphicsInterfaceOf.
-        if (mesh && (output.viewport || output.pointSize || output.cullDistance != std::numeric_limits<std::uint32_t>::max())) state.Fail("unsupported mesh output kind (viewport index, point size or cull distance)");
+        // f7a2903ed) clip distances; cull distances are staged per vertex in threadgroup memory
+        // (aps5_mcull) and turned into the primitive's cull flag by the mesh epilogue.
+        if (mesh && (output.viewport || output.pointSize)) state.Fail("unsupported mesh output kind (viewport index or point size)");
         if (output.layer && mesh) {
             // Per vertex in threadgroup memory; each primitive takes its provoking vertex's layer.
             const auto index = state.GuestInvocationIndex();
@@ -555,7 +557,14 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
         // Upstream #423: Metal has no cull distance output. The guest program's distances go to the
         // vertex function's per-vertex record (aps5_cull, EmitMslEntryPoint), which turns them into
         // one clip distance per primitive (MslAbi Version 10).
-        if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_cull[" + std::to_string(output.cullDistance) + "] = as_type<float>(" + raw + ");");
+        // Mesh functions: no per-vertex record survives to the primitive, so the distance goes to
+        // threadgroup memory, read by the epilogue's per-primitive verdict (MeshCullTest).
+        if (output.cullDistance != std::numeric_limits<std::uint32_t>::max() && mesh) {
+            const auto index = state.GuestInvocationIndex();
+            state.Line("if (" + index + " < " + U32(vertex.mesh.maxVertices) + ") aps5_mcull[" + index + " * " + U32(MslCullDistanceCount(state)) + " + " + U32(output.cullDistance) + "] = as_type<float>(" + raw + ");");
+        } else if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) {
+            state.Line("aps5_cull[" + std::to_string(output.cullDistance) + "] = as_type<float>(" + raw + ");");
+        }
     }
 }
 
@@ -909,9 +918,10 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             case StageOutputKind::ClipDistance: break;
             case StageOutputKind::CullDistance:
                 // Upstream f7a2903ed writes gl_CullDistance per mesh vertex; Metal has no cull
-                // distance output, and the mesh function's primitive verdict over its vertices'
-                // distances (as D30 does for vertex functions) is not implemented.
-                state.Fail("mesh functions with guest cull distances are not implemented (Metal has no cull distance output; TechnicalDebt metal-mesh-functions)");
+                // distance output: the mesh epilogue culls a primitive whose vertices all have a
+                // negative distance in one slot (as D30 does for vertex functions; MeshCullTest).
+                if (MslCullDistanceCount(state) > MaxClipDistances) state.Fail("more than 8 guest cull distances");
+                break;
             default: state.Fail("mesh functions output the position, parameters, layer and clip distances only: point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
             }
         }
@@ -1089,9 +1099,10 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     // Upstream 1ffc5f672: a PA_SC_AA_MASK that is the same for the four quad pixels but leaves
     // samples out is the Vulkan pipeline's sample mask; MTLRenderPipelineDescriptor has none, so the
     // driver compiles the function with APS5_SAMPLE_MASK (the guest samples kept) and the function
-    // ANDs its coverage with it (MTLCompileOptions.preprocessorMacros, as APS5_SAMPLE_BASE). A function without other outputs cannot
-    // apply it (the driver refuses such draws).
-    const bool hostMaskMember = !state.reflection.exportsSampleMask && !members.empty();
+    // ANDs its coverage with it (MTLCompileOptions.preprocessorMacros, as APS5_SAMPLE_BASE). A function without other
+    // outputs returns a struct whose only member is that mask under the macro (empty without it, which Metal takes as
+    // no outputs), so a depth- or stencil-writing draw of an output-less program keeps the mask off those writes.
+    const bool hostMaskMember = !state.reflection.exportsSampleMask;
     if (hostMaskMember) members += "#if defined(APS5_SAMPLE_MASK)\n    uint aps5_sample_mask [[sample_mask]];\n#endif\n";
     if (!members.empty()) {
         text += "struct Aps5FragmentOut {\n" + members + "};\n\n";

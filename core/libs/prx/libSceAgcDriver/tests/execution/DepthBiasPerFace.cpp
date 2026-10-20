@@ -251,6 +251,22 @@ void DepthDrawRecipe(AgcDriver::VulkanDevice& device) {
     std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
     device.Draw(state, draw, shaders, {}, &recipe);
     device.WaitIdle();
+#if defined(__APPLE__)
+    // Metal has no draw recipes (TechnicalDebt metal-d6-bring-up-draws): the draw gives none and DrawFromRecipe
+    // rebuilds. The recipe's reuse and rejection steps become fresh draws with the same, a moved and no depth target.
+    Require(recipe == nullptr, "a Metal draw produced a draw recipe");
+    Require(device.DrawFromRecipe(state, draw, shaders, {}, recipe) == AgcDriver::RecipeOutcome::Rebuild, "a Metal draw from no recipe did not rebuild");
+    device.Draw(state, draw, shaders, {}, nullptr);
+    auto movedDepthState = state;
+    movedDepthState.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(RecipeAlternateDepthMemory.data()), 0, {TargetWidth, TargetHeight}, VK_FORMAT_D32_SFLOAT, SurfaceDepth, 0};
+    device.Draw(movedDepthState, draw, shaders, {}, nullptr);
+    auto noDepthState = state;
+    noDepthState.depth.reset();
+    noDepthState.depthTest = false;
+    noDepthState.depthBias = false;
+    device.Draw(noDepthState, draw, shaders, {}, nullptr);
+    device.WaitIdle();
+#else
     Require(recipe != nullptr, "a direct draw with depth target must produce a recipe");
     Require(recipe->hasDepth, "the recipe must record depth target presence");
     Require(recipe->targetViews.size() == 2, "the recipe must record color and depth views");
@@ -268,6 +284,7 @@ void DepthDrawRecipe(AgcDriver::VulkanDevice& device) {
     removedDepthState.depth.reset();
     const auto rejectedDepthOutcome = device.DrawFromRecipe(removedDepthState, draw, shaders, {}, recipe);
     Require(rejectedDepthOutcome == AgcDriver::RecipeOutcome::Rebuild, "a recipe with depth must be rejected when depth target is removed");
+#endif
 }
 
 }

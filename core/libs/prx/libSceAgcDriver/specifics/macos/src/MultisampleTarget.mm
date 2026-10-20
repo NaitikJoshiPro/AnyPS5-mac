@@ -46,6 +46,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -727,7 +728,12 @@ MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const st
         if (!target->active->load(std::memory_order_acquire)) continue;
         const auto& color = target->target;
         if (target->context.device != context.device || color.address != address) continue;
-        Require(color.extent.width == width && color.extent.height == height && color.samples == samples, std::string("AGC graphics: a 2D MSAA T# disagrees with the multisampled color target at its address in extent or sample count") + described);
+        if (color.extent.width != width || color.extent.height != height || color.samples != samples) {
+            // Upstream's MultisampleTargetTexture text (agc_driver_sample_multisample_target matches it).
+            char text[320];
+            std::snprintf(text, sizeof(text), "AGC graphics: sampling multisampled color target 0x%llx (%ux%u, %u samples, vk format %d) as a %ux%u texture of %u samples and guest format %u (vk %d) is not implemented", static_cast<unsigned long long>(address), color.extent.width, color.extent.height, color.samples, static_cast<int>(color.format), width, height, samples, guestFormat, static_cast<int>(format));
+            throw std::runtime_error(std::string(text) + described);
+        }
         // Upstream 90c3b61c6c: a sampled view in the red/blue-swapped format reads with swapped components.
         const bool swap = swapped != nullptr && redBlueSwapped(color.format, format);
         Require(color.format == format || swap, std::string("AGC graphics: a 2D MSAA T# reads a multisampled color target in another format, which is not implemented") + described);
@@ -736,8 +742,11 @@ MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const st
         return *target;
     }
     if (fillUnrendered) {
-        Require(Recorder::Active() != nullptr, "a multisampled texture is only sampled by recorded draws and dispatches");
-        auto& created = createFilled(context, DecodeTextureResource(words), format);
+        // Upstream MultisampleTargetTexture / MultisampleTargetStorageView: memory no draw rendered
+        // to becomes a target holding its uniform color memory, for sampling and for writing alike.
+        const bool storage = std::string_view(what) == "storage view";
+        Require(Recorder::Active() != nullptr, storage ? "a multisampled color target is only written by recorded dispatches" : "a multisampled texture is only sampled by recorded draws and dispatches");
+        auto& created = createFilled(context, DecodeTextureResource(words), format, storage ? "writing" : "sampling");
         created.ApplyFastClear(created.target);
         return created;
     }
@@ -768,7 +777,7 @@ std::shared_ptr<Texture> MultisampleSampledTexture(const Context& context, std::
 
 std::shared_ptr<Texture> MultisampleStorageTexture(const Context& context, std::span<const std::uint32_t> words) {
     std::lock_guard lock(targetsMutex());
-    auto& target = TargetOfDescriptor(context, words, "storage view", false);
+    auto& target = TargetOfDescriptor(context, words, "storage view", true);
     // Brought up to date before the access; the access (recorded after this) writes the shadow.
     target.SyncShadow();
     target.shadowNewer = true;

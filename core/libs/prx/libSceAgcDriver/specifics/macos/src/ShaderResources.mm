@@ -1918,6 +1918,18 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 // macOS: the Metal device binds buffers, address tables and data itself.
                 if (metalImagesOnly) {
                     if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, binding.guestDescriptor);
+                    // The guest buffers the shader may store to (addGuestBuffer's ranges), for
+                    // finishImageTables' "written by its own dispatch" poison as upstream's allocations.
+                    if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::uint64_t>(binding.count) * 4) {
+                        for (std::uint32_t element = 0; element < binding.count; ++element) {
+                            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                            if (!written) continue;
+                            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4);
+                            const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1] & ~0x40000000u, words[2], words[3]}};
+                            const auto bytes = guestBufferBytes(words);
+                            if (descriptor.Type() == 0u && descriptor.Base48() != 0 && bytes != 0) metalWrittenBuffers.emplace_back(descriptor.Base48(), bytes);
+                        }
+                    }
                     continue;
                 }
                 if (!bufferRole) Require(false, std::string("unsupported descriptor role ") + roleName(binding.role));
@@ -3245,13 +3257,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 TextureCounts().tablesReused.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            for (std::uint32_t element = 0; element < images->count; ++element) {
-                if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
-                const auto words = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
-                const auto resource = DecodeTextureResource(words);
-                if (textureIndex >= textures.size() || table.elementTextures[element] != textureIndex || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element)) != textures[textureIndex]) return false;
-                ++textureIndex;
-            }
+            // macOS: a table no remembered table vouches for is resolved again by a fresh build
+            // (tablesVouched below), as upstream's dispatch build, seldom reusable, does.
+            return false;
         }
         if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
         // The walk proved every object current again: the records move to what it proved, or one
@@ -3384,6 +3392,37 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+    }
+    // macOS: a MetalImagesOnly build holds no guest buffers, so it stays reusable where upstream's
+    // dispatch build (with the buffers its SRT names) seldom is, and upstream serves a table again
+    // only through the remembered table of the thread's collect epoch (resolveImageTables). A fast
+    // proof keeps the build's tables only while that table vouches for each of them (same
+    // TableState, current, its textures still cached and the build's): otherwise a fresh build
+    // resolves them (agc_driver_image_table_reuse counts both).
+    if (fast) {
+        std::uint64_t vouched = 0;
+        for (const auto& table : tableStages) {
+            if (table.elementTextures.empty()) continue;
+            const auto* images = tableImages(shaders, table.stage);
+            if (images == nullptr || images->count != table.elementTextures.size()) return finish(fast, false);
+            std::vector<std::shared_ptr<Texture>> cached;
+            auto* reused = FindReusedTable(context.device, *images, CurrentTableState());
+            if (reused == nullptr || !TableCurrent(*reused) || !CachedTableTextures(*reused, cached)) return finish(fast, false);
+            auto next = cached.begin();
+            for (std::uint32_t element = 0; element < images->count; ++element) {
+                const auto& entry = reused->elements[element];
+                const auto index = table.elementTextures[element];
+                if (entry.rejected) {
+                    if (index != std::numeric_limits<std::size_t>::max()) return finish(fast, false);
+                    continue;
+                }
+                const auto& texture = *next++;
+                if (index == std::numeric_limits<std::size_t>::max()) continue;
+                if (index >= textures.size() || textures[index] != texture) return finish(fast, false);
+            }
+            ++vouched;
+        }
+        if (vouched != 0) TextureCounts().tablesReused.fetch_add(vouched, std::memory_order_relaxed);
     }
     return finish(fast, true);
 }
@@ -4823,6 +4862,7 @@ void ShaderResources::finishImageTables() {
             };
             bool written = false;
             for (const auto& allocation : allocations) written = written || (allocation.guest && allocation.written && tableOverlaps(allocation.address, allocation.size));
+            for (const auto& [address, bytes] : metalWrittenBuffers) written = written || tableOverlaps(address, bytes);
             for (std::size_t image = 0; image < storageTextures.size(); ++image) written = written || (storageWritten[image] && storageTextures[image] != nullptr && tableOverlaps(storageTextures[image]->Descriptor().baseAddress, storageTextures[image]->GuestBytes()));
             if (!written) continue;
             ShaderRecompiler::ImageTableEntryPoison poison{};
@@ -4840,6 +4880,7 @@ void ShaderResources::finishImageTables() {
         faults.push_back({IrStage(table.stage), table.program->imageTableShader, table.poison, table.messages});
         ranges.insert(ranges.end(), table.program->imageTableRanges.begin(), table.program->imageTableRanges.end());
     }
+    imageTableRanges = ranges;
     if (bda == nullptr) return;
     bda->SetImageTables(std::move(faults), std::move(ranges));
 }

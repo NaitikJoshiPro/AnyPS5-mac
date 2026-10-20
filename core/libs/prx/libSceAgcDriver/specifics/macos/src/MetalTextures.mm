@@ -239,7 +239,7 @@ bool HasImages(const ShaderRecompiler::RecompileResult& shader) {
     // MslAbi Version 15: image and sampler tables (and their map) come from the build too.
     return std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) {
         using Role = ShaderRecompiler::DescriptorRole;
-        return binding.role == Role::GuestImages || binding.role == Role::GuestSamplers || binding.role == Role::ImageTable || binding.role == Role::SamplerTable || binding.role == Role::ImageTableMap;
+        return binding.role == Role::GuestImages || binding.role == Role::GuestSamplers || binding.role == Role::ImageTable || binding.role == Role::ImageStorageTable || binding.role == Role::SamplerTable || binding.role == Role::ImageTableMap;
     });
 }
 
@@ -251,6 +251,9 @@ ImageBindings::ImageBindings(ImageCache& cache, std::function<void(std::uint64_t
 ImageBindings::~ImageBindings() = default;
 
 void ImageBindings::Prepare(const ShaderRecompiler::RecompileResult& shader) {
+    // A draw prepares each stage in turn: every stage writes its entries from its own build (the
+    // previous stage's stays in `builds` for Commit).
+    resources = nullptr;
     if (!HasImages(shader)) return;
     const auto* context = cache.ImageContext();
     if (context == nullptr) FailD5("a dispatch binds guest images before the image cache is attached to the device's Context");
@@ -280,6 +283,7 @@ void ImageBindings::Prepare(const ShaderRecompiler::RecompileResult& shader) {
             }
         }
     }
+    if (std::find(builds.begin(), builds.end(), resources) == builds.end()) builds.push_back(resources);
 }
 
 void ImageBindings::Write(const ShaderRecompiler::DescriptorBinding& binding, std::span<std::uint64_t> entries) {
@@ -288,14 +292,21 @@ void ImageBindings::Write(const ShaderRecompiler::DescriptorBinding& binding, st
     resources->WriteTableEntries(binding, entries);
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ImageBindings::TableRanges() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& build : builds) ranges.insert(ranges.end(), build->ImageTableRanges().begin(), build->ImageTableRanges().end());
+    return ranges;
+}
+
 void ImageBindings::Commit(Recorder& recorder) {
     if (committed) return;
     committed = true;
-    if (resources == nullptr) return;
     // ShaderResources::MarkGpuWrites marks the written storage images dirty (pending: stored when a
-    // reader needs their memory) and notes their ranges; the batch keeps the build.
-    resources->MarkGpuWrites(recorder);
-    recorder.Keep(resources);
+    // reader needs their memory) and notes their ranges; the batch keeps each stage's build.
+    for (auto& build : builds) {
+        build->MarkGpuWrites(recorder);
+        recorder.Keep(build);
+    }
 }
 
 }

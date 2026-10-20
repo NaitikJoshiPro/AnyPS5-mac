@@ -1,8 +1,15 @@
 #include "MetalBackend/MslEmitterState.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <functional>
+#include <initializer_list>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -583,14 +590,224 @@ std::string Median(const std::string& a, const std::string& b, const std::string
     return "max(min(" + a + ", " + b + "), min(max(" + a + ", " + b + "), " + c + "))";
 }
 
+// Window narrowing (upstream 30fab0777e, SpirvModuleSetup.cpp WindowIndexBounds/IndexedWindowSlots and
+// SpirvAluEmitterRegisters.cpp AccessNarrowedWindow): the window array holds only the slots the relative
+// accesses likely reach, from a bound analysis of their indices; every other slot is a local of its own the
+// Metal compiler can keep in a register (a function-scope array that is dynamically indexed lives in stack
+// memory on Apple GPUs). A relative access whose index lands past the array at run time switches over those
+// locals, so the guess only affects speed. APS5_NO_WINDOW_NARROWING=1 turns it off. The analysis is
+// upstream's, kept in step with it.
+class WindowIndexBounds {
+public:
+    std::optional<std::uint64_t> Of(const IrValue& input) {
+        const IrValue* value = input.Resolve();
+        if (value->HasImmediate()) return value->ImmediateU32();
+        if (const auto found = memo.find(value); found != memo.end()) return found->second;
+        if (!active.insert(value).second || active.size() > 256u) return std::nullopt;
+        const auto bound = compute(*value);
+        active.erase(value);
+        memo.emplace(value, bound);
+        return bound;
+    }
+
+private:
+    using Bound = std::optional<std::uint64_t>;
+
+    Bound maxOf(std::initializer_list<Bound> bounds) {
+        std::uint64_t result = 0;
+        for (const auto& bound : bounds) {
+            if (!bound) return std::nullopt;
+            result = std::max(result, *bound);
+        }
+        return result;
+    }
+
+    static std::vector<const IrValue*> reachingStores(const IrValue& load, std::uint32_t slot) {
+        std::vector<const IrValue*> values;
+        std::unordered_set<const IrBlock*> visited;
+        std::vector<std::pair<IrBlock*, const IrValue*>> pending{{load.Parent(), &load}};
+        while (!pending.empty()) {
+            const auto [block, before] = pending.back();
+            pending.pop_back();
+            const auto& instructions = block->Instructions();
+            auto it = instructions.rbegin();
+            if (before != nullptr) it = std::next(std::find(instructions.rbegin(), instructions.rend(), before));
+            bool stored = false;
+            for (; it != instructions.rend() && !stored; ++it) {
+                if ((*it)->Opcode() != IrOpcode::StoreVectorWindow) continue;
+                const IrValue* index = (*it)->Argument(0)->Resolve();
+                if (!index->HasImmediate() || index->ImmediateU32() != slot) continue;
+                values.push_back((*it)->Argument(1));
+                stored = true;
+            }
+            if (stored) continue;
+            for (IrBlock* predecessor : block->Predecessors()) {
+                if (visited.insert(predecessor).second) pending.emplace_back(predecessor, nullptr);
+            }
+        }
+        return values;
+    }
+
+    Bound compute(const IrValue& value) {
+        const auto arg = [&](std::size_t index) { return Of(*value.Argument(index)); };
+        const auto immediate = [&](std::size_t index) -> std::optional<std::uint32_t> {
+            const IrValue* operand = value.Argument(index)->Resolve();
+            if (!operand->HasImmediate()) return std::nullopt;
+            return operand->ImmediateU32();
+        };
+        const auto fits = [](std::uint64_t bound) -> Bound { return bound <= 0xffffffffull ? Bound(bound) : std::nullopt; };
+        switch (value.Opcode()) {
+        case IrOpcode::BitFieldUExtract: {
+            const auto count = immediate(2);
+            if (count && *count < 32u) return (std::uint64_t{1} << *count) - 1u;
+            return arg(0);
+        }
+        case IrOpcode::BitwiseAnd32: {
+            const auto lhs = arg(0);
+            const auto rhs = arg(1);
+            if (lhs && rhs) return std::min(*lhs, *rhs);
+            return lhs ? lhs : rhs;
+        }
+        case IrOpcode::UMin32: {
+            const auto lhs = arg(0);
+            const auto rhs = arg(1);
+            if (!lhs || !rhs) return std::nullopt;
+            return std::min(*lhs, *rhs);
+        }
+        case IrOpcode::UMax32:
+            return maxOf({arg(0), arg(1)});
+        case IrOpcode::BitwiseOr32: {
+            const auto both = maxOf({arg(0), arg(1)});
+            if (!both) return std::nullopt;
+            std::uint64_t mask = 0;
+            while (mask < *both) mask = mask << 1u | 1u;
+            return mask;
+        }
+        case IrOpcode::IAdd32: {
+            const auto lhs = arg(0);
+            const auto rhs = arg(1);
+            if (!lhs || !rhs) return std::nullopt;
+            return fits(*lhs + *rhs);
+        }
+        case IrOpcode::ShiftRightLogical32: {
+            const auto shift = immediate(1);
+            const auto bound = arg(0);
+            if (!bound) return std::nullopt;
+            return shift ? *bound >> (*shift & 31u) : *bound;
+        }
+        case IrOpcode::ShiftLeftLogical32: {
+            const auto shift = immediate(1);
+            const auto bound = arg(0);
+            if (!bound || !shift) return std::nullopt;
+            return fits(*bound << (*shift & 31u));
+        }
+        case IrOpcode::ConvertU32U16:
+            return 0xffffu;
+        case IrOpcode::Select:
+        case IrOpcode::SelectU32: {
+            if (value.Argument(0)->Resolve()->Opcode() == IrOpcode::GetExec || value.Argument(2)->Resolve()->Opcode() == IrOpcode::LoadVectorWindow) return arg(1);
+            const auto lhs = arg(1);
+            const auto rhs = arg(2);
+            if (lhs && rhs) return std::max(*lhs, *rhs);
+            return lhs ? lhs : rhs;
+        }
+        case IrOpcode::ReadFirstLane:
+            return arg(0);
+        case IrOpcode::Identity:
+        case IrOpcode::Phi: {
+            Bound bound;
+            for (std::size_t index = 0; index < value.ArgumentCount(); ++index) {
+                if (const auto incoming = arg(index)) bound = std::max(bound.value_or(0u), *incoming);
+            }
+            return bound;
+        }
+        case IrOpcode::LoadVectorWindow: {
+            const IrValue* index = value.Argument(0)->Resolve();
+            if (!index->HasImmediate()) return std::nullopt;
+            Bound bound = 0u;
+            for (const IrValue* stored : reachingStores(value, index->ImmediateU32())) {
+                bound = maxOf({bound, Of(*stored)});
+                if (!bound) return std::nullopt;
+            }
+            return bound;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+    std::unordered_map<const IrValue*, Bound> memo;
+    std::unordered_set<const IrValue*> active;
+};
+
+std::uint32_t IndexedWindowSlots(const IrProgram& program) {
+    const auto window = program.Metadata().vectorWindowSize;
+    WindowIndexBounds bounds;
+    std::uint64_t reached = 0;
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::LoadVectorWindow && inst->Opcode() != IrOpcode::StoreVectorWindow) continue;
+            const IrValue* index = inst->Argument(0)->Resolve();
+            if (index->HasImmediate()) continue;
+            const auto bound = bounds.Of(*index);
+            if (bound && *bound < window / 2u) reached = std::max(reached, *bound + 1u);
+        }
+    }
+    return static_cast<std::uint32_t>(reached);
+}
+
 // The relative-addressing window of vector registers (v_movrels/v_movreld): a function-scope array per
-// guest lane of the invocation, as the SPIR-V path's Function-storage `vector_window` per lane half.
-std::string VectorWindow(MslEmitterState& state, const IrValue& instruction) {
+// guest lane of the invocation, as the SPIR-V path's Function-storage `vector_window` per lane half, plus
+// one local per narrowed-out slot (`<window>_s<slot>`). `access(element)` emits the load or store of one
+// element expression; a dynamic index past the array switches over the slot locals (a load of a slot past
+// the window reads 0, as upstream's OpSwitch default).
+void AccessVectorWindow(MslEmitterState& state, const IrValue& instruction, const std::function<void(const std::string&)>& access, const std::string* loadTarget) {
     const auto size = state.program.Metadata().vectorWindowSize;
     if (size == 0u) state.Fail(instruction, "has no relative-addressing window in the program metadata");
+    if (!state.vectorWindowIndexed) {
+        static const bool narrowWindow = std::getenv("APS5_NO_WINDOW_NARROWING") == nullptr;
+        state.vectorWindowIndexed = narrowWindow ? IndexedWindowSlots(state.program) : 0u;
+    }
+    const std::uint32_t indexed = *state.vectorWindowIndexed;
+    const std::uint32_t arraySize = indexed != 0u ? indexed : size;
     const std::string name = state.half == 0u ? "aps5_vector_window" : "aps5_vector_window_h";
-    if (state.locals.find(" " + name + "[") == std::string::npos) state.DeclareLocal("uint", name + "[" + std::to_string(size) + "]", "{}");
-    return name + "[" + state.Arg(instruction, 0u) + "]";
+    if (state.locals.find(" " + name + "[") == std::string::npos) {
+        state.DeclareLocal("uint", name + "[" + std::to_string(arraySize) + "]", "{}");
+        for (std::uint32_t slot = arraySize; slot < size; ++slot) state.DeclareLocal("uint", name + "_s" + std::to_string(slot), "0u");
+    }
+    const auto slotName = [&](std::uint32_t slot) { return name + "_s" + std::to_string(slot); };
+    const IrValue* index = instruction.Argument(0)->Resolve();
+    const std::string at = state.Arg(instruction, 0u);
+    if (indexed == 0u) return access(name + "[" + at + "]");
+    if (index->HasImmediate()) {
+        const auto slot = index->ImmediateU32();
+        if (slot < indexed) return access(name + "[" + at + "]");
+        if (slot < size) return access(slotName(slot));
+        if (loadTarget != nullptr) state.Line(*loadTarget + " = 0u;");
+        return;
+    }
+    state.Line("if (" + at + " < " + std::to_string(indexed) + "u) {");
+    state.Indent();
+    access(name + "[" + at + "]");
+    state.Outdent();
+    state.Line("} else {");
+    state.Indent();
+    state.Line("switch (" + at + ") {");
+    for (std::uint32_t slot = indexed; slot < size; ++slot) {
+        state.Line("case " + std::to_string(slot) + "u:");
+        state.Indent();
+        access(slotName(slot));
+        state.Line("break;");
+        state.Outdent();
+    }
+    state.Line("default:");
+    state.Indent();
+    if (loadTarget != nullptr) state.Line(*loadTarget + " = 0u;");
+    state.Line("break;");
+    state.Outdent();
+    state.Line("}");
+    state.Outdent();
+    state.Line("}");
 }
 
 }
@@ -977,12 +1194,14 @@ bool EmitMslAluInstruction(MslEmitterState& state, const IrValue& instruction) {
         return true;
 
     // Relative addressing of vector registers.
-    case IrOpcode::LoadVectorWindow:
-        state.Define(instruction, VectorWindow(state, instruction));
+    case IrOpcode::LoadVectorWindow: {
+        const auto target = state.Name(instruction);
+        AccessVectorWindow(state, instruction, [&](const std::string& element) { state.Line(target + " = " + element + ";"); }, &target);
         return true;
+    }
     case IrOpcode::StoreVectorWindow: {
-        const auto element = VectorWindow(state, instruction);
-        state.Line(element + " = " + state.Arg(instruction, 1u) + ";");
+        const auto value = state.Arg(instruction, 1u);
+        AccessVectorWindow(state, instruction, [&](const std::string& element) { state.Line(element + " = " + value + ";"); }, nullptr);
         return true;
     }
     default:

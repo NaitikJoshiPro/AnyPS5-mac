@@ -8,6 +8,7 @@
 #include <bitset>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -120,6 +121,10 @@ public:
     // reads that stay in the reading lane's 32-lane half at one lane per invocation.
     [[nodiscard]] std::string HalfBallot(const IrValue* predicate);
     std::uint32_t half = 0u;
+    // Relative-addressing window slots kept in the window array (the rest are locals of their own,
+    // MslAluMath.cpp VectorWindow): unset until the first window access computes it, 0 for the whole
+    // window in the array.
+    std::optional<std::uint32_t> vectorWindowIndexed;
     std::uint32_t hostSubgroupSize = 32u;
     const ShaderWorkgroupInputInfo* workgroup = nullptr;
     std::unordered_set<const IrValue*> waveUniform;

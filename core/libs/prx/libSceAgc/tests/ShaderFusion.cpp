@@ -340,20 +340,17 @@ void testDisplacedFusion() {
     check(sceAgcFuseShaderHalves_0200(&fused, front, back, scratch) == 0, "displaced fusion failed");
     const auto taken = faults() - before;
     if (taken != 0) throw std::runtime_error("displaced fusion took " + std::to_string(taken) + " displaced faults (a native read through the guest address)");
-    check(fused.code == scratch && fused.shader_size == 256 + halves.back.shader_size, "displaced fused code placement is wrong");
-    const auto* code = memory.Host(scratch);
-    check(word(code, 0) == SMovS0 && word(code, 1) == VMovV0 && word(code, 64) == halves.backCode[0], "displaced fused program was not copied");
-    const auto inside = [&](const void* pointer) {
-        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-        return address >= reinterpret_cast<std::uintptr_t>(scratch) && address < reinterpret_cast<std::uintptr_t>(scratch) + size.m_size;
-    };
-    check(inside(fused.sh_registers) && inside(fused.cx_registers) && inside(fused.specials) && inside(fused.user_data), "displaced fused tables are not at their guest addresses");
-    const auto* userData = memory.Host(fused.user_data);
-    check(inside(userData->direct_resource_offset) && memory.Host(userData->direct_resource_offset)[1] == 9u, "displaced fused user data is wrong");
+    // Upstream 0d078f75d3: the fused program (code, tables, user data) lives in host memory libSceAgc owns, which is
+    // never displaced; only the fused register list is written to the caller's (displaced) scratch memory.
+    const auto code = reinterpret_cast<std::uintptr_t>(fused.code);
+    check(!GuestArena::IsDisplaced(code) && code % 256 == 0 && fused.shader_size == 256 + halves.back.shader_size, "displaced fused code placement is wrong");
+    check(word(reinterpret_cast<const void*>(code), 0) == SMovS0 && word(reinterpret_cast<const void*>(code), 1) == VMovV0 && word(reinterpret_cast<const void*>(code), 64) == halves.backCode[0], "displaced fused program was not copied");
+    check(reinterpret_cast<std::uintptr_t>(fused.sh_registers) == reinterpret_cast<std::uintptr_t>(scratch), "displaced fused registers are not at their guest address");
+    check(fused.user_data != nullptr && !GuestArena::IsDisplaced(reinterpret_cast<std::uintptr_t>(fused.user_data)) && fused.user_data->direct_resource_offset[1] == 9u, "displaced fused user data is wrong");
     const auto* lo = memory.Host(fused.sh_registers);
     bool patched = false;
-    for (std::size_t i = 0; i < fused.num_sh_registers; ++i) patched |= lo[i].offset == 0x0C8u && lo[i].value == static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(scratch) >> 8u);
-    check(patched, "displaced fused program address is not the guest address");
+    for (std::size_t i = 0; i < fused.num_sh_registers; ++i) patched |= lo[i].offset == 0x0C8u && lo[i].value == static_cast<std::uint32_t>(code >> 8u);
+    check(patched, "displaced fused program address is not the fused code address");
     GuestAllocations::Mutation().Remove(reinterpret_cast<void*>(Base));
 #endif
 }

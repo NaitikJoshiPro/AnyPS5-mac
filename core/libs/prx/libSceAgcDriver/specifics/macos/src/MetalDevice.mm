@@ -490,14 +490,32 @@ void VulkanDevice::State::Sync() {
 
 // The BdaAbi fault buffer after a batch with dispatches completed: GPU stores through BDA addresses
 // are reported to the write tracker (written-page record), then a published fault record is raised.
-void VulkanDevice::State::CheckFaults() {
+void VulkanDevice::State::CheckFaults(std::uint64_t serial) {
     auto* words = static_cast<std::uint32_t*>(faults.contents);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> tableRanges;
+    if (serial != 0u) {
+        std::lock_guard lock(tableRangeMutex);
+        for (auto batch = batchTableRanges.begin(); batch != batchTableRanges.end() && batch->first <= serial;) {
+            tableRanges.insert(tableRanges.end(), batch->second.begin(), batch->second.end());
+            batch = batchTableRanges.erase(batch);
+        }
+    }
     if (words[Bda::WrittenOverflowWord] != 0u) {
         std::memset(faults.contents, 0, Bda::WrittenListWord * sizeof(std::uint32_t));
         throw std::runtime_error("Metal device: more than " + std::to_string(Bda::WrittenPageSlots) + " chunks of " + std::to_string(Bda::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     }
     if (const auto count = words[Bda::WrittenCountWord]; count != 0u) {
-        const bool valid = Bda::ForEachWrittenRange(words, [](std::uint64_t address, std::size_t bytes) { GuestMemory::MarkWritten(address, bytes); });
+        std::uint64_t selfWritten = 0;
+        bool selfWrite = false;
+        const bool valid = Bda::ForEachWrittenRange(words, [&](std::uint64_t address, std::size_t bytes) {
+            for (const auto& [base, size] : tableRanges) {
+                if (!selfWrite && size != 0u && address < base + size && base < address + bytes) {
+                    selfWrite = true;
+                    selfWritten = base;
+                }
+            }
+            GuestMemory::MarkWritten(address, bytes);
+        });
         for (std::uint32_t claim = 0; claim < std::min(count, Bda::WrittenPageSlots); ++claim) {
             const auto slot = words[Bda::WrittenListWord + claim];
             if (slot >= Bda::WrittenPageSlots) continue;
@@ -506,6 +524,9 @@ void VulkanDevice::State::CheckFaults() {
         }
         words[Bda::WrittenCountWord] = 0u;
         if (!valid) throw std::runtime_error("Metal device: invalid BDA written-page record");
+        // Upstream's BdaResources::markWrittenPages text.
+        if (selfWrite) lastFaultStage = 0u;
+        if (selfWrite) throw std::runtime_error("Metal device: image table at " + Hex(selfWritten) + " is written by its own dispatch");
     }
     Bda::Fault report {};
     std::memcpy(&report, faults.contents, sizeof(report));
@@ -528,7 +549,13 @@ void VulkanDevice::State::CheckFaults() {
     if (report.reason == Bda::FaultReason::InvalidDescriptor) message += " (InvalidDescriptor)";
     // MslAbi Version 15: upstream's report (BdaResources::CheckFault) from the bound tables' poison lists.
     if (report.reason == Bda::FaultReason::ImageTable) throw std::runtime_error(Graphics::DescribeImageTableFault(report.stage, report.instruction, report.address, report.bytes));
-    if (report.reason == Bda::FaultReason::UnlinkedCall) message += " (UnlinkedCall: a call to a function the program was not linked with)";
+    // Upstream's report (BdaResources::CheckFault): the target address and the program counter of
+    // a call the relinker linked no callee for.
+    if (report.reason == Bda::FaultReason::UnlinkedCall) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "shader stage %u called address 0x%llx at program counter 0x%x, which no linked callee of that call matches", report.stage, static_cast<unsigned long long>(report.address), report.instruction);
+        throw std::runtime_error(text);
+    }
     throw std::runtime_error(message);
 }
 
@@ -760,6 +787,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // draw-relative instance (aps5_group.y, MslTessellation.cpp). BaseInstance in any other
             // stage stays refused by the MSL backend.
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDrawParameters));
+            // MSL 2.3+ discard_fragment() demotes the fragment to a helper thread (its quad's derivatives stay defined),
+            // which is what OpDemoteToHelperInvocation does: the PA_SC_AA_MASK quad pixel mask discards its uncovered
+            // pixels that way (MslEntryPoint.cpp), so masked pixel programs with implicit-LOD sampling or cross-lane
+            // reads run (agc_driver_quad_pixel_mask), where a Vulkan device without the feature refuses them.
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDemoteToHelperInvocation));
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
@@ -820,6 +852,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.shaderClipDistance = true;
             context.shaderCullDistance = true;
             context.viewportIndexLayer = true;
+            // The color sample counts the GPU renders (the twins' harness reports the same), and
+            // multisampled storage images: Metal shaders cannot write texture2d_ms, so guest MSAA
+            // storage goes through the target's storage shadow (DECISIONS D22/D28,
+            // MultisampleStorageTexture), which is what Context::storageImageMultisample promises.
+            VkSampleCountFlags colorSamples = 0;
+            for (const std::uint32_t count : {1u, 2u, 4u, 8u}) {
+                if ([state->device supportsTextureSampleCount:count]) colorSamples |= count;
+            }
+            context.limits.framebufferColorSampleCounts = colorSamples;
+            context.storageImageMultisample = true;
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
             Graphics::Metal::DescribeMemory(context, state->device);
@@ -1656,16 +1698,22 @@ void VulkanDevice::State::NoteBindings(const StageBindings& plan) {
     if (!plan.writes.empty()) recorder->NotePendingWrites(plan.writes);
 }
 
-void VulkanDevice::State::CheckFaultsOnComplete(bool draw) {
+void VulkanDevice::State::CheckFaultsOnComplete(bool draw, std::vector<std::pair<std::uint64_t, std::uint64_t>> tableRanges) {
+    const auto serial = recorder->OpenSerial();
+    if (!tableRanges.empty()) {
+        std::lock_guard lock(tableRangeMutex);
+        auto& ranges = batchTableRanges[serial];
+        ranges.insert(ranges.end(), tableRanges.begin(), tableRanges.end());
+    }
     // Faults and written pages of this batch's commands (one shared record) when it completes. As
     // upstream (BdaResources::CheckFault in a completion): a fault record throws, which the recorder
     // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait. A
     // draw's graphics-stage fault is also kept for WaitIdle: upstream's draw over non-resident
     // targets runs synchronously and throws it from Draw (agc_driver_pixel_interlock).
-    recorder->OnComplete([this, draw] {
+    recorder->OnComplete([this, draw, serial] {
         if (!tearingDown) {
             try {
-                CheckFaults();
+                CheckFaults(serial);
             } catch (...) {
                 constexpr std::uint32_t ComputeStage = 4u;  // IrShaderStage::Compute in Bda::Fault::stage
                 if (draw && lastFaultStage != ComputeStage) {
@@ -1677,7 +1725,7 @@ void VulkanDevice::State::CheckFaultsOnComplete(bool draw) {
             return;
         }
         try {
-            CheckFaults();
+            CheckFaults(serial);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[metal] %s\n", error.what());
         }
@@ -1788,7 +1836,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         plan.reads.pop_back();
     }
     NoteBindings(plan);
-    CheckFaultsOnComplete();
+    CheckFaultsOnComplete(false, imageBindings.TableRanges());
     if (Trace() && std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::Gds; })) {
         // After the dispatch completes: what the CPU sees in GDS dwords 4-7, and what the GPU sees
         // through the bound mapping (copied into a fresh buffer behind the dispatch).
@@ -1896,6 +1944,9 @@ void VulkanDevice::NoteRecipe(RecipeEvent, RecipeKind) {
 
 Graphics::Context VulkanDevice::graphicsContext() const {
     if (state->recorder == nullptr) Unimplemented("the Graphics::Context of a compile-only device", "work package D1");
+    // Upstream's graphics context carries the texture detiler and the image caches: on Metal that is
+    // the image cache's copy of the device Context (ImageCache::Attach), once attached.
+    if (state->images != nullptr && state->images->ImageContext() != nullptr) return *state->images->ImageContext();
     return state->context;
 }
 

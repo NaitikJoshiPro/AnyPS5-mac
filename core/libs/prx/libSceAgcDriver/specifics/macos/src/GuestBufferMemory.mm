@@ -1071,6 +1071,11 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
     auto windowBegin = range.address + cell(begin) * window;
     const auto endCell = cell(end - 1);
     auto windowEnd = endCell == lastCell ? range.address + range.bytes : range.address + (endCell + 1) * window;
+    // The cells are relative to the range's base, so one can cross a 1 GiB import piece edge; importRun has already
+    // clipped a longer range to the piece holding the access (MaxImportBytes, D42), and no import leaves its piece.
+    windowBegin = std::max(windowBegin, run.base);
+    windowEnd = std::min(windowEnd, run.base + run.bytes);
+    if (windowEnd <= windowBegin) return run;
     for (bool grown = true; grown;) {
         grown = false;
         auto it = state.imports.upper_bound(windowBegin);

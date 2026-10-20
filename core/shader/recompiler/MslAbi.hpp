@@ -374,7 +374,12 @@ inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
 inline constexpr const char* SampleMaskMacro = "APS5_SAMPLE_MASK";
 // Version 18: the stage function's discard of pixels without samples left by APS5_SAMPLE_MASK
 // (before the guest body; the host coverage bits are guest samples APS5_SAMPLE_BASE and up).
-inline constexpr const char* SampleMaskDiscardText = "#if defined(APS5_SAMPLE_MASK)\n    if (((aps5_sample_mask_in << APS5_SAMPLE_BASE) & (APS5_SAMPLE_MASK)) == 0u) discard_fragment();\n#endif\n";
+// aps5_sample_coverage is the stage function's [[sample_mask]] input, or for a function that runs
+// per sample its own sample's bit of it (Metal's input holds the pixel's whole coverage there).
+// Metal's discard_fragment demotes the thread, but the thread keeps writing device memory and
+// simd_is_helper_thread() stays false, so the function records the demotion in aps5_demoted, which
+// the guest body's helper-invocation test reads (MslStageIo.cpp HelperInvocation).
+inline constexpr const char* SampleMaskDiscardText = "#if defined(APS5_SAMPLE_MASK)\n    if (((aps5_sample_coverage << APS5_SAMPLE_BASE) & (APS5_SAMPLE_MASK)) == 0u) { discard_fragment(); aps5_demoted = true; }\n#endif\n";
 // Version 5: the triangle-vertices expansion, shared by conservative rasterization and the per-vertex
 // fragment value emulation (no Metal geometry stage; per-vertex fragment inputs are Apple10-only):
 // - vertex: 1 when the draw is non-indexed with 3 host vertices per guest triangle and binds
