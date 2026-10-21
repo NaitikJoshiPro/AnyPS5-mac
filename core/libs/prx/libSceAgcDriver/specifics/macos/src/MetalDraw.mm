@@ -1553,6 +1553,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         const auto start = recorder.StartDrawPass(slicePassKey, clears, false, access);
         auto& stream = Graphics::Metal::Stream(start.commands);
         const bool continued = start.continued && cache.passKey == slicePassKey && !cache.passTextures.empty();
+        if (Trace()) std::fprintf(stderr, "[metal] draw pass: recorder %s, key %s, pass textures %zu; %zu reads, %zu writes, unknown reads %d, unknown writes %d, address draw %d\n", start.continued ? "continued" : "began", cache.passKey == slicePassKey ? "same" : "changed", cache.passTextures.size(), passReads.size(), passWrites.size(), access.anyReads ? 1 : 0, access.anyWrites ? 1 : 0, addressDraw ? 1 : 0);
         id<MTL4RenderCommandEncoder> encoder = nil;
         std::vector<std::shared_ptr<DrawCache::TiledTarget>> passTiled;
         if (continued) {
