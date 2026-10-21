@@ -869,6 +869,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 if ([state->device supportsTextureSampleCount:count]) colorSamples |= count;
             }
             context.limits.framebufferColorSampleCounts = colorSamples;
+            // Depth targets render at the same counts (MetalDraw.mm attaches multisampled depth
+            // textures of the draw's sample count; supportsTextureSampleCount covers every format).
+            context.limits.framebufferDepthSampleCounts = colorSamples;
             context.storageImageMultisample = true;
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
