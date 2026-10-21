@@ -2005,6 +2005,16 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
     @autoreleasepool {
         state->RecordCompute(shader, x, y, z, 0u, snapshots);
     }
+    // Dispatch recipes on Metal (TechnicalDebt metal-dispatch-recipes): a direct dispatch records by
+    // guest address (no ShaderResources template, no lease, no copied writes to complete), so every
+    // recorded one is reusable and its dispatch-cache variant gets a recipe naming this device. The
+    // driver commits such variants as pipelined items (APS5_PIPELINE_DISPATCH); a hit replays through
+    // this ordinary record, there being no resource build for a template to skip (PrepareRecipe).
+    if (recipe != nullptr && DispatchRecipes()) {
+        auto built = std::make_shared<Recipe>();
+        built->device = Graphics::Metal::DeviceHandle(state->device);
+        *recipe = std::move(built);
+    }
 }
 
 // DISPATCH_INDIRECT as upstream decides it (decideIndirect): the GPU reads the three group counts
@@ -2057,16 +2067,20 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
     return outcome;
 }
 
+// A Metal recipe has nothing to pre-check or replay: the ordinary record binds by address, so the
+// pre-check yields no hit and the caller (or the pipelined item's commit) dispatches through
+// Dispatch with the captured snapshots, as a recipe hit's Rebuild would.
 std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<const Recipe>&, bool) {
     return nullptr;
 }
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult&, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t, const std::shared_ptr<RecipeHit>&, IndirectOutcome&, const std::shared_ptr<PreparedDispatch>&, bool, const std::array<std::uint32_t, 3>&) {
-    Unimplemented("DispatchRecipe (dispatch recipes are off on Metal: DispatchRecipes() is false)", "work package D1");
+    return RecipeOutcome::Rebuild;
 }
 
 bool VulkanDevice::DispatchRecipes() {
-    return false;
+    static const bool noDispatchRecipe = std::getenv("APS5_NO_DISPATCH_RECIPE") != nullptr;
+    return !noDispatchRecipe;
 }
 
 bool VulkanDevice::VerifyRecipes() {
