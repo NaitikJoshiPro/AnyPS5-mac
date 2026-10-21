@@ -138,7 +138,6 @@ ShaderRecompiler::RecompileResult Compile(const AgcDriver::VulkanDevice& device,
         device.Target(),
         {0, 0, 0, 128}
     };
-    request.useCache = false;
     return ShaderRecompiler::Recompile(request);
 }
 
