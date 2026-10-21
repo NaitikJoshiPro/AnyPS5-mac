@@ -910,7 +910,12 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     }
     if (!initialize_sockets()) return fail(5);
     const NativeSocket native = ::socket(family == NET_AF_INET ? AF_INET : AF_INET6, type, protocol);
-    if (native == INVALID_NATIVE_SOCKET) return fail(native_error());
+    if (native == INVALID_NATIVE_SOCKET) {
+        // XNU's socreate answers EPROTOTYPE for a protocol that exists under another socket type (TCP
+        // for SOCK_DGRAM); FreeBSD's answers EPROTOTYPE only for protocol 0, otherwise EPROTONOSUPPORT.
+        const int error = native_error();
+        return fail(error == 41 && protocol != 0 ? 43 : error);
+    }
 #ifdef _WIN32
     u_long nonblocking = 1;
     if (ioctlsocket(native, FIONBIO, &nonblocking) != 0) {
