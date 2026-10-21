@@ -45,7 +45,7 @@ inline MeshDrawPlan PlanMeshDraw(const Graphics::State& graphics, const Pm4::Dra
     const auto& mesh = *graphics.stages.mesh;
     const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
     const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
-    if (mesh.primitivesPerGroup == 0u) throw std::runtime_error("AGC graphics: mesh draw contains no complete primitive");
+    if (mesh.primitivesPerGroup == 0u) throw std::runtime_error("AGC graphics: mesh pipeline groups no primitive (zero primitives per group)");
     MeshDrawPlan plan;
     std::vector<std::uint32_t> restartTable;
     if (draw.indexed) {
@@ -79,7 +79,8 @@ inline MeshDrawPlan PlanMeshDraw(const Graphics::State& graphics, const Pm4::Dra
         plan.instances = resolved.instances;
         needsArguments = true;
     } else {
-        if (draw.indexCount < inputSize) throw std::runtime_error("AGC graphics: mesh draw contains no complete primitive");
+        // Upstream e2a4d109c0: a draw shorter than one primitive draws nothing (no groups; MetalDraw skips it).
+        if (draw.indexCount < inputSize) return plan;
         const auto primitives = (draw.indexCount - inputSize) / step + 1u;
         plan.groups = (primitives - 1u) / mesh.primitivesPerGroup + 1u;
         plan.instances = draw.instanceCount;
