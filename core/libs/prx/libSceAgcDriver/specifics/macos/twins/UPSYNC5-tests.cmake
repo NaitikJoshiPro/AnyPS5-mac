@@ -12,3 +12,9 @@ foreach(agcMetalSkippedTest IN ITEMS agc_driver_sample_location_grid_fallback ag
         set_tests_properties(${agcMetalSkippedTest} PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endforeach()
+
+# The DCC clear-key hand-over mode of tests/Recorder.cpp (--clear-hand-over-only, agc_storage_clear_hand_over;
+# upstream 92063916d2/b176274da1) as a Metal port registered with RecorderTwin.mm.
+list(APPEND agcMetalTwins
+        "tests/Recorder.cpp=specifics/macos/tests/ClearHandOverTwin.mm"
+)

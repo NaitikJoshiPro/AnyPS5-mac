@@ -44,9 +44,8 @@ constexpr Mode Modes[] = {
     // are ported in Upsync3RecorderModesD.mm, --host-import-lifetime-only and --host-import-mutation-race-only in
     // HostImportLifetimeTwin.mm (the twin of tests/HostImportLifetime.cpp).
     // Upstream 6b6c701636 (UPSYNC5) modes: --queued-write-groups-only gains QueuedWriteOrder's checks (eef987ae7b,
-    // Upsync3RecorderModesA.mm) and --idle-publish-wait-only (db3af40970) is ported in D3RecorderModes.mm. The DCC
-    // clear-key hand-over (92063916d2, b176274da1) belongs to the Texture twin's port.
-    {"--clear-hand-over-only", "agc_storage_clear_hand_over", "UPSYNC5 Texture (DCC clear-key hand-over, 92063916d2/b176274da1)", nullptr},
+    // Upsync3RecorderModesA.mm) and --idle-publish-wait-only (db3af40970) is ported in D3RecorderModes.mm, the DCC
+    // clear-key hand-over's --clear-hand-over-only (92063916d2, b176274da1) in ClearHandOverTwin.mm.
     {"--draw-descriptors-only", "agc_draw_descriptors", nullptr,
      "skipped, the device writes no Vulkan descriptor sets: the checks count vkUpdateDescriptorSets writes per set, and Metal descriptor tables are written into the per-batch upload ring"},
     // Modes upstream registers only under if(WIN32) (Windows host import settles, write-watch probes and mappings);
