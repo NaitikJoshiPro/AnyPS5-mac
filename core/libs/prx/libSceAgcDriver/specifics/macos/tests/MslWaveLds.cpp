@@ -344,10 +344,10 @@ int main() {
             const Program program {"lds_beyond_device_limit", LdsBeyondCode, 64u, 32u, 16384u, 8u};
             const auto result = Recompile(program);
             const std::string source(result.msl.Source());
-            Require(result.msl.Reflection().workgroupMemoryStrideDwords == 16385u, "lds_beyond_device_limit: the arena stride must be the LDS dwords plus the lock dword");
+            Require(result.msl.Reflection().workgroupMemoryStrideDwords == 16386u, "lds_beyond_device_limit: the arena stride must be the LDS dwords plus the lock dword, rounded up to an even dword count (upstream af0af833c1)");
             Has(program, source, "device uint* aps5_wgm [[buffer(" + std::to_string(ShaderRecompiler::MslAbi::Index(ShaderRecompiler::MslAbi::BufferIndex::WorkgroupMemory)) + ")]]");
             Has(program, source, "device uint* aps5_lds = aps5_wgm + ");
-            Has(program, source, "* 16385u;");
+            Has(program, source, "* 16386u;");
             Lacks(program, source, "threadgroup uint aps5_lds[");
             const Program within {"lds_within_device_limit", LdsBeyondCode, 64u, 32u, 1024u, 8u};
             const auto small = Recompile(within);
