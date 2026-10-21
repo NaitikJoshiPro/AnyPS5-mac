@@ -1153,8 +1153,9 @@ void ShaderStageTests() {
             queue.context[0x2db] = parameters;
             const auto decoded = AgcDriver::Graphics::DecodeState(queue, false, all).stages.tessellation;
             Require(decoded && decoded->domain == domain && decoded->partitioning == partitioning && decoded->outputTopology == topology, "a tessellation configuration the target supports decoded differently");
-            // The reference path (upstream #4082) takes triangle and quad domains, fractional_odd, cw and ccw.
-            const bool reference = (domain == 1 || domain == 2) && partitioning == 2 && (topology == 2 || topology == 3);
+            // The reference path (upstream #4082) takes triangle and quad domains, integer, fractional_odd and
+            // fractional_even partitioning (State.cpp), cw and ccw.
+            const bool reference = (domain == 1 || domain == 2) && (partitioning == 0 || partitioning == 2 || partitioning == 3) && (topology == 2 || topology == 3);
             if (reference) Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation.has_value(), "the reference path refused a configuration it supports");
             else expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "only triangle and quad domains");
         }
