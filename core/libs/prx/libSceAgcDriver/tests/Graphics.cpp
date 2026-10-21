@@ -1069,7 +1069,7 @@ void ShaderStageTests() {
         lines.context[0x2ce] = 5;
         for (const auto output : {0u, 3u, 0x80000001u, 0x101u}) {
             lines.context[0x29b] = output;
-            expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a line strip from a geometry program, is unsupported");
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a line strip from a geometry program, or a rect list from a vertex program, is unsupported");
         }
         lines.userConfig[0x242] = 4;
         lines.context[0x205] = 0x2a40;
@@ -1281,7 +1281,7 @@ void NggVertexWorkgroupTests() {
     }
     queue.context[0x2d5] = 0x12010;
     queue.context[0x29b] = 1;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a line strip from a geometry program, is unsupported");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a line strip from a geometry program, or a rect list from a vertex program, is unsupported");
 }
 
 constexpr std::array<std::uint8_t, 8> IdentityExports{0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u};
