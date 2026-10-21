@@ -10,9 +10,10 @@
 // Metal 4 GPU renders 4x color, and the Metal image path has no null descriptors (it binds placeholders), so the
 // twin requires the sample count and does not look at nullDescriptor. Upstream sync 3 cases ported as written: a
 // 2D multisample T# (type 14) over the rendered target is sampled as a view of the target's texture (one Texture
-// per lookup, MultisampleSources, not reusable), mismatched sample count/width, an unrendered linear T# and storage
-// access are refused (upstream 5c42e97f47: storage access moves the target to a storable image when the device has
-// shaderStorageImageMultisample; the Metal device sets Context::storageImageMultisample, D22/D28), and a remapped or removed allocation retires the target (a new view, a new sampled texture);
+// per lookup, MultisampleSources, not reusable), mismatched sample count/width, and an unrendered linear T# are
+// refused; storage access (upstream 5c42e97f47 moves the target to a storable image when the device has
+// shaderStorageImageMultisample) goes through the target's storage shadow on Metal, which sets
+// Context::storageImageMultisample (D22/D28), so the rendered image keeps its view; and a remapped or removed allocation retires the target (a new view, a new sampled texture);
 // clearTargets submits and waits before ClearMultisampleTargets. Expected values are upstream's.
 
 #include "RecorderTwinHarness.h"
@@ -195,8 +196,13 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
         std::lock_guard gpu(GpuMutex());
         const auto rendered = MultisampleTargetView(context, target);
         Require(!MultisampleTargetStorable(context, target), "sampling the multisampled target gave it storage usage");
+        // Upstream moves the target to an image with storage usage (a new view). Metal shaders cannot write
+        // texture2d_ms, so a storage binding goes through the target's storage shadow (DECISIONS D22/D28,
+        // MultisampleStorageTexture) and the rendered image keeps its usage and view; the lookup still records
+        // the target as a multisampled source (upstream 5c42e97f47), which keeps the resources out of reuse.
         ShaderResources resources(context, storedCompute);
-        Require(MultisampleTargetStorable(context, target) && MultisampleTargetView(context, target) != rendered, "a storage binding did not move the multisampled target to an image with storage usage");
+        Require(!MultisampleTargetStorable(context, target) && MultisampleTargetView(context, target) == rendered, "a storage binding through the storage shadow replaced the multisampled target's image");
+        Require(resources.MultisampleSources() == std::vector<std::uint64_t>{address} && !resources.Reusable(), "resources storing to a multisampled target are kept for reuse without the barrier their lookup records");
         recorder.Submit();
         device.WaitQueue();
         recorder.Sync();
