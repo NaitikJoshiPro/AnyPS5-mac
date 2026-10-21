@@ -111,7 +111,9 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t wave, std::uint32_t lev
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     std::vector<AgcDriver::Graphics::CompiledShader> shaders{{ShaderStage::Vertex, &vertexResult, 0}};
     ShaderRecompiler::RecompileResult geometry;
-    if (pixelResult.barycentricEmulation.active) {
+    // The Metal device (MSL backend) draws emulated barycentrics through its triangle-vertices expansion (MslAbi
+    // Version 5) instead of a generated geometry stage.
+    if (pixelResult.barycentricEmulation.active && target.backend != ShaderRecompiler::ShaderBackend::Msl) {
         geometry = ShaderRecompiler::BuildBarycentricGeometryShader(vertexResult, pixelResult, target, device.GeometryLimits());
         shaders.push_back({ShaderStage::Geometry, &geometry, 0});
     }
@@ -150,7 +152,7 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!device->GeometryLimits()) {
+        if (device->Target().backend != ShaderRecompiler::ShaderBackend::Msl && !device->GeometryLimits()) {
             std::puts("skipped, the device lacks geometryShader");
             return VulkanTestSkipped;
         }
