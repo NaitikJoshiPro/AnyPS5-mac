@@ -1046,8 +1046,10 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup, c
         const bool rectList = primitive == 17 && vertexWorkgroup && outputType == 3;
         const auto outputSize = outputType == 1 ? 2u : 3u;
         if (!rectList) {
-            validate(outputType == 2 || (outputType == 1 && !vertexWorkgroup), "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a line strip from a geometry program, or a rect list from a vertex program, is unsupported");
-            if (!((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && verticesPerPrimitive >= outputSize)) {
+            // A vertex program's RECTLIST output over any input other than a rect list is an assembly refusal (D41).
+            const bool rectOutput = outputType == 3 && vertexWorkgroup;
+            validate(outputType == 2 || (outputType == 1 && !vertexWorkgroup) || rectOutput, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a line strip from a geometry program, or a rect list from a vertex program, is unsupported");
+            if (rectOutput || !((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 5 || primitive == 6) && verticesPerPrimitive >= outputSize)) {
                 const std::string assembly = "unsupported geometry input or output assembly (VGT_PRIMITIVE_TYPE " + std::to_string(primitive) + ", VGT_GS_OUT_PRIM_TYPE " + std::to_string(outputType) + ", " + std::to_string(verticesPerPrimitive) + " vertices per output primitive)";
                 validate(false, assembly.c_str());
             }
