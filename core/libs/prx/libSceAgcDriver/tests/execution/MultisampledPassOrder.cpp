@@ -120,6 +120,13 @@ int main() {
             std::puts("skipped, the device cannot render four-sample color and depth");
             return VulkanTestSkipped;
         }
+#ifdef __APPLE__
+        // The test captures vkCmdPipelineBarrier through a Vulkan deviceProc on a Vulkan context; the
+        // Metal recorder takes a Metal device and queue and records MTL4 barriers
+        // (TechnicalDebt metal-vulkan-internal-tests).
+        std::puts("skipped, the test captures Vulkan pipeline barriers, which the Metal recorder does not record");
+        return VulkanTestSkipped;
+#endif
         if (!Recorder::MergeBarriers()) {
             std::puts("skipped, barrier elision is off");
             return VulkanTestSkipped;

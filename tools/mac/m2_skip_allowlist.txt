@@ -52,3 +52,4 @@ agc_driver_image_table_vouched_lookups | no host import probe result | metal-d3-
 agc_driver_prepared_graphics_prebuild_0 | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_driver_prepared_graphics_prebuild_1 | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_driver_prepared_graphics_prebuild_unset | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_multisampled_pass_order | captures Vulkan pipeline barriers | metal-vulkan-internal-tests
