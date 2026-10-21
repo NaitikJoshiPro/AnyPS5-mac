@@ -169,6 +169,25 @@ TFloat NanValue(const NanSubject& subject, const char*& end) {
     }
 }
 
+#if !defined(__x86_64__)
+// ParseFloat's NaN rule for the guest long double, which is X87Extended off x86-64: the
+// console's strtold and wcstold return the positive default quiet NaN whatever the sign and
+// sequence (NanValue), so the NaN subject is settled here before ParseX87, which keeps the sign.
+X87Extended ParseGuestLongDouble(const char* text, char** end) {
+    if (const NanSubject subject = FindNanSubject(text); subject.tail != nullptr) {
+        if (end != nullptr) *end = const_cast<char*>(NanSequenceEnd(subject.tail));
+        return {0xc000000000000000ull, 0x7fff};
+    }
+    // ParseX87 already returns positive zero and leaves end at text when nothing converts.
+    // As in ParseFloat, the console sets ERANGE only when the conversion underflows to zero:
+    // a non-zero denormal result leaves errno alone, while RoundX87 reports its inexactness.
+    const int saved = errno;
+    const X87Extended value = LibcDetail::ParseX87(text, end);
+    if (errno == ERANGE && (value.signExponent & 0x7fff) == 0 && value.significand != 0) errno = saved;
+    return value;
+}
+#endif
+
 template<typename TParse>
 auto ParseAsciiPrefix(const char16_t* text, char16_t** end, TParse parse) {
     const std::string prefix = AsciiPrefix(text);
@@ -390,8 +409,7 @@ GuestLongDouble APS5_VABI strtold_nid_postfix(const char* str, char** endptr) {
     static_assert(sizeof(long double) == 16, "Guest long double requires x87 extended precision storage");
     return ParseFloat<long double>(str, endptr, std::strtold);
 #else
-    // ParseX87 already returns positive zero and leaves endptr at str when nothing converts.
-    return LibcDetail::ParseX87(str, endptr);
+    return ParseGuestLongDouble(str, endptr);
 #endif
 }
 
@@ -708,7 +726,7 @@ GuestLongDouble APS5_VABI wcstold_nid_postfix(const char16_t* str, char16_t** en
     static_assert(std::numeric_limits<long double>::digits == 64);
     return ParseAsciiPrefix(str, endptr, [](const char* text, char** end) { return ParseFloat<long double>(text, end, std::strtold); });
 #else
-    return ParseAsciiPrefix(str, endptr, [](const char* text, char** end) { return LibcDetail::ParseX87(text, end); });
+    return ParseAsciiPrefix(str, endptr, ParseGuestLongDouble);
 #endif
 }
 
