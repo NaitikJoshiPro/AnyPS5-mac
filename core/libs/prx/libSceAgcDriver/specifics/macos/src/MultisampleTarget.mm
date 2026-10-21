@@ -21,6 +21,12 @@
 // MSAA codes (12b20e17f6), a full DCC fill of a resident target taken as its fast clear (74a6bdaa01),
 // watched-range checks before writes and named DCC ranges (3738088b1a 4b674a72ba 58f0e89ca3), and
 // sampling undrawn Z/D 64 KiB swizzle textures and Z ones whose HTILE is cleared (69afb0569f 24bc68375d).
+// Upstream sync 7 (6b6c701636): a target recreated with another pipe-bank XOR is imported again
+// (388527d6b2: Recreate), RADV's comp-to-single clear of a multisampled DCC target is recorded and its
+// 0x10 DCC keys take the recorded color (51d6c2f9f2 b97a3da15c d6cd6de586), cached image accesses guard
+// against color targets only (67575aae81: RequireNoMultisampleColorTarget), and the sample-order pass
+// gets its target with a keep reference (57ceb9e370 adc46f3ea0: MultisampleTargetOrderTarget, over the
+// host image: Metal has no multisampled storage alias).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -36,6 +42,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -96,6 +103,12 @@ VkComponentMapping swapRedBlue(VkComponentMapping components) {
 
 bool sameTarget(const ColorTarget& a, const ColorTarget& b) {
     return a.surfaceAddress == b.surfaceAddress && a.format == b.format && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.samples == b.samples;
+}
+
+// Upstream 388527d6b2: the guest made the target again over the same memory and metadata with another
+// pipe-bank XOR (the resident image's contents no longer describe it): it is imported again.
+bool recreated(const ColorTarget& resident, const ColorTarget& use) {
+    return use.dccAddress != 0 && use.pipeBankXor != resident.pipeBankXor && use.address == resident.address && use.dccAddress == resident.dccAddress && use.dccControl == resident.dccControl && use.dccAlphaOnMsb == resident.dccAlphaOnMsb && use.dccPipeAligned == resident.dccPipeAligned && use.cmaskAddress == resident.cmaskAddress && use.cmaskBytes == resident.cmaskBytes && use.tileMode == resident.tileMode && use.elementBytes == resident.elementBytes;
 }
 
 VkClearColorValue fastClearColor(const ColorTarget& target) {
@@ -201,6 +214,31 @@ public:
             if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
         });
         // The clear covers every sample: the shadow's writes are gone, the host image is newer.
+        shadowNewer = false;
+        hostNewer = true;
+    }
+
+    // Upstream 388527d6b2: a recreated target (recreated()) takes the new use's metadata and imports its
+    // initial DCC clear again into every sample of every host slice (DECISIONS D28). The storage
+    // shadow's writes are superseded by the import (the host image is newer).
+    void Recreate(const ColorTarget& use) {
+        target = use;
+        cmask = MultisampledCmask(use.cmaskAddress, use.cmaskBytes);
+        colorFill = MultisampledColorFill(use);
+        fromTexture = false;
+        dccRanges.clear();
+        dccFill.reset();
+        cmaskFill.reset();
+        metadataValid = std::make_shared<std::atomic<bool>>(true);
+        const auto initial = initialDccClear(use);
+        Keep();
+        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, host.slices};
+            Metal::Vk::CmdClearColorImage(commands, image, VK_IMAGE_LAYOUT_GENERAL, &initial, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+        });
         shadowNewer = false;
         hostNewer = true;
     }
@@ -454,9 +492,43 @@ void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
 }
 
+// Upstream 51d6c2f9f2 d6cd6de586: the clear color RADV's comp-to-single clear kernel wrote for a
+// multisampled DCC image (its DCC keys then read 0x10), tied to the image's surface, pipe-bank XOR,
+// extent and sample count; forgotten when that memory is unmapped.
+struct RecordedSingleClear {
+    std::uint64_t surface = 0;
+    std::uint32_t pipeBankXor = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t samples = 0;
+    std::array<std::uint32_t, 4> color{};
+};
+
+std::mutex& singleClearsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<RecordedSingleClear>& singleClears() {
+    static std::vector<RecordedSingleClear> list;
+    return list;
+}
+
+std::atomic<bool>& anySingleClears() {
+    static std::atomic<bool> any{false};
+    return any;
+}
+
+void forgetSingleClears(std::uintptr_t address, std::size_t bytes) {
+    std::lock_guard lock(singleClearsMutex());
+    std::erase_if(singleClears(), [&](const RecordedSingleClear& clear) { return clear.surface >= address && clear.surface - address < bytes; });
+    anySingleClears().store(!singleClears().empty(), std::memory_order_release);
+}
+
 // GuestAllocations' unmap observer (upstream f7fd7569f): a target whose whole guarded range is unmapped
 // is retired, so memory mapped there again is not taken for it.
 void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
+    forgetSingleClears(address, bytes);
     RetireUnmappedDepth_nid_no_patch(address, bytes);
     std::unique_lock lock(guardedMutex());
     std::erase_if(guarded(), [&](const auto& range) {
@@ -511,6 +583,17 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || !sameTarget(target->target, use)) continue;
+        if (recreated(target->target, use)) {
+            {
+                std::unique_lock lock(guardedMutex());
+                std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active; });
+                anyGuarded().store(!guarded().empty(), std::memory_order_release);
+            }
+            target->Recreate(use);
+            guard(context, use, target->active, target->metadataValid);
+            target->ApplyFastClear(use);
+            return *target;
+        }
         if (target->fromTexture && use.cmaskAddress != 0) {
             target->fromTexture = false;
             target->cmask = MultisampledCmask(use.cmaskAddress, use.cmaskBytes);
@@ -624,7 +707,7 @@ void InstallResidentImageReadGuard_nid_no_patch() {
 void UpdateResidentImageUnmapObserver_nid_no_patch() {
     static std::mutex mutex;
     std::lock_guard lock(mutex);
-    GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(anyGuarded().load(std::memory_order_acquire) || HasResidentDepthGuards_nid_no_patch() ? &retireUnmapped : nullptr);
+    GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(anyGuarded().load(std::memory_order_acquire) || anySingleClears().load(std::memory_order_acquire) || HasResidentDepthGuards_nid_no_patch() ? &retireUnmapped : nullptr);
 }
 
 // Upstream 12b20e17f6: a CMASK byte holds two 4-bit MSAA tile codes; both 0 is a register color clear,
@@ -704,6 +787,65 @@ std::size_t MultisampledDccBytes(const ColorTarget& target) {
     return static_cast<std::size_t>(((target.extent.width + width - 1) / width) * ((target.extent.height + height - 1) / height) * 4096u);
 }
 
+namespace {
+
+std::optional<std::array<std::uint32_t, 4>> recordedSingleClear(const ColorTarget& target) {
+    std::lock_guard lock(singleClearsMutex());
+    for (const auto& clear : singleClears()) {
+        if (clear.surface == target.surfaceAddress && clear.pipeBankXor == target.pipeBankXor && clear.width == target.extent.width && clear.height == target.extent.height && clear.samples == target.samples) return clear.color;
+    }
+    return std::nullopt;
+}
+
+// Upstream 51d6c2f9f2 b97a3da15c: the recorded comp-to-single color of 8-, 16-, 32-, 64- or 128-bit texels.
+VkClearColorValue singleClearColor(const ColorTarget& target) {
+    const auto color = recordedSingleClear(target);
+    Require(color.has_value(), "multisampled DCC comp-to-single keys without a recorded clear color are not implemented");
+    const auto elementBytes = static_cast<std::size_t>(target.elementBytes);
+    Require(elementBytes == 1 || elementBytes == 2 || elementBytes == 4 || elementBytes == 8 || elementBytes == 16, "multisampled DCC comp-to-single clears of this texel size are not implemented");
+    std::array<std::uint32_t, 4> pattern{};
+    for (std::size_t offset = 0; offset < sizeof(pattern); offset += elementBytes) std::memcpy(reinterpret_cast<std::byte*>(pattern.data()) + offset, color->data(), elementBytes);
+    VkClearColorValue clear{};
+    Require(ClearColorForTexel(target.format, target.elementBytes, pattern, clear), "multisampled DCC comp-to-single clear has no exact host value");
+    return clear;
+}
+
+}
+
+// Upstream 51d6c2f9f2: RADV's comp-to-single clear kernel (8x8x1 threads): user data 2 the image
+// descriptor's low address bits (the descriptor's high bits are 2), 5..8 the clear color.
+std::optional<MultisampledSingleClear> MatchMultisampledSingleClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
+    static constexpr std::array<std::uint32_t, 22> kernel{0xbe800303u, 0xbe830382u, 0xf40c0401u, 0xfa000000u, 0xd7460000u, 0x04010609u, 0xd7460001u, 0x0405060au, 0x7e060208u, 0x7e0c020bu, 0x7e0e0280u, 0xd5690004u, 0x02000100u, 0x7e000205u, 0xd5690005u, 0x02000901u, 0xd7000001u, 0x02000c80u, 0xbf8cc07fu, 0xf0201f38u, 0x00040004u, 0xbf810000u};
+    if (userData.size() < 9 || numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    if (userData[3] == 0 || userData[4] == 0) return std::nullopt;
+    return MultisampledSingleClear{userData[2] | (std::uint64_t{2} << 32u), {userData[5], userData[6], userData[7], userData[8]}};
+}
+
+void NoteMultisampledSingleClear(const GuestTextureResource& resource, const std::array<std::uint32_t, 4>& color) {
+    {
+        std::lock_guard lock(singleClearsMutex());
+        auto& list = singleClears();
+        std::erase_if(list, [&](const RecordedSingleClear& clear) { return clear.surface == resource.baseAddress; });
+        list.push_back({resource.baseAddress, resource.pipeBankXor, resource.width, resource.height, resource.samples, color});
+        anySingleClears().store(true, std::memory_order_release);
+    }
+    UpdateResidentImageUnmapObserver_nid_no_patch();
+}
+
+// The dispatch path takes the kernel as recorded state instead of running it (Dispatch.cpp, shared).
+bool TakeMultisampledSingleClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
+    const auto clear = MatchMultisampledSingleClear(code, userData, numThreads);
+    if (!clear) return false;
+    std::array<std::uint32_t, 8> words{};
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(clear->descriptor), sizeof(words))) return false;
+    GuestMemory::Read(clear->descriptor, std::as_writable_bytes(std::span(words)));
+    const auto resource = DecodeTextureResource(words);
+    if (resource.samples < 2) return false;
+    NoteMultisampledSingleClear(resource, clear->color);
+    return true;
+}
+
 VkClearColorValue MultisampledDccClear(const ColorTarget& target, std::span<const std::byte> dcc, std::span<const std::byte> cmask) {
     Require(target.dccAddress != 0 && (target.dccControl & 0x3ff80u) == 0 && (target.pipeBankXor & ~0xcf00u) == 0, "multisampled DCC address, color transform, lossy mode or XOR is not implemented");
     Require(dcc.size() == MultisampledDccBytes(target), "multisampled DCC metadata snapshot size mismatch");
@@ -714,6 +856,7 @@ VkClearColorValue MultisampledDccClear(const ColorTarget& target, std::span<cons
         const auto expanded = target.samples == 2 ? 0xddu : target.samples == 4 ? 0xeeu : 0xffu;
         Require(std::ranges::all_of(cmask, [&](std::byte key) { return key == cmask.front(); }) && (code == 0xccu || code == expanded), "multisampled DCC CMASK compression or register clear is not implemented");
     }
+    if (dcc.front() == std::byte{0x10}) return singleClearColor(target);
     DccKeys keys;
     switch (std::to_integer<std::uint32_t>(dcc.front())) {
         case 0x00u: keys = DccKeys::Clear0000; break;
@@ -783,6 +926,20 @@ bool TakeMultisampledClear(MultisampledCmask& cmask, MultisampledColorFill& colo
     if (!fill) return false;
     Require(MultisampledFillClearColor(use, *fill, clear), "a fill over the color memory of a multisampled target has no exact clear value in its format");
     return true;
+}
+
+// Upstream 57ceb9e370 adc46f3ea0: the multisampled color target whose samples a pass puts in the guest's
+// order, kept alive by the returned `keep` under that work. Metal's programmable sample positions are
+// per-pixel uniform, so every multisampled pass over a 2x2 location grid is in the reorder case. Metal
+// compute cannot write a multisampled texture, so there is no storage alias (upstream's orderFormat /
+// OrderView): the order target is the host image itself (a 2D multisample array of HostSamplesOf's
+// slices, DECISIONS D28) in the target's format, and the Metal reorder moves samples with per-sample
+// render passes (as CopyStorageToMultisample does). The reorder reads and writes the host image.
+SampleOrderTarget MultisampleTargetOrderTarget(const Context& context, const ColorTarget& target) {
+    std::lock_guard lock(targetsMutex());
+    auto& found = acquire(context, target);
+    found.hostNewer = true;
+    return {found.image, found.view, target.format, target.extent, target.samples, SampleOrderMethod::Storage, found.shared_from_this()};
 }
 
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, VkImage* image) {
@@ -1026,6 +1183,12 @@ void ClearMultisampleTargets(VkDevice device) {
 
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
     RequireNoResidentDepthRead_nid_no_patch(address, bytes);
+    RequireNoMultisampleColorTarget(address, bytes, access);
+}
+
+// Upstream 67575aae81: the color-target half of RequireNoMultisampleTarget (a cached image access
+// guards against multisampled color targets only).
+void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return;
     std::shared_lock lock(guardedMutex());
     for (const auto& range : guarded()) {
