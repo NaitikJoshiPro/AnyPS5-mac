@@ -129,7 +129,17 @@ int native_error() { return net_error(WSAGetLastError()); }
 using NativeSocket = int;
 using NativeLength = socklen_t;
 constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
+#ifdef __APPLE__
+// XNU's private MSG_NBIO (bsd/sys/socket.h, 0x20000). Darwin's sosend only uses MSG_DONTWAIT to avoid
+// waiting for the send buffer lock and still sleeps for buffer space (sosendcheck tests SS_NBIO or
+// MSG_NBIO), so a guest MSG_DONTWAIT send would block behind a slow peer. sendit passes user flags
+// through unchanged. Every send carries it; native_transfer emulates blocking sends with poll, which
+// also keeps the bytes queued before an abort or timeout, as FreeBSD's guest-visible sends do.
+constexpr int DARWIN_MSG_NBIO = 0x20000;
+constexpr int NATIVE_SEND_FLAGS = MSG_NOSIGNAL | DARWIN_MSG_NBIO;
+#else
 constexpr int NATIVE_SEND_FLAGS = MSG_NOSIGNAL;
+#endif
 bool initialize_sockets() { return true; }
 void close_socket(NativeSocket socket) { ::close(socket); }
 int net_error(int code) { return GuestSockets::GuestErrorFromHost(code); }
@@ -517,6 +527,38 @@ auto native_transfer(const NativeSocketHandle& socket, int flags, bool send, TOp
         descriptor.events = send ? POLLWRNORM : POLLRDNORM;
         const int ready = WSAPoll(&descriptor, 1, milliseconds);
         if (ready < 0) return transferred > 0 ? static_cast<Result>(transferred) : static_cast<Result>(-1);
+    }
+#elif defined(__APPLE__)
+    // Sends carry DARWIN_MSG_NBIO and never sleep in the host; a blocking guest send waits here instead.
+    using Result = decltype(operation(0));
+    if (!send || (flags & NET_MSG_DONTWAIT) != 0 || socket.nonblock.load()) return operation(0);
+    const int timeout = timed ? socket.sendTimeout.load() : 0;
+    const auto deadline = timeout > 0 ? std::chrono::steady_clock::now() + std::chrono::microseconds(timeout)
+        : std::chrono::steady_clock::time_point::max();
+    int transferred = 0;
+    for (;;) {
+        const auto result = operation(transferred);
+        if (result != static_cast<Result>(-1)) {
+            if (!socket.stream) return result;
+            transferred += static_cast<int>(result);
+            if (transferred >= length || result == 0) return static_cast<Result>(transferred);
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno != EAGAIN) {
+            return transferred > 0 ? static_cast<Result>(transferred) : result;
+        }
+        int milliseconds = -1;
+        if (timeout > 0) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                errno = EAGAIN;
+                return transferred > 0 ? static_cast<Result>(transferred) : static_cast<Result>(-1);
+            }
+            milliseconds = static_cast<int>(std::min<std::int64_t>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count(), INT_MAX));
+        }
+        pollfd descriptor{socket.value, POLLOUT, 0};
+        if (::poll(&descriptor, 1, milliseconds) < 0 && errno != EINTR)
+            return transferred > 0 ? static_cast<Result>(transferred) : static_cast<Result>(-1);
     }
 #else
     static_cast<void>(socket);
