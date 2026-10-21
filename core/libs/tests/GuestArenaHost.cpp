@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,8 @@ namespace {
 
 constexpr std::uintptr_t ArenaStart = 0x0000000200000000ull;
 constexpr std::uintptr_t ApplicationAreaEnd = 0x000000FC00000000ull;
+constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull;
+constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull;
 constexpr std::uint32_t ProtectionNoAccess = 0x01;
 constexpr std::uint32_t ProtectionReadOnly = 0x02;
 constexpr std::uint32_t ProtectionReadWrite = 0x04;
@@ -74,8 +77,21 @@ void CheckSkipsUnmappable() {
 
 void CheckHostRegionsKept() {
     std::size_t hostRegions = 0;
+    std::size_t displacedRegions = 0;
+    Require(GuestArenaAvailable_nid_postfix(), "the guest arena is unavailable on macOS"); // reserves the window first
+    const bool displaced = GuestDisplacedActive_nid_no_patch();
     for (const auto& region : RegionsInArenaRange()) {
         if (region.maxProtection == VM_PROT_ALL) continue;
+        const bool systemReserved = region.start < SystemReservedEnd && region.end > SystemReservedStart;
+        if (displaced && !systemReserved && region.start >= DisplacedStart() && region.end <= DisplacedEnd) {
+            // arm64 port (D31, D33): the host-reserved ranges inside the displaced window (shared region tail, GPU
+            // carveout) are backed by the alias at guest | DisplacedFlip, so fixed guest mappings there are taken; the
+            // host region itself is never touched. The PS5 system-reserved range (the commpage guard) stays refused.
+            ++displacedRegions;
+            GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(region.start), region.end - region.start);
+            GuestArenaRelease_nid_postfix(reinterpret_cast<void*>(region.start), region.end - region.start);
+            continue;
+        }
         ++hostRegions;
         bool rejected = false;
         try {
@@ -85,7 +101,7 @@ void CheckHostRegionsKept() {
         }
         Require(rejected, "a fixed guest mapping over a host region was accepted");
     }
-    std::printf("%zu host regions inside the arena range are protected\n", hostRegions);
+    std::printf("%zu host regions inside the arena range are protected, %zu displaced\n", hostRegions, displacedRegions);
 }
 
 void CheckCommitAndProtect() {
