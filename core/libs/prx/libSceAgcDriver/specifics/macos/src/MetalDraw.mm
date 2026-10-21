@@ -1870,6 +1870,12 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck) {
 }
 
+// Upstream Pipeline.cpp: an overrasterized draw (a multisampled rasterizer into one-sample color
+// targets) needs merged coverage reduction, which Metal has no counterpart of (render pass sample
+// counts must match): refused as on a Vulkan device without the extension
+// (TechnicalDebt metal-mixed-samples).
+constexpr const char* MergedCoverageRefusal = "Metal draw: an overrasterized draw (a multisampled rasterizer into one-sample color targets) requires VK_NV_framebuffer_mixed_samples with merged coverage reduction, which Metal render passes have no counterpart of";
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
     for (const auto& shader : shaders) {
@@ -1877,6 +1883,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
     }
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot draw");
+    if (graphics.mergedCoverage) throw std::runtime_error(MergedCoverageRefusal);
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
     Graphics::Metal::TessellationStages tessellation;
@@ -1917,6 +1924,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    if (graphics.mergedCoverage) return std::string(MergedCoverageRefusal);
     const bool meshPath = graphics.stages.path == Graphics::ShaderPath::Geometry && graphics.stages.mesh;
     const bool tessellationPath = graphics.stages.path == Graphics::ShaderPath::Tessellation && graphics.stages.tessellation;
     if (graphics.stages.path != Graphics::ShaderPath::Vertex && !meshPath && !tessellationPath) return std::string("Metal draw (work package D6): the geometry path without a mesh configuration and tessellation plus geometry are not implemented");
