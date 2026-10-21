@@ -1,6 +1,7 @@
 // Work package D5: Metal twin of Graphics/src/PipelineCache.cpp (see MetalPipelineCache.h).
 #include "MetalPipelineCache.h"
 #include "ShaderCacheDirectory.hpp"
+#include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 #include <sys/sysctl.h>
@@ -98,7 +99,12 @@ std::filesystem::path DefaultDirectory() {
     if (const char* directory = std::getenv("APS5_METAL_PIPELINE_CACHE"); directory != nullptr && *directory != '\0') return directory;
     const auto shaders = ShaderRecompiler::ShaderCacheDirectory();
     if (shaders.empty()) return {};
-    return shaders / "metal";
+    // Upstream 907c9cd1b6: the pipeline cache sits in the directory of the current shader cache source
+    // version, next to the variants it was built from, so archives (and library sources) of earlier
+    // recompiler versions are not loaded and do not grow without bound.
+    char version[17];
+    std::snprintf(version, sizeof(version), "%016llx", static_cast<unsigned long long>(ShaderRecompiler::ShaderDiskCache::SourceVersion()));
+    return shaders / version / "metal";
 }
 
 void AppendColor(std::string& key, const ColorAttachmentState& color) {
