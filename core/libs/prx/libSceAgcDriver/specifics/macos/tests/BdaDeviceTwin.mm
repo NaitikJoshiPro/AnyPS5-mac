@@ -492,7 +492,7 @@ void StoreChecks(Gpu& gpu) {
         if (reason == Abi::FaultReason {}) {
             Check(report.state == Abi::FaultState::Empty && report.reason == Abi::FaultReason {} && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.otherFaults == 0, label + "mapped store published a fault");
         } else {
-            Check(report.state == Abi::FaultState::Ready && report.reason == reason && report.address == faultAddress && report.bytes == faultBytes && report.stage == ComputeStage && report.instruction == Pc && report.otherFaults == 0, label + "incorrect first fault metadata");
+            Check(report.state == Abi::FaultState::Ready && report.reason == reason && report.address == faultAddress && report.bytes == faultBytes && report.stage == ComputeStage && report.instruction == Pc && report.otherFaults == 1, label + "incorrect first fault metadata");
         }
         std::array<std::uint32_t, Abi::FaultBufferBytes / sizeof(std::uint32_t)> words {};
         std::memcpy(words.data(), fault.contents, sizeof(words));
