@@ -130,6 +130,10 @@ inline bool MultisampledDescriptor(std::span<const std::uint32_t> words) {
     const auto type = (words[3] >> 28u) & 0xfu;
     return type == 14u || type == 15u;
 }
+// The guest address a multisampled T# (MultisampledDescriptor) addresses: its color target's base.
+inline std::uint64_t MultisampledDescriptorAddress(std::span<const std::uint32_t> words) {
+    return ((static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u)) & 0xffffffffffull) << 8u;
+}
 
 // How a guest sample count renders on `device` (DECISIONS D28): natively (slices 1), or, when the
 // device cannot render that many samples (8x on Apple9, which renders 1, 2 and 4), as `slices`

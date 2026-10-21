@@ -883,7 +883,7 @@ namespace {
 // d0cd50c82). Called with targetsMutex held.
 MultisampleTarget& TargetOfDescriptor(const Context& context, std::span<const std::uint32_t> words, const char* what, bool fillUnrendered, bool* swapped = nullptr) {
     Require(MultisampledDescriptor(words), std::string("a ") + what + " of a T# that is not 2D MSAA");
-    const auto address = ((static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u)) & 0xffffffffffull) << 8u;
+    const auto address = MultisampledDescriptorAddress(words);
     const auto guestFormat = (words[1] >> 20u) & 0x1ffu;
     const auto width = (((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u;
     const auto height = ((words[2] >> 14u) & 0x3fffu) + 1u;

@@ -4659,6 +4659,9 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 if (binding.imageShape != ShaderRecompiler::DescriptorImageShape::Image2DMultisample && binding.imageShape != ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray) throw std::runtime_error("AGC graphics: a 2D MSAA T# is bound where the shader declares a single-sample image");
                 if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) throw std::runtime_error("AGC graphics: a 2D MSAA T# sampled with unnormalized coordinates");
                 auto texture = Metal::MultisampleSampledTexture(context, words);
+                // Upstream 4b71846fab: the lookup records the multisampled source, which keeps the
+                // resources out of reuse (MarkReusable) since their barrier belongs to this lookup.
+                multisampleSources.push_back(Metal::MultisampledDescriptorAddress(words));
                 previousSampled = {};
                 textures.push_back(std::move(texture));
                 textureFirstLayer.push_back(false);
@@ -4744,6 +4747,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             // kept with the sampled textures (it has no guest surface of its own) and tagged.
             if (element < binding.imageAtomic64.size() && binding.imageAtomic64[element]) throw std::runtime_error("AGC graphics: 64-bit atomics on a multisampled storage image are not implemented (TechnicalDebt metal-ms-storage)");
             textures.push_back(Metal::MultisampleStorageTexture(context, words));
+            multisampleSources.push_back(Metal::MultisampledDescriptorAddress(words)); // upstream 5c42e97f47
             textureFirstLayer.push_back(false);
             textureBaseLevel.push_back(false);
             textureSrgb.push_back(false);

@@ -12,7 +12,7 @@
 // 2D multisample T# (type 14) over the rendered target is sampled as a view of the target's texture (one Texture
 // per lookup, MultisampleSources, not reusable), mismatched sample count/width, an unrendered linear T# and storage
 // access are refused (upstream 5c42e97f47: storage access moves the target to a storable image when the device has
-// shaderStorageImageMultisample; the Metal device leaves Context::storageImageMultisample false, so it is refused), and a remapped or removed allocation retires the target (a new view, a new sampled texture);
+// shaderStorageImageMultisample; the Metal device sets Context::storageImageMultisample, D22/D28), and a remapped or removed allocation retires the target (a new view, a new sampled texture);
 // clearTargets submits and waits before ClearMultisampleTargets. Expected values are upstream's.
 
 #include "RecorderTwinHarness.h"

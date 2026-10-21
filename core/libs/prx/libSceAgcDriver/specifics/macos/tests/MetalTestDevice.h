@@ -36,6 +36,9 @@ struct Device {
         context.device = Metal::DeviceHandle(device);
         context.queue = Metal::QueueHandle(queue);
         context.bufferDeviceAddress = true;
+        // What MetalDevice.mm promises: guest MSAA storage goes through the target's storage shadow (D22/D28), so
+        // the storage MSAA placeholder heaps exist (upstream fd872264e2 omits them only where this is false).
+        context.storageImageMultisample = true;
         // One pool per device, as the device's setup makes it (copies of the Context share it).
         context.bufferPool = std::make_shared<BufferPool>(context);
     }
