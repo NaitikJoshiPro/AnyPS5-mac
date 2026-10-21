@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -928,6 +929,13 @@ void VulkanDevice::WaitForPipelineJournalReplay() {
     startJournalReplay();
 }
 
+// Upstream 529dbb0480: an immediate guest exit (Lifecycle) writes the pipeline cache before the
+// process ends without the device teardown; on Metal that is the pipeline archive (Save waits for
+// the compiles in flight, as the teardown's save does).
+void VulkanDevice::SavePipelineCache() {
+    if (state->pipelines != nullptr) static_cast<void>(state->pipelines->Save());
+}
+
 // Guest compute pipelines the pipeline cache built since this device's cache was created (the count
 // is process-wide: two live devices building at once share it; tests run one device at a time).
 std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
@@ -1034,6 +1042,23 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     }();
     target.mslNanTestElimination = nanTestElimination;
     return target;
+}
+
+// Upstream 57ceb9e370 / f8e8dc6f67: without a 2x2 sample location grid, pixel (0,0)'s locations stand
+// in for every pixel, and where every pixel holds one set of positions upstream keeps the guest's
+// sample order (the pixel shader permutes SampleID, masks and coverage; reorder passes at the
+// render pass bounds). Metal's setSamplePositions is one pattern for every pixel, so the Metal device
+// is always in the stand-in case; it has no reorder passes yet (TechnicalDebt metal-sample-order),
+// so it draws with the stand-in alone and names no order, as upstream does when it refuses one.
+Graphics::SampleOrder VulkanDevice::HostSampleOrder(const Graphics::State& graphics) const {
+    if (!graphics.sampleLocationGrid || graphics.samples <= 1u) return {};
+    static std::atomic<std::uint32_t> reported {0};
+    const auto bit = 1u << std::min(graphics.samples, 31u);
+    if ((reported.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u) {
+        const bool sameSet = Graphics::SameSetSampleOrder(graphics).has_value();
+        std::fprintf(stderr, "[gpu] no 2x2 sample location grid at sample count %u on Metal: pixel (0,0)'s sample locations stand in for every pixel (%s)\n", graphics.samples, sameSet ? "the guest's per-pixel sample order is not kept: the Metal device has no sample reorder passes" : "its pixels hold different locations");
+    }
+    return {};
 }
 
 const std::uint32_t* VulkanDevice::WorkGroupCountLimit() const {
@@ -1212,6 +1237,11 @@ std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint
 
 bool VulkanDevice::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return state->recorder != nullptr && state->recorder->OpenWriteOverlaps(address, bytes);
+}
+
+// Upstream 12d720f743: a guest flush seals the open pass's write-only stores (PacketExecution).
+void VulkanDevice::SealPassWriteOnly() {
+    if (state->recorder != nullptr) state->recorder->SealPassWriteOnly();
 }
 
 bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const {
@@ -1603,7 +1633,7 @@ void VulkanDevice::State::WrapUnions(std::span<const StageBindings* const> plans
     }
 }
 
-std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream, StageBindings& plan, std::span<std::byte> push) {
+std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream, StageBindings& plan, std::span<std::byte> push, Graphics::Metal::Upload* shaderData) {
     const auto& reflection = shader.msl.Reflection();
     if (reflection.table.bytes == 0u) return 0u;
     auto& recorder = *this->recorder;
@@ -1640,6 +1670,7 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
             const auto data = stream.Allocate(std::max<std::size_t>(bytes, 4u), 16u);
             if (bytes != 0u) std::memcpy(data.host, binding.guestDescriptor.data(), bytes);
             entries[0] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
+            if (shaderData != nullptr && binding.role == ShaderRecompiler::DescriptorRole::ShaderData) *shaderData = data;
             break;
         }
         case ShaderRecompiler::DescriptorRole::Gds: {
@@ -1765,7 +1796,7 @@ void VulkanDevice::State::CheckFaultsOnComplete(bool draw, std::vector<std::pair
     });
 }
 
-void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirectArguments, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
+void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirectArguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::array<std::uint32_t, 3>* threadGroup, const std::array<std::uint32_t, 3>* threadLimit) {
     const auto& reflection = shader.msl.Reflection();
     const auto stride = WorkgroupStride(shader);
     const bool split = indirectArguments == 0u && (x > GroupLimit || y > GroupLimit || z > GroupLimit);
@@ -1814,8 +1845,38 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         if (shader.pushConstants.size() > push.size()) throw std::runtime_error("Metal device: push constants exceed the push data block");
         std::memcpy(push.data(), shader.pushConstants.data(), shader.pushConstants.size());
     }
-    const std::uint64_t tableAddress = WriteTable(shader, snapshots, stream, plan, std::span<std::byte>(push).first(shader.pushConstants.size()));
-    const auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    const bool threadDimensions = threadGroup != nullptr || threadLimit != nullptr;
+    Graphics::Metal::Upload shaderData {};
+    const std::uint64_t tableAddress = WriteTable(shader, snapshots, stream, plan, std::span<std::byte>(push).first(shader.pushConstants.size()), threadDimensions ? &shaderData : nullptr);
+    auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    if (threadDimensions) {
+        // Upstream 612b41e4f3 (recordDispatch): the program was compiled with partialThreads ~0, so it
+        // clips its threads at the three ShaderData words before imageMetadataDword.
+        const auto limitDword = shader.imageMetadataDword;
+        const std::size_t shaderDataBytes = [&] {
+            for (const auto& binding : shader.bindings) {
+                if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) return binding.guestDescriptor.size() * sizeof(std::uint32_t);
+            }
+            return std::size_t {0};
+        }();
+        const std::size_t limitByte = limitDword >= 3u ? static_cast<std::size_t>(limitDword - 3u) * sizeof(std::uint32_t) : 0u;
+        if (shaderData.buffer == nil || limitDword < 3u || limitByte + 12u > shaderDataBytes) throw std::runtime_error("Metal dispatch: a thread-dimension dispatch has no ShaderData thread limit");
+        if (threadLimit != nullptr) {
+            std::memcpy(shaderData.host + limitByte, threadLimit->data(), 12u);
+        } else {
+            if (indirect == 0u) throw std::runtime_error("Metal dispatch: GPU thread dimensions need wrapped indirect arguments");
+            // The argument kernel writes the group counts (bytes 0-11) and the thread counts (12-23);
+            // the thread counts are copied into the ShaderData limit, and the dispatch reads the groups.
+            const auto counts = stream.Allocate(24u, 16u);
+            if (!recorder.RecordDispatchArguments(Graphics::Metal::Handle(stream), indirect, counts.address, threadGroup)) {
+                throw std::runtime_error("Metal dispatch: thread-dimension indirect arguments need the argument kernel, which did not build (see the [gpu] indirect dispatches line)");
+            }
+            stream.CopyBuffer(counts.buffer, counts.offset + 12u, shaderData.buffer, shaderData.offset + limitByte, 12u);
+            stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::DispatchLeading);
+            indirect = counts.address;
+        }
+    }
     const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     std::vector<std::uint64_t> driverAddresses;
     std::vector<MTLSize> chunkGroups;
@@ -1901,8 +1962,29 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
     if (Trace()) std::fprintf(stderr, "[metal] dispatch %ux%ux%u%s (%zu chunks, arena %s, %zu reads, %zu writes; stream: %llu encoders, %llu barriers, %llu commands; covered 0x%x)\n", x, y, z, indirect != 0u ? " indirect" : "", driverAddresses.size(), arena != nil ? "yes" : "no", plan.reads.size(), plan.writes.size(), static_cast<unsigned long long>(stream.Encoders()), static_cast<unsigned long long>(stream.Barriers()), static_cast<unsigned long long>(stream.CommandCount()), covered);
 }
 
+namespace {
+
+// Upstream 84e3b73f16 (dispatch): a depth plane a GuestBuffers V# reads or writes is flushed to guest
+// memory first (a stale plane holds depth only its surface has).
+void FlushBoundDepthPlanes(const ShaderRecompiler::RecompileResult& shader) {
+    for (const auto& binding : shader.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        for (std::size_t at = 0; at + 4u <= binding.guestDescriptor.size(); at += 4u) {
+            const auto* words = binding.guestDescriptor.data() + at;
+            const auto base = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u);
+            const auto stride = (words[1] >> 16u) & 0x3fffu;
+            const auto records = static_cast<std::uint64_t>(words[2]);
+            const auto bytes = stride != 0u ? records * stride : records;
+            if (base != 0u && bytes != 0u) static_cast<void>(Graphics::FlushDepthPlanes(base, static_cast<std::size_t>(bytes)));
+        }
+    }
+}
+
+}
+
 void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
+    FlushBoundDepthPlanes(shader);
     state->RequireDispatchable(shader);
     if (x == 0u || y == 0u || z == 0u) return;
     TraceGds("before Dispatch");
@@ -1917,8 +1999,9 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
 // flush hook waits for the batch that writes them) and dispatched directly: 8 the shader uses the
 // device-memory LDS arena, sized from the counts; 2 a label is pending over the counts; 3 they
 // cannot be wrapped (unmapped, executable or misaligned memory).
-VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe) {
+VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t, std::shared_ptr<PreparedDispatch>, std::shared_ptr<const Recipe>* recipe, const std::array<std::uint32_t, 3>& threadGroup) {
     if (recipe != nullptr) *recipe = nullptr;
+    FlushBoundDepthPlanes(shader);
     state->RequireDispatchable(shader);
     IndirectOutcome outcome {0, 0.0};
     auto& recorder = *state->recorder;
@@ -1936,8 +2019,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
         } else if (arguments % 4u != 0u || state->TryWrap(arguments, 12u) == 0u) {
             outcome.cpuReason = 3;
         }
+        // Upstream 612b41e4f3: a USE_THREAD_DIMENSIONS dispatch (threadGroup non-zero) names thread
+        // counts; the GPU path turns them into group counts with the argument kernel.
+        const bool threadDimensions = threadGroup != std::array<std::uint32_t, 3> {};
+        if (threadDimensions && std::ranges::any_of(threadGroup, [](std::uint32_t size) { return size == 0u; })) throw std::runtime_error("Metal dispatch: a thread-dimension dispatch with an empty thread group");
         if (outcome.cpuReason == 0) {
-            state->RecordCompute(shader, 1u, 1u, 1u, arguments, snapshots);
+            state->RecordCompute(shader, 1u, 1u, 1u, arguments, snapshots, threadDimensions ? &threadGroup : nullptr);
             return outcome;
         }
         const auto start = std::chrono::steady_clock::now();
@@ -1946,8 +2033,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
         Graphics::FinishLeaseWork();
         std::array<std::uint32_t, 3> groups {};
         GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4u);
+        const auto threads = groups;
+        if (threadDimensions) {
+            for (std::size_t axis = 0; axis < groups.size(); ++axis) groups[axis] = groups[axis] / threadGroup[axis] + (groups[axis] % threadGroup[axis] != 0u ? 1u : 0u);
+        }
         outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        if (groups[0] != 0u && groups[1] != 0u && groups[2] != 0u) state->RecordCompute(shader, groups[0], groups[1], groups[2], 0u, snapshots);
+        if (groups[0] != 0u && groups[1] != 0u && groups[2] != 0u) state->RecordCompute(shader, groups[0], groups[1], groups[2], 0u, snapshots, nullptr, threadDimensions ? &threads : nullptr);
     }
     return outcome;
 }
@@ -1956,7 +2047,7 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     return nullptr;
 }
 
-RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult&, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t, const std::shared_ptr<RecipeHit>&, IndirectOutcome&, const std::shared_ptr<PreparedDispatch>&, bool) {
+RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult&, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t, const std::shared_ptr<RecipeHit>&, IndirectOutcome&, const std::shared_ptr<PreparedDispatch>&, bool, const std::array<std::uint32_t, 3>&) {
     Unimplemented("DispatchRecipe (dispatch recipes are off on Metal: DispatchRecipes() is false)", "work package D1");
 }
 

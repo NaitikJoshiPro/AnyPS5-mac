@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <array>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -47,6 +48,9 @@ public:
     // Starts the journal replay if the device has not (a headless device starts it at its first
     // draw or dispatch) and joins it (tests; the teardown joins it anyway).
     void WaitForPipelineJournalReplay();
+    // Upstream 529dbb0480: writes the pipeline cache now (an immediate guest exit skips the teardown);
+    // macOS: the Metal pipeline cache archive and library store (MetalPipelineCache.h).
+    void SavePipelineCache();
     // Compute pipelines this device built, by dispatches and by the journal replay (tests).
     // macOS: the Metal pipeline cache's archive takes the journal's place (MetalDevice.mm: no
     // replay starts; ReplayComputePipeline builds through the pipeline cache).
@@ -58,6 +62,9 @@ public:
     std::string DriverInfo() const;
     bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
+    // Upstream 57ceb9e370: the order the pixel shader puts each pixel's samples in when pixel (0,0)'s
+    // locations stand in for a 2x2 grid. macOS: always none (TechnicalDebt metal-sample-order).
+    Graphics::SampleOrder HostSampleOrder(const Graphics::State& graphics) const;
     std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;
     std::uint32_t MaxFragmentInputComponents() const;
     const std::uint32_t* WorkGroupCountLimit() const;
@@ -107,6 +114,7 @@ public:
     // Pending-label table lookup and open-batch overlap test for WAIT_REG_MEM (see Recorder).
     std::optional<Graphics::Recorder::LabelHit> PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal = nullptr) const;
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    void SealPassWriteOnly();
     bool RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const;
     bool StoresPendingOver(std::uint64_t address, std::size_t bytes) const;
     // Fills [address, address + bytes) of host-imported guest memory with a repeating 16-byte pattern,
@@ -286,7 +294,7 @@ public:
         int cpuReason;
         double argumentReadMs;
     };
-    IndirectOutcome DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr);
+    IndirectOutcome DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr, const std::array<std::uint32_t, 3>& threadGroup = {});
     // A value-equal dispatch-cache hit with a recipe (design_cpu_final M4), in two steps.
     // PrepareRecipe, WITHOUT GuestMemory::GpuMutex: the pre-checks (recipes on, the recipe's
     // device is this one, its template and pipeline objects still alive), the template's
@@ -308,7 +316,7 @@ public:
     // with the recipe's, else the process aborts. `refreshByWords`: the driver's data-only hit
     // (`shader` carries live flat-SRT words the recipe's hash does not name), so the template's
     // data refresh is decided by the per-word compare instead of the hash.
-    RecipeOutcome DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify = nullptr, bool refreshByWords = false);
+    RecipeOutcome DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify = nullptr, bool refreshByWords = false, const std::array<std::uint32_t, 3>& threadGroup = {});
     // Whether dispatch-cache hits use recipes (APS5_NO_DISPATCH_RECIPE unset) and whether every
     // hit is verified (APS5_VERIFY_RECIPE=1).
     static bool DispatchRecipes();
@@ -329,7 +337,9 @@ public:
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
+    bool DrawInputsInPlace() const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
+    void DepthCopyPass(const Graphics::DepthCopyPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
