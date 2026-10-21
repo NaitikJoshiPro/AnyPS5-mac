@@ -555,10 +555,10 @@ constexpr int RECEIVE_NOTHING = -1;
 int wait_for_datagram(const Sock& socket, int flags) {
     if (socket.type == NET_SOCK_STREAM) return 0;
     if (socket.read_shut || socket.aborted) return RECEIVE_NOTHING;
-    if (socket.nonblock || (flags & NET_MSG_DONTWAIT) != 0) return 0;
+    if (socket.native->nonblock || (flags & NET_MSG_DONTWAIT) != 0) return 0;
     pollfd descriptors[2] = {{socket.native->value, POLLIN, 0}, {socket.native->WakeDescriptor(), POLLIN, 0}};
-    const auto deadline = socket.rcv_timeout_us > 0
-        ? std::chrono::steady_clock::now() + std::chrono::microseconds(socket.rcv_timeout_us)
+    const auto deadline = socket.native->receiveTimeout > 0
+        ? std::chrono::steady_clock::now() + std::chrono::microseconds(socket.native->receiveTimeout)
         : std::chrono::steady_clock::time_point::max();
     for (;;) {
         int timeout = -1;
