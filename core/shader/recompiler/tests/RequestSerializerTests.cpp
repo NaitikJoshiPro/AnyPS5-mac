@@ -556,6 +556,7 @@ int main() {
     Require(version41.end() - order > static_cast<std::ptrdiff_t>(sizeof(pixel.sampleOrder)) && *order == 0x10u);
     version41.erase(order, order + sizeof(pixel.sampleOrder));
     version41[4] = 41u;
+    version41.resize(version41.size() - kMacTailBytes); // upstream's v41 has no Mac tail
     const auto replay41 = serializer.Deserialize(EncodeBase64(version41));
     Require(replay41.request.context.pixel.has_value() && replay41.request.context.pixel->sampleLocations == pixel.sampleLocations && replay41.request.context.pixel->sampleOrder == std::array<std::uint32_t, 4>{});
     pixel.sampleOrder = {};
