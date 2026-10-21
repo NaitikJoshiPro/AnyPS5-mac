@@ -507,7 +507,9 @@ static void WholeWordReplacesRefusal(HelperRead read) {
     const Row row {9u, 0x123u, false, RasterPrimitive::Rectangle};
     Require(Evaluate(built.written->Argument(2), row) == (3u | (9u << 8u)));
 }
-enum class StartingQuad { Kept, BallotAfterBranch, BallotOfOtherLanes, ComputeStage };
+// HostExec*: the active words are the pixel-stage host exec word, WQM(ballot(true)) halves,
+// as an ACO s_mov_b64 s[0:1], exec / s_wqm_b64 exec, exec prologue reads them (upstream 27b196bee0).
+enum class StartingQuad { Kept, BallotAfterBranch, BallotOfOtherLanes, ComputeStage, HostExecKept, HostExecOtherLanes };
 
 static IrValue& StartingQuadMasked(IrProgram& program, StartingQuad shape) {
     auto& entry = Begin(program);
@@ -527,12 +529,20 @@ static IrValue& StartingQuadMasked(IrProgram& program, StartingQuad shape) {
     builder.SetInsertionPoint(entry);
     IrValue& ancillary = AncillaryBuiltin(builder);
     IrValue& helper = builder.Emit(IrOpcode::GetBuiltin, IrType::U32, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::HelperInvocation)), &builder.Constant(0u)});
-    IrValue& started = shape == StartingQuad::BallotOfOtherLanes ? FrontFacingBuiltin(builder) : builder.IEqual(helper, builder.Constant(0u));
+    const bool otherLanes = shape == StartingQuad::BallotOfOtherLanes || shape == StartingQuad::HostExecOtherLanes;
+    IrValue& started = otherLanes ? FrontFacingBuiltin(builder) : builder.IEqual(helper, builder.Constant(0u));
     IrValue& live = builder.Emit(IrOpcode::Ballot, IrType::Vec4U32, {&started});
     builder.SetInsertionPoint(*tail);
     IrValue& active = builder.Emit(IrOpcode::Ballot, IrType::Vec4U32, {&builder.ConstantBool(true)});
-    IrValue& low = builder.BitwiseAnd(builder.CompositeExtract(live, 0u), builder.CompositeExtract(active, 0u));
-    IrValue& high = builder.BitwiseAnd(builder.CompositeExtract(live, 1u), builder.CompositeExtract(active, 1u));
+    IrValue* activeLow = &builder.CompositeExtract(active, 0u);
+    IrValue* activeHigh = &builder.CompositeExtract(active, 1u);
+    if (shape == StartingQuad::HostExecKept || shape == StartingQuad::HostExecOtherLanes) {
+        IrValue& hostQuads = builder.Emit(IrOpcode::WqmU64, IrType::U64, {&builder.Emit(IrOpcode::CompositeConstructU64, IrType::U64, {activeLow, activeHigh})});
+        activeLow = &builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&hostQuads, &builder.Constant(0u)});
+        activeHigh = &builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&hostQuads, &builder.Constant(1u)});
+    }
+    IrValue& low = builder.BitwiseAnd(builder.CompositeExtract(live, 0u), *activeLow);
+    IrValue& high = builder.BitwiseAnd(builder.CompositeExtract(live, 1u), *activeHigh);
     IrValue& quads = builder.Emit(IrOpcode::WqmU64, IrType::U64, {&builder.Emit(IrOpcode::CompositeConstructU64, IrType::U64, {&low, &high})});
     IrValue& lane = LaneBit(builder, builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&quads, &builder.Constant(0u)}), builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&quads, &builder.Constant(1u)}));
     IrValue& kept = builder.Select(lane, builder.Constant(SelectOther), ancillary);
@@ -554,9 +564,9 @@ static const IrValue* StartingQuadExported(IrProgram& program, StartingQuad shap
     }
     return nullptr;
 }
-static void StartingQuadOnly() {
+static void StartingQuadOnly(StartingQuad shape = StartingQuad::Kept) {
     IrProgram program;
-    const IrValue* value = StartingQuadExported(program, StartingQuad::Kept);
+    const IrValue* value = StartingQuadExported(program, shape);
     Require(value != nullptr && value->HasImmediate() && value->ImmediateU32() == SelectOther);
 }
 static void StartingQuadOutsidePixel() {
@@ -631,6 +641,8 @@ int main() {
     StartingQuadOnly();
     StartingQuadRefused(StartingQuad::BallotAfterBranch);
     StartingQuadRefused(StartingQuad::BallotOfOtherLanes);
+    StartingQuadOnly(StartingQuad::HostExecKept);
+    StartingQuadRefused(StartingQuad::HostExecOtherLanes);
     StartingQuadOutsidePixel();
     Iterated = false;
     PerPixelSampleNumber(false);
