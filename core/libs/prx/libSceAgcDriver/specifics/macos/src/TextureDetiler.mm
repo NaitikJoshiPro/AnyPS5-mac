@@ -3,6 +3,10 @@
 // CmaskClear.comp in MSL, recorded into the command stream through its helper dispatch. The class
 // keeps its header (Vulkan-typed members carry Metal objects, D-M2-3): `module` holds the library,
 // `pipelines` the specialized pipeline states (CF-retained), `cmaskPipeline` the CMASK kernel.
+// Upstream sync 6 (6b6c701636): DispatchDepthSample (191c8a8d2b 120900a342), the DB depth copy's
+// DepthSample*.comp as MSL (`depthSamplePipelines`). Upstream's shader-module cache key (28ce7bc0b8,
+// CreateShaderModule) is Vulkan's; b4fbf24d1e's per-sample upload
+// (MultisampleUpload.cpp, compiled unchanged) is unreachable: Metal compute cannot write multisampled textures.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -276,6 +280,40 @@ kernel void cmask_clear(constant CmaskParams& params [[buffer(0)]], uint2 pixel 
     }
     if ((pixel.x & 7u) == 0u && (pixel.y & 7u) == 0u) atomic_fetch_or_explicit(params.errors, 1u, memory_order_relaxed);
 }
+
+// Graphics/shaders/DepthSampleSingle.comp / DepthSampleMultisample.comp (upstream 191c8a8d2b 120900a342):
+// one sample of a depth surface into a single-sample 32-bit target, exactly (read, no filtering). A
+// multisampled surface is a 2D multisample array (DECISIONS D28): guest sample s is slice s / h,
+// sample s % h (h = hostSamples). `bits`: the target is a 32-bit integer view (the float's bits).
+struct DepthSampleParams {
+    uint width;
+    uint height;
+    uint sample;
+    uint hostSamples;
+    uint bits;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    depth2d<float, access::read> single;
+    depth2d_ms_array<float, access::read> multi;
+    texture2d<float, access::write> target;
+    texture2d<uint, access::write> targetBits;
+};
+
+static void storeDepthSample(constant DepthSampleParams& params, float depth, uint2 pixel) {
+    if (params.bits != 0u) params.targetBits.write(uint4(as_type<uint>(depth), 0u, 0u, 0u), pixel);
+    else params.target.write(float4(depth, 0.0f, 0.0f, 1.0f), pixel);
+}
+
+kernel void depth_sample_single(constant DepthSampleParams& params [[buffer(0)]], uint2 pixel [[thread_position_in_grid]]) {
+    if (pixel.x >= params.width || pixel.y >= params.height) return;
+    storeDepthSample(params, params.single.read(pixel), pixel);
+}
+
+kernel void depth_sample_multisample(constant DepthSampleParams& params [[buffer(0)]], uint2 pixel [[thread_position_in_grid]]) {
+    if (pixel.x >= params.width || pixel.y >= params.height) return;
+    storeDepthSample(params, params.multi.read(pixel, params.sample / params.hostSamples, params.sample % params.hostSamples), pixel);
+}
 )MSL";
 
 struct Push {
@@ -319,6 +357,20 @@ struct RepackParams {
     std::uint64_t destination;
 };
 static_assert(sizeof(RepackParams) == 24 && offsetof(RepackParams, source) == 8);
+
+struct DepthSampleParams {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t sample;
+    std::uint32_t hostSamples;
+    std::uint32_t bits;
+    std::uint32_t pad[3];
+    std::uint64_t single;
+    std::uint64_t multi;
+    std::uint64_t target;
+    std::uint64_t targetBits;
+};
+static_assert(sizeof(DepthSampleParams) == 64 && offsetof(DepthSampleParams, single) == 32);
 
 struct CmaskParams {
     std::uint32_t base;
@@ -397,6 +449,10 @@ void TextureDetiler::release() noexcept {
     cmaskErrors.reset();
     if (repackPipeline != VK_NULL_HANDLE) CFRelease(reinterpret_cast<CFTypeRef>(repackPipeline));
     repackPipeline = VK_NULL_HANDLE;
+    for (auto& depthSample : depthSamplePipelines) {
+        if (depthSample != VK_NULL_HANDLE) CFRelease(reinterpret_cast<CFTypeRef>(depthSample));
+        depthSample = VK_NULL_HANDLE;
+    }
 }
 
 VkFormat TextureDetiler::ImageElementFormat(std::uint32_t elementBytes) {
@@ -597,6 +653,46 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
     stream.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     stream.FillBuffer(Metal::BufferOf(cmask), cmaskOffset, cmaskBytes, 0xffffffffu);
     stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT);
+}
+
+// Upstream 191c8a8d2b 120900a342: a DB depth copy's sample of a depth surface into a single-sample 32-bit
+// float target (Graphics/shaders/DepthSample*.comp as the MSL kernels above). The surface is read
+// directly (Metal compute reads depth textures, multisampled ones too, without a sampler); `depth` is
+// a view of the surface's texture (Depth32Float or Depth32Float_Stencil8, whose read returns depth), a
+// 2D multisample array when `multisampled` (DECISIONS D28). The target is a 32-bit float view, or a
+// 32-bit integer view that takes the float's bits.
+void TextureDetiler::DispatchDepthSample(VkCommandBuffer commands, VkImageView depth, bool multisampled, VkImageView target, std::uint32_t width, std::uint32_t height, std::uint32_t sample) {
+    Require(commands != VK_NULL_HANDLE && depth != VK_NULL_HANDLE && target != VK_NULL_HANDLE, "a depth sample copy needs a command buffer, the depth view and the target view");
+    id<MTLTexture> depthTexture = Metal::TextureOfView(depth);
+    id<MTLTexture> targetTexture = Metal::TextureOfView(target);
+    Require(depthTexture.pixelFormat == MTLPixelFormatDepth32Float || depthTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8, "a depth sample copy reads 32-bit float depth");
+    Require(multisampled == (depthTexture.textureType == MTLTextureType2DMultisampleArray) && (multisampled || depthTexture.textureType == MTLTextureType2D), "a depth sample copy's depth view is not the surface's 2D (multisample array) texture");
+    const auto targetFormat = targetTexture.pixelFormat;
+    Require(targetFormat == MTLPixelFormatR32Float || targetFormat == MTLPixelFormatR32Uint || targetFormat == MTLPixelFormatR32Sint, "a depth sample copy writes a 32-bit single-channel target");
+    Require(width != 0 && height != 0 && width <= depthTexture.width && height <= depthTexture.height && width <= targetTexture.width && height <= targetTexture.height, "a depth sample copy's extent exceeds its depth surface or target");
+    const auto hostSamples = multisampled ? static_cast<std::uint32_t>(depthTexture.sampleCount) : 1u;
+    Require(sample < hostSamples * static_cast<std::uint32_t>(multisampled ? depthTexture.arrayLength : 1u), "a depth sample copy of a sample the depth surface does not have");
+    auto& depthSamplePipeline = depthSamplePipelines[multisampled ? 1u : 0u];
+    if (depthSamplePipeline == VK_NULL_HANDLE) {
+        pipeline(TextureTileMode::kLinear, 4u, false, false);  // compiles the library
+        NSError* error = nil;
+        id<MTLFunction> function = [LibraryOf(module) newFunctionWithName:(multisampled ? @"depth_sample_multisample" : @"depth_sample_single")];
+        id<MTLComputePipelineState> state = function == nil ? nil : [DeviceFor(context) newComputePipelineStateWithFunction:function error:&error];
+        if (state == nil) Fail("cannot build the depth sample copy pipeline: " + Metal::Describe(error));
+        depthSamplePipeline = reinterpret_cast<VkPipeline>(const_cast<void*>(CFBridgingRetain(state)));
+    }
+    DepthSampleParams params{};
+    params.width = width;
+    params.height = height;
+    params.sample = sample;
+    params.hostSamples = hostSamples;
+    params.bits = targetFormat == MTLPixelFormatR32Float ? 0u : 1u;
+    (multisampled ? params.multi : params.single) = depthTexture.gpuResourceID._impl;
+    (params.bits != 0u ? params.targetBits : params.target) = targetTexture.gpuResourceID._impl;
+    auto& stream = Metal::Stream(commands);
+    stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    stream.DispatchHelper(PipelineOf(depthSamplePipeline), std::as_bytes(std::span(&params, 1)), MTLSizeMake((width + 7u) / 8u, (height + 7u) / 8u, 1), MTLSizeMake(8, 8, 1));
+    stream.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT);
 }
 
 }
