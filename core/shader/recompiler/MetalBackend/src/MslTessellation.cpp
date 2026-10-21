@@ -53,6 +53,12 @@ std::uint32_t ControlWords(const MslEmitterState& state) {
     return state.program.Metadata().tessellationControlStride / 4u;
 }
 
+// Upstream 8b8219dcef: a merged hull program's LDS, one record of tessellationSharedStride bytes per
+// output control point (TessellationAttribute::ControlShared).
+std::uint32_t SharedWords(const MslEmitterState& state) {
+    return StageOf(state) == IrShaderStage::TessellationControl ? state.program.Metadata().tessellationSharedStride / 4u : 0u;
+}
+
 // Patch-constant record dwords (upstream #4163, SpirvModuleEmitter DefineTessellationInterfaces):
 // TessellationLowering places every hull patch output and domain patch input at its off-chip address
 // modulo the record stride (ProgramMetadata::tessellationPatchStride), so the hull and the domain
@@ -91,6 +97,20 @@ void Get(MslEmitterState& state, const IrValue& instruction) {
         state.Line("const uint " + address + " = uint(" + state.Arg(instruction, 1u) + ");");
         state.Line("const uint " + index + " = min(" + address + " / " + U32(stride) + ", " + U32(Tessellation(state).inputControlPoints - 1u) + ") * " + U32(stride / 4u) + " + (" + address + " % " + U32(stride) + ") / 4u;");
         state.Define(instruction, "(" + predicate + ") ? aps5_tess_local[" + index + "] : 0u");
+        return;
+    }
+    if (kind == TessellationAttribute::ControlShared) {
+        // Upstream 8b8219dcef (SpirvModuleEmitter TessellationPointer): a merged hull program reads
+        // any control point's record of its patch after the barrier, at an address relative to the
+        // patch's first record (the lowering adds InvocationId * stride for reads of its own).
+        if (StageOf(state) != IrShaderStage::TessellationControl) state.Fail(instruction, "merged hull LDS reads outside the hull program");
+        const auto stride = state.program.Metadata().tessellationSharedStride;
+        if (stride == 0u || stride % 4u != 0u) state.Fail(instruction, "merged hull LDS reads need a whole-dword record stride");
+        state.AddParameter("threadgroup uint* aps5_tess_shared");
+        const auto address = state.Temporary("aps5_ta");
+        state.Line("const uint " + address + " = uint(" + state.Arg(instruction, 1u) + ");");
+        state.Line("const uint " + index + " = (" + address + " / " + U32(stride) + ") * " + U32(stride / 4u) + " + (" + address + " % " + U32(stride) + ") / 4u;");
+        state.Define(instruction, "(" + predicate + ") && " + index + " < " + U32(Tessellation(state).outputControlPoints * (stride / 4u)) + " ? aps5_tess_shared[" + index + "] : 0u");
         return;
     }
     if (kind == TessellationAttribute::EvaluationInput) {
@@ -153,6 +173,15 @@ void Set(MslEmitterState& state, const IrValue& instruction) {
         // patch) run the program for its barriers only.
         state.Line("if (aps5_invocation_id < " + U32(Tessellation(state).outputControlPoints) + " && " + index + " < " + U32(ControlWords(state)) + ") aps5_tess_payload[" + U32(HeaderWords) + " + aps5_invocation_id * " + U32(ControlWords(state)) + " + " + index + "] = " + value + ";");
         break;
+    case TessellationAttribute::ControlShared:
+        // Upstream 8b8219dcef: a merged hull program writes its LDS in its own control point's
+        // record (the lowering refuses other writes), at the offset within the record.
+        if (StageOf(state) != IrShaderStage::TessellationControl) state.Fail(instruction, "merged hull LDS writes outside the hull program");
+        if (SharedWords(state) == 0u) state.Fail(instruction, "merged hull LDS writes need a record stride");
+        state.AddParameter("threadgroup uint* aps5_tess_shared");
+        state.AddParameter("uint aps5_invocation_id");
+        state.Line("if (aps5_invocation_id < " + U32(Tessellation(state).outputControlPoints) + " && " + index + " < " + U32(SharedWords(state)) + ") aps5_tess_shared[aps5_invocation_id * " + U32(SharedWords(state)) + " + " + index + "] = " + value + ";");
+        break;
     case TessellationAttribute::InstanceOutput:
         // Upstream 30e85a3a2: the local program's draw-relative instance for the hull. The object
         // function already knows each patch's instance and hands it to the hull (InstanceInput).
@@ -198,7 +227,7 @@ Role RoleOf(const MslEmitterState& state) {
     case IrShaderStage::Local:
         return {"local", {"device const Aps5Table& aps5_table", "constant uint* aps5_push", "constant Aps5DriverData& aps5_driver", "device const Aps5VertexFetch* aps5_fetch", "uint aps5_vertex_id", "uint aps5_instance_id", "uint aps5_base_instance", "uint aps5_simd_lane", "threadgroup uint* aps5_tess_local"}};
     case IrShaderStage::TessellationControl:
-        return {"hull", {"device const Aps5Table& aps5_table", "constant uint* aps5_push", "constant Aps5DriverData& aps5_driver", "uint aps5_invocation_id", "uint aps5_patch_id", "uint aps5_hull_instance", "uint aps5_simd_lane", "threadgroup uint* aps5_tess_local", "object_data uint* aps5_tess_payload"}};
+        return {"hull", {"device const Aps5Table& aps5_table", "constant uint* aps5_push", "constant Aps5DriverData& aps5_driver", "uint aps5_invocation_id", "uint aps5_patch_id", "uint aps5_hull_instance", "uint aps5_simd_lane", "threadgroup uint* aps5_tess_local", "threadgroup uint* aps5_tess_shared", "object_data uint* aps5_tess_payload"}};
     case IrShaderStage::TessellationEvaluation:
         return {"domain", {"device const Aps5Table& aps5_table", "constant uint* aps5_push", "constant Aps5DriverData& aps5_driver", "uint aps5_patch_id", "float3 aps5_tess_coord", "uint aps5_simd_lane", "const object_data uint* aps5_tess_payload", "thread Aps5VertexOut& aps5_out"}};
     default:
@@ -283,6 +312,7 @@ std::string EmitMslTessellationStage(MslEmitterState& state, std::vector<std::st
     text += "constexpr constant uint aps5_tess_outputs = " + U32(tess.outputControlPoints) + ";\n";
     text += "constexpr constant uint aps5_tess_local_words = " + U32(LocalWords(state)) + ";\n";
     text += "constexpr constant uint aps5_tess_control_words = " + U32(ControlWords(state)) + ";\n";
+    text += "constexpr constant uint aps5_tess_shared_words = " + U32(SharedWords(state)) + ";\n";
     text += "constexpr constant uint aps5_tess_payload_words = " + U32(stage == IrShaderStage::Local ? 0u : PayloadWords(state)) + ";\n\n";
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
@@ -417,6 +447,8 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     object += "    device const Aps5TessDraw& aps5_draw [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::TessellationDraw)) + ")]],\n";
     object += "    uint3 aps5_group [[threadgroup_position_in_grid]],\n    uint aps5_tid [[thread_index_in_threadgroup]],\n    uint aps5_lane [[thread_index_in_simdgroup]])\n{\n";
     object += "    threadgroup uint aps5_local[" + U32(std::max(config.inputControlPoints * localWords, 1u)) + "];\n";
+    // MslAbi Version 21: a merged hull program's per-control-point LDS records (upstream 8b8219dcef).
+    object += "    threadgroup uint aps5_shared[" + U32(std::max(config.outputControlPoints * Declared(hull, "aps5_tess_shared_words"), 1u)) + "];\n";
     object += "    threadgroup int aps5_none[1];\n";
     object += "    const uint aps5_patch_id = aps5_group.x;\n";
     object += "    if (aps5_tid < " + U32(config.inputControlPoints) + ") {\n";
@@ -427,7 +459,7 @@ MslTessellationPipeline LinkMslTessellation(const MslTessellationProgram& local,
     object += "        aps5_ls::aps5_stage(aps5_ls_table, aps5_push, aps5_driver, aps5_fetch, aps5_vertex, aps5_draw.firstInstance + aps5_group.y, aps5_draw.firstInstance, aps5_lane, aps5_local + aps5_tid * " + U32(localWords) + ");\n";
     object += "    }\n";
     object += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    object += "    aps5_hs::aps5_stage(aps5_hs_table, aps5_push, *reinterpret_cast<constant aps5_hs::Aps5DriverData*>(&aps5_driver), aps5_tid, aps5_patch_id, aps5_group.y, aps5_lane, aps5_local, aps5_payload.words);\n";
+    object += "    aps5_hs::aps5_stage(aps5_hs_table, aps5_push, *reinterpret_cast<constant aps5_hs::Aps5DriverData*>(&aps5_driver), aps5_tid, aps5_patch_id, aps5_group.y, aps5_lane, aps5_local, aps5_shared, aps5_payload.words);\n";
     object += "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_object_data);\n";
     object += "    if (aps5_tid == 0u) {\n" + std::string(clamp) + factors;
     object += "        const int aps5_count = aps5_tess_primitive_count(aps5_patch, aps5_none);\n";

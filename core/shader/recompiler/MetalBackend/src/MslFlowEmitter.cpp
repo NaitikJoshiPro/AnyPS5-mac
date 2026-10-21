@@ -502,7 +502,9 @@ void EmitBarrier(MslEmitterState& state, const IrValue& instruction) {
         return;
     }
     if (stage == IrShaderStage::TessellationControl) {
-        state.Line("threadgroup_barrier(mem_flags::mem_none);");
+        // Upstream 8b8219dcef: a merged hull program's barrier orders its LDS records
+        // (TessellationAttribute::ControlShared, threadgroup memory of the object function).
+        state.Line(state.program.Metadata().tessellationSharedStride != 0u ? "threadgroup_barrier(mem_flags::mem_threadgroup);" : "threadgroup_barrier(mem_flags::mem_none);");
         return;
     }
     state.Line("threadgroup_barrier(" + state.LdsMemoryFlags() + ");");
