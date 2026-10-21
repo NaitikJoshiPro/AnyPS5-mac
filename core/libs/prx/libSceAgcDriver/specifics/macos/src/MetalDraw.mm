@@ -981,7 +981,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // Upstream b6cde5698 passes patterns that differ between the pixels of the guest's 2x2 grid
         // as a VK_EXT_sample_locations 2x2 grid; Metal's setSamplePositions takes one pattern for
         // every pixel (docs/dev/TechnicalDebt.md). Pixel 0's pattern leads the array either way.
-        if (graphics.sampleLocationGrid) Fail("sample locations that vary between the pixels of the 2x2 grid (PA_SC_AA_SAMPLE_LOCS_PIXEL_*): Metal sets one sample pattern for every pixel");
+        // Upstream 57ceb9e370: without a 2x2 grid pixel (0,0)'s locations stand in for every pixel
+        // (HostSampleOrder logs it; TechnicalDebt metal-sample-order).
         const auto locations = Graphics::SampleLocations(graphics);
         passKey = Mix(passKey, graphics.samples);
         for (std::uint32_t sample = 0; sample < graphics.samples; ++sample) {
@@ -1597,7 +1598,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         [encoder setFrontFacingWinding:graphics.frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE ? MTLWindingCounterClockwise : MTLWindingClockwise];
         [encoder setDepthClipMode:graphics.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
         [encoder setBlendColorRed:graphics.blendConstants[0] green:graphics.blendConstants[1] blue:graphics.blendConstants[2] alpha:graphics.blendConstants[3]];
-        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        // Upstream e61d31d287: PA_SU_SC_MODE_CNTL POLY_MODE line draws one-pixel lines (MTLTriangleFillModeLines);
+        // the point type is refused (KnownDrawRejection, TechnicalDebt metal-polygon-mode-points).
+        [encoder setTriangleFillMode:graphics.polygonMode == VK_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
         if (depthStencil != nil) {
             [encoder setDepthStencilState:depthStencil];
             [encoder setStencilFrontReferenceValue:graphics.stencilFront.reference & 0xffu backReferenceValue:graphics.stencilBack.reference & 0xffu];
@@ -1874,6 +1877,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
     }
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot draw");
+    if (graphics.polygonMode == VK_POLYGON_MODE_POINT) Fail("a point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE): MTLTriangleFillMode has fill and lines only (TechnicalDebt metal-polygon-mode-points)");
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
     Graphics::Metal::TessellationStages tessellation;
@@ -1922,6 +1926,7 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
         const bool tessellationStage = stage == ShaderRecompiler::ShaderStage::Local || stage == ShaderRecompiler::ShaderStage::TessellationControl || stage == ShaderRecompiler::ShaderStage::TessellationEvaluation;
         if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh && !(tessellationPath && tessellationStage)) return std::string("Metal draw (work package D6): only vertex, mesh, tessellation and pixel stages are implemented");
     }
+    if (graphics.polygonMode == VK_POLYGON_MODE_POINT) return std::string("Metal draw: a point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE) has no Metal fill mode (MTLTriangleFillMode has fill and lines only; TechnicalDebt metal-polygon-mode-points)");
     // Sample counts the device cannot render are emulated as slices (DECISIONS D28); only counts with
     // no split into renderable slices are refused.
     if (graphics.samples > 1u && state->queue != nil) {
@@ -1932,6 +1937,21 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
         }
     }
     return std::nullopt;
+}
+
+// Upstream: whether draws read their index and vertex buffers in place (PassInputHazard). The Metal
+// draw binds wrapped guest memory unless the Context turns it off.
+bool VulkanDevice::DrawInputsInPlace() const {
+    return state->context.drawInputsInPlace;
+}
+
+// Upstream 191c8a8d2b: a DB depth copy (DB_RENDER_CONTROL DEPTH_COPY) writes one depth sample into a
+// single-sample R32 float color target. As upstream, through Graphics::RunDepthCopyPass (Draw.cpp) over
+// the image cache's Context: the destination is the target's resident image, written by
+// CopyDepthSample (the Metal twin in DepthSurface.mm).
+void VulkanDevice::DepthCopyPass(const Graphics::DepthCopyPass& pass) {
+    if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device has no DB depth copies");
+    Graphics::RunDepthCopyPass(graphicsContext(), pass);
 }
 
 // CB metadata passes: a fast-clear eliminate (or a DCC decompress of a target without DCC) expands
