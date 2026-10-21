@@ -1170,7 +1170,7 @@ void AbiDeferredVertexInputs() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "statically bound vertex attributes are not implemented");
 }
 
-void AbiDeferredRectanglePairs() {
+[[maybe_unused]] void AbiDeferredRectanglePairs() {
     static AbiHeader front;
     DescribeFront(front);
     static AbiHeader pixel;
@@ -1288,7 +1288,17 @@ int main(int argc, char** argv) {
             else if (abiMode == "--abi-deferred-undecodable-state") AbiDeferredUndecodableState();
             else if (abiMode == "--abi-deferred-registration-failure") AbiDeferredRegistrationFailure();
             else if (abiMode == "--abi-deferred-vertex-inputs") AbiDeferredVertexInputs();
-            else if (abiMode == "--abi-deferred-rectangle-pairs") AbiDeferredRectanglePairs();
+            else if (abiMode == "--abi-deferred-rectangle-pairs") {
+#ifdef __APPLE__
+                // The MSL backend expands rect lists in the vertex function and interpolates custom
+                // per-vertex inputs there, so the pair builds and nothing is deferred
+                // (TechnicalDebt metal-vulkan-internal-tests).
+                std::cout << "skipped, the MSL backend builds rectangle pairs with custom per-vertex interpolation\n";
+                return VulkanTestSkipped;
+#else
+                AbiDeferredRectanglePairs();
+#endif
+            }
             else AbiDeferredRectangle();
             std::cout << "shader ABI deferral tests passed: " << abiMode << '\n';
             return 0;

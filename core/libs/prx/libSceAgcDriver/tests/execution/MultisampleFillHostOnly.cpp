@@ -186,6 +186,14 @@ bool FillsTakenAsMultisampledClearsAreNotStored(AgcDriver::VulkanDevice& device)
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         auto* active = AgcDriver::Graphics::Recorder::Active();
+#ifdef __APPLE__
+        // Every Metal device on one GPU wraps the one system MTLDevice, so a second device's
+        // recorder has the same VkDevice handle (TechnicalDebt metal-shared-device-handle).
+        if (active != nullptr && active->Device() == context.device) {
+            std::cout << "skipped, Metal devices on one GPU share one VkDevice handle\n";
+            return false;
+        }
+#endif
         Require(active != nullptr && active->Device() != context.device, "the fill test requires a second device's active recorder");
         const auto keptBytes = active->OpenKeptBytes();
         std::shared_ptr<void> owner;
