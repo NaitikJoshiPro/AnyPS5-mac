@@ -13,8 +13,17 @@
 //   usage subset (MetalVulkanImages.mm CreateImageView makes a newTextureViewWithPixelFormat view), so the twin checks
 //   instead that the view is a one-level 2D sRGB view of the storage texture and that it is reused. The decoded red is
 //   read by an MSL kernel. Expected values are upstream's.
+// - --deferred-failure-report-only (agc_recorder_deferred_failure_report, deferredFailureReportTests): copied
+//   unchanged with its StderrCapture and DeferredFailureLines helpers; Recorder.mm reports deferred write-back
+//   failures as Recorder.cpp does (every plain failure, the first 8 unaligned BDA reports per instruction, then
+//   every 1024th).
+// - --gpu-timing-complete-only / --gpu-timing-incomplete-only (agc_gpu_timing_complete, agc_gpu_timing_incomplete,
+//   gpuTimingCompletionTests): copied unchanged but for upstream's "queue timestamp queries unavailable" exit: the
+//   Metal recorder always has its MTL4 timestamp heap (Recorder.mm readGpuTiming), so there is nothing to skip.
 
 #include "RecorderTwinHarness.h"
+#include <functional>
+#include <unistd.h>
 #include "RecorderTwins.h"
 #include "../src/MetalCommandStream.h"
 #include "../src/MetalVulkanImages.h"
@@ -186,5 +195,114 @@ const bool deviceSelection = AgcDriver::MetalTwins::RegisterRecorderMode("--devi
 const bool sampledStorageBaseLevelUsage = AgcDriver::MetalTwins::RegisterRecorderMode("--sampled-storage-base-level-usage-only", [] {
     return RunMode([](const Device& device, Recorder& recorder) { sampledStorageBaseLevelUsageTests(device, recorder); });
 });
+
+
+class StderrCapture {
+public:
+    StderrCapture() {
+        std::fflush(stderr);
+        file = std::tmpfile();
+        Require(file != nullptr, "cannot open a temporary file for stderr");
+        saved = dup(fileno(stderr));
+        dup2(fileno(file), fileno(stderr));
+    }
+
+    std::string Finish() {
+        std::fflush(stderr);
+        dup2(saved, fileno(stderr));
+        close(saved);
+        std::rewind(file);
+        std::string text;
+        char buffer[4096];
+        for (std::size_t read = 0; (read = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, read);
+        std::fclose(file);
+        std::fwrite(text.data(), 1, text.size(), stderr);
+        return text;
+    }
+
+private:
+    std::FILE* file = nullptr;
+    int saved = -1;
+};
+
+std::size_t DeferredFailureLines(Recorder& recorder, std::size_t count, const std::function<void()>& failure, std::string* log = nullptr) {
+    StderrCapture capture;
+    for (std::size_t index = 0; index < count; ++index) recorder.OnComplete(failure);
+    recorder.Sync();
+    const auto text = capture.Finish();
+    if (log != nullptr) *log = text;
+    std::size_t lines = 0;
+    for (auto at = text.find("deferred write-back failed"); at != std::string::npos; at = text.find("deferred write-back failed", at + 1)) ++lines;
+    return lines;
+}
+
+void deferredFailureReportTests(Recorder& recorder) {
+    using AgcDriver::Graphics::BdaUnalignedAccess;
+    std::uint32_t serial = 0;
+    const auto plain = [&serial] { throw std::runtime_error("image table: poisoned entry " + std::to_string(serial++)); };
+    const auto unaligned = [](std::uint32_t instruction) { return [instruction] { throw BdaUnalignedAccess("BDA access failed: unaligned", instruction); }; };
+    Require(DeferredFailureLines(recorder, 12, plain) == 12, "a deferred failure other than an unaligned BDA access was not printed every time");
+    Require(DeferredFailureLines(recorder, 12, unaligned(0x5c8)) == 8, "the first 8 deferred reports of an unaligned BDA access were not the only ones printed");
+    std::string log;
+    Require(DeferredFailureLines(recorder, 1012, unaligned(0x5c8), &log) == 1 && log.find("pc 0x5c8 1024 times so far") != std::string::npos, "the 1024th deferred report of an unaligned BDA access was not the only one printed");
+    Require(DeferredFailureLines(recorder, 12, unaligned(0x7a0)) == 8, "unaligned BDA reports at one instruction limited the printing of the reports at another");
+    Require(DeferredFailureLines(recorder, 12, plain) == 12, "unaligned BDA reports limited the printing of other deferred failures");
+}
+
+const bool deferredFailureReport = AgcDriver::MetalTwins::RegisterRecorderMode("--deferred-failure-report-only", [] {
+    return RunMode([](const Device&, Recorder& recorder) {
+        deferredFailureReportTests(recorder);
+        std::cout << "Deferred failure report tests passed\n";
+    });
+});
+
+int gpuTimingCompletionTests(const Device& device, bool incomplete) {
+    const auto& context = device.GetContext();
+    Require(Recorder::GpuTimingEnabled(), "GPU timing completion test requires APS5_PROFILE_GPU");
+    std::unique_lock gpu(GpuMutex());
+    int completed = 0;
+    Recorder recorder(context);
+    recorder.Activate();
+    for (int round = 0; round < 3; ++round) {
+        const bool missingEnd = incomplete && round == 1;
+        const auto first = recorder.BeginGpuTiming(0x12340);
+        Require(first != Recorder::NoTiming, "first GPU timing range was not allocated");
+        if (!missingEnd) recorder.EndGpuTiming(first);
+        const auto second = recorder.BeginGpuTiming(0x12341);
+        Require(second != Recorder::NoTiming && second != first, "second GPU timing range was not allocated");
+        recorder.EndGpuTiming(second);
+        recorder.OnComplete([&] { ++completed; });
+        const auto serial = recorder.Submissions() + 1;
+        recorder.Submit();
+        recorder.Sync();
+        Require(completed == round + 1 && recorder.Idle(), "GPU timing prevented batch completion");
+        std::size_t missing = 0;
+        const auto batches = recorder.CompletedBatches(serial - 1, serial, missing);
+        Require(missing == 0 && batches.size() == 1 && batches.front().serial == serial, "GPU timing batch completion record is missing");
+        const auto& batch = batches.front();
+        if (missingEnd) {
+            Require(batch.gpuStartNs == 0 && batch.gpuEndNs == 0, "incomplete query batch published GPU timings");
+        } else {
+            Require(batch.gpuStartNs > 0 && batch.gpuEndNs >= batch.gpuStartNs, "complete query batch lost GPU timings");
+        }
+    }
+    std::cout << "GPU timing batch completion checked, incomplete=" << incomplete << '\n';
+    return 0;
+}
+
+int RunGpuTiming(bool incomplete) {
+    @autoreleasepool {
+        try {
+            Device device;
+            return gpuTimingCompletionTests(device, incomplete);
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
+}
+
+const bool gpuTimingComplete = AgcDriver::MetalTwins::RegisterRecorderMode("--gpu-timing-complete-only", [] { return RunGpuTiming(false); });
+const bool gpuTimingIncomplete = AgcDriver::MetalTwins::RegisterRecorderMode("--gpu-timing-incomplete-only", [] { return RunGpuTiming(true); });
 
 }
