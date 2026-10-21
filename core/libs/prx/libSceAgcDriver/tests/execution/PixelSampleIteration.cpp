@@ -424,7 +424,14 @@ int main() {
         ExpectModules();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+#ifndef __APPLE__
         Require(TargetHasCapability(device->Target(), spv::CapabilityInterpolationFunction), "the test device lacks sampleRateShading");
+#else
+        // The Metal device shades per sample through [[sample_id]] and interpolate_at_* in the MSL
+        // backend without advertising the SPIR-V InterpolationFunction capability (offset barycentrics
+        // are host-interpolated at the read's location flag, MslStageIo.cpp; DECISIONS D38): the
+        // draws below are what is checked there.
+#endif
         std::uint32_t ran = 0;
         for (const std::uint32_t samples : {4u, 2u}) {
             const auto name = std::to_string(samples) + "x ";
