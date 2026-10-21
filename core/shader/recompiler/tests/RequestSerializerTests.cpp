@@ -11,8 +11,8 @@
 
 namespace {
 
-// Mac fork: after upstream's version 32 layout, version 33 appends float32DenormFlushNative and version 34
-// mslWave64LaneLocal and mslNanTestElimination (one byte each).
+// Mac fork: after upstream's version 38 layout, version 39 appends float32DenormFlushNative, mslWave64LaneLocal and
+// mslNanTestElimination (one byte each). The earlier Mac numbering (33, 34) is upstream's now and reads upstream's layout.
 constexpr std::uint8_t kCurrentVersion = 39u; // upstream v38 + the Mac tail (D72 round 4)
 constexpr std::size_t kMacTailBytes = 3u;
 
@@ -437,7 +437,7 @@ int main() {
         }
     }
 
-    // The Mac tail: float32DenormFlushNative (v33), mslWave64LaneLocal and mslNanTestElimination (v34).
+    // The Mac tail (v39): float32DenormFlushNative, mslWave64LaneLocal and mslNanTestElimination.
     for (unsigned flags = 0; flags < 8u; ++flags) {
         ShaderRecompiler::RecompileRequest flagRequest{};
         flagRequest.target.float32DenormFlushNative = (flags & 1u) != 0u;
@@ -462,16 +462,23 @@ int main() {
             }
             Require(invalidRejected);
         }
-        auto version33 = bytes;
-        version33[4] = 33u;
-        version33.resize(tail + 1u);
-        const auto earlier = serializer.Deserialize(EncodeBase64(version33));
-        Require(earlier.request.target.float32DenormFlushNative == flagRequest.target.float32DenormFlushNative);
-        auto version32 = bytes;
-        version32[4] = 32u;
-        version32.resize(tail);
-        const auto upstream = serializer.Deserialize(EncodeBase64(version32));
-        Require(!upstream.request.target.float32DenormFlushNative);
+        // Upstream's v38 layout is the same request without the tail: it loads with every Mac flag off.
+        auto version38 = bytes;
+        version38[4] = 38u;
+        version38.resize(tail);
+        const auto upstream = serializer.Deserialize(EncodeBase64(version38));
+        Require(!upstream.request.target.float32DenormFlushNative && !upstream.request.target.mslWave64LaneLocal &&
+                !upstream.request.target.mslNanTestElimination);
+        // A v38 header in front of the Mac tail is not a v38 request.
+        auto taggedTail = bytes;
+        taggedTail[4] = 38u;
+        bool trailingRejected = false;
+        try {
+            static_cast<void>(serializer.Deserialize(EncodeBase64(taggedTail)));
+        } catch (const std::runtime_error& error) {
+            trailingRejected = std::string_view(error.what()) == "RequestSerializer: unexpected trailing data";
+        }
+        Require(trailingRejected);
     }
 
     ShaderRecompiler::RecompileRequest request{};
@@ -531,7 +538,7 @@ int main() {
         Require(stencilOperationValue < version35.end() && *stencilOperationValue == 0u);
         version35.erase(stencilOperationValue);
         version35[4] = 35u;
-        version35.pop_back();
+        version35.resize(version35.size() - 1u - kMacTailBytes); // float32FlushToZero (v36) and the Mac tail (v39)
         const auto replay35 = serializer.Deserialize(EncodeBase64(version35));
         Require(replay35.request.target.spannedWaves == spanned && !replay35.request.target.float32FlushToZero);
     }
