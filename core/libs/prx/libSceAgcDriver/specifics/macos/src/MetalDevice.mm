@@ -872,7 +872,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 if ([state->device supportsTextureSampleCount:count]) colorSamples |= count;
             }
             context.limits.framebufferColorSampleCounts = colorSamples;
+            // Depth and stencil attachments take the same counts: every Apple GPU renders Depth16Unorm,
+            // Depth32Float and Depth32Float_Stencil8 multisampled (Metal Feature Set Tables, "MSAA" per
+            // pixel format), and the D6 depth surfaces are 2D multisample textures of those formats.
+            context.limits.framebufferDepthSampleCounts = colorSamples;
+            context.limits.framebufferStencilSampleCounts = colorSamples;
             context.storageImageMultisample = true;
+            // Per-sample shading is native: an MSL fragment function reading [[sample_id]] runs once per
+            // sample (MSL spec 5.2.3.4), which the MSL backend emits for guest per-sample pixel programs.
+            // The guest sample order that upstream builds on it is not on Metal (TechnicalDebt metal-sample-order).
+            context.sampleRateShading = true;
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
             Graphics::Metal::DescribeMemory(context, state->device);
