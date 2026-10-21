@@ -1081,7 +1081,11 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
             state.Outdent();
             state.Line("} else if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
         } else {
-            state.Line("if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
+            // Upstream 96c692c887: with the V# base off a dword boundary, an atomic whose containing dword lies
+            // before the first aligned dword of the view is out of bounds (returns 0, writes nothing); the view
+            // starts at byte MemoryByteOffset + misalignment of the bound buffer.
+            const auto first = "((" + state.MemoryByteOffset(element) + " + " + descriptor.memory + ".misalignment + 3u) >> 2u)";
+            state.Line("if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ") && (" + byte + " >> 2u) >= " + first + ") {");
         }
         state.Indent();
         if (wide) apply("(" + buffer + ".address + ulong(" + byte + "))");
