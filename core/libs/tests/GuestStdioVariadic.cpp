@@ -1,5 +1,6 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/VarArgsAbi.hpp"
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -18,13 +19,8 @@ int APS5_VABI vswscanf_nid_postfix(const char16_t*, const char16_t*, void*);
 int APS5_VABI vswscanf_s_nid_postfix(const char16_t*, const char16_t*, void*);
 }
 
-#ifdef _WIN32
-#define APS5_VA_BEGIN(last) __builtin_sysv_va_list args; __builtin_sysv_va_start(args, last)
-#define APS5_VA_END() __builtin_sysv_va_end(args)
-#else
-#define APS5_VA_BEGIN(last) std::va_list args; va_start(args, last)
-#define APS5_VA_END() va_end(args)
-#endif
+// The guest va_list the v* exports read: the host's only on x86-64 Linux, a SysV va_list on
+// Windows, and a VaList over the host's stack arguments on arm64 macOS (VarArgsAbi.hpp).
 
 static void Require(bool value, const char* what) {
     if (value) return;
