@@ -6,7 +6,9 @@
 // mesh render pipeline (MTLMeshRenderPipelineDescriptor), which checks that the mesh vertex
 // user() outputs match the fragment inputs. Each non-rect mesh function is also compiled in its
 // triangle-vertices mode (MslAbi Version 13) and linked with a per-vertex/barycentric fragment
-// function. The rendering itself is checked by agc_driver_mesh and agc_driver_mesh_per_vertex_inputs.
+// function. A point-list geometry program (upstream ee81c5112d, MslAbi Version 21) defines its own
+// point topology and point size. The rendering itself is checked by agc_driver_mesh and
+// agc_driver_mesh_per_vertex_inputs.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -193,6 +195,13 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
         Require(!Has(source, "aps5_tv_v[") && !Has(source, "aps5_lds_words[aps5_i * "), name + ": a rect-list mesh function has the triangle-vertices mode");
         return;
     }
+    // MslAbi Version 21 (upstream ee81c5112d): a point-list geometry program outputs points whatever
+    // the draw's topology, the primitive export's first index each, with [[point_size]] 1.0.
+    if (test.mesh.outputPrimitiveSize == 1u) {
+        Require(Has(source, "#define " + std::string(Abi::PrimitiveVerticesMacro) + " 1u\n") && Has(source, "#define " + std::string(Abi::PointsMacro) + " 1\n") && Has(source, "float aps5_default_point_size [[point_size]]"), name + ": the point-list program does not define its point topology and point size");
+        Require(source.find("#define " + std::string(Abi::PrimitiveVerticesMacro) + " 1u") < source.find("struct Aps5MeshVertex"), name + ": the point-list topology is defined after the records that read it");
+        return;
+    }
 
     // The triangle-vertices mode: unshared vertices, MeshTriangleVerticesPrimitives triangles per
     // split threadgroup, compiled with the driver's macros and linked with a fragment function that
@@ -268,7 +277,7 @@ int main() {
             Require(target.mesh.has_value(), "the Metal target advertises no mesh shader limits");
             // tests/Mesh.cpp's subgroups: {input primitive, primitives and vertices per group, max
             // vertices, max primitives, threads, LDS dwords, provoking vertex, ESGS item size}.
-            const std::array<MeshCase, 11> cases{{
+            const std::array<MeshCase, 12> cases{{
                 {"triangle list, one-wave subgroups, wave64", {4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, 64u, true},
                 {"triangle list, two-wave subgroups, wave64", {4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u}, 64u, true},
                 {"triangle list, wave32", {4u, 4u, 12u, 12u, 4u, 32u, 1024u, 0u, 4u}, 32u, false},
@@ -284,6 +293,8 @@ int main() {
                 // 192 vertices: together past the 32 KiB threadgroup limit, so the staging reuses the
                 // LDS once the guest program returned (ASTRO BOT's worldmap meshes).
                 {"triangle list, LDS beside the triangle-vertices staging", {4u, 64u, 192u, 192u, 64u, 192u, 5120u, 0u, 4u}, 64u, true},
+                // Upstream ee81c5112d: VGT_GS_OUT_PRIM_TYPE 0, a point-list geometry program.
+                {"point-list geometry output", {4u, 4u, 12u, 12u, 12u, 64u, 1024u, 0u, 4u, 1u}, 64u, true},
             }};
             for (const auto& test : cases) Check(metal, target, test);
         }
