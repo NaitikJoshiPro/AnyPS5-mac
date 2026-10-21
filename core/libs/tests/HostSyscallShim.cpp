@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -22,6 +24,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -196,6 +199,22 @@ std::uint64_t RunKernelStructs(std::uintptr_t base, std::uint8_t* guest, std::ui
     Require(::getrlimit(RLIMIT_NOFILE, reinterpret_cast<rlimit*>(at(0x10200))) == 0 &&
             reinterpret_cast<rlimit*>(host(0x10200))->rlim_cur > 0,
         base, "getrlimit into a displaced struct");
+    Require(::statvfs(GuestString(guest, alias, Scratch + 0x10400, file.string()), reinterpret_cast<struct statvfs*>(at(0x10800))) == 0 &&
+            reinterpret_cast<struct statvfs*>(host(0x10800))->f_bsize > 0,
+        base, "statvfs with a displaced path and struct");
+
+    // libkernel's fault-safe guest copies (Socket/Udp.cpp ReadGuest/WriteGuest) go through the task's VM map.
+    for (std::size_t index = 0; index < 0x40; ++index) host(0x11100)[index] = Pattern(index);
+    Require(::mach_vm_write(mach_task_self(), reinterpret_cast<mach_vm_address_t>(at(0x11000)),
+                reinterpret_cast<vm_offset_t>(at(0x11100)), 0x40) == KERN_SUCCESS &&
+            std::memcmp(host(0x11000), host(0x11100), 0x40) == 0,
+        base, "mach_vm_write between displaced ranges");
+    std::uint8_t copy[0x40]{};
+    mach_vm_size_t copied = 0;
+    Require(::mach_vm_read_overwrite(mach_task_self(), reinterpret_cast<mach_vm_address_t>(at(0x11000)), sizeof(copy),
+                reinterpret_cast<mach_vm_address_t>(copy), &copied) == KERN_SUCCESS &&
+            copied == sizeof(copy) && std::memcmp(copy, host(0x11100), sizeof(copy)) == 0,
+        base, "mach_vm_read_overwrite from a displaced range");
     return formatFaults + printFaults;
 }
 

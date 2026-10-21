@@ -15,6 +15,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -73,23 +74,30 @@ void MapDriverMemory() {
     mapped = reinterpret_cast<void*>(DriverMemoryAddress);
     GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PAGE_READWRITE, DriverMemoryBytes);
 #elif defined(__APPLE__)
-    // macOS has no MAP_FIXED_NOREPLACE; the guest arena already reserves the range, so commit it there.
+    // The range lies in the PS5 system-reserved range, which the guest arena keeps as one used range (no guest
+    // mapping, fixed or not, lands there; GuestArenaCommit refuses it), so the driver maps it itself. On arm64 it is
+    // also inside the displaced window (the commpage guard, D33): the host backs it at its alias, which the
+    // displaced window reserves PROT_NONE, and guest accesses and GPU imports reach it through HostAddress().
     mapped = reinterpret_cast<void*>(DriverMemoryAddress);
-    GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PROT_READ | PROT_WRITE, DriverMemoryBytes);
+    // MAP_FIXED would replace whatever the host has there: only the displaced alias may be replaced.
+    if (!GuestArena::IsDisplaced(DriverMemoryAddress)) throw std::runtime_error("the AGC driver memory range is not in the displaced window on this host");
+    if (mmap(GuestArena::HostPointer(mapped), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
+        throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
 #else
     mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
 #endif
     if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
-    auto* routineTable = reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress);
+    // Written through the host view: on arm64 macOS the guest addresses are displaced (identity elsewhere).
+    auto* routineTable = GuestArena::HostPointer(reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress));
     for (std::uint64_t record = 0; record < FsRoutineRecords; ++record) {
         routineTable[record * 2u] = FsRoutineAddress;
         routineTable[record * 2u + 1u] = 0u;
     }
-    auto* routine = reinterpret_cast<std::uint32_t*>(FsRoutineAddress);
+    auto* routine = GuestArena::HostPointer(reinterpret_cast<std::uint32_t*>(FsRoutineAddress));
     routine[0] = ScalarSetpcB64LinkS14;
     routine[1] = ScalarEndProgram;
-    auto* slot = reinterpret_cast<std::uint64_t*>(FsTableAddress);
+    auto* slot = GuestArena::HostPointer(reinterpret_cast<std::uint64_t*>(FsTableAddress));
     slot[0] = (FsRoutineTableAddress & 0xffffffffffffull) | 16ull << 48u;
     slot[1] = FsTableDword3 << 32u | FsRoutineRecords;
     GuestAllocations::Mutation mutation;

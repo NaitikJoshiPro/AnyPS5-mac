@@ -50,6 +50,7 @@ _NSConcreteGlobalBlock	data	none	data symbol
 _NSConcreteStackBlock	data	none	data symbol
 _NSGetArgc	userspace	none	
 _NSGetArgv	userspace	none	
+_NSGetEnviron	userspace	none	returns the host environ pointer
 _NSGetExecutablePath	userspace	none	
 _tlv_atexit	userspace	none	context pointer retained and handed back: identity, never translated
 _tlv_bootstrap	userspace	none	
@@ -103,6 +104,8 @@ dispatch_after	userspace	none	context pointer retained and handed back: identity
 dispatch_async_f	userspace	none	context pointer retained and handed back: identity, never translated
 dispatch_get_global_queue	userspace	none	
 dispatch_once_f	userspace	none	context pointer retained and handed back: identity, never translated
+dispatch_queue_attr_make_with_qos_class	userspace	none	
+dispatch_queue_create	userspace	none	host label string
 dispatch_resume	userspace	none	
 dispatch_semaphore_create	userspace	none	
 dispatch_semaphore_signal	userspace	none	
@@ -122,6 +125,9 @@ dlsym	userspace	none
 dup	scalar	none	kernel call without a pointer argument
 dup2	scalar	none	kernel call without a pointer argument
 environ	data	none	data symbol
+erf	userspace	none	
+erfc	userspace	none	
+erfcf	userspace	none	
 erfcl	userspace	none	
 erff	userspace	none	
 erfl	userspace	none	
@@ -140,6 +146,8 @@ fchmod	scalar	none	kernel call without a pointer argument
 fchmodat	path	shim	directory-relative path string
 fclose	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
 fcntl	buffer	shim	F_GETPATH/F_GETPATH_NOFIRMLINK, F_GETLK/F_SETLK/F_SETLKW, F_PREALLOCATE, F_PUNCHHOLE, F_LOG2PHYS(_EXT), F_RDADVISE, F_SETSIZE; other commands pass through
+fdim	userspace	none	
+fdimf	userspace	none	
 fdopen	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
 fdopendir	scalar	none	kernel call without a pointer argument
 fegetround	userspace	none	
@@ -182,6 +190,7 @@ futimes	buffer	shim	timeval[2]
 fwrite	stdio	shim	buffer; large transfers reach read/write(2) inside libsystem_c directly from it
 getaddrinfo	userspace	none	name lookup over IPC; arguments and results are copied in userspace
 getc	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
+getdtablesize	scalar	none	kernel call without a pointer argument
 getentropy	buffer	shim	buffer, length given
 getenv	userspace	none	
 geteuid	scalar	none	kernel call without a pointer argument
@@ -206,7 +215,9 @@ host_statistics64	userspace	none	MIG: arguments are copied into a message in use
 hypot	userspace	none	
 hypotl	userspace	none	
 if_indextoname	userspace	none	Darwin copies the name in userspace (sysctl NET_RT_IFLIST into its own buffer, then strlcpy); libSceNetCtl passes a host buffer
+ilogb	userspace	none	
 ilogbf	userspace	none	
+ilogbl	userspace	none	
 inet_ntop	userspace	none	
 inet_pton	userspace	none	
 ioctl	buffer	shim	IOCPARM_LEN(request) bytes when IOC_IN/IOC_OUT is set; IOC_VOID and size 0 pass the argument through (documented gap: a request that takes a pointer without encoding its size)
@@ -234,6 +245,7 @@ log2	userspace	none
 log2f	userspace	none	
 logb	userspace	none	
 logbf	userspace	none	
+logbl	userspace	none	
 logf	userspace	none	
 longjmp	userspace	none	jmp_buf on a host stack; the signal mask is saved by a libc-internal sigprocmask
 lseek	scalar	none	kernel call without a pointer argument
@@ -251,9 +263,11 @@ mach_vm_allocate	address	hand	guest address identity: DirectMemory and the arena
 mach_vm_deallocate	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 mach_vm_map	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 mach_vm_protect	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_read_overwrite	buffer	shim	source and destination ranges of this task (libkernel's fault-safe guest copy)
 mach_vm_region	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 mach_vm_region_recurse	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 mach_vm_remap	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
+mach_vm_write	buffer	shim	destination and source ranges of this task (libkernel's fault-safe guest copy)
 mach_wait_until	scalar	none	kernel call without a pointer argument
 malloc	userspace	none	
 mbrtowc	userspace	none	
@@ -275,6 +289,7 @@ munlock	address	hand	guest address identity: DirectMemory and the arena translat
 munlockall	scalar	none	kernel call without a pointer argument
 munmap	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 nanosleep	buffer	shim	timespec in and out (libc computes them in userspace on arm64; translated anyway)
+nextafter	userspace	none	
 nextafterf	userspace	none	
 notify_cancel	userspace	none	
 notify_get_state	userspace	none	
@@ -286,6 +301,11 @@ pipe	buffer	shim	int[2] out-array
 pipe2	buffer	shim	int[2] out-array
 poll	buffer	shim	pollfd array
 posix_memalign	userspace	none	
+posix_spawn	path	hand	LoadExec passes host copies of the path and argv and the host environ
+posix_spawn_file_actions_addinherit_np	userspace	none	
+posix_spawn_file_actions_init	userspace	none	
+posix_spawnattr_init	userspace	none	
+posix_spawnattr_setflags	userspace	none	
 pow	userspace	none	
 powf	userspace	none	
 pread	buffer	shim	buffer, length given
@@ -320,7 +340,9 @@ pthread_mutex_init	userspace	none	psynch keys on the object address; guest mutex
 pthread_mutex_lock	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
 pthread_mutex_trylock	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
 pthread_mutex_unlock	userspace	none	psynch keys on the object address; guest mutexes and condition variables are libkernel host objects
+pthread_mutexattr_destroy	userspace	none	
 pthread_mutexattr_init	userspace	none	
+pthread_mutexattr_setpolicy_np	userspace	none	
 pthread_mutexattr_settype	userspace	none	
 pthread_once	userspace	none	context pointer retained and handed back: identity, never translated
 pthread_self	userspace	none	
@@ -347,7 +369,11 @@ recv	buffer	shim	buffer, length given
 recvfrom	buffer	shim	buffer and socket address out-struct
 remainder	userspace	none	
 remainderf	userspace	none	
+remainderl	userspace	none	
 remove	path	shim	path string
+remquo	userspace	none	quotient written by userspace code
+remquof	userspace	none	quotient written by userspace code
+remquol	userspace	none	quotient written by userspace code
 rename	path	shim	two path strings
 rewind	stdio	none	no guest buffer: character or FILE argument only, I/O through the FILE's host buffer
 rewinddir	userspace	none	
@@ -358,6 +384,7 @@ scalbnl	userspace	none
 sched_get_priority_max	scalar	none	kernel call without a pointer argument
 sched_get_priority_min	scalar	none	kernel call without a pointer argument
 sched_yield	scalar	none	kernel call without a pointer argument
+seekdir	userspace	none	host DIR stream; its buffer is libSystem's own
 select	buffer	shim	fd_set words for nfds and the timeval
 send	buffer	shim	buffer, length given
 sendto	buffer	shim	buffer and socket address
@@ -381,6 +408,7 @@ socket	scalar	none	kernel call without a pointer argument
 socketpair	buffer	shim	int[2] out-array
 sscanf	userspace	none	
 stat	path	shim	path string and stat out-struct
+statvfs	path	shim	path string and statvfs out-struct (libSceLibcInternal passes host copies; translated anyway)
 strcasecmp	userspace	none	
 strcasestr	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
 strcat	userspace	none	returns a pointer derived from an argument: never translated, so it stays a guest pointer
@@ -421,6 +449,8 @@ tan	userspace	none
 tanf	userspace	none	
 tanh	userspace	none	
 tanhf	userspace	none	
+telldir	userspace	none	host DIR stream
+tgamma	userspace	none	
 tgammal	userspace	none	
 thread_info	userspace	none	MIG: arguments are copied into a message in userspace
 thread_policy_set	userspace	none	MIG: arguments are copied into a message in userspace

@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/mach_time.h>
 #include <poll.h>
 #include <pthread.h>
@@ -89,11 +90,12 @@ void* LibSystem(const char* name) {
     X(accept) X(access) X(bind) X(chmod) X(clock_getres) X(clock_gettime) X(connect) X(dlopen) X(execv) X(faccessat) \
     X(fchmodat) X(fcntl) X(fgets) X(fopen) X(fputs) X(fread) X(freopen) X(fsgetpath) X(fstat) X(fstatat) X(fstatfs) X(fstatvfs) \
     X(futimes) X(fwrite) X(getentropy) X(getpeername) X(getrlimit) X(getrusage) X(getsockname) X(getsockopt) \
-    X(gettimeofday) X(ioctl) X(kevent) X(lstat) X(lutimes) X(mach_msg) X(mach_timebase_info) X(mkdir) X(mkstemp) \
+    X(gettimeofday) X(ioctl) X(kevent) X(lstat) X(lutimes) X(mach_msg) X(mach_timebase_info) X(mach_vm_read_overwrite) \
+    X(mach_vm_write) X(mkdir) X(mkstemp) \
     X(nanosleep) X(open) X(openat) X(opendir) X(pipe) X(pipe2) X(poll) X(pread) X(preadv) X(pthread_setname_np) \
     X(pthread_sigmask) X(puts) X(pwrite) X(pwritev) X(read) X(readv) X(recv) X(recvfrom) X(remove) X(rename) X(rmdir) \
     X(select) X(send) X(sendto) X(setrlimit) X(setsockopt) X(setvbuf) X(shm_open) X(shm_unlink) X(sigaction) \
-    X(socketpair) X(stat) X(sysctl) X(sysctlbyname) X(truncate) X(uname) X(unlink) X(utimes) X(write) X(writev)
+    X(socketpair) X(stat) X(statvfs) X(sysctl) X(sysctlbyname) X(truncate) X(uname) X(unlink) X(utimes) X(write) X(writev)
 
 enum class Shimmed : std::size_t {
 #define APS5_SHIMMED_SLOT(name) name,
@@ -323,6 +325,10 @@ APS5_HOST_SHIM int fstatvfs(int fd, struct statvfs* status) {
     return APS5_REAL(fstatvfs)(fd, Host(status, sizeof(struct statvfs)));
 }
 
+APS5_HOST_SHIM int statvfs(const char* path, struct statvfs* status) {
+    return APS5_REAL(statvfs)(HostString(path), Host(status, sizeof(struct statvfs)));
+}
+
 APS5_HOST_SHIM int sysctl(int* name, u_int nameLength, void* old, std::size_t* oldLength, void* replacement, std::size_t replacementLength) {
     std::size_t* hostOldLength = Host(oldLength, sizeof(std::size_t));
     void* hostOld = old != nullptr && hostOldLength != nullptr ? Host(old, *hostOldLength) : old;
@@ -398,6 +404,25 @@ APS5_HOST_SHIM int clock_getres(clockid_t clock, timespec* resolution) {
 
 APS5_HOST_SHIM kern_return_t mach_timebase_info(mach_timebase_info_t info) {
     return APS5_REAL(mach_timebase_info)(Host(info, sizeof(*info)));
+}
+
+// The kernel reads and writes these ranges through the task's VM map, where a displaced guest address has no mapping
+// (KERN_INVALID_ADDRESS). Only this task's ranges are translated: another task's addresses are not guest addresses.
+APS5_HOST_SHIM kern_return_t mach_vm_read_overwrite(vm_map_read_t task, mach_vm_address_t address, mach_vm_size_t size,
+    mach_vm_address_t data, mach_vm_size_t* copied) {
+    if (task == mach_task_self()) {
+        address = reinterpret_cast<mach_vm_address_t>(Host(reinterpret_cast<void*>(address), size));
+        data = reinterpret_cast<mach_vm_address_t>(Host(reinterpret_cast<void*>(data), size));
+    }
+    return APS5_REAL(mach_vm_read_overwrite)(task, address, size, data, copied);
+}
+
+APS5_HOST_SHIM kern_return_t mach_vm_write(vm_map_t task, mach_vm_address_t address, vm_offset_t data, mach_msg_type_number_t bytes) {
+    if (task == mach_task_self()) {
+        address = reinterpret_cast<mach_vm_address_t>(Host(reinterpret_cast<void*>(address), bytes));
+        data = reinterpret_cast<vm_offset_t>(Host(reinterpret_cast<void*>(data), bytes));
+    }
+    return APS5_REAL(mach_vm_write)(task, address, data, bytes);
 }
 
 // Out-of-line descriptors inside the message are not translated.

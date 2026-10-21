@@ -100,10 +100,10 @@ static ulong3 aps5_bda_anchor(Aps5Bda bda, ulong base) {
     const ulong begin = aps5_bda_word64(words, entry);
     ulong bound = aps5_bda_word64(words, entry + 2u);
     if (low < count) bound = min(bound, aps5_bda_word64(words, 4u + low * 8u));
-    const ulong device = aps5_bda_word64(words, entry + 4u);
+    const ulong deviceAddress = aps5_bda_word64(words, entry + 4u);
     const ulong span = bound - begin;
-    const bool usable = device != 0ul && device + span > device && bound <= 0xffffffff00000000ul && span <= (1ul << 62u);
-    return ulong3(usable ? span : 0ul, device, base - begin);
+    const bool usable = deviceAddress != 0ul && deviceAddress + span > deviceAddress && bound <= 0xffffffff00000000ul && span <= (1ul << 62u);
+    return ulong3(usable ? span : 0ul, deviceAddress, base - begin);
 }
 
 // address + offset (or - offset) with an Overflow fault when it wraps (AddBdaAddress).

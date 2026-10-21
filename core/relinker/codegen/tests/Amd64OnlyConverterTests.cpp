@@ -1395,9 +1395,12 @@ std::vector<std::array<std::uint64_t, 8>> stackHeaders(const Bytes& output) {
 }
 
 void linuxStackSynthesis() {
-    const auto patchOutput = [](std::uint16_t slots, std::vector<Domain::ProgramHeader> headers) {
+    // poisonPadding: the table is full only without zero padding after it (0x1C8..0x200 is one free slot after 7),
+    // which the Linux patcher would otherwise use first (DECISIONS D29, second pass).
+    const auto patchOutput = [](std::uint16_t slots, std::vector<Domain::ProgramHeader> headers, bool poisonPadding = false) {
         auto elf = elfFixture({0xC3});
         write<std::uint16_t>(elf, 56, slots);
+        if (poisonPadding) std::fill(elf.begin() + 64 + slots * 56, elf.begin() + 0x200, 0xA5);
         auto patcher = linuxPatcher();
         return patcher.Patch(std::move(elf), std::move(headers), {}, 0, "$ORIGIN/libs", true, false, {});
     };
@@ -1405,10 +1408,15 @@ void linuxStackSynthesis() {
     const std::vector<std::array<std::uint64_t, 8>> synthetic = {{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0, 16}};
     const std::vector<std::array<std::uint64_t, 8>> preserved = {{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0x20000, 16}};
 
-    const auto exactFit = patchOutput(7, elfHeaders());
+    const auto exactFit = patchOutput(7, elfHeaders(), true);
     require(read<std::uint64_t>(exactFit, 32) >= 0x400, "a full input table must move to make room for the synthetic stack");
     require(read<std::uint16_t>(exactFit, 56) == 8, "the output must use the reserved synthetic stack slot");
     require(stackHeaders(exactFit) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto zeroPadding = patchOutput(7, elfHeaders());
+    require(read<std::uint64_t>(zeroPadding, 32) == 64, "zero padding after a full table must give it the synthetic stack slot");
+    require(read<std::uint16_t>(zeroPadding, 56) == 8, "the zero padding slot must be filled by the synthetic stack");
+    require(stackHeaders(zeroPadding) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
 
     const auto spareSlot = patchOutput(8, elfHeaders());
     require(read<std::uint64_t>(spareSlot, 32) == 64, "the required count must not move a table that has a free slot");
@@ -1425,7 +1433,7 @@ void linuxStackSynthesis() {
     require(read<std::uint16_t>(keptStackExact, 56) == 8, "an input stack must not grow the output count");
     require(stackHeaders(keptStackExact) == preserved, "a kept PT_GNU_STACK must stay unchanged");
 
-    const auto keptStackShort = patchOutput(7, {elfHeaders()[0], elfHeaders()[1], inputStack});
+    const auto keptStackShort = patchOutput(7, {elfHeaders()[0], elfHeaders()[1], inputStack}, true);
     require(read<std::uint64_t>(keptStackShort, 32) >= 0x400, "a full input table must move when the kept stack does not fit");
     require(read<std::uint16_t>(keptStackShort, 56) == 8, "the moved table must carry the kept stack");
     require(stackHeaders(keptStackShort) == preserved, "a kept PT_GNU_STACK must stay unchanged");

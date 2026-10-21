@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -6,8 +7,8 @@
 #include <cstring>
 #if defined(__x86_64__)
 #include <xmmintrin.h>
-static unsigned HostControl() { return HostControl(); }
-static void SetHostControl(unsigned value) { SetHostControl(value); }
+static unsigned HostControl() { return _mm_getcsr(); }
+static void SetHostControl(unsigned value) { _mm_setcsr(value); }
 #else
 // arm64 host: FPCR stands for MXCSR (the builtins must not depend on either).
 static unsigned HostControl() {
@@ -57,33 +58,37 @@ Uint128 APS5_VABI __fixunssfti_nid_postfix(float);
 std::uint32_t APS5_VABI __fixunsdfsi_nid_postfix(double);
 std::uint64_t APS5_VABI __fixunsdfdi_nid_postfix(double);
 Uint128 APS5_VABI __fixunsdfti_nid_postfix(double);
-std::int64_t APS5_VABI __fixxfdi_nid_postfix(long double);
-Int128 APS5_VABI __fixxfti_nid_postfix(long double);
-std::uint32_t APS5_VABI __fixunsxfsi_nid_postfix(long double);
-std::uint64_t APS5_VABI __fixunsxfdi_nid_postfix(long double);
-Uint128 APS5_VABI __fixunsxfti_nid_postfix(long double);
+std::int64_t APS5_VABI __fixxfdi_nid_postfix(GuestLongDouble);
+Int128 APS5_VABI __fixxfti_nid_postfix(GuestLongDouble);
+std::uint32_t APS5_VABI __fixunsxfsi_nid_postfix(GuestLongDouble);
+std::uint64_t APS5_VABI __fixunsxfdi_nid_postfix(GuestLongDouble);
+Uint128 APS5_VABI __fixunsxfti_nid_postfix(GuestLongDouble);
 double APS5_VABI __floatsidf_nid_postfix(std::int32_t);
 double APS5_VABI __floatunsidf_nid_postfix(std::uint32_t);
 float APS5_VABI __floatsisf_nid_postfix(std::int32_t);
 float APS5_VABI __floatunsisf_nid_postfix(std::uint32_t);
 double APS5_VABI __floatdidf_nid_postfix(std::int64_t);
 float APS5_VABI __floatdisf_nid_postfix(std::int64_t);
-long double APS5_VABI __floatdixf_nid_postfix(std::int64_t);
+GuestLongDouble APS5_VABI __floatdixf_nid_postfix(std::int64_t);
 double APS5_VABI __floatundidf_nid_postfix(std::uint64_t);
 float APS5_VABI __floatundisf_nid_postfix(std::uint64_t);
-long double APS5_VABI __floatundixf_nid_postfix(std::uint64_t);
+GuestLongDouble APS5_VABI __floatundixf_nid_postfix(std::uint64_t);
 double APS5_VABI __floattidf_nid_postfix(Int128);
 float APS5_VABI __floattisf_nid_postfix(Int128);
-long double APS5_VABI __floattixf_nid_postfix(Int128);
+GuestLongDouble APS5_VABI __floattixf_nid_postfix(Int128);
 double APS5_VABI __floatuntidf_nid_postfix(Uint128);
 float APS5_VABI __floatuntisf_nid_postfix(Uint128);
-long double APS5_VABI __floatuntixf_nid_postfix(Uint128);
+GuestLongDouble APS5_VABI __floatuntixf_nid_postfix(Uint128);
 __complex__ float APS5_VABI __mulsc3_nid_postfix(float, float, float, float);
 __complex__ double APS5_VABI __muldc3_nid_postfix(double, double, double, double);
+#if defined(__x86_64__)
 __complex__ long double APS5_VABI __mulxc3_nid_postfix(long double, long double, long double, long double);
+#endif
 __complex__ float APS5_VABI __divsc3_nid_postfix(float, float, float, float);
 __complex__ double APS5_VABI __divdc3_nid_postfix(double, double, double, double);
+#if defined(__x86_64__)
 __complex__ long double APS5_VABI __divxc3_nid_postfix(long double, long double, long double, long double);
+#endif
 long double APS5_VABI __powixf2_nid_postfix(long double, int);
 }
 
@@ -94,6 +99,20 @@ static std::uint32_t Bits(float value) { return std::bit_cast<std::uint32_t>(val
 static double Double(std::uint64_t bits) { return std::bit_cast<double>(bits); }
 static float Float(std::uint32_t bits) { return std::bit_cast<float>(bits); }
 static Uint128 Make(std::uint64_t high, std::uint64_t low) { return (static_cast<Uint128>(high) << 64) | low; }
+
+// The guest's long double (x87 80-bit): the host's own on x86-64, its bits on arm64, whose long double is a double.
+static GuestLongDouble Extended(std::uint16_t signExponent, std::uint64_t mantissa) {
+    static_assert(sizeof(GuestLongDouble) == 16);
+    GuestLongDouble value {};
+    unsigned char bytes[sizeof(GuestLongDouble)] = {};
+    std::memcpy(bytes, &mantissa, sizeof(mantissa));
+    std::memcpy(bytes + 8, &signExponent, sizeof(signExponent));
+    std::memcpy(&value, bytes, sizeof(bytes));
+    return value;
+}
+static GuestLongDouble Guest(double value) { return GuestLongDoubleFromDouble(value); }
+static bool Same(const GuestLongDouble& left, const GuestLongDouble& right) { return std::memcmp(&left, &right, 10) == 0; }
+static const GuestLongDouble Max64 = Extended(0x403e, ~0ull); // 2^64 - 1, exact in the x87 format only
 
 #if defined(__x86_64__)
 static constexpr unsigned GuestMxcsr = 0x1f80 | 0x6000 | 0x8040;
@@ -174,18 +193,20 @@ static void CheckFloatToInteger() {
     Require(__fixunssfsi_nid_postfix(0x1p32f) == 0 && __fixunssfsi_nid_postfix(0x1p55f) == 1u << 23 && __fixunssfdi_nid_postfix(0x1p63f) == 1ull << 63);
     Require(__fixunsdfdi_nid_postfix(18446744073709549568.) == 18446744073709549568ull);
     Require(__fixunssfti_nid_postfix(0x1p127f) == Make(1ull << 63, 0) && __fixunsdfti_nid_postfix(-2.) == 0);
-    Require(__fixxfdi_nid_postfix(-5.5L) == -5 && __fixxfdi_nid_postfix(0x1p63L) == INT64_MIN);
-    Require(__fixunsxfdi_nid_postfix(0x1p64L) == 1 && __fixunsxfdi_nid_postfix(18446744073709551615.L) == ~0ull);
-    Require(__fixxfti_nid_postfix(-0x1p70L) == -static_cast<Int128>(Make(1ull << 6, 0)));
-    Require(__fixunsxfti_nid_postfix(0x1.8p100L) == Make(3ull << 35, 0) && __fixunsxfti_nid_postfix(-1.L) == 0);
-    Require(__fixunsxfsi_nid_postfix(3e9L) == 3000000000u && __fixunsxfsi_nid_postfix(0x1p32L) == 1);
+    Require(__fixxfdi_nid_postfix(Guest(-5.5)) == -5 && __fixxfdi_nid_postfix(Guest(0x1p63)) == INT64_MIN);
+    Require(__fixunsxfdi_nid_postfix(Guest(0x1p64)) == 1 && __fixunsxfdi_nid_postfix(Max64) == ~0ull);
+    Require(__fixxfdi_nid_postfix(Extended(0xc03d, 0xfffffffffffffffeull)) == -0x7fffffffffffffffll);
+    Require(__fixxfti_nid_postfix(Guest(-0x1p70)) == -static_cast<Int128>(Make(1ull << 6, 0)));
+    Require(__fixunsxfti_nid_postfix(Guest(0x1.8p100)) == Make(3ull << 35, 0) && __fixunsxfti_nid_postfix(Guest(-1.)) == 0);
+    Require(__fixunsxfsi_nid_postfix(Guest(3e9)) == 3000000000u && __fixunsxfsi_nid_postfix(Guest(0x1p32)) == 1);
 }
 
 static void CheckIntegerToFloat() {
     Require(__floatsidf_nid_postfix(INT32_MIN) == -0x1p31 && __floatunsidf_nid_postfix(0xffffffffu) == 4294967295.);
     Require(__floatdidf_nid_postfix(-3) == -3. && __floatdisf_nid_postfix(1ll << 40) == 0x1p40f);
     Require(__floatundidf_nid_postfix(~0ull) == 0x1p64 && __floatundisf_nid_postfix(~0ull) == 0x1p64f);
-    Require(__floatdixf_nid_postfix(INT64_MIN) == -0x1p63L && __floatundixf_nid_postfix(~0ull) == 18446744073709551615.L);
+    Require(Same(__floatdixf_nid_postfix(INT64_MIN), Guest(-0x1p63)) && Same(__floatundixf_nid_postfix(~0ull), Max64));
+    Require(Same(__floatdixf_nid_postfix(0), Guest(0.)) && Same(__floatdixf_nid_postfix(-3), Guest(-3.)));
     const unsigned saved = HostControl();
     SetHostControl(GuestMxcsr);
     const float tie = __floatsisf_nid_postfix(16777217);
@@ -200,10 +221,10 @@ static void CheckIntegerToFloat() {
     Require(__floatuntisf_nid_postfix(Make(~0ull, ~0ull)) == INFINITY);
     Require(__floatuntidf_nid_postfix(Make(~0ull, ~0ull)) == 0x1p128);
     Require(__floatuntidf_nid_postfix(0) == 0. && !std::signbit(__floattidf_nid_postfix(0)));
-    Require(__floattixf_nid_postfix(-static_cast<Int128>(Make(1, 1))) == -0x1p64L);
-    Require(__floattixf_nid_postfix(-static_cast<Int128>(Make(1, 3))) == -(0x1p64L + 4));
-    Require(__floatuntixf_nid_postfix(Make(~0ull, ~0ull)) == 0x1p128L);
-    Require(__floatuntixf_nid_postfix(Make(0, ~0ull)) == 18446744073709551615.L);
+    Require(Same(__floattixf_nid_postfix(-static_cast<Int128>(Make(1, 1))), Guest(-0x1p64)));
+    Require(Same(__floattixf_nid_postfix(-static_cast<Int128>(Make(1, 3))), Extended(0xc03f, 0x8000000000000002ull)));
+    Require(Same(__floatuntixf_nid_postfix(Make(~0ull, ~0ull)), Guest(0x1p128)));
+    Require(Same(__floatuntixf_nid_postfix(Make(0, ~0ull)), Max64));
 }
 
 static void CheckComplex() {
@@ -211,16 +232,21 @@ static void CheckComplex() {
     Require(__real__ product == -5.f && __imag__ product == 10.f);
     const __complex__ double infinite = __muldc3_nid_postfix(INFINITY, NAN, 1., 0.);
     Require(__real__ infinite == INFINITY);
+#if defined(__x86_64__)
     const __complex__ long double extended = __mulxc3_nid_postfix(1.L, 1.L, 1.L, -1.L);
     Require(__real__ extended == 2.L && __imag__ extended == 0.L);
+#endif
     const __complex__ double quotient = __divdc3_nid_postfix(6., 8., 3., 4.);
     Require(__real__ quotient == 2. && __imag__ quotient == 0.);
     const __complex__ float single = __divsc3_nid_postfix(1.f, 0.f, 0.f, 1.f);
     Require(__real__ single == 0.f && __imag__ single == -1.f);
     const __complex__ double byZero = __divdc3_nid_postfix(1., 0., 0., 0.);
     Require(__real__ byZero == INFINITY);
+#if defined(__x86_64__)
+    // _Complex long double results are not bridged on arm64 (TechnicalDebt arm64-complex-long-double).
     const __complex__ long double large = __divxc3_nid_postfix(1e4000L, 1e4000L, 1e4000L, 1e4000L);
     Require(__real__ large == 1.L && __imag__ large == 0.L);
+#endif
     const __complex__ double byInfinity = __divdc3_nid_postfix(1., 1., INFINITY, INFINITY);
     Require(__real__ byInfinity == 0. && __imag__ byInfinity == 0.);
 }
@@ -234,11 +260,14 @@ int main() {
     CheckComplex();
     Require(__powixf2_nid_postfix(2.L, 10) == 1024.L && __powixf2_nid_postfix(2.L, -2) == .25L);
     Require(__powixf2_nid_postfix(-3.L, 3) == -27.L && __powixf2_nid_postfix(5.L, 0) == 1.L);
+#if defined(__x86_64__)
+    // On arm64 __powixf2 takes the host's long double, a double the bridge converts the guest's x87 value to.
     long double signaling;
     const unsigned char signalingBytes[10] = {1, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x7f};
     std::memset(&signaling, 0, sizeof(signaling));
     std::memcpy(&signaling, signalingBytes, sizeof(signalingBytes));
     const long double same = __powixf2_nid_postfix(signaling, 1);
     Require(std::memcmp(&same, signalingBytes, sizeof(signalingBytes)) == 0);
+#endif
     return 0;
 }

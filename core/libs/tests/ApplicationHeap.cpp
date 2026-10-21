@@ -19,6 +19,8 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include "ProcessParametersFixture.hpp"
 #endif
 
 extern "C" {
@@ -114,6 +116,8 @@ void installProcessParameters() {
         return 1;
     }, &installed);
     require(installed);
+#elif defined(__APPLE__)
+    require(ProcessParametersFixture::Install(process.data(), process.size()));
 #endif
 }
 
