@@ -1,4 +1,4 @@
 # Port ledger of the Metal twins, read and updated by tools/mac/port_ledger.py.
 # reviewed <upstream commit>: every twin is up to date with its original as of this upstream commit.
 # twin-test <original test source> <Metal twin test source>: an upstream test that a Metal-only test replaces.
-reviewed 661f8b71718083fbac1c45b44f5d67dc39cb4624
+reviewed 6b6c7016365271245e8b81c1b734cac2d65f664d
