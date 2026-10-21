@@ -17,6 +17,7 @@ int APS5_VABI scePlayGoInitialize(const PlayGoInitParams*);
 int APS5_VABI scePlayGoOpen(int*, const void*);
 int APS5_VABI scePlayGoClose(int);
 int APS5_VABI scePlayGoGetLanguageMask(int, std::uint64_t*);
+int APS5_VABI scePlayGoSetLanguageMask(int, std::uint64_t);
 int APS5_VABI scePlayGoGetSupportedOptionalChunk(int, std::int32_t, PlayGoOptionalChunk*);
 int APS5_VABI scePlayGoGetOptionalChunk(int, std::int32_t, PlayGoOptionalChunk*);
 int APS5_VABI scePlayGoSetToDoList(int, const PlayGoToDo*, std::uint32_t);
@@ -102,6 +103,12 @@ static int CheckNoPlayGoFile(const char* root) {
     std::uint64_t mask = 0;
     Require(scePlayGoGetLanguageMask(handle + 1, &mask) == badHandle);
     Require(scePlayGoGetLanguageMask(handle, nullptr) == badPointer);
+    Require(scePlayGoGetLanguageMask(handle, &mask) == 0 && mask == ~0ull);
+    Require(scePlayGoSetLanguageMask(handle + 1, 0x5) == badHandle);
+    Require(scePlayGoGetLanguageMask(handle, &mask) == 0 && mask == ~0ull);
+    Require(scePlayGoSetLanguageMask(handle, 0x5) == 0);
+    Require(scePlayGoGetLanguageMask(handle, &mask) == 0 && mask == 0x5);
+    Require(scePlayGoSetLanguageMask(handle, ~0ull) == 0);
     Require(scePlayGoGetLanguageMask(handle, &mask) == 0 && mask == ~0ull);
 
     for (const auto getOptionalChunk : {scePlayGoGetSupportedOptionalChunk, scePlayGoGetOptionalChunk}) {
@@ -221,10 +228,10 @@ static void RunLayout(const char* self, const char* mode, std::initializer_list<
     Require(status == 0);
 }
 
-static std::string ChunkTableFile() {
+static std::string ChunkTableFile(const char* magic = "plgx", char chunks = 3) {
     std::string header(0x100, '\0');
-    header.replace(0, 4, "plgx");
-    header[0x0A] = 3;
+    header.replace(0, 4, magic);
+    header[0x0A] = chunks;
     return header;
 }
 
@@ -246,10 +253,12 @@ int main(int argc, char** argv) {
     RunLayout(argv[0], "--no-file-absent", {});
     RunLayout(argv[0], "--no-file-unknown-answer", {});
     RunLayout(argv[0], "--package-chunk-table", {{"playgo-chunk.dat", ChunkTableFile()}});
+    RunLayout(argv[0], "--package-chunk-table", {{"playgo-chunk.dat", ChunkTableFile("plgo")}});
     RunLayout(argv[0], "--scenario-with-chunk-table", {{"playgo-chunk.dat", ChunkTableFile()}, {"playgo-scenario.json", "{}"}});
     RunLayout(argv[0], "--scenario-only", {{"playgo-scenario.json", "{}"}});
     RunLayout(argv[0], "--ficm-only", {{"playgo-ficm.dat", "x"}});
     RunLayout(argv[0], "--hash-table-only", {{"playgo-hash-table.dat", "x"}});
     RunLayout(argv[0], "--invalid-chunk-table", {{"playgo-chunk.dat", "not a chunk table"}});
+    RunLayout(argv[0], "--invalid-chunk-table", {{"playgo-chunk.dat", ChunkTableFile("plgo", 0)}});
     return 0;
 }

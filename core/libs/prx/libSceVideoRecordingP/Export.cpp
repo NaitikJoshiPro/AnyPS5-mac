@@ -12,6 +12,7 @@
 namespace {
 std::mutex g_infoMutex;
 std::map<int32_t, std::vector<unsigned char>> g_info;
+constexpr int SceVideoRecordingStatusNone = 0;
 }
 
 extern "C" {
@@ -63,8 +64,7 @@ int APS5_VABI sceVideoRecordingGetInfoByHandle(int handle, int32_t info, void* d
 }
 
 int APS5_VABI sceVideoRecordingGetStatus(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SceVideoRecordingStatusNone;
 }
 
 int APS5_VABI sceVideoRecordingGetSupportInfo(void* info) {
@@ -80,7 +80,6 @@ int APS5_VABI sceVideoRecordingGetVideoOutMode(void* mode) {
 }
 
 int APS5_VABI sceVideoRecordingInit(void) {
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
@@ -141,7 +140,6 @@ int APS5_VABI sceVideoRecordingRestModeProcessStart(void* param) {
 int APS5_VABI sceVideoRecordingSendCommand(int cmd, const void* param) {
  (void)cmd;
  (void)param;
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
@@ -164,7 +162,6 @@ int APS5_VABI sceVideoRecordingStop(void) {
 }
 
 int APS5_VABI sceVideoRecordingTerm(void) {
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 

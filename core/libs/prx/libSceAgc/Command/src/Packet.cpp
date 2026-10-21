@@ -1,7 +1,9 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -100,9 +102,8 @@ std::uint32_t* WriteRegisterRange(CommandBuffer* buffer, std::uint32_t opcode, s
     Require(count != 0 && count <= 0x3fffu && offset <= 0xffffu && count <= 0x10000u - offset, function, "invalid register range");
     std::vector<std::uint32_t> snapshot;
     if (values != nullptr) {
-        CheckAddress(reinterpret_cast<std::uintptr_t>(values), 4, function);
-        const auto* host = Host(values);
-        snapshot.assign(host, host + count);
+        snapshot.resize(count);
+        std::memcpy(snapshot.data(), Host(values), static_cast<std::size_t>(count) * sizeof(std::uint32_t));
     }
     auto* const guest = Allocate(buffer, count + 2u, function);
     auto* packet = Host(guest);

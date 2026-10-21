@@ -199,6 +199,10 @@ Driver::Driver() {
     InstallAsyncLog_nid_no_patch();
     static const bool driverMemory = (MapDriverMemory(), true);
     static_cast<void>(driverMemory);
+    LibcSetExitDrain_nid_no_patch([] {
+        const auto current = Driver::Get().device.Load();
+        if (current) current->SavePipelineCache();
+    });
     static_cast<void>(GuestMemory::TrackerGeneration());
     // D80: GPU completions and landed labels wake the queue workers that wait for them.
     Progress::SetHook([](void* driver) { static_cast<Driver*>(driver)->changed.notify_all(); }, this);
@@ -304,4 +308,9 @@ std::unique_lock<std::mutex> HoldAsyncLog() {
     return AsyncLog::Get().Hold();
 }
 
+}
+
+extern "C" void* AgcDriverStaticTable_nid_postfix() {
+    static_cast<void>(AgcDriver::DriverDetail::Driver::Get());
+    return reinterpret_cast<void*>(AgcDriver::DriverDetail::FsTableAddress);
 }

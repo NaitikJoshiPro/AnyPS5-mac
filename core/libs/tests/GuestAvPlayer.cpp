@@ -25,6 +25,7 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 #include "prx/libc/include/GuestDisplaced.hpp"
 #endif
+#include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 
 extern "C" {
 AvPlayerInternal* APS5_VABI sceAvPlayerInit(AvPlayerInitData*);
@@ -1298,6 +1299,26 @@ void TestRestartAfterPausedJumpKeepsClockRunning() {
     Check(sceAvPlayerClose(player) == 0, "close failed");
 }
 
+void TestPausedPreparationAfterAudioStarts(std::uint32_t syncMode) {
+    Events events;
+    auto init = InitData(&events);
+    auto* player = sceAvPlayerInit(&init);
+    Check(player != nullptr, "init failed");
+    Check(sceAvPlayerAddSource(player, "/app0/avplayer.mp4") == 0, "add source failed");
+    Check(sceAvPlayerEnableStream(player, VideoStream) == 0, "enable video failed");
+    Check(sceAvPlayerEnableStream(player, EnglishAudioStream) == 0, "enable audio failed");
+    Check(sceAvPlayerSetAvSyncMode(player, syncMode) == 0, "sync mode failed");
+    Check(sceAvPlayerStart(player) == 0, "start failed");
+    AvPlayerFrameInfo audio{};
+    Check(WaitFor([&] { return sceAvPlayerGetAudioData(player, &audio) != 0; }), "no initial audio frame");
+    Check(sceAvPlayerPause(player) == 0, "pause failed");
+    AvPlayerFrameInfoEx frame{};
+    Check(WaitFor([&] { return sceAvPlayerGetVideoDataEx(player, &frame) != 0; }), "first video frame blocked during paused preparation after audio started");
+    CheckVideoFrame(frame);
+    Check(!sceAvPlayerGetVideoDataEx(player, &frame), "paused preparation delivered more than the initial video frame");
+    Check(sceAvPlayerClose(player) == 0, "close failed");
+}
+
 void TestUnsyncedVideoKeepsUpWithAudio() {
     Events events;
     AvPlayerInitData init = InitData(&events);
@@ -1650,6 +1671,29 @@ void TestCloseFromEventCallback(std::int32_t event) {
     Check(allocations.blocks.empty(), "callback close leaked media allocations");
 }
 
+void TestVideoSyncTolerance() {
+    Events events;
+    AvPlayerInitData init = InitData(&events);
+    auto* player = sceAvPlayerInit(&init);
+    Check(player != nullptr, "sync tolerance init failed");
+    Check(sceAvPlayerAddSource(player, "/app0/avplayer.mp4") == 0, "sync tolerance source failed");
+    Check(WaitFor([&] { return events.Seen(EventReady); }), "sync tolerance ready missing");
+    Check(sceAvPlayerEnableStream(player, VideoStream) == 0, "sync tolerance video failed");
+    Check(sceAvPlayerStart(player) == 0, "sync tolerance start failed");
+    Check(WaitFor([&] { return events.Seen(EventPlay); }), "sync tolerance play missing");
+    AvPlayerFrameInfoEx frame{};
+    Check(WaitFor([&] { return sceAvPlayerGetVideoDataEx(player, &frame) != 0; }), "sync tolerance first frame missing");
+    Check(FrameIndex(frame.timestamp) == 0, "first frame not index 0");
+    AvPlayer::SetAvPlayerClockForTest_nid_no_patch(player, 5.0);
+    Check(!sceAvPlayerGetVideoDataEx(player, &frame), "frame beyond sync tolerance delivered prematurely");
+    AvPlayer::SetAvPlayerClockForTest_nid_no_patch(player, 10.0);
+    Check(sceAvPlayerGetVideoDataEx(player, &frame), "frame within sync tolerance was not delivered");
+    Check(FrameIndex(frame.timestamp) == 1, "unexpected second frame index");
+    Check(sceAvPlayerClose(player) == 0, "sync tolerance close failed");
+    std::lock_guard lock(allocations.mutex);
+    Check(allocations.blocks.empty(), "sync tolerance allocations leaked");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1659,6 +1703,13 @@ int main(int argc, char** argv) {
             TestCloseFromEventCallback(EventReady);
             TestCloseFromEventCallback(EventStop);
             std::puts("AvPlayer callback close tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--paused-first-video") == 0) {
+            WriteMovie();
+            TestPausedPreparationAfterAudioStarts(0);
+            TestPausedPreparationAfterAudioStarts(1);
+            std::puts("AvPlayer paused first video tests passed");
             return 0;
         }
         Check(argc == 1, "unknown AvPlayer test arguments");
@@ -1684,6 +1735,7 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__) && defined(__aarch64__)
         TestDisplacedBuffers();
 #endif
+        TestVideoSyncTolerance();
         std::puts("AvPlayer tests passed");
         return 0;
     } catch (const std::exception& error) {

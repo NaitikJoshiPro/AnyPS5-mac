@@ -356,7 +356,10 @@ struct Session {
         const auto chunk = static_cast<int>(std::min<std::size_t>(length, INT_MAX));
         for (;;) {
 #ifdef _WIN32
-            const auto sent = ::send(static_cast<SOCKET>(session.socket), reinterpret_cast<const char*>(buffer), chunk, 0);
+            auto* owner = static_cast<KernelSocketPoll::NativeOwner*>(session.socketOwner.get());
+            const auto sent = owner && owner->transfer
+                ? owner->transfer(owner, true, const_cast<unsigned char*>(buffer), chunk)
+                : ::send(static_cast<SOCKET>(session.socket), reinterpret_cast<const char*>(buffer), chunk, 0);
 #else
             const auto sent = ::send(static_cast<int>(session.socket), buffer, static_cast<std::size_t>(chunk), MSG_NOSIGNAL);
 #endif
@@ -375,7 +378,10 @@ struct Session {
         const auto chunk = static_cast<int>(std::min<std::size_t>(length, INT_MAX));
         for (;;) {
 #ifdef _WIN32
-            const auto received = ::recv(static_cast<SOCKET>(session.socket), reinterpret_cast<char*>(buffer), chunk, 0);
+            auto* owner = static_cast<KernelSocketPoll::NativeOwner*>(session.socketOwner.get());
+            const auto received = owner && owner->transfer
+                ? owner->transfer(owner, false, buffer, chunk)
+                : ::recv(static_cast<SOCKET>(session.socket), reinterpret_cast<char*>(buffer), chunk, 0);
 #else
             const auto received = ::recv(static_cast<int>(session.socket), buffer, static_cast<std::size_t>(chunk), 0);
 #endif
@@ -1161,6 +1167,121 @@ int APS5_VABI sceSslGetPem(int sslCtxId, void* sslCert, char* buf, std::size_t* 
 
 void* APS5_VABI sceSslGetSubjectName(int sslCtxId, void* sslCert) {
     return ExtractCertName(__func__, sslCtxId, sslCert, true);
+}
+
+int APS5_VABI CA_MGMT_extractKeyBlobEx() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI CA_MGMT_extractPublicKeyInfo() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI CA_MGMT_freeKeyBlob() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI CRYPTO_initAsymmetricKey() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI CRYPTO_uninitAsymmetricKey() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI RSA_verifySignature() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI VLONG_freeVlongQueue() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslCheckRecvPending() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslCreateSslConnection() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslDeleteSslConnection() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslDisableOption() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslDisableOptionInternal() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslDisableOptionInternalInsecure() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslEnableOption() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslEnableOptionInternal() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslGetNanoSSLModuleId() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslGetPeerCert() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslGetSslError() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslLoadRootCACert() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslRecv(int sslConnectionId, void* buf, std::size_t fulllen) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslReuseConnection(int sslConnectionId, int sockId) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslSend(int sslConnectionId, void* msg, std::size_t fulllen) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSslSetSslVersion() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 }

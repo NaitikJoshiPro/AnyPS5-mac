@@ -44,7 +44,7 @@ static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "Tessel
 constexpr std::uint32_t FileMagic = 0x4c4a5041u;
 // Bumped when the recipe codec, CanonicalPipelineState or the store key change in a way the
 // layout guards above do not catch (a field renumbered or reinterpreted at the same size).
-constexpr std::uint32_t FileFormat = 4u;
+constexpr std::uint32_t FileFormat = 6u;
 constexpr std::uint32_t ModuleRecord = 1u;
 constexpr std::uint32_t GraphicsRecord = 2u;
 constexpr std::uint32_t ComputeRecord = 3u;
@@ -208,6 +208,7 @@ void encodeState(Writer& writer, const State& state) {
     writer.Bool(state.depthClamp);
     writer.U32(static_cast<std::uint32_t>(state.conservativeRasterization));
     writer.U32(state.cullMode);
+    writer.U32(static_cast<std::uint32_t>(state.polygonMode));
     writer.U32(static_cast<std::uint32_t>(state.frontFace));
     writer.U32(static_cast<std::uint32_t>(state.provokingVertexMode));
     writer.U32(state.samples);
@@ -268,6 +269,7 @@ void decodeState(Reader& reader, State& state) {
     state.depthClamp = reader.Bool();
     state.conservativeRasterization = static_cast<VkConservativeRasterizationModeEXT>(reader.U32());
     state.cullMode = reader.U32();
+    state.polygonMode = static_cast<VkPolygonMode>(reader.U32());
     state.frontFace = static_cast<VkFrontFace>(reader.U32());
     state.provokingVertexMode = static_cast<VkProvokingVertexModeEXT>(reader.U32());
     state.samples = reader.U32();
@@ -564,8 +566,15 @@ private:
     Journal() {
         const char* off = std::getenv("APS5_NO_PIPELINE_JOURNAL");
         if ((off != nullptr && std::strcmp(off, "0") != 0) || !ShaderRecompiler::ShaderDiskCache::Enabled()) return;
-        path = ShaderRecompiler::ShaderDiskCache::EntryDirectory() / "pipelines.journal";
-        lockPath = ShaderRecompiler::ShaderDiskCache::EntryDirectory() / "pipelines.journal.lock";
+        auto directory = ShaderRecompiler::ShaderDiskCache::EntryDirectory();
+#ifdef _WIN32
+        std::error_code error;
+        const auto native = ShaderRecompiler::NativeCachePath_nid_no_patch(directory, error);
+        if (error) throw std::filesystem::filesystem_error("cannot resolve the pipeline journal directory", directory, error);
+        directory = native;
+#endif
+        path = directory / "pipelines.journal";
+        lockPath = directory / "pipelines.journal.lock";
         maxBytes = configured("APS5_PIPELINE_JOURNAL_MAX_MIB", 1024u) << 20u;
         std::thread([this] { run(); }).detach();
     }
@@ -1033,6 +1042,7 @@ State CanonicalPipelineState(const State& state) {
     canonical.depthClamp = state.depthClamp;
     canonical.conservativeRasterization = state.conservativeRasterization;
     canonical.cullMode = state.cullMode;
+    canonical.polygonMode = state.polygonMode;
     canonical.frontFace = state.frontFace;
     canonical.provokingVertexMode = state.provokingVertexMode;
     canonical.samples = state.samples;

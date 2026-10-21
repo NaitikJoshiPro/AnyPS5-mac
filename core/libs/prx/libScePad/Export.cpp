@@ -83,8 +83,8 @@ int APS5_VABI scePadGetControllerInformation(int handle, PadControllerInformatio
  info = GuestArena::HostPointer(info);
  std::memset(info, 0, sizeof(*info));
  info->touchPadInfo.pixelDensity = 44.86f;
- info->touchPadInfo.resolution.x = 1920;
- info->touchPadInfo.resolution.y = 943;
+ info->touchPadInfo.resolution.x = kTouchPadWidth;
+ info->touchPadInfo.resolution.y = kTouchPadHeight;
  info->stickInfo.deadZoneLeft = 2;
  info->stickInfo.deadZoneRight = 2;
  info->connectionType = PAD_CONNECTION_TYPE_LOCAL;
@@ -129,8 +129,8 @@ int APS5_VABI scePadGetExtControllerInformation(int handle, void* info) {
  std::memset(info, 0, 0x2c);
  PadControllerInformation* base = static_cast<PadControllerInformation*>(info);
  base->touchPadInfo.pixelDensity = 44.86f;
- base->touchPadInfo.resolution.x = 1920;
- base->touchPadInfo.resolution.y = 943;
+ base->touchPadInfo.resolution.x = kTouchPadWidth;
+ base->touchPadInfo.resolution.y = kTouchPadHeight;
  base->stickInfo.deadZoneLeft = 2;
  base->stickInfo.deadZoneRight = 2;
  base->connectionType = PAD_CONNECTION_TYPE_LOCAL;
@@ -184,13 +184,13 @@ int APS5_VABI scePadOutputReport() { NotImplemented_nid_no_patch(__func__); retu
 
 int APS5_VABI scePadRead_nid_postfix(int handle, PadData* data, int num) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
- if (data == nullptr || num <= 0) APS5_INVALID_ARG_EX;
+ if (data == nullptr || num <= 0) return PAD_ERROR_INVALID_ARG;
  return Pad::Read(GuestArena::HostRange(data, static_cast<std::size_t>(num) * sizeof(PadData)), num);
 }
 
 int APS5_VABI scePadReadState(int handle, PadData* data) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
- if (data == nullptr) APS5_INVALID_ARG_EX;
+ if (data == nullptr) return PAD_ERROR_INVALID_ARG;
 
  *GuestArena::HostPointer(data) = Pad::ReadState();
 
@@ -366,7 +366,6 @@ int APS5_VABI scePadGetExtensionUnitInfo(void) {
 }
 
 int APS5_VABI scePadEnableExtensionPort(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
