@@ -2846,7 +2846,7 @@ namespace {
 // of the reused ones, fast = every image proved current from stamps, full = the lookups were repeated.
 // Why the fast path left an object to the full walk (the "fast-fail by reason" counts).
 using FastFail = ShaderResources::FastFail;
-constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface"};
+constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface", "replaced texture", "audit"};
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
@@ -2984,6 +2984,19 @@ bool EpochRevalidate() {
     return enabled;
 }
 
+std::chrono::steady_clock::duration TemplateAuditInterval() {
+    static const auto interval = [] {
+        const char* text = std::getenv("APS5_TEMPLATE_AUDIT_MS");
+        return std::chrono::milliseconds(text != nullptr ? std::strtoull(text, nullptr, 10) : 1000ull);
+    }();
+    return interval;
+}
+
+bool TemplateAuditDue(std::chrono::steady_clock::time_point last) {
+    const auto interval = TemplateAuditInterval();
+    return interval.count() != 0 && std::chrono::steady_clock::now() - last >= interval;
+}
+
 }
 
 std::size_t ShaderResources::LookupLogCapacity() {
@@ -3062,6 +3075,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
             continue;
         }
+        if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
@@ -3188,6 +3202,7 @@ bool ShaderResources::fastRevalidateEach() {
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return false;
             continue;
         }
+        if (textures[i]->Released()) return false;
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
@@ -3393,6 +3408,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
     const auto fullWalk = [&] {
+        lastFullWalk = std::chrono::steady_clock::now();
         lookupLog().clear();
         BuildLookups lookups;
         std::size_t textureIndex = 0;
@@ -3501,6 +3517,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
+    if (fast && TemplateAuditDue(lastFullWalk)) {
+        fast = false;
+        ownRefreshed = false;
+        reason = FastFail::Audit;
+    }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
@@ -3508,7 +3529,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;
-                    case FastFail::Evicted: return ProofFailure::Evicted;
+                    case FastFail::Evicted: case FastFail::Replaced: return ProofFailure::Evicted;
                     case FastFail::Changed: return ProofFailure::Changed;
                     case FastFail::Keys: case FastFail::ClearedView: case FastFail::StorageKeys: return ProofFailure::Keys;
                     default: return ProofFailure::Other;
