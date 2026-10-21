@@ -961,6 +961,19 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         const auto subgroup = meshOutput.rectList ? std::string(" (rect list: guest vertices plus one per rect)") : std::string();
         if (meshOutput.vertices == 0u || meshOutput.vertices > 256u) state.Fail("mesh functions output 1 to 256 vertices (Metal mesh<> limit), the subgroup has " + std::to_string(meshOutput.vertices) + subgroup);
         if (meshOutput.primitives == 0u || meshOutput.primitives > 512u) state.Fail("mesh functions output 1 to 512 primitives (Metal mesh<> limit), the subgroup has " + std::to_string(meshOutput.primitives) + subgroup);
+        // MslAbi Version 16 (DECISIONS D75): point and line draws output points and lines, one or
+        // two of the primitive export's indices per primitive (PrimitiveVerticesMacro). Upstream
+        // a0347cfed / ee81c5112d: an NGG geometry program with line-strip or point-list output
+        // (ShaderMeshInputInfo::outputPrimitiveSize 2 or 1) exports lines or points whatever the
+        // draw's topology, so the function defines the macro itself (before the records that read
+        // it); a point-list program also writes [[point_size]] 1.0 (PointsMacro, MslAbi Version 21).
+        const auto outputVertices = VertexInfo(state).mesh.outputPrimitiveSize;
+        if (!meshOutput.rectList) {
+            if (outputVertices < 1u || outputVertices > 3u) state.Fail("mesh functions output points, lines or triangles, the program outputs primitives of " + std::to_string(outputVertices) + " vertices");
+            const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
+            if (outputVertices != 3u) text += "#undef " + primitiveVertices + "\n#define " + primitiveVertices + " " + std::to_string(outputVertices) + "u\n";
+            if (outputVertices == 1u) text += "#undef " + std::string(MslAbi::PointsMacro) + "\n#define " + std::string(MslAbi::PointsMacro) + " 1\n";
+        }
         text += "struct Aps5MeshVertex {\n    float4 aps5_position [[position]];\n";
         std::uint32_t scalars = 4u;
         bool layer = false;
@@ -1026,14 +1039,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", metal::topology::triangle>;\n\n";
         } else {
             const auto split = MslAbi::MeshTriangleVerticesPrimitives(meshOutput.primitives);
-            // MslAbi Version 16 (DECISIONS D75): point and line draws output points and lines, one or
-            // two of the primitive export's indices per primitive (PrimitiveVerticesMacro).
             const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
-            // Upstream a0347cfed: an NGG geometry program with line-strip output
-            // (ShaderMeshInputInfo::outputPrimitiveSize 2) exports lines whatever the draw's topology.
-            const auto outputVertices = VertexInfo(state).mesh.outputPrimitiveSize;
-            if (outputVertices != 2u && outputVertices != 3u) state.Fail("mesh functions output lines or triangles, the program outputs primitives of " + std::to_string(outputVertices) + " vertices");
-            if (outputVertices == 2u) text += "#undef " + primitiveVertices + "\n#define " + primitiveVertices + " 2u\n";
             text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
             text += "#if " + primitiveVertices + " == 1u\n#define APS5_MESH_TOPOLOGY metal::topology::point\n#elif " + primitiveVertices + " == 2u\n#define APS5_MESH_TOPOLOGY metal::topology::line\n#else\n#define APS5_MESH_TOPOLOGY metal::topology::triangle\n#endif\n";
             text += "#if " + TriangleVerticesCondition() + "\n";
