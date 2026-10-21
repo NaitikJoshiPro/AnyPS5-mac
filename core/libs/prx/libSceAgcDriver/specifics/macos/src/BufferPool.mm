@@ -100,14 +100,19 @@ BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags u
     const bool host = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     const MTLResourceOptions options = MTLResourceHazardTrackingModeUntracked | (host ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate);
     const auto length = std::max<std::size_t>(capacity, 1);
-    id<MTLBuffer> buffer = [metal->device newBufferWithLength:length options:options];
+    // A length beyond maxBufferLength cannot be allocated: the release runtime returns nil, the API validation
+    // layer asserts (MTL_DEBUG_LAYER), so it is refused here as nil, and the retries and the failure report below
+    // run as they would for any refused allocation.
+    const bool fits = length <= static_cast<std::size_t>(metal->device.maxBufferLength);
+    const auto make = [&]() -> id<MTLBuffer> { return fits ? [metal->device newBufferWithLength:length options:options] : nil; };
+    id<MTLBuffer> buffer = make();
     VkDeviceSize reclaimed = 0;
     VkDeviceSize released = 0;
     unsigned attempts = 1;
     if (buffer == nil) {
         reclaimed = trim();
         if (reclaimed != 0) {
-            buffer = [metal->device newBufferWithLength:length options:options];
+            buffer = make();
             ++attempts;
         }
     }
@@ -115,7 +120,7 @@ BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags u
     if (buffer == nil) {
         if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(length));
         if (released != 0) {
-            buffer = [metal->device newBufferWithLength:length options:options];
+            buffer = make();
             ++attempts;
         }
     }
