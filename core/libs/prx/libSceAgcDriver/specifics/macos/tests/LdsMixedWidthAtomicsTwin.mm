@@ -82,7 +82,8 @@ void LockBudget(AgcDriver::VulkanDevice& device) {
     if (std::getenv("ANYPS5_REQUIRE_ROBUST2") != nullptr) Require(target.robustBufferAccess2, "lds lock budget: robustBufferAccess2 was not enabled");
     Require(limit >= 32u && limit % 4u == 0u, "lds lock budget: unexpected device shared-memory limit");
     const auto operations = static_cast<std::uint64_t>(Threads) * Iterations;
-    Run(device, UniformCode, "limit", operations, 1, limit / 4u, limit / 4u + 1u);
+    // Upstream af0af833c1: the slice is LDS dwords + 1 rounded up to an even count (8-byte aligned 64-bit atomics).
+    Run(device, UniformCode, "limit", operations, 1, limit / 4u, (limit / 4u + 2u) & ~1u);
     Run(device, UniformCode, "limit-4", operations, 1, (limit - 4u) / 4u, 0u);
     std::puts("lds lock budget tests passed");
 }
