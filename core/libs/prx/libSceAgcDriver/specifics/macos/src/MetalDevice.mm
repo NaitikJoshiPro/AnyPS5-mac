@@ -857,6 +857,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // backend has no remap, so the Metal device keeps passing the guest range to MTLViewport as it
             // did before (MetalDraw.mm) and Target().depthRangeRemap stays false.
             context.depthRangeUnrestricted = true;
+            // VkPipelineRasterizationStateCreateInfo::depthClampEnable: MetalDraw.mm sets
+            // MTLDepthClipModeClamp for a draw with the guest's depth clamp.
+            context.depthClamp = true;
             // The color sample counts the GPU renders (the twins' harness reports the same), and
             // multisampled storage images: Metal shaders cannot write texture2d_ms, so guest MSAA
             // storage goes through the target's storage shadow (DECISIONS D22/D28,

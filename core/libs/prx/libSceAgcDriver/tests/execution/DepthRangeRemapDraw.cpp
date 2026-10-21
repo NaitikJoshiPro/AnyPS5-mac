@@ -188,7 +188,16 @@ int main() {
         }};
         std::size_t surfaces = 0;
         std::size_t ran = 0;
+#ifdef __APPLE__
+        // The MSL backend has no vertex-shader depth remap (MetalDevice.mm: depthRangeUnrestricted,
+        // Target().depthRangeRemap false; TechnicalDebt metal-vulkan-internal-tests): the Metal device
+        // passes the guest range to MTLViewport, so only the unrestricted path is compared there.
+        constexpr bool remapPath = false;
+#else
+        constexpr bool remapPath = true;
+#endif
         for (const bool remap : {true, false}) {
+            if (remap && !remapPath) continue;
             if (!remap && !context.depthRangeUnrestricted) continue;
             for (const auto& test : cases) {
                 if (!remap && (test.remapOnly || (test.transform.negativeOneToOne && !context.depthClipControl))) continue;
@@ -208,7 +217,7 @@ int main() {
         // Scale and offset reach the vertex shader through the draw's push block, so two draws whose depth remap
         // differs only in them build one pipeline between them: the second finds it in the store, and both
         // store the depth they should.
-        {
+        if (remapPath) {
             constexpr Transform widerScale{false, 4.0f, -1.5f, 0.0f, 1.0f};
             Require(surfaces + 2u <= Depths.size(), "the test ran out of depth surfaces");
             const auto depthA = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Depths[surfaces++].data()));
@@ -228,7 +237,7 @@ int main() {
         // A remapped vertex shader with no push data of its own, and a fragment shader with none: the pipeline's
         // push stages must still include the vertex stage (a non-GPL layout names them), or the scale and offset
         // reach no one.
-        {
+        if (remapPath) {
             Require(surfaces < Depths.size(), "the test ran out of depth surfaces");
             const auto depth = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Depths[surfaces++].data()));
             const auto drawn = Draw(*device, depth, widened, true, 0.5f + Step / 2.0f, true, true);
@@ -241,6 +250,7 @@ int main() {
         // in-range draw (mode 0) with no push data of its own still carries the remap's push block: it must validate
         // and draw, from a direct build and from a prepared one.
         for (const bool prepared : {false, true}) {
+            if (!remapPath) break;
             Require(surfaces < Depths.size(), "the test ran out of depth surfaces");
             const auto depth = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Depths[surfaces++].data()));
             const auto drawn = Draw(*device, depth, Plain, false, 0.5f + Step / 2.0f, true, true, true, prepared);
