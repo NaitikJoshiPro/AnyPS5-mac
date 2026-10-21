@@ -280,7 +280,7 @@ std::string Squeeze(const std::string& text) {
 
 // MslLockLoop's shape, which keeps every emulated atomic free of intra-SIMD-group waits (Apple SIMD
 // groups have no independent forward progress): each round, inside `if (!done)`, one lane elected by
-// simd_is_first() try-locks once; acquire, the critical section, release and the unlocking store all
+// simd_is_first() try-locks once; acquire, the critical section, release and the unlocking exchange all
 // run in that same `if` and nothing in it loops; the loop leaves through simd_any or the round limit's
 // LoopLimit fault. Returns the number of lock loops.
 std::size_t CheckLockLoops(const Program& program, const std::string& source) {
@@ -298,8 +298,8 @@ std::size_t CheckLockLoops(const Program& program, const std::string& source) {
         const auto critical = Block(loop, loop.find("atomic_compare_exchange_weak_explicit("));
         const auto inner = Squeeze(critical);
         Require(inner.find("memory_order_acquire") != std::string::npos || inner.find("memory_order_seq_cst") != std::string::npos, name + ": no acquire fence after the lock is taken");
-        const auto unlock = "atomic_store_explicit(" + lock + ",0u,memory_order_relaxed);" + done + "=true;}";
-        Require(inner.size() >= unlock.size() && inner.compare(inner.size() - unlock.size(), unlock.size(), unlock) == 0, name + ": the critical section does not end with the unlocking store and " + done + " = true\n" + critical);
+        const auto unlock = "(void)atomic_exchange_explicit(" + lock + ",0u,memory_order_relaxed);" + done + "=true;}";
+        Require(inner.size() >= unlock.size() && inner.compare(inner.size() - unlock.size(), unlock.size(), unlock) == 0, name + ": the critical section does not end with the unlocking exchange (upstream 317a323ee) and " + done + " = true\n" + critical);
         for (const char* forbidden : {"for(", "while(", "simd_any(", "simd_ballot(", "simd_shuffle("}) {
             Require(inner.find(forbidden) == std::string::npos, name + ": `" + forbidden + "` inside the critical section\n" + critical);
         }
