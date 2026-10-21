@@ -182,13 +182,6 @@ GuestResolver::HostEntry* APS5_VABI gethostbyname_nid_postfix(const char* name) 
         int hostError = 0;
         int error = 0;
         if (!numeric) {
-#ifdef __APPLE__
-            native = ::gethostbyname(name);
-            if (native == nullptr) {
-                hostError = h_errno;
-                error = hostError == TRY_AGAIN ? EAGAIN : 0;
-            }
-#else
             buffer.resize(1024);
 #ifdef __APPLE__
             native = ::gethostbyname(name);
