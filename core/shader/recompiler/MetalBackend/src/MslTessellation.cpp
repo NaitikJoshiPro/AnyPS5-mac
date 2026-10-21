@@ -93,13 +93,24 @@ void Get(MslEmitterState& state, const IrValue& instruction) {
         state.Define(instruction, "(" + predicate + ") ? aps5_tess_local[" + index + "] : 0u");
         return;
     }
-    state.Line("const uint " + index + " = " + Index(state, instruction) + ";");
     if (kind == TessellationAttribute::EvaluationInput) {
         if (StageOf(state) != IrShaderStage::TessellationEvaluation) state.Fail(instruction, "evaluation inputs outside the domain program");
         state.AddParameter("const object_data uint* aps5_tess_payload");
+        // Upstream f95471ec6a (SpirvModuleEmitter TessellationPointer): the control point of a
+        // domain input address, which may be computed from data, is clamped to the patch's last
+        // output control point; the offset within the control point stays.
+        const auto stride = state.program.Metadata().tessellationControlStride;
+        if (stride != 0u && stride % 4u == 0u) {
+            const auto address = state.Temporary("aps5_ta");
+            state.Line("const uint " + address + " = uint(" + state.Arg(instruction, 1u) + ");");
+            state.Line("const uint " + index + " = min(" + address + " / " + U32(stride) + ", " + U32(Tessellation(state).outputControlPoints - 1u) + ") * " + U32(stride / 4u) + " + (" + address + " % " + U32(stride) + ") / 4u;");
+        } else {
+            state.Line("const uint " + index + " = " + Index(state, instruction) + ";");
+        }
         state.Define(instruction, "(" + predicate + ") && " + index + " < " + U32(ControlPointWords(state)) + " ? aps5_tess_payload[" + U32(HeaderWords) + " + " + index + "] : 0u");
         return;
     }
+    state.Line("const uint " + index + " = " + Index(state, instruction) + ";");
     if (kind == TessellationAttribute::InstanceInput) {
         // Upstream 30e85a3a2: the draw-relative instance of the patch's control points (the local
         // program's InstanceIndex - BaseInstance on the SPIR-V path), so a hull numbers the patches
