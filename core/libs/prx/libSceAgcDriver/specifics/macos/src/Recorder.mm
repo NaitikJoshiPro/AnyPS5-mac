@@ -2578,6 +2578,15 @@ void Recorder::readGpuTiming(Batch& batch) {
     // its class range) against the batch span gives what no range covers.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
     intervals.reserve(batch.timedKeys.size());
+    // A range begun and never ended (its end stamp unwritten, MTLCounterErrorValue): upstream's
+    // vkGetQueryPoolResults returns VK_NOT_READY and the batch publishes no timings at all
+    // (agc_gpu_timing_incomplete); so does this one.
+    for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+        if (stamps[i * 2] != MTLCounterErrorValue && stamps[i * 2 + 1] == MTLCounterErrorValue) {
+            timingInvalid.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
         // A stamp the GPU never wrote (MTLCounterErrorValue) or a pair out of order is left out and
