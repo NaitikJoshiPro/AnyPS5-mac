@@ -203,7 +203,10 @@ namespace ShaderRecompiler::MslAbi {
 // - images: a depth-comparison 1D (array) image remapped to a 2D (array) binding (upstream
 //   c97e5e0338, ImageResource::remappedDepth1D) is sampled as the 1D view it was (y at the centre of
 //   row 0, the slice from the second address component).
-inline constexpr std::uint32_t Version = 21u;
+// Version 22: indexed rect lists (RectListIdsMacro): vertex functions take the TriangleVertices
+// slot's id table in the rect-list mode too; draws whose indirect records the GPU reads (MetalDraw.mm
+// GPU indirect draws) write the rect's table base and first vertex into DriverData on the GPU.
+inline constexpr std::uint32_t Version = 22u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
@@ -406,6 +409,10 @@ inline constexpr const char* VertexOutputsMacro = "APS5_VERTEX_OUTPUTS";
 inline constexpr const char* VertexOutputsHighMacro = "APS5_VERTEX_OUTPUTS_HI";
 // - vertex: 1 when the draw is a rect list expanded to 6 host vertices per rect;
 inline constexpr const char* RectListMacro = "APS5_RECT_LIST";
+// - vertex (Version 22): 1 with RectListMacro when the rect list is indexed: the rect's guest vertex
+//   ids are uint32 entries workgroupBase[0] + rect * 3 + 0..2 of the table at
+//   BufferIndex::TriangleVertices (the guest indices plus the base vertex, gathered by the driver).
+inline constexpr const char* RectListIdsMacro = "APS5_RECT_LIST_IDS";
 // - vertex: 1 when the guest clip space has z in [-w, w] (the function remaps z = (z + w) / 2).
 inline constexpr const char* DepthNegativeOneToOneMacro = "APS5_DEPTH_NEGATIVE_ONE_TO_ONE";
 // - vertex/mesh: 1 when the guest position is in window space (PA_CL_VTE_CNTL 0x300: x, y in pixels,

@@ -163,6 +163,79 @@ kernel void IndexGather(constant IndexGatherParameters& p [[buffer(0)]], uint in
     p.target[index] = p.indexSize == 2u ? uint(reinterpret_cast<device const ushort*>(p.source)[position]) : reinterpret_cast<device const uint*>(p.source)[position];
 }
 
+// GPU indirect draws (TechnicalDebt metal-d6-indirect): the guest's indirect draw records rewritten
+// into Metal's argument layouts on the GPU, after their writers in queue order, so their values never
+// cross to the CPU. Thread (0, r) writes record r's MTLDraw(Indexed)PrimitivesIndirectArguments: the
+// count (clamped to the index buffer for indexed draws, 0 past the GPU-side record count), the
+// instances, the first vertex or index and base vertex (in place, or the driver's constant), the first
+// instance. Rect lists draw 6 host vertices per guest rect from vertex 0, the rect's guest first vertex
+// (or its first entry of the id table) in its DriverData.workgroupBase[0]; indexed rect lists also get
+// an id table of indexCount entries per record (thread (x, r): the guest index at x plus the record's
+// base vertex), which the vertex function reads (MslAbi::RectListIdsMacro).
+struct IndirectDrawParameters {
+    device const uint* records;
+    device const uint* countWord;
+    device uint* arguments;
+    device const uchar* indices;
+    device uint* ids;
+    device const ulong* driverData;
+    uint stride;
+    uint count;
+    uint recordBytes;
+    uint indexed;
+    uint indexCount;
+    uint indexSize;
+    uint rect;
+    uint vertexInPlace;
+    uint vertexConstant;
+    uint instanceInPlace;
+    uint instanceConstant;
+    uint argumentStride;
+};
+
+kernel void IndirectDraws(constant IndirectDrawParameters& p [[buffer(0)]], uint2 position [[thread_position_in_grid]]) {
+    const uint record = position.y;
+    if (record >= p.count) return;
+    device const uint* words = p.records + record * (p.stride / 4u);
+    const uint live = p.countWord != nullptr ? min(p.countWord[0], p.count) : p.count;
+    const bool present = record < live;
+    const uint instances = present ? words[1] : 0u;
+    const uint first = present ? words[2] : 0u;
+    const uint vertexOffset = p.indexed != 0u ? (p.vertexInPlace != 0u ? (present ? words[3] : 0u) : p.vertexConstant) : 0u;
+    const uint firstInstance = p.instanceInPlace != 0u ? (present ? words[p.recordBytes == 20u ? 4u : 3u] : 0u) : p.instanceConstant;
+    uint count = present ? words[0] : 0u;
+    if (p.indexed != 0u) count = first < p.indexCount ? min(count, p.indexCount - first) : 0u;
+    if (p.rect != 0u && p.indexed != 0u && p.ids != nullptr && position.x < p.indexCount) {
+        const uint value = p.indexSize == 2u ? uint(reinterpret_cast<device const ushort*>(p.indices)[position.x]) : reinterpret_cast<device const uint*>(p.indices)[position.x];
+        p.ids[record * p.indexCount + position.x] = value + vertexOffset;
+    }
+    if (position.x != 0u) return;
+    device uint* out = p.arguments + record * (p.argumentStride / 4u);
+    if (instances == 0u) count = 0u;
+    if (p.rect != 0u) {
+        const uint rects = count / 3u;
+        out[0] = rects * 6u;
+        out[1] = rects != 0u ? instances : 0u;
+        out[2] = 0u;
+        out[3] = firstInstance;
+        device uint* driver = reinterpret_cast<device uint*>(p.driverData[record]);
+        driver[0] = p.indexed != 0u ? record * p.indexCount + first : (p.vertexInPlace != 0u ? first : p.vertexConstant);
+        return;
+    }
+    if (p.indexed != 0u) {
+        out[0] = count;
+        out[1] = count != 0u ? instances : 0u;
+        out[2] = first;
+        out[3] = vertexOffset;
+        out[4] = firstInstance;
+        return;
+    }
+    out[0] = count;
+    out[1] = count != 0u ? instances : 0u;
+    out[2] = p.vertexInPlace != 0u ? first : p.vertexConstant;
+    out[3] = firstInstance;
+}
+
 kernel void SampleDumps(constant SampleDumpParameters& p [[buffer(0)]]) {
     uint low = p.counter[0];
     uint high = p.counter[1];

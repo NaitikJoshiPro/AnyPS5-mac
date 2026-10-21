@@ -25,20 +25,19 @@ list(APPEND agcMetalTwins
         # The GPU presentation pass is Vulkan-only (metal-present-pass): the twin runs the letterbox checks and skips.
         "tests/PresentationPass.cpp=specifics/macos/tests/PresentationPassTwin.mm"
         # Third round: upstream execution tests of Vulkan-only behaviour (DCC key presync and resource cache growth of
-        # stage-A dispatch preparation, the pipeline journal) or of Metal driver features not written yet
-        # (GPU indirect draws): PendingTwins.mm skips each with its reason. tests/execution/AddressPasses.cpp runs
+        # stage-A dispatch preparation, the pipeline journal): PendingTwins.mm skips each with its reason.
+        # tests/execution/RectListIndirect.cpp runs unchanged since SKIPFIX5 (MetalDraw.mm GPU indirect draws). tests/execution/AddressPasses.cpp runs
         # unchanged since SKIPFIX5 (MetalDraw.mm reports Graphics::DrawPassTotals).
         "tests/execution/DccKeyPresync.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/ResourceCacheGrowth.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/PipelineJournal.cpp=specifics/macos/tests/PendingTwins.mm"
-        "tests/execution/RectListIndirect.cpp=specifics/macos/tests/PendingTwins.mm"
         # Third round: Vulkan fault-injection tests (command batch submit/fence failures, descriptor layout/pool failures).
         "tests/CommandBatch.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/DescriptorCacheFailure.cpp=specifics/macos/tests/PendingTwins.mm"
         # Third round: execution tests that run on Metal through a thin twin that includes the upstream source:
         # the f16 op check reads the MSL text (no SPIR-V for Metal targets); guest memory lifetime has Metal host
         # imports (no libvulkan probe); the mesh tests see MeshShadingEXT (NGG runs as MSL mesh functions, D23);
-        # pipelined dispatch skips its APS5_PIPELINE_DISPATCH item run (metal-dispatch-recipes).
+        # pipelined dispatch runs its APS5_PIPELINE_DISPATCH item run on Metal dispatch recipes (metal-dispatch-recipes).
         "tests/execution/Float16Native.cpp=specifics/macos/tests/Float16NativeTwin.mm"
         "tests/execution/GuestMemoryLifetime.cpp=specifics/macos/tests/GuestMemoryLifetimeTwin.mm"
         "tests/execution/MeshDrawRelocation.cpp=specifics/macos/tests/MeshDrawRelocationTwin.mm"

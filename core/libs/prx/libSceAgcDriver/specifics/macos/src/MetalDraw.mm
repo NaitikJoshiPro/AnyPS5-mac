@@ -14,8 +14,9 @@
 // - pipelines and depth-stencil states from D5's PipelineCache; viewport, scissor, cull, winding,
 //   depth bias, stencil references and blend constants as dynamic encoder state;
 // - primitives: lists and strips draw directly, triangle fans become index lists (Vulkan order),
-//   rect lists use B6's vertex-ID expansion (6 host vertices per rect); indirect draws read their
-//   records on the CPU (DrawIndirectSupport reports no GPU path yet).
+//   rect lists use B6's vertex-ID expansion (6 host vertices per rect, indexed ones through an id
+//   table); indirect draws are drawn from records a helper kernel rewrites on the GPU, or read on the
+//   CPU when the draw needs a CPU-planned index expansion (TechnicalDebt metal-d6-indirect).
 // Unsupported states throw std::runtime_error naming D6 (docs/dev/TechnicalDebt.md metal-d6-*).
 
 #include "MetalDeviceState.h"
@@ -27,6 +28,7 @@
 #include "MetalMesh.h"
 #include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -330,6 +332,16 @@ bool GpuIndexGather() {
     static const bool enabled = std::getenv("APS5_CPU_INDEX_EXPANSION") == nullptr;
     return enabled;
 }
+
+// GPU indirect draws (TechnicalDebt metal-d6-indirect): APS5_CPU_INDIRECT_DRAWS=1 reads every
+// record on the CPU. A draw encodes one indirect draw per record, so the record count is bounded;
+// indexed rect lists also bound their id table (records x index buffer entries).
+bool GpuIndirectDraws() {
+    static const bool enabled = std::getenv("APS5_CPU_INDIRECT_DRAWS") == nullptr;
+    return enabled;
+}
+constexpr std::uint32_t MaxGpuIndirectRecords = 1024u;
+constexpr std::uint64_t MaxGpuIndirectRectIds = 1ull << 22u;
 std::atomic<std::uint64_t> emulatedSlicePasses{0};
 std::atomic<std::uint64_t> emulatedBegun{0};
 
@@ -704,11 +716,43 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (tess && (draw.indirect || graphics.rectList)) Fail(draw.indirect ? "indirect tessellated draws (refused as upstream)" : "tessellated rect lists");
     if (graphics.depthBoundsTest) Fail("the depth bounds test");
 
+    // GPU indirect draws (TechnicalDebt metal-d6-indirect): the records are read by the IndirectDraws
+    // helper kernel (RecorderKernels.h) before the pass, ordered after their writers in queue order,
+    // and drawn from Metal argument records, for draws that need no CPU-planned index expansion
+    // (`expand` below: fans, restarts, last-vertex rotation, point polygons, the triangle-vertices
+    // table), mesh or tessellation, over wrappable records with no label pending over them (as
+    // DispatchIndirect decides). The others read the records on the CPU here.
+    const bool lastVertexRotation = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList && primitive.topologyClass != MTLPrimitiveTopologyClassPoint;
+    const bool restartList = draw.indexed && graphics.primitiveRestart && !graphics.rectList && (graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    const bool plannedExpansion = graphics.polygonMode == VK_POLYGON_MODE_POINT || primitive.fan || triangleVertices || restartList || lastVertexRotation;
+    std::uint64_t gpuRecords = 0;
+    std::uint64_t gpuCount = 0;
+    if (draw.indirect && !mesh && !tess && !plannedExpansion && GpuIndirectDraws()) {
+        const auto& args = *draw.indirect;
+        const auto bytes = args.RangeBytes();
+        const bool aligned = args.arguments % 4u == 0u && args.stride % 4u == 0u && (!args.countIndirect || args.countAddress % 4u == 0u);
+        const bool rectIds = graphics.rectList && draw.indexed;
+        const bool idsFit = !rectIds || (static_cast<std::uint64_t>(args.count) * draw.indexCount <= MaxGpuIndirectRectIds && draw.indexSize != 0u && draw.indexAddress % draw.indexSize == 0u);
+        if (aligned && bytes != 0u && args.count <= MaxGpuIndirectRecords && idsFit && !state.recorder->PendingLabelIn(args.arguments, bytes) && (!args.countIndirect || !state.recorder->PendingLabelIn(args.countAddress, 4u))) {
+            gpuRecords = state.TryWrap(args.arguments, bytes);
+            if (gpuRecords != 0u && !Graphics::Metal::FlushForGpuRead(args.arguments, static_cast<std::size_t>(bytes))) gpuRecords = 0u;
+            if (gpuRecords != 0u && args.countIndirect) {
+                gpuCount = state.TryWrap(args.countAddress, 4u);
+                if (gpuCount != 0u && !Graphics::Metal::FlushForGpuRead(args.countAddress, 4u)) gpuCount = 0u;
+                if (gpuCount == 0u) gpuRecords = 0u;
+            }
+        }
+    }
+    const bool gpuIndirect = gpuRecords != 0u;
+
     // The draws to record: direct, or the indirect records read on the CPU (through the checked
-    // guest memory path, which waits for recorded GPU work that writes them).
+    // guest memory path, which waits for recorded GPU work that writes them). A GPU indirect draw has
+    // one call standing for its records (the encoding draws them from the kernel's arguments).
     std::vector<DrawCall> calls;
     std::uint32_t highestIndexCount = draw.indexCount;
-    if (draw.indirect) {
+    if (gpuIndirect) {
+        calls.push_back({0u, 0u, 0u, 0, 0u});
+    } else if (draw.indirect) {
         using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
         const auto& args = *draw.indirect;
         const auto count = args.countIndirect ? std::min(args.count, Pm4::ReadDrawCount(args)) : args.count;
@@ -765,7 +809,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const std::uint32_t primitiveVertices = primitive.topologyClass == MTLPrimitiveTopologyClassPoint ? 1u : primitive.topologyClass == MTLPrimitiveTopologyClassLine ? 2u : 3u;
     // The mesh path fetches rect-list indices like any list (DECISIONS D41); the vertex function's
     // expansion counts vertex ids.
-    if (graphics.rectList && draw.indexed && !mesh) Fail("indexed rect lists");
+    // Indexed rect lists (MslAbi Version 22) read their guest vertex ids from a table at the
+    // TriangleVertices slot (RectListIdsMacro): gathered on the CPU from the settled indices below,
+    // or by the IndirectDraws kernel for a GPU indirect draw.
+    const bool rectIds = graphics.rectList && draw.indexed && !mesh;
     if (draw.indexed && draw.indexSize != 2u && draw.indexSize != 4u) Fail("index size " + std::to_string(draw.indexSize));
 
     // Guest ranges of both stages, the vertex fetches, the indices and the color targets.
@@ -1021,6 +1068,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
     // Mesh draws expand rect lists from the mesh configuration (DECISIONS D41), not the macro.
     if (graphics.rectList && !mesh) request.vertex.macros.push_back({Abi::RectListMacro, "1"});
+    if (rectIds) request.vertex.macros.push_back({Abi::RectListIdsMacro, "1"});
     if (cullPoints) request.vertex.macros.push_back({Abi::CullPointsMacro, "1"});
     // Mesh draws of points and lines output that topology in either mode (MslAbi Version 16, D75).
     if (mesh && !graphics.rectList && primitiveVertices != 3u) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
@@ -1222,6 +1270,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     const bool listRestart = draw.indexed && graphics.primitiveRestart && listTopology && !graphics.rectList;
     const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
+    if (gpuIndirect && expand) Fail("a GPU indirect draw that needs a CPU-planned index expansion");
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
     // D81: indices that recorded GPU work still writes are not read on the CPU (that waited for the
@@ -1352,6 +1401,103 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         recorder.NotePendingRead(indexBegin, static_cast<std::size_t>(indexBytes), Recorder::ReadKind::DrawInput);
         gatheredAddress = gathered.address;
         indexGathers.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    // Indexed rect lists read on the CPU: each call's guest vertex ids (its indices plus its base
+    // vertex) in one table, the call's first entry in its DriverData.workgroupBase[0].
+    std::uint64_t rectIdsAddress = 0;
+    std::vector<std::uint32_t> rectIdBases;
+    if (rectIds && !gpuIndirect) {
+        state.SettleRange(indexBegin, indexBytes);
+        const auto* guest = reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, indexBytes));
+        std::vector<std::uint32_t> ids;
+        for (const auto& call : calls) {
+            rectIdBases.push_back(static_cast<std::uint32_t>(ids.size()));
+            const auto entries = call.count / 3u * 3u;
+            for (std::uint32_t position = call.first; position < call.first + entries; ++position) {
+                std::uint32_t value = 0;
+                if (draw.indexSize == 2u) {
+                    std::uint16_t half;
+                    std::memcpy(&half, guest + static_cast<std::size_t>(position) * 2u, 2u);
+                    value = half;
+                } else {
+                    std::memcpy(&value, guest + static_cast<std::size_t>(position) * 4u, 4u);
+                }
+                ids.push_back(value + static_cast<std::uint32_t>(call.vertexOffset));
+            }
+        }
+        if (ids.empty()) ids.push_back(0u);
+        rectIdsAddress = Graphics::Metal::Stream(recorder.Commands()).Write(std::as_bytes(std::span(ids)), 16u).address;
+    }
+
+    // GPU indirect draws: the IndirectDraws kernel turns the records into Metal argument records (and
+    // the rect lists' DriverData and id tables), before the pass as D81's gather.
+    std::uint64_t gpuArguments = 0;
+    std::uint32_t gpuArgumentStride = 0;
+    std::uint32_t gpuRecordCount = 0;
+    std::vector<std::uint64_t> gpuDriverData;
+    if (gpuIndirect) {
+        const auto& args = *draw.indirect;
+        auto& stream = Graphics::Metal::Stream(recorder.Commands());
+        gpuRecordCount = args.count;
+        gpuArgumentStride = draw.indexed && !graphics.rectList ? 20u : 16u;
+        gpuArguments = stream.Allocate(static_cast<std::size_t>(gpuRecordCount) * gpuArgumentStride, 16u).address;
+        std::uint64_t driverTable = 0;
+        if (graphics.rectList) {
+            for (std::uint32_t record = 0; record < gpuRecordCount; ++record) gpuDriverData.push_back(state.WriteDriverData(stream, {0u, 0u, 0u}));
+            driverTable = stream.Write(std::as_bytes(std::span(gpuDriverData)), 16u).address;
+        }
+        std::uint64_t indices = 0;
+        if (rectIds) {
+            indices = state.TryWrap(indexBegin, indexBytes);
+            if (indices == 0u || !Graphics::Metal::FlushForGpuRead(indexBegin, static_cast<std::size_t>(indexBytes))) {
+                // The indices cannot be read on the GPU: a copy of them as the CPU sees them now (settled).
+                state.SettleRange(indexBegin, indexBytes);
+                indices = stream.Write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes), 16u).address;
+            } else {
+                state.KeepWrapped(indexBegin, indexBytes);
+                recorder.NotePendingRead(indexBegin, static_cast<std::size_t>(indexBytes), Recorder::ReadKind::DrawInput);
+            }
+            rectIdsAddress = stream.Allocate(static_cast<std::size_t>(gpuRecordCount) * draw.indexCount * 4u, 16u).address;
+        }
+        using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+        struct {
+            std::uint64_t records;
+            std::uint64_t countWord;
+            std::uint64_t arguments;
+            std::uint64_t indices;
+            std::uint64_t ids;
+            std::uint64_t driverData;
+            std::uint32_t stride;
+            std::uint32_t count;
+            std::uint32_t recordBytes;
+            std::uint32_t indexed;
+            std::uint32_t indexCount;
+            std::uint32_t indexSize;
+            std::uint32_t rect;
+            std::uint32_t vertexInPlace;
+            std::uint32_t vertexConstant;
+            std::uint32_t instanceInPlace;
+            std::uint32_t instanceConstant;
+            std::uint32_t argumentStride;
+        } parameters{gpuRecords, gpuCount, gpuArguments, indices, rectIds ? rectIdsAddress : 0u, driverTable, args.stride, gpuRecordCount, args.recordBytes, draw.indexed ? 1u : 0u, draw.indexed ? draw.indexCount : 0u, draw.indexed ? draw.indexSize : 0u, graphics.rectList ? 1u : 0u, args.vertexRule == Rule::InPlace ? 1u : 0u, args.vertexConstant, args.instanceRule == Rule::InPlace ? 1u : 0u, args.instanceConstant, gpuArgumentStride};
+        static_assert(sizeof(parameters) == 96);
+        // Earlier recorded writers of the records (and the indices) first.
+        stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        id<MTLComputePipelineState> pipeline = Graphics::Metal::HelperPipeline(state.device, Graphics::Metal::HelperKernel::IndirectDraws);
+        const std::uint32_t columns = rectIds ? std::max(draw.indexCount, 1u) : 1u;
+        const NSUInteger width = std::min<NSUInteger>(std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 256u), columns);
+        stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake((columns + width - 1u) / width, gpuRecordCount, 1u), MTLSizeMake(width, 1u, 1u));
+        state.KeepWrapped(args.arguments, args.RangeBytes());
+        recorder.NotePendingRead(args.arguments, static_cast<std::size_t>(args.RangeBytes()), Recorder::ReadKind::DrawInput);
+        if (args.countIndirect) {
+            state.KeepWrapped(args.countAddress, 4u);
+            recorder.NotePendingRead(args.countAddress, 4u, Recorder::ReadKind::DrawInput);
+        }
+        Graphics::CountIndirectDraw(Graphics::IndirectDrawPath::Gpu, 0.0, true);
+    } else if (draw.indirect) {
+        // Read on the CPU above (the driver's classification sent it to the device as GPU-side).
+        Graphics::CountIndirectDraw(Graphics::IndirectDrawPath::FeatureGap, 0.0);
     }
 
     state.WrapUnions(plans);
@@ -1714,14 +1860,35 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     held->objects.push_back(pass.pipeline);
                     continue;
                 }
-                for (const auto& call : drawCalls) {
+                if (rectIdsAddress != 0u) [cache.vertexArguments setAddress:rectIdsAddress atIndex:Abi::Index(Abi::BufferIndex::TriangleVertices)];
+                if (gpuIndirect) {
+                    // One indirect draw per record from the kernel's argument records (zero counts
+                    // for records past the GPU-side count or without vertices draw nothing).
+                    for (std::uint32_t record = 0; record < gpuRecordCount; ++record) {
+                        const auto arguments = gpuArguments + static_cast<std::uint64_t>(record) * gpuArgumentStride;
+                        if (graphics.rectList) {
+                            [cache.vertexArguments setAddress:gpuDriverData[record] atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+                            [encoder drawPrimitives:MTLPrimitiveTypeTriangle indirectBuffer:arguments];
+                        } else if (indexedDraw) {
+                            [encoder drawIndexedPrimitives:drawType indexType:indexType indexBuffer:indexAddress indexBufferLength:indexLength indirectBuffer:arguments];
+                        } else {
+                            [encoder drawPrimitives:drawType indirectBuffer:arguments];
+                        }
+                        stream.CountCommand();
+                        ++recorded;
+                    }
+                    held->objects.push_back(pass.pipeline);
+                    continue;
+                }
+                for (std::size_t callIndex = 0; callIndex < drawCalls.size(); ++callIndex) {
+                    const auto& call = drawCalls[callIndex];
                     if (call.count == 0u || call.instances == 0u) continue;
                     if (graphics.rectList) {
                         // Rect lists (B6/D6 interface): 6 host vertices per rect from vertex 0, the
                         // guest first vertex in the vertex stage's DriverData.workgroupBase[0].
                         const auto rects = call.count / 3u;
                         if (rects == 0u) continue;
-                        [cache.vertexArguments setAddress:state.WriteDriverData(stream, {call.first, 0u, 0u}) atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
+                        [cache.vertexArguments setAddress:state.WriteDriverData(stream, {rectIds ? rectIdBases[callIndex] : call.first, 0u, 0u}) atIndex:Abi::Index(Abi::BufferIndex::DriverData)];
                         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:static_cast<NSUInteger>(rects) * 6u instanceCount:call.instances baseInstance:call.firstInstance];
                     } else if (indexedDraw) {
                         const auto size = indexType == MTLIndexTypeUInt16 ? 2u : 4u;
@@ -1897,7 +2064,6 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
     }
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot draw");
-    if (graphics.polygonMode == VK_POLYGON_MODE_POINT) Fail("a point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE): MTLTriangleFillMode has fill and lines only (TechnicalDebt metal-polygon-mode-points)");
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
     Graphics::Metal::TessellationStages tessellation;
@@ -1946,7 +2112,8 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
         const bool tessellationStage = stage == ShaderRecompiler::ShaderStage::Local || stage == ShaderRecompiler::ShaderStage::TessellationControl || stage == ShaderRecompiler::ShaderStage::TessellationEvaluation;
         if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh && !(tessellationPath && tessellationStage)) return std::string("Metal draw (work package D6): only vertex, mesh, tessellation and pixel stages are implemented");
     }
-    if (graphics.polygonMode == VK_POLYGON_MODE_POINT) return std::string("Metal draw: a point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE) has no Metal fill mode (MTLTriangleFillMode has fill and lines only; TechnicalDebt metal-polygon-mode-points)");
+    if (graphics.polygonMode == VK_POLYGON_MODE_POINT && (meshPath || tessellationPath || graphics.rectList)) return std::string("Metal draw: a point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE) on the mesh or tessellation path or a rect list (TechnicalDebt metal-polygon-mode-points)");
+    if (graphics.polygonMode == VK_POLYGON_MODE_POINT && (graphics.cullMode == VK_CULL_MODE_FRONT_BIT || graphics.cullMode == VK_CULL_MODE_BACK_BIT)) return std::string("Metal draw: a point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE) that culls one face: Metal points have no facing (TechnicalDebt metal-polygon-mode-points)");
     // Sample counts the device cannot render are emulated as slices (DECISIONS D28); only counts with
     // no split into renderable slices are refused.
     if (graphics.samples > 1u && state->queue != nil) {
@@ -2014,8 +2181,12 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State&, const Pm4::Dr
     return RecipeOutcome::Rebuild;
 }
 
+// Every indirect record layout and count is drawn by the device (RecordDraw): from Metal argument
+// records the IndirectDraws kernel writes (baseInstance is part of Metal's layouts, one indirect draw
+// per record, the GPU-side count read by the kernel), or read on the CPU where the draw needs a
+// CPU-planned expansion.
 VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
-    return {false, false, false};
+    return {true, true, true};
 }
 
 bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages&, std::span<const Graphics::CompiledShader>) {
