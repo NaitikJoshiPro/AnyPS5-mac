@@ -988,11 +988,6 @@ int APS5_VABI sceKernelGetCpumodeGame(void) {
     return 0;
 }
 
-int APS5_VABI sceKernelGetCurrentFanDuty(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceKernelGetDataTransferMode(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -1059,16 +1054,6 @@ int APS5_VABI sceKernelGetGPO(void) {
 }
 
 int APS5_VABI sceKernelGetHwFeatureInfoForDecid(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceKernelGetHwModelName(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceKernelGetHwSerialNumber(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -2308,52 +2293,12 @@ int APS5_VABI scePthreadAttrSetscope(void) {
     return 0;
 }
 
-int APS5_VABI scePthreadBarrierDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadBarrierInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadBarrierWait(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadBarrierattrDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadBarrierattrGetpshared(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadBarrierattrInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadBarrierattrSetpshared(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI scePthreadCondattrGetclock(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI scePthreadGetconcurrency(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI scePthreadGetcpuclockid(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
