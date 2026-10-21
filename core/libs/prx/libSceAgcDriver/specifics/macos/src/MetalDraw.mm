@@ -840,6 +840,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             colors.push_back(attachment);
             continue;
         }
+        // Upstream 84e3b73f16 (Draw.cpp): a stale depth plane under the target's memory is stored first.
+        static_cast<void>(Graphics::FlushDepthPlanes(target.address, Graphics::ColorTargetLayout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor).Bytes()));
         // Tiled targets are the image cache's resident images (upstream image path): their writes
         // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
         std::shared_ptr<Graphics::StorageTexture> resident;
@@ -966,7 +968,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         if (target.samples != graphics.samples) Fail("the depth target's sample count differs from the rasterizer's");
         const auto format = DepthFormat(target);
         bool created = false;
-        const auto use = Graphics::Metal::AcquireDepthSurface(state.device, target, format, &created);
+        const auto use = Graphics::Metal::AcquireDepthSurface(state.device, target, format, &created, graphics.depthWrite);
         if (created) {
             const std::array<id<MTLTexture>, 1> resident {use.texture};
             state.images->MakeResident(resident);
