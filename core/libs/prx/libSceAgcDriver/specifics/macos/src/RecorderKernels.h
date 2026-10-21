@@ -67,19 +67,39 @@ kernel void MeshArguments(constant MeshArgumentParameters& p [[buffer(0)]]) {
 // e54d2f35fe: the MSL twin of DispatchArguments.comp. An indirect dispatch's group counts copied
 // into a 12-byte argument buffer, all three 0 when one exceeds the device limit (a count a skipped
 // producer never wrote, 0xffffffff, would otherwise launch up to 2^32 groups and hang the GPU).
+// 612b41e4f3: with threadDimensions set the source holds thread counts (DISPATCH_INDIRECT with
+// USE_THREAD_DIMENSIONS): they are kept in arguments[3..5] (the caller copies them into the
+// ShaderData thread limit) and rounded up to group counts of `group` threads, so the dispatch stays
+// on the GPU path (24-byte argument buffer then).
 struct DispatchArgumentParameters {
     device const uint* source;
     device uint* arguments;
     uint maxX;
     uint maxY;
     uint maxZ;
+    uint threadDimensions;
+    uint groupX;
+    uint groupY;
+    uint groupZ;
     uint unused;
 };
 
+static uint DispatchArgumentGroups(uint threads, uint group) {
+    return threads / group + (threads % group != 0u ? 1u : 0u);
+}
+
 kernel void DispatchArguments(constant DispatchArgumentParameters& p [[buffer(0)]]) {
-    const uint x = p.source[0];
-    const uint y = p.source[1];
-    const uint z = p.source[2];
+    uint x = p.source[0];
+    uint y = p.source[1];
+    uint z = p.source[2];
+    if (p.threadDimensions != 0u) {
+        p.arguments[3] = x;
+        p.arguments[4] = y;
+        p.arguments[5] = z;
+        x = DispatchArgumentGroups(x, p.groupX);
+        y = DispatchArgumentGroups(y, p.groupY);
+        z = DispatchArgumentGroups(z, p.groupZ);
+    }
     const bool valid = x <= p.maxX && y <= p.maxY && z <= p.maxZ;
     p.arguments[0] = valid ? x : 0u;
     p.arguments[1] = valid ? y : 0u;

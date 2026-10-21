@@ -2527,8 +2527,11 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
 // e54d2f35fe: an indirect dispatch's group counts checked against the device limit on the GPU
 // (DispatchArguments in RecorderKernels.h); the caller dispatches from `arguments` (12 bytes). False:
 // the kernel did not build, and the caller reads the counts from the import unchecked, as before.
-bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments) {
-    constexpr std::uint32_t PushBytes = 32;
+// 612b41e4f3: with `threadGroup` the source holds thread counts; the kernel turns them into group
+// counts and keeps the counts at `arguments` + 12 (24 bytes), which the caller then copies (a blit,
+// hence the transfer reader below) into the ShaderData thread limit.
+bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup) {
+    constexpr std::uint32_t PushBytes = 48;
     MetalPipeline pipeline = nil;
     if (dispatchArgumentState >= 0) {
         try {
@@ -2546,10 +2549,17 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
         VkDeviceAddress source;
         VkDeviceAddress arguments;
         std::array<std::uint32_t, 4> limits;
-    } parameters{source, arguments, {limit[0], limit[1], limit[2], 0u}};
+        std::array<std::uint32_t, 4> group;
+    } parameters{source, arguments, {limit[0], limit[1], limit[2], threadGroup != nullptr ? 1u : 0u}, {1u, 1u, 1u, 0u}};
+    if (threadGroup != nullptr) {
+        Require(std::none_of(threadGroup->begin(), threadGroup->end(), [](std::uint32_t size) { return size == 0; }), "Metal dispatch: a thread-dimension indirect dispatch has an empty thread group");
+        std::copy(threadGroup->begin(), threadGroup->end(), parameters.group.begin());
+    }
     static_assert(sizeof(parameters) == PushBytes);
     Metal::Stream(commands).DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
-    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    const VkPipelineStageFlags readers = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | (threadGroup != nullptr ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u);
+    const VkAccessFlags reads = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | (threadGroup != nullptr ? VK_ACCESS_TRANSFER_READ_BIT : 0u);
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, readers, VK_ACCESS_SHADER_WRITE_BIT, reads);
     CountBarriers(CommandClass::DispatchLeading, 2);
     return true;
 }
