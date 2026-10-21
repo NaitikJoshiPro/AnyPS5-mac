@@ -694,7 +694,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool perVertex = fragmentReflection != nullptr && (fragmentReflection->perVertexLocations != 0u || fragmentReflection->emulatedBarycentrics != 0u);
     // Tessellated draws take patch lists, whose primitives the tessellator makes (the mesh pipeline
     // has no topology class).
-    const auto primitive = graphics.rectList || tess ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : PrimitiveOf(graphics.topology);
+    // Upstream e61d31d287 point polygon mode (PA_SU_SC_MODE_CNTL POLY_MODE point, VK_POLYGON_MODE_POINT):
+    // MTLTriangleFillMode has fill and lines only, so the triangles' vertices draw as points. The
+    // index expansion lists each triangle's three vertices (strips, fans, restarts and incomplete
+    // triangles as for triangles) and the pass draws that list as points of size 1 (PointsMacro), as
+    // Vulkan draws the vertices of every polygon. Points are never culled, so a draw that culls one
+    // face is refused (TechnicalDebt metal-polygon-mode-points).
+    const bool pointPolygons = graphics.polygonMode == VK_POLYGON_MODE_POINT && !graphics.rectList && !tess && PrimitiveOf(graphics.topology).topologyClass == MTLPrimitiveTopologyClassTriangle;
+    if (pointPolygons && mesh) Fail("a point polygon mode on the mesh path (its primitive export lists triangles; TechnicalDebt metal-polygon-mode-points)");
+    if (pointPolygons && (graphics.cullMode == VK_CULL_MODE_FRONT_BIT || graphics.cullMode == VK_CULL_MODE_BACK_BIT)) Fail("a point polygon mode that culls one face: Metal points have no facing (TechnicalDebt metal-polygon-mode-points)");
+    if (graphics.polygonMode == VK_POLYGON_MODE_POINT && (graphics.rectList || tess)) Fail("a point polygon mode on a rect list or tessellated draw (TechnicalDebt metal-polygon-mode-points)");
+    const auto primitive = graphics.rectList || tess ? Primitive{MTLPrimitiveTypeTriangle, MTLPrimitiveTopologyClassTriangle} : pointPolygons ? Primitive{MTLPrimitiveTypePoint, MTLPrimitiveTopologyClassPoint} : PrimitiveOf(graphics.topology);
     // Guest cull distances (upstream #423, MslAbi v10): Metal has none, so the vertex function
     // emulates them in one more clip distance, which needs the whole primitive: triangles draw in
     // the triangle-vertices mode, rect lists and points have their own macro, lines are refused.
@@ -1269,7 +1279,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // as VK_EXT_primitive_topology_list_restart and the guest's VGT reset index do).
     const bool listTopology = graphics.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     const bool listRestart = draw.indexed && graphics.primitiveRestart && listTopology && !graphics.rectList;
-    const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
+    const bool expand = !mesh && !tess && (pointPolygons || primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     if (gpuIndirect && expand) Fail("a GPU indirect draw that needs a CPU-planned index expansion");
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
@@ -1763,7 +1773,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         [encoder setDepthClipMode:graphics.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
         [encoder setBlendColorRed:graphics.blendConstants[0] green:graphics.blendConstants[1] blue:graphics.blendConstants[2] alpha:graphics.blendConstants[3]];
         // Upstream e61d31d287: PA_SU_SC_MODE_CNTL POLY_MODE line draws one-pixel lines (MTLTriangleFillModeLines);
-        // the point type is refused (KnownDrawRejection, TechnicalDebt metal-polygon-mode-points).
+        // the point type draws the triangles' vertices as points (pointPolygons).
         [encoder setTriangleFillMode:graphics.polygonMode == VK_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
         if (depthStencil != nil) {
             [encoder setDepthStencilState:depthStencil];
