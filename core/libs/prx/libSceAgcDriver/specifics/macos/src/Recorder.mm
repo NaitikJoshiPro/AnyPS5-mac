@@ -18,6 +18,7 @@
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -354,7 +355,9 @@ void FailNextRecorderSubmit(const char* what, bool beforeCommit) {
 namespace {
 
 // One listener for every recorder's timeline notifications (D80), on a serial user-interactive queue: its blocks only
-// raise a progress event.
+// raise a progress event and end the guest's short (<= 1 ms) sleeps (SleepWake.hpp; upstream's ProgressWatcher thread,
+// 82dd286192: here the listener the timeline already notifies is that thread). Both are lock-free or take only their
+// own small mutex, never GuestMemory::GpuMutex.
 MTLSharedEventListener* ProgressListener() {
     static MTLSharedEventListener* listener = [[MTLSharedEventListener alloc]
         initWithDispatchQueue:dispatch_queue_create("aps5.gpu-progress", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0))];
@@ -362,7 +365,10 @@ MTLSharedEventListener* ProgressListener() {
 }
 
 MTLSharedEventNotificationBlock ProgressBlock() {
-    static MTLSharedEventNotificationBlock block = ^(MetalEvent, uint64_t) { ::AgcDriver::Progress::Notify(); };
+    static MTLSharedEventNotificationBlock block = ^(MetalEvent, uint64_t) {
+        ::AgcDriver::Progress::Notify();
+        KernelWakeSleepers_nid_no_patch();
+    };
     return block;
 }
 
@@ -4142,6 +4148,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         }
     }
+    if (!batch->completions.empty()) KernelWakeSleepers_nid_no_patch();
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
