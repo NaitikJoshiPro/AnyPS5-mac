@@ -240,6 +240,16 @@ static uint aps5_atomic_update(A object, uint op, uint value, uint comparator) {
     return observed;
 }
 
+// aps5_atomic_update for a dword whose low bytes (keepMask) lie outside the buffer view (upstream 96c692c887):
+// the operation's result keeps them, and the whole dword as it was is returned.
+template <typename A>
+static uint aps5_atomic_update_keep(A object, uint op, uint value, uint comparator, uint keepMask) {
+    uint observed = atomic_load_explicit(object, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(object, &observed, (aps5_atomic_next(op, observed, value, comparator) & ~keepMask) | (observed & keepMask), memory_order_relaxed, memory_order_relaxed)) {
+    }
+    return observed;
+}
+
 )";
 
 // Typed buffer formats: SpirvFormatConvert.cpp as MSL functions over the component type (the
@@ -1081,15 +1091,29 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
             state.Outdent();
             state.Line("} else if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
         } else {
-            // Upstream 96c692c887: with the V# base off a dword boundary, an atomic whose containing dword lies
-            // before the first aligned dword of the view is out of bounds (returns 0, writes nothing); the view
-            // starts at byte MemoryByteOffset + misalignment of the bound buffer.
-            const auto first = "((" + state.MemoryByteOffset(element) + " + " + descriptor.memory + ".misalignment + 3u) >> 2u)";
-            state.Line("if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ") && (" + byte + " >> 2u) >= " + first + ") {");
+            state.Line("if ((" + byte + " >> " + shift + ") < (" + buffer + ".bytes >> " + shift + ")) {");
         }
         state.Indent();
-        if (wide) apply("(" + buffer + ".address + ulong(" + byte + "))");
-        else apply("(reinterpret_cast<device atomic_uint*>(" + buffer + ".address) + (" + byte + " >> 2u))");
+        if (wide) {
+            apply("(" + buffer + ".address + ulong(" + byte + "))");
+        } else {
+            // Upstream 96c692c887: the view of a V# whose base is off a dword boundary starts at byte
+            // MemoryByteOffset + misalignment of the bound buffer, and the bytes of the containing dword before it
+            // are not the view's: an atomic on that dword returns the whole dword as it was and keeps those bytes.
+            const auto pointer = "(reinterpret_cast<device atomic_uint*>(" + buffer + ".address) + (" + byte + " >> 2u))";
+            const auto start = state.Temporary("aps5_vs");
+            state.Line("const uint " + start + " = " + state.MemoryByteOffset(element) + " + " + descriptor.memory + ".misalignment;");
+            state.Line("if ((" + start + " & 3u) != 0u && (" + byte + " >> 2u) == (" + start + " >> 2u)) {");
+            state.Indent();
+            state.Line(result + " = aps5_atomic_update_keep(" + pointer + ", " + std::to_string(static_cast<std::uint32_t>(op)) + "u, " + value + ", " + (comparator.empty() ? std::string("0u") : comparator) + ", (1u << ((" + start + " & 3u) * 8u)) - 1u);");
+            if (const auto fence = MslAtomicFence(); !fence.empty()) state.Line(fence);
+            state.Outdent();
+            state.Line("} else {");
+            state.Indent();
+            apply(pointer);
+            state.Outdent();
+            state.Line("}");
+        }
         state.Outdent();
         state.Line("}");
     } else {
