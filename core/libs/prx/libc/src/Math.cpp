@@ -239,6 +239,10 @@ float GuestBesselSecondKindZero() {
 }
 
 float ScaledHyperbolic(float x, float y, bool sine) {
+    // The exception flags are part of the result (guest_math CheckScaledHyperbolic). Without
+    // this, clang on arm64 speculates the sine path's x * y ahead of an fcsel, so _FCosh(0, inf)
+    // raised FE_INVALID from 0 * inf.
+#pragma STDC FENV_ACCESS ON
     const auto xBits = std::bit_cast<std::uint32_t>(x);
     const auto xMagnitude = xBits & 0x7fffffffu;
     const auto yMagnitude = std::bit_cast<std::uint32_t>(y) & 0x7fffffffu;
