@@ -353,6 +353,12 @@ struct MslGraphicsInterface {
 // `uint aps5_sample_mask_in [[sample_mask]]` parameter EmitMslEntryPoint adds).
 [[nodiscard]] std::string MslQuadCoverage(const MslEmitterState& state);
 [[nodiscard]] std::string MslQuadUncovered(const MslEmitterState& state);
+// Upstream 57ceb9e370 (MslAbi Version 21): the guest's sample order of a pixel function's quad pixel
+// when pixel (0,0)'s sample locations stand in for a 2x2 grid (ShaderPixelInputInfo::ReordersSamples):
+// a uint expression over aps5_in whose nibble h is the guest index of host sample h. Empty when the
+// request keeps the order. aps5_guest_sample(order, host) and aps5_samples_to_guest/_host(order,
+// bits) (the fragment declarations) map indices and masks.
+[[nodiscard]] std::string MslSampleOrderWord(const MslEmitterState& state);
 [[nodiscard]] std::string PerVertexField(std::uint32_t location, std::uint32_t vertex);
 // The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
 // laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.

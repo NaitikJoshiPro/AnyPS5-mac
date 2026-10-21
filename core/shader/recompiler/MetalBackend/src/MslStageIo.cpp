@@ -103,11 +103,26 @@ std::string MslQuadCoverage(const MslEmitterState& state) {
     return "((((" + QuadPixel() + " & 2u) != 0u ? " + std::to_string(bottom) + "u : " + std::to_string(top) + "u) >> ((" + QuadPixel() + " & 1u) << 4u)) & 0xffffu)";
 }
 
+std::string MslSampleOrderWord(const MslEmitterState& state) {
+    if (state.inputInfo.pixel == nullptr || !state.inputInfo.pixel->ReordersSamples()) return {};
+    // SpirvModuleEmitter EmitProgram: the pixel's word by the parity of its window position, 0 for
+    // the kept order.
+    const auto& order = state.inputInfo.pixel->sampleOrder;
+    const auto word = [&](std::size_t pixel) { return std::to_string(order[pixel] == 0u ? 0x76543210u : order[pixel]) + "u"; };
+    const auto quad = QuadPixel();
+    return "(" + quad + " == 0u ? " + word(0u) + " : " + quad + " == 1u ? " + word(1u) + " : " + quad + " == 2u ? " + word(2u) + " : " + word(3u) + ")";
+}
+
 std::string MslQuadUncovered(const MslEmitterState& state) {
     const auto& pixel = *state.inputInfo.pixel;
     // The host mask's bits are guest samples APS5_SAMPLE_BASE and up (DECISIONS D28).
     // aps5_sample_coverage: the stage function's coverage, a per-sample invocation's own sample (MslAbi::SampleMaskDiscardText).
-    if (pixel.QuadSampleMaskPartial()) return "(((aps5_sample_coverage << APS5_SAMPLE_BASE) & " + MslQuadCoverage(state) + ") == 0u)";
+    // Upstream 57ceb9e370: the guest's order of the rasterized samples before the quad's mask.
+    if (pixel.QuadSampleMaskPartial()) {
+        const auto order = MslSampleOrderWord(state);
+        const auto coverage = std::string("(aps5_sample_coverage << APS5_SAMPLE_BASE)");
+        return "((" + (order.empty() ? coverage : "aps5_samples_to_guest(" + order + ", " + coverage + ")") + " & " + MslQuadCoverage(state) + ") == 0u)";
+    }
     return "(((" + std::to_string(static_cast<std::uint32_t>(pixel.quadPixelMask)) + "u >> " + QuadPixel() + ") & 1u) == 0u)";
 }
 
@@ -318,7 +333,9 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             state.AddParameter("uint aps5_sample_id [[sample_id]]");
             state.reflection.perSample = true;
             // MslAbi Version 9: APS5_SAMPLE_BASE is the guest index of host sample 0 (4 in the second
-            // half of an 8x target emulated as two 4x halves, DECISIONS D28).
+            // half of an 8x target emulated as two 4x halves, DECISIONS D28). Version 21 (upstream
+            // 57ceb9e370): the guest index of that host sample in the pixel's sample order.
+            if (const auto order = MslSampleOrderWord(state); !order.empty()) return "aps5_guest_sample(" + order + ", aps5_sample_id + APS5_SAMPLE_BASE)";
             return "(aps5_sample_id + APS5_SAMPLE_BASE)";
         case StageInputKind::PrimitiveId:
             state.AddParameter("uint aps5_primitive_id [[primitive_id]]");
@@ -346,6 +363,8 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             // every fragment function declares (EmitMslEntryPoint); host sample 0 is guest sample
             // APS5_SAMPLE_BASE (DECISIONS D28). The driver refuses the per-sample case, as upstream.
             state.AddParameter("uint aps5_sample_mask_in [[sample_mask]]");
+            // Upstream 57ceb9e370: the rasterized samples in the guest's order.
+            if (const auto order = MslSampleOrderWord(state); !order.empty()) return "aps5_samples_to_guest(" + order + ", aps5_sample_mask_in << APS5_SAMPLE_BASE)";
             return "(aps5_sample_mask_in << APS5_SAMPLE_BASE)";
         case StageInputKind::BaryCoordSmoothCenter:
         case StageInputKind::BaryCoordSmoothSample:
@@ -1033,6 +1052,13 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     text += "#ifndef APS5_VERTEX_OUTPUTS\n#define APS5_VERTEX_OUTPUTS 0xffffffff\n#endif\n#ifndef APS5_VERTEX_OUTPUTS_HI\n#define APS5_VERTEX_OUTPUTS_HI 0xffffffff\n#endif\n";
     text += "#ifndef APS5_PRIMITIVE_VERTICES\n#define APS5_PRIMITIVE_VERTICES 3u\n#endif\n";
     text += "#ifndef APS5_SAMPLE_BASE\n#define APS5_SAMPLE_BASE 0\n#endif\n";
+    // MslAbi Version 21 (upstream 57ceb9e370, SpirvModuleEmitter GuestSampleIndex and
+    // ReorderedSampleBits): nibble h of a sample order is the guest index of host sample h.
+    if (pixel.ReordersSamples()) {
+        text += "static inline uint aps5_guest_sample(uint order, uint host) {\n    return (order >> ((host & 7u) * 4u)) & 7u;\n}\n";
+        text += "static inline uint aps5_samples_to_guest(uint order, uint bits) {\n    uint guest = bits & ~0xffu;\n    for (uint s = 0u; s < 8u; ++s) guest |= ((bits >> s) & 1u) << ((order >> (s * 4u)) & 7u);\n    return guest;\n}\n";
+        text += "static inline uint aps5_samples_to_host(uint order, uint bits) {\n    uint host = bits & ~0xffu;\n    for (uint s = 0u; s < 8u; ++s) host |= ((bits >> ((order >> (s * 4u)) & 7u)) & 1u) << s;\n    return host;\n}\n";
+    }
     text += "struct Aps5FragmentIn {\n    float4 aps5_position [[position]];\n";
     std::string accessors;
     using Mode = MslEmitterState::FragmentInput::Mode;
@@ -1170,6 +1196,10 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     // DECISIONS D28).
     const std::string toHost = "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";
     if (state.reflection.exportsSampleMask) {
+        // Upstream 57ceb9e370 (StoreCoverage): the coverage the function wrote names guest samples;
+        // the host's are in the pixel's sample order. APS5_SAMPLE_MASK is a host mask (the driver keeps
+        // a uniform mask the order would change in the quad masks, Graphics::SampleMaskFollowsOrder).
+        if (const auto order = MslSampleOrderWord(state); !order.empty()) result.epilogue += "    aps5_out.aps5_sample_mask = aps5_samples_to_host(" + order + ", aps5_out.aps5_sample_mask);\n";
         result.epilogue += "#if defined(APS5_SAMPLE_MASK)\n    aps5_out.aps5_sample_mask &= APS5_SAMPLE_MASK;\n#endif\n" + toHost;
     } else if (hostMaskMember) {
         result.epilogue += "#if defined(APS5_SAMPLE_MASK)\n    aps5_out.aps5_sample_mask = APS5_SAMPLE_MASK;\n" + toHost + "#endif\n";
