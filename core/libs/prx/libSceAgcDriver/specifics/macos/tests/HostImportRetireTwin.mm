@@ -11,6 +11,13 @@
 //   batch is left waiting); a batch upstream completes by signaling its fence is waited for with
 //   Recorder::WaitSerial, which does not reap, as upstream's mock signal does not.
 // The checks and their messages are upstream's.
+// Upstream 89bd3f19b6 adds RunHostImportFailureTests (tests/HostImportFailure.cpp): vkCreateBuffer, vkAllocateMemory
+// and vkBindBufferMemory failures injected through the device resolver must publish no handle and release nothing
+// undefined, and a retry must import. A Metal import has one creation step (newBufferWithBytesNoCopy over the
+// guest pages, after GuestBufferMemory.mm's unwrappable() page check), so FailedImportPublishesNothing makes it
+// fail the way it can on Metal: the registered range's pages are unreadable (PROT_NONE). The failure must leave no
+// import, no live bytes and no release-probe call (no buffer was published), and once the pages are readable a
+// retry must import a buffer over them (TechnicalDebt metal-host-import-failure-seams: no seam for the other steps).
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -22,8 +29,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <sys/mman.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <memory>
@@ -295,6 +304,64 @@ void BusyRetireOutlivesALaterBatch(const Device& device) {
     Expect(!Live(retired), "the dropped import outlived every batch of its hold");
 }
 
+void FailedImportPublishesNothing(const Device& device) {
+    const auto& context = device.GetContext();
+    void* mapped = mmap(nullptr, Alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapped == MAP_FAILED) throw std::runtime_error("cannot map the host import failure heap");
+    auto* data = static_cast<std::byte*>(mapped);
+    std::memset(data, 0x37, Alignment);
+    struct Release {
+        std::byte* data;
+        ~Release() {
+            try {
+                GuestAllocations::Mutation().Remove(data);
+            } catch (...) {
+            }
+            munmap(data, Alignment);
+        }
+    } release{data};
+    GuestAllocations::Mutation().Add(data, Alignment, true, true, true);
+    const auto address = reinterpret_cast<std::uint64_t>(data);
+    constexpr std::size_t Bytes = 4096;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    ClearHostImports(context.device);
+    SetImportWatch(context, ImportWatch::Unwatch);
+    std::size_t releasedBefore = 0;
+    {
+        std::lock_guard lock(destroyedMutex);
+        releasedBefore = destroyed.size();
+    }
+    if (mprotect(data, Alignment, PROT_NONE) != 0) throw std::runtime_error("cannot make the host import failure heap unreadable");
+    const HostImport* failed = nullptr;
+    bool threw = false;
+    try {
+        failed = HostImportFor(context, address, Bytes);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    const bool rejected = failed == nullptr && ExistingHostImportFor(context, address, Bytes) == nullptr && HostImportLiveBytes() == 0;
+    std::size_t releasedAfter = 0;
+    {
+        std::lock_guard lock(destroyedMutex);
+        releasedAfter = destroyed.size();
+    }
+    if (mprotect(data, Alignment, PROT_READ | PROT_WRITE) != 0) throw std::runtime_error("cannot make the host import failure heap readable again");
+    ClearHostImports(context.device);
+    Expect(rejected, "a failed host import creation published an import or counted its bytes");
+    Expect(releasedAfter == releasedBefore, "a failed host import creation released a buffer it never published");
+    const auto* recovered = HostImportFor(context, address, Bytes);
+    Expect(recovered != nullptr && recovered->buffer != VK_NULL_HANDLE && recovered->address != 0, "host import retry failed");
+    if (recovered != nullptr && recovered->buffer != VK_NULL_HANDLE) {
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)reinterpret_cast<void*>(recovered->buffer);
+        const auto offset = address - recovered->base;
+        Expect(buffer.length >= offset + Bytes && std::memcmp(static_cast<const std::byte*>(buffer.contents) + offset, data, Bytes) == 0, "host import retry returned incorrect data");
+        Track(recovered->buffer);
+    }
+    ClearHostImports(context.device);
+    Expect(HostImportLiveBytes() == 0, "the retried host import was not cleaned up");
+    std::printf("host import failure: threw=%u rejected=%u\n", threw ? 1u : 0u, rejected ? 1u : 0u);
+}
+
 }
 
 int main() {
@@ -307,6 +374,7 @@ int main() {
             WindowPromotionOutlivesTheHold(device);
             IdleRetireOutlivesTheHold(device);
             BusyRetireOutlivesALaterBatch(device);
+            FailedImportPublishesNothing(device);
         }
     } catch (const std::exception& error) {
         AgcDriver::Metal::SetImportReleaseProbe(nullptr);

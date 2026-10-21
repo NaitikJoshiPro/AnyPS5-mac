@@ -389,6 +389,9 @@ void partialUnmap(Fixture& fixture) {
     Require(!RegisteredReadableCovers(reinterpret_cast<std::uint64_t>(middle), allocation.alignment), "the middle of a partial unmap remains registered");
     const auto low = fixture.Import(allocation.Address(), allocation.alignment);
     const auto high = fixture.Import(allocation.Address() + 2 * allocation.alignment, allocation.alignment);
+    // Upstream a9b14023dd: the whole import retires before the cut; nothing imported across the unmapped range is reused.
+    Require(imported->freed.load(), "the side kept from an unmap inside the host import reused memory imported across the unmapped range");
+    Require(high->address == allocation.Address() + 2 * allocation.alignment && high->bytes == allocation.alignment, "the kept side of the host import does not cover its remaining range");
     Require(!low->freed.load() && !high->freed.load() && !other->freed.load(), "remaining partial mappings could not be imported");
     {
         GuestAllocations::Mutation mutation;
