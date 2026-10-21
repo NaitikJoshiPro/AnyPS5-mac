@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <io.h>
 #else
+#include <climits>
 #include <ctime>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -280,7 +281,15 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path, bool mo
         trailing = name.empty() || name == "." || name == "..";
         if (!trailing) names.push_back(name);
     }
-    return HostPath(state, WithTrailingSeparator(std::move(names), trailing), module);
+    auto host = HostPath(state, WithTrailingSeparator(std::move(names), trailing), module);
+#ifdef __APPLE__
+    // macOS refuses a path of PATH_MAX (1024) bytes with ENAMETOOLONG, so a guest path within FreeBSD's MAXPATHLEN
+    // can still be too long for the host once the host root is prepended. Nothing the guest creates can live at such
+    // a host path (every create resolves it here too), so it does not exist: ENOENT, as on Windows past MAX_PATH.
+    if (host.native().size() >= PATH_MAX)
+        throw std::filesystem::filesystem_error("Host path of a guest path is too long", host, std::make_error_code(std::errc::no_such_file_or_directory));
+#endif
+    return host;
 }
 #ifdef _WIN32
 using WriteMark = FILETIME;
