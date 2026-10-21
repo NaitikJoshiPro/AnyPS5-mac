@@ -122,7 +122,11 @@ ShaderRecompiler::RecompileResult Recompile(std::uint32_t waveSize, std::span<co
     return ShaderRecompiler::Recompile(request);
 }
 
-bool SearchesAnchor(const ShaderRecompiler::SharedSpirv& spirv) {
+bool SearchesAnchor(const ShaderRecompiler::RecompileResult& result) {
+    // The MSL backend computes the shared anchor in its prologue (MslAddress.cpp, `= aps5_bda_anchor(`;
+    // the prelude always defines the helper, so the call site is what is searched for).
+    if (!result.msl.empty()) return result.msl.Source().find("= aps5_bda_anchor(") != std::string::npos;
+    const auto& spirv = result.spirv;
     const std::string_view text(reinterpret_cast<const char*>(spirv.data()), spirv.size() * sizeof(std::uint32_t));
     return text.find("bda_anchor_range") != std::string_view::npos;
 }
@@ -133,7 +137,7 @@ void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t waveS
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(guest.Data()));
     const std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
     const auto result = Recompile(waveSize, userData, std::span<const std::byte>(reinterpret_cast<const std::byte*>(guest.Data()), InputDwords * sizeof(std::uint32_t)), target);
-    Require(SearchesAnchor(result.spirv), "BDA anchor reads: " + name + " reads of one user-data base do not share an anchor");
+    Require(SearchesAnchor(result), "BDA anchor reads: " + name + " reads of one user-data base do not share an anchor");
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(Code.data()));
     device.WaitIdle();
     std::memcpy(memory.data(), guest.Data(), BlockBytes);
