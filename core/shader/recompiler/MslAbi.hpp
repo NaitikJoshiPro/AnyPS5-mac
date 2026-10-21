@@ -179,7 +179,31 @@ namespace ShaderRecompiler::MslAbi {
 //   and line draws in the triangle-vertices mode output and read only their own corners' per-vertex
 //   fields (PrimitiveVerticesMacro in the fragment function too); mesh point draws need no staging
 //   (MeshPointSplitVertices, PointSplitVerticesMacro).
-inline constexpr std::uint32_t Version = 20u;
+// Version 21 (upstream sync UPSYNC5, 661f8b717..6b6c70163, DECISIONS D72 round 5; the SpirvBackend
+// changes mirrored):
+// - PipelineSpecialization::SampleCountBase moved from 12288 to 14336 (upstream's StoreQuantizeBase
+//   took 12288). The MSL backend declares no StoreQuantize constants: Metal's texture writes round
+//   normalized texels from the exact product already (MSL specification 8.7.1.2).
+// - fragment: a request whose ShaderPixelInputInfo::sampleOrder reorders samples (upstream
+//   57ceb9e370: pixel (0,0)'s sample locations stand in for a 2x2 grid) reads SampleId, the
+//   [[sample_mask]] input and the quad coverage in the guest's order of the pixel's quad position,
+//   and maps the coverage it writes back to host order before APS5_SAMPLE_MASK and APS5_SAMPLE_BASE.
+// - a coherent (GLC/DLC) buffer_store_dwordx2 of a descriptor-table buffer whose dwords are in
+//   bounds, adjacent and 8-byte aligned is one 64-bit store under the 64-bit atomic lock table
+//   (MslDeviceAtomic64 swap, upstream e5b4bd72dd), so read2 never pairs a new flag with an old value.
+// - mesh: an NGG geometry program with point-list output (outputPrimitiveSize 1, upstream
+//   ee81c5112d) defines PrimitiveVerticesMacro 1 and PointsMacro 1 itself (metal::topology::point,
+//   the primitive export's first index, [[point_size]] 1.0).
+// - domain: an EvaluationInput read clamps its control point to the last output control point
+//   (upstream f95471ec6a, data-computed indices).
+// - hull: the fixed signature takes `threadgroup uint* aps5_tess_shared` after aps5_tess_local; a
+//   merged hull program (binary type 3, upstream 8b8219dcef) keeps its LDS as per-control-point
+//   records of aps5_tess_shared_words dwords there (TessellationAttribute::ControlShared), and its
+//   barriers order threadgroup memory.
+// - images: a depth-comparison 1D (array) image remapped to a 2D (array) binding (upstream
+//   c97e5e0338, ImageResource::remappedDepth1D) is sampled as the 1D view it was (y at the centre of
+//   row 0, the slice from the second address component).
+inline constexpr std::uint32_t Version = 21u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
