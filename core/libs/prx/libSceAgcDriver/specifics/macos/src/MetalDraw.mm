@@ -817,6 +817,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         indexBegin = draw.indexAddress;
         indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
         if (indexBegin == 0u || indexBytes == 0u) Fail("an indexed draw without an index buffer");
+        // Upstream Draw.cpp: an index range the guest cannot read (unmapped, or a sparse range
+        // without backing) is refused before it is wrapped.
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(indexBegin), static_cast<std::size_t>(indexBytes), draw.indexSize);
         fetchPlan.reads.push_back({indexBegin, indexBegin + indexBytes});
     }
 
