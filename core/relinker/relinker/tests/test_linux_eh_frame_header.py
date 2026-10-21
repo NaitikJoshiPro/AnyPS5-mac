@@ -113,12 +113,16 @@ def main():
         result, elf = relink(relinker, directory, "zero-padding-slots", fixture(6))
         headers = program_headers(elf)
         assert [header for header in headers if header[0] == PT_GNU_EH_FRAME] == [EH_FRAME_HEADER], headers
-        assert len(headers) == 7, headers
+        # Upstream now always emits a PT_GNU_STACK (synthesised when the input has none): 8 headers, table in place.
+        assert len(headers) == 8, headers
+        assert struct.unpack_from("<Q", elf, 0x20)[0] == 64, "Zero padding must extend the table in place"
+        assert [header for header in headers if header[0] == PT_GNU_STACK] == [(PT_GNU_STACK, 6, 0, 0, 0, 0, 0, 16)], headers
         assert "PT_GNU_EH_FRAME" not in result.stderr, result.stderr
         image = fixture(2, with_frame=False)
         image[176:232] = bytes(56)
         result, elf = relink(relinker, directory, "zero-padding-no-sce-slots", image)
-        assert len(program_headers(elf)) == 6, program_headers(elf)
+        assert len(program_headers(elf)) == 7, program_headers(elf)
+        assert struct.unpack_from("<Q", elf, 0x20)[0] == 64, "Zero padding must extend the table in place"
 
         image = fixture(6, with_frame=False)
         table_end = 64 + 6 * 56
