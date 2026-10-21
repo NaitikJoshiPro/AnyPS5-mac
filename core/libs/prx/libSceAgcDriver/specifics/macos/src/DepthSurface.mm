@@ -1553,6 +1553,8 @@ Surface* BindSurface(const Context* context, id<MTLDevice> device, const DepthTa
             other->mirrorPlane = {};
         }
     }
+    static const bool trace = std::getenv("APS5_TRACE_DEPTH_PLANES") != nullptr;
+    if (trace) std::fprintf(stderr, "[depth-plane] bind 0x%llx created=%d mirrorable=%d context=%d depthWritten=%d cleared=%d\n", static_cast<unsigned long long>(target.address), *created ? 1 : 0, mirrorable(target) ? 1 : 0, surface->context.has_value() ? 1 : 0, depthWritten ? 1 : 0, cleared ? 1 : 0);
     if ((depthWritten || cleared) && mirrored) {
         surface->memoryStale = true;
         const auto [begin, end] = stalePlaneRange(*surface);
@@ -1770,6 +1772,8 @@ bool DepthPlanesStale() {
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes) {
     static thread_local bool flushing = false;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    static const bool trace = std::getenv("APS5_TRACE_DEPTH_PLANES") != nullptr;
+    if (trace) std::fprintf(stderr, "[depth-plane] flush 0x%llx+0x%zx overlaps-stale=%d flushing=%d\n", static_cast<unsigned long long>(address), bytes, overlapsStalePlane(address, end) ? 1 : 0, flushing ? 1 : 0);
     if (flushing || !overlapsStalePlane(address, end)) return {};
     flushing = true;
     struct Reset {
@@ -1793,7 +1797,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
             surface->memoryStale = false;
             // A plane is marked stale only once its surface has a context (BindSurface).
             if (!surface->context) continue;
-            if (SyncFromMemory(*surface->context, *surface, resource)) continue;
+            if (SyncFromMemory(*surface->context, *surface, resource)) {
+                if (trace) std::fprintf(stderr, "[depth-plane] 0x%llx reloaded from guest memory\n", static_cast<unsigned long long>(plane));
+                continue;
+            }
+            if (trace) std::fprintf(stderr, "[depth-plane] 0x%llx+0x%llx stored\n", static_cast<unsigned long long>(plane), static_cast<unsigned long long>(planeBytes));
             stored.emplace_back(surface.get(), StoreDepthPlane(*surface->context, *surface, resource));
             ranges.emplace_back(plane, planeBytes);
         }
