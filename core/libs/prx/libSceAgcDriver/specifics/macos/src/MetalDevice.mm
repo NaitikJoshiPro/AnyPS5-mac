@@ -1815,7 +1815,14 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         std::memcpy(push.data(), shader.pushConstants.data(), shader.pushConstants.size());
     }
     const std::uint64_t tableAddress = WriteTable(shader, snapshots, stream, plan, std::span<std::byte>(push).first(shader.pushConstants.size()));
-    const auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    if (indirect != 0u) {
+        // e54d2f35fe (VulkanDevice.cpp RecordDispatchArguments): the group counts are checked
+        // against the device limit on the GPU into a 12-byte copy, dispatched from when the
+        // kernel built; otherwise read from the guest unchecked.
+        const auto checked = stream.Allocate(12u, 16u);
+        if (recorder.RecordDispatchArguments(Graphics::Metal::Handle(stream), indirect, checked.address)) indirect = checked.address;
+    }
     const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     std::vector<std::uint64_t> driverAddresses;
     std::vector<MTLSize> chunkGroups;
