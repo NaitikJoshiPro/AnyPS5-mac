@@ -341,6 +341,87 @@ int Images() {
             }
             if (image != VK_NULL_HANDLE) Vk::DestroyImage(context->device, image, nullptr);
         }
+        // UPSYNC5 (upstream c97e5e0338, 086e98a42a, 3b6f6359f7, 4513d47104), the image shapes
+        // Texture.mm now creates. A 1D depth-comparison texture is a 2D depth image one texel high
+        // with 2D(-array) views; a cube descriptor with slices past its last whole cube is viewed
+        // as a 2D array of all of them; arrays stop at Metal's 2048 slices.
+        Check(context->limits.maxImageArrayLayers == 2048u, "the image context reports Metal's 2048-slice array limit");
+        {
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = VK_FORMAT_D32_SFLOAT;
+            info.extent = {64u, 1u, 1u};
+            info.mipLevels = 3;
+            info.arrayLayers = 3;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            VkImage image = VK_NULL_HANDLE;
+            Check(Vk::CreateImage(context->device, &info, nullptr, &image) == VK_SUCCESS, "a 64x1 depth image backs a 1D depth-comparison array");
+            {
+                auto owned = std::make_shared<OwnedImage>(*context, image, VK_NULL_HANDLE);
+                VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                allocation.allocationSize = 4096u;
+                owned->Allocate(*context, allocation, ~0u, "vkAllocateMemory test");
+                Check(owned->memory != VK_NULL_HANDLE && owned->memoryBytes == 4096u && owned->memoryType == 0u, "OwnedImage::Allocate records the allocation");
+                VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                viewInfo.image = image;
+                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                viewInfo.format = VK_FORMAT_D32_SFLOAT;
+                viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 3u, 0u, 3u};
+                VkImageView view = VK_NULL_HANDLE;
+                Check(Vk::CreateImageView(context->device, &viewInfo, nullptr, &view) == VK_SUCCESS && TextureOfView(view).textureType == MTLTextureType2DArray && TextureOfView(view).height == 1u && TextureOfView(view).arrayLength == 3u, "a 1D depth-comparison array is viewed as a one-texel-high 2D depth array");
+                if (view != VK_NULL_HANDLE) Vk::DestroyImageView(context->device, view, nullptr);
+                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u, 1u};
+                Check(Vk::CreateImageView(context->device, &viewInfo, nullptr, &view) == VK_SUCCESS && TextureOfView(view).textureType == MTLTextureType2D && TextureOfView(view).pixelFormat == MTLPixelFormatDepth32Float, "its first-layer and base-level view is a 2D depth view");
+                if (view != VK_NULL_HANDLE) Vk::DestroyImageView(context->device, view, nullptr);
+                // ~OwnedImage releases the image and the memory token.
+            }
+            // Pooled image memory (upstream 4513d47104): the texture is placed at offset 0 of a
+            // placement heap of GetImageCreateRequirements' size.
+            VkMemoryRequirements requirements{};
+            Vk::GetImageCreateRequirements(context->device, &info, &requirements);
+            Check(requirements.size != 0u && requirements.size % requirements.alignment == 0u, "GetImageCreateRequirements gives an aligned heap size");
+            MTLHeapDescriptor* heapDescriptor = [MTLHeapDescriptor new];
+            heapDescriptor.type = MTLHeapTypePlacement;
+            heapDescriptor.size = static_cast<NSUInteger>(requirements.size);
+            heapDescriptor.storageMode = MTLStorageModePrivate;
+            heapDescriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+            id<MTLHeap> heap = [device newHeapWithDescriptor:heapDescriptor];
+            Check(heap != nil, "a placement heap of the image's size");
+            if (heap != nil) {
+                const auto memory = reinterpret_cast<VkDeviceMemory>(const_cast<void*>(CFBridgingRetain(heap)));
+                Check(!Vk::IsMemoryToken(memory), "a heap is not the memory token");
+                VkImage placed = VK_NULL_HANDLE;
+                Check(Vk::CreateImageInMemory(context->device, &info, memory, &placed) == VK_SUCCESS && TextureOfImage(placed).heap == heap && TextureOfImage(placed).arrayLength == 3u, "CreateImageInMemory places the texture in the heap");
+                if (placed != VK_NULL_HANDLE) Vk::DestroyImage(context->device, placed, nullptr);
+                CFRelease(reinterpret_cast<CFTypeRef>(memory));
+            }
+        }
+        {
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = VK_FORMAT_R8G8B8A8_UNORM;
+            info.extent = {8u, 8u, 1u};
+            info.mipLevels = 1;
+            info.arrayLayers = 8;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            VkImage image = VK_NULL_HANDLE;
+            Check(Vk::CreateImage(context->device, &info, nullptr, &image) == VK_SUCCESS, "a cube image with 8 slices (one whole cube and two more) is created");
+            VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewInfo.image = image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 1u, 7u};
+            VkImageView view = VK_NULL_HANDLE;
+            Check(Vk::CreateImageView(context->device, &viewInfo, nullptr, &view) == VK_SUCCESS && TextureOfView(view).arrayLength == 7u, "a cube view of 7 slices past its base is a 2D array of all 7");
+            if (view != VK_NULL_HANDLE) Vk::DestroyImageView(context->device, view, nullptr);
+            if (image != VK_NULL_HANDLE) Vk::DestroyImage(context->device, image, nullptr);
+        }
         recorder.Sync();
         attached.Teardown();
     }
