@@ -2,14 +2,19 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <type_traits>
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 
 namespace {
 
 using Int128 = __int128;
 using Uint128 = unsigned __int128;
+// The guest's long double, the x87 80-bit format: the host's own long double on x86-64; on arm64, whose long
+// double is a double, its bits (X87Extended), so the xf builtins see and give the guest's exact value.
+using Extended = GuestLongDouble;
 
 constexpr std::uint32_t DefaultMxcsr = 0x1f80;
 #if !defined(__x86_64__)
@@ -60,8 +65,9 @@ struct ExtendedBits {
     int exponent;
 };
 
-ExtendedBits DecomposeExtended(long double value) {
-    unsigned char bytes[sizeof(long double)];
+ExtendedBits DecomposeExtended(Extended value) {
+    static_assert(sizeof(Extended) == 16);
+    unsigned char bytes[sizeof(Extended)];
     std::memcpy(bytes, &value, sizeof(bytes));
     std::uint64_t mantissa;
     std::uint16_t signExponent;
@@ -70,12 +76,12 @@ ExtendedBits DecomposeExtended(long double value) {
     return {mantissa, (signExponent & 0x8000u) != 0, static_cast<int>(signExponent & 0x7fffu) - 16383};
 }
 
-long double ComposeExtended(bool negative, int biased, std::uint64_t mantissa) {
-    unsigned char bytes[sizeof(long double)] = {};
+Extended ComposeExtended(bool negative, int biased, std::uint64_t mantissa) {
+    unsigned char bytes[sizeof(Extended)] = {};
     const std::uint16_t signExponent = static_cast<std::uint16_t>((negative ? 0x8000u : 0u) | static_cast<unsigned>(biased));
     std::memcpy(bytes, &mantissa, sizeof(mantissa));
     std::memcpy(bytes + 8, &signExponent, sizeof(signExponent));
-    long double value;
+    Extended value;
     std::memcpy(&value, bytes, sizeof(value));
     return value;
 }
@@ -107,7 +113,7 @@ TResult FixUnsigned(TFloat value) {
 }
 
 template<typename TResult>
-TResult FixExtendedSigned(long double value) {
+TResult FixExtendedSigned(Extended value) {
     const ExtendedBits parts = DecomposeExtended(value);
     if (parts.exponent < 0) return 0;
     TResult magnitude;
@@ -124,7 +130,7 @@ TResult FixExtendedSigned(long double value) {
 }
 
 template<typename TResult>
-TResult FixExtendedUnsigned(long double value) {
+TResult FixExtendedUnsigned(Extended value) {
     const ExtendedBits parts = DecomposeExtended(value);
     if (parts.negative || parts.exponent < 0) return 0;
     if constexpr (sizeof(TResult) == 16) {
@@ -169,7 +175,7 @@ TFloat RoundToFloat(bool negative, Uint128 magnitude) {
     return std::bit_cast<TFloat>(static_cast<Rep>(sign | (static_cast<Rep>(biased) << Format::SignificandBits) | fraction));
 }
 
-long double RoundToExtended(bool negative, Uint128 magnitude) {
+Extended RoundToExtended(bool negative, Uint128 magnitude) {
     if (magnitude == 0) return ComposeExtended(negative, 0, 0);
     int exponent = HighestBit(magnitude);
     Uint128 significand;
@@ -216,7 +222,19 @@ TFloat Negate(TFloat value) {
 }
 
 template<typename TFloat>
+TFloat Quieted(TFloat value) {
+    using Format = FloatFormat<TFloat>;
+    using Rep = typename Format::Rep;
+    return std::bit_cast<TFloat>(static_cast<Rep>(std::bit_cast<Rep>(value) | (static_cast<Rep>(1) << (Format::SignificandBits - 1))));
+}
+
+template<typename TFloat>
 TFloat GeneratedNan(TFloat result, TFloat a, TFloat b) {
+#if !defined(__x86_64__)
+    // SSE gives the first NaN operand, quieted; arm64 prefers a signalling NaN over a quiet one wherever it is.
+    if (IsNan(a)) return Quieted(a);
+    if (IsNan(b)) return Quieted(b);
+#endif
     return IsNan(result) && !IsNan(a) && !IsNan(b) ? QuietNan<TFloat>() : result;
 }
 
@@ -487,7 +505,9 @@ void DivideComplex(TFloat a, TFloat b, TFloat c, TFloat d, TFloat& real, TFloat&
 
 using ComplexFloat = __complex__ float;
 using ComplexDouble = __complex__ double;
+#if defined(__x86_64__)
 using ComplexExtended = __complex__ long double;
+#endif
 
 ComplexFloat MakeComplex(float real, float imaginary) {
     ComplexFloat result;
@@ -503,12 +523,14 @@ ComplexDouble MakeComplex(double real, double imaginary) {
     return result;
 }
 
+#if defined(__x86_64__)
 ComplexExtended MakeComplex(long double real, long double imaginary) {
     ComplexExtended result;
     __real__ result = real;
     __imag__ result = imaginary;
     return result;
 }
+#endif
 
 }
 
@@ -580,11 +602,11 @@ std::uint32_t APS5_VABI __fixunsdfsi_nid_postfix(double a) {
 
 std::uint64_t APS5_VABI __fixunsdfdi_nid_postfix(double a) { return FixUnsigned<std::uint64_t>(a); }
 Uint128 APS5_VABI __fixunsdfti_nid_postfix(double a) { return FixUnsigned<Uint128>(a); }
-std::int64_t APS5_VABI __fixxfdi_nid_postfix(long double a) { return FixExtendedSigned<std::int64_t>(a); }
-Int128 APS5_VABI __fixxfti_nid_postfix(long double a) { return FixExtendedSigned<Int128>(a); }
-std::uint32_t APS5_VABI __fixunsxfsi_nid_postfix(long double a) { return FixExtendedUnsigned<std::uint32_t>(a); }
-std::uint64_t APS5_VABI __fixunsxfdi_nid_postfix(long double a) { return FixExtendedUnsigned<std::uint64_t>(a); }
-Uint128 APS5_VABI __fixunsxfti_nid_postfix(long double a) { return FixExtendedUnsigned<Uint128>(a); }
+std::int64_t APS5_VABI __fixxfdi_nid_postfix(Extended a) { return FixExtendedSigned<std::int64_t>(a); }
+Int128 APS5_VABI __fixxfti_nid_postfix(Extended a) { return FixExtendedSigned<Int128>(a); }
+std::uint32_t APS5_VABI __fixunsxfsi_nid_postfix(Extended a) { return FixExtendedUnsigned<std::uint32_t>(a); }
+std::uint64_t APS5_VABI __fixunsxfdi_nid_postfix(Extended a) { return FixExtendedUnsigned<std::uint64_t>(a); }
+Uint128 APS5_VABI __fixunsxfti_nid_postfix(Extended a) { return FixExtendedUnsigned<Uint128>(a); }
 
 double APS5_VABI __floatsidf_nid_postfix(std::int32_t a) { return static_cast<double>(a); }
 double APS5_VABI __floatunsidf_nid_postfix(std::uint32_t a) { return static_cast<double>(a); }
@@ -592,16 +614,16 @@ float APS5_VABI __floatsisf_nid_postfix(std::int32_t a) { return RoundToFloat<fl
 float APS5_VABI __floatunsisf_nid_postfix(std::uint32_t a) { return RoundToFloat<float>(false, a); }
 double APS5_VABI __floatdidf_nid_postfix(std::int64_t a) { return static_cast<double>(a); }
 float APS5_VABI __floatdisf_nid_postfix(std::int64_t a) { return static_cast<float>(a); }
-long double APS5_VABI __floatdixf_nid_postfix(std::int64_t a) { return static_cast<long double>(a); }
+Extended APS5_VABI __floatdixf_nid_postfix(std::int64_t a) { return RoundToExtended(a < 0, Magnitude(a)); }
 double APS5_VABI __floatundidf_nid_postfix(std::uint64_t a) { return static_cast<double>(a); }
 float APS5_VABI __floatundisf_nid_postfix(std::uint64_t a) { return static_cast<float>(a); }
-long double APS5_VABI __floatundixf_nid_postfix(std::uint64_t a) { return static_cast<long double>(a); }
+Extended APS5_VABI __floatundixf_nid_postfix(std::uint64_t a) { return RoundToExtended(false, a); }
 double APS5_VABI __floattidf_nid_postfix(Int128 a) { return RoundToFloat<double>(a < 0, Magnitude(a)); }
 float APS5_VABI __floattisf_nid_postfix(Int128 a) { return RoundToFloat<float>(a < 0, Magnitude(a)); }
-long double APS5_VABI __floattixf_nid_postfix(Int128 a) { return RoundToExtended(a < 0, Magnitude(a)); }
+Extended APS5_VABI __floattixf_nid_postfix(Int128 a) { return RoundToExtended(a < 0, Magnitude(a)); }
 double APS5_VABI __floatuntidf_nid_postfix(Uint128 a) { return RoundToFloat<double>(false, a); }
 float APS5_VABI __floatuntisf_nid_postfix(Uint128 a) { return RoundToFloat<float>(false, a); }
-long double APS5_VABI __floatuntixf_nid_postfix(Uint128 a) { return RoundToExtended(false, a); }
+Extended APS5_VABI __floatuntixf_nid_postfix(Uint128 a) { return RoundToExtended(false, a); }
 
 __complex__ float APS5_VABI __mulsc3_nid_postfix(float a, float b, float c, float d) {
     float real, imaginary;
@@ -615,11 +637,17 @@ __complex__ double APS5_VABI __muldc3_nid_postfix(double a, double b, double c, 
     return MakeComplex(real, imaginary);
 }
 
+#if defined(__x86_64__)
 __complex__ long double APS5_VABI __mulxc3_nid_postfix(long double a, long double b, long double c, long double d) {
     long double real, imaginary;
     MultiplyComplex<long double, false>(a, b, c, d, real, imaginary);
     return MakeComplex(real, imaginary);
 }
+#else
+// The guest's _Complex long double result is two x87 values in st(0) and st(1), which the bridge does not place
+// (TechnicalDebt arm64-complex-long-double).
+void APS5_VABI __mulxc3_nid_postfix() { throw std::runtime_error("__mulxc3: _Complex long double results are not bridged on arm64"); }
+#endif
 
 __complex__ float APS5_VABI __divsc3_nid_postfix(float a, float b, float c, float d) {
     float real, imaginary;
@@ -633,11 +661,15 @@ __complex__ double APS5_VABI __divdc3_nid_postfix(double a, double b, double c, 
     return MakeComplex(real, imaginary);
 }
 
+#if defined(__x86_64__)
 __complex__ long double APS5_VABI __divxc3_nid_postfix(long double a, long double b, long double c, long double d) {
     long double real, imaginary;
     DivideComplex<long double, false>(a, b, c, d, real, imaginary);
     return MakeComplex(real, imaginary);
 }
+#else
+void APS5_VABI __divxc3_nid_postfix() { throw std::runtime_error("__divxc3: _Complex long double results are not bridged on arm64"); }
+#endif
 
 long double APS5_VABI __powixf2_nid_postfix(long double base, int exponent) {
     const bool reciprocal = exponent < 0;

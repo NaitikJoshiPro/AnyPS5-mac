@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -7,6 +8,7 @@
 #include <limits>
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/X87Extended.hpp"
 
 namespace {
 
@@ -26,9 +28,14 @@ struct ExtendedBits {
     std::uint16_t signExponent;
 };
 
-ExtendedBits Bits(const long double& value) {
+// The guest's long double, the x87 80-bit format: the host's own on x86-64, its bits on arm64 (whose long double
+// is a double), so the classification exports see the guest's exact value there too.
+using Extended = GuestLongDouble;
+
+ExtendedBits Bits(const Extended& value) {
+    static_assert(sizeof(Extended) == 16);
     ExtendedBits bits;
-    unsigned char bytes[sizeof(long double)];
+    unsigned char bytes[sizeof(Extended)];
     std::memcpy(bytes, &value, sizeof(bytes));
     std::memcpy(&bits.mantissa, bytes, sizeof(bits.mantissa));
     std::memcpy(&bits.signExponent, bytes + 8, sizeof(bits.signExponent));
@@ -119,10 +126,17 @@ long double APS5_VABI logbl_nid_postfix(long double x) {
     return std::logb(x);
 }
 
-int APS5_VABI ilogbl_nid_postfix(long double x) {
-    if ((Bits(x).signExponent & 0x7fff) == 0x7fff) return INT_MAX;
+int APS5_VABI ilogbl_nid_postfix(Extended x) {
+    const ExtendedBits bits = Bits(x);
+    const int exponent = bits.signExponent & 0x7fff;
+    if (exponent == 0x7fff) return INT_MAX;
+#if defined(__x86_64__)
     ErrnoGuard guard;
     return std::ilogb(x);
+#else
+    if (bits.mantissa == 0) return INT_MIN;
+    return (exponent == 0 ? 1 : exponent) - 16383 - std::countl_zero(bits.mantissa);
+#endif
 }
 
 long double APS5_VABI rintl_nid_postfix(long double x) { return std::rint(x); }
@@ -147,12 +161,20 @@ long double APS5_VABI sqrtl_nid_postfix(long double x) {
     return std::sqrt(x);
 }
 
-long double APS5_VABI modfl_nid_postfix(long double x, long double* integral) {
+long double APS5_VABI modfl_nid_postfix(long double x, Extended* integral) {
+#if defined(__x86_64__)
     if (std::isnan(x)) {
         *integral = x;
         return x;
     }
     return std::modf(x, integral);
+#else
+    // The guest's integral part is an x87 value in its memory; x arrives as a double (the bridge's conversion).
+    long double whole = x;
+    const long double fraction = std::isnan(x) ? x : std::modf(x, &whole);
+    *integral = GuestLongDoubleFromDouble(static_cast<double>(whole));
+    return fraction;
+#endif
 }
 long double APS5_VABI nanl_nid_postfix(const char*) { return std::numeric_limits<long double>::quiet_NaN(); }
 
@@ -239,23 +261,23 @@ float APS5_VABI scalbf_nid_postfix(float x, float exponent) {
 int APS5_VABI finite_nid_postfix(double x) { return std::isfinite(x) ? 1 : 0; }
 int APS5_VABI finitef_nid_postfix(float x) { return std::isfinite(x) ? 1 : 0; }
 
-int APS5_VABI __fpclassifyl_nid_postfix(long double x) {
+int APS5_VABI __fpclassifyl_nid_postfix(Extended x) {
     const ExtendedBits bits = Bits(x);
     if ((bits.signExponent & 0x7fff) != 0 || bits.mantissa == 0) return TestExtended(bits);
     return Denormal;
 }
-int APS5_VABI __isinfl_nid_postfix(long double x) { return TestExtended(Bits(x)) == Infinite ? 1 : 0; }
-int APS5_VABI __isnanl_nid_postfix(long double x) { return TestExtended(Bits(x)) == NotANumber ? 1 : 0; }
+int APS5_VABI __isinfl_nid_postfix(Extended x) { return TestExtended(Bits(x)) == Infinite ? 1 : 0; }
+int APS5_VABI __isnanl_nid_postfix(Extended x) { return TestExtended(Bits(x)) == NotANumber ? 1 : 0; }
 
-int APS5_VABI __isnormall_nid_postfix(long double x) {
+int APS5_VABI __isnormall_nid_postfix(Extended x) {
     const int exponent = Bits(x).signExponent & 0x7fff;
     return exponent != 0 && exponent != 0x7fff ? 1 : 0;
 }
 
-short APS5_VABI _LDtest_nid_postfix(const long double* value) { return TestExtended(Bits(*value)); }
+short APS5_VABI _LDtest_nid_postfix(const Extended* value) { return TestExtended(Bits(*value)); }
 int APS5_VABI _Dclass_nid_postfix(double x) { return TestFloat(x); }
 int APS5_VABI _FDclass_nid_postfix(float x) { return TestFloat(x); }
-int APS5_VABI _LDclass_nid_postfix(long double x) { return TestExtended(Bits(x)); }
-short APS5_VABI _LDsign_nid_postfix(long double x) { return static_cast<short>(Bits(x).signExponent & 0x8000); }
+int APS5_VABI _LDclass_nid_postfix(Extended x) { return TestExtended(Bits(x)); }
+short APS5_VABI _LDsign_nid_postfix(Extended x) { return static_cast<short>(Bits(x).signExponent & 0x8000); }
 
 }

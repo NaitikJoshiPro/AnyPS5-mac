@@ -253,6 +253,13 @@ class GeneratorTests(unittest.TestCase):
                                   capture_output=True, text=True)
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
+    def test_complex_long_double_is_unclassified(self):
+        source = self.root / "core" / "libs" / "prx" / "libprobe" / "Export.cpp"
+        source.write_text(SOURCE + 'extern "C" __complex__ long double ProbeComplex_nid_postfix(long double value) { return value; }\n')
+        _, document = self.generate()
+        self.assertTrue(any("ProbeComplex_nid_postfix: cannot classify _Complex long double" in problem
+                            for problem in document["problems"]), document["problems"])
+
     def test_unparsable_unit_fails(self):
         source = self.root / "core" / "libs" / "prx" / "libprobe" / "Export.cpp"
         source.write_text(SOURCE + "UnknownType ProbeBroken();\n")

@@ -322,7 +322,8 @@ constexpr VariadicExport VariadicExports[] = {
     {"_fcntl_nid_postfix", Integers, 2},
 };
 
-constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix"};
+constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix", "__floatdixf_nid_postfix",
+                                           "__floatundixf_nid_postfix", "__floattixf_nid_postfix", "__floatuntixf_nid_postfix"};
 
 template <std::size_t... Sizes>
 constexpr std::array<std::uint8_t, (Sizes + ...)> Join(const std::array<std::uint8_t, Sizes>&... parts) {

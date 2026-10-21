@@ -412,6 +412,9 @@ class UnitReader:
                     "element": LEAF_KINDS.get(element["kind"], "int"), "count": count}
         if kind == TYPE_COMPLEX:
             element = self.value(clang.getElementType(canonical), CALLBACK_DEPTH)
+            if element["kind"] == "long double":
+                # The guest's is two x87 values: 32 bytes in memory, a result in st(0) and st(1) (COMPLEX_X87).
+                raise Unclassified(f"{spelling}: its long double parts differ in size between the guest and arm64")
             leaf, part = LEAF_KINDS[element["kind"]], element["size"]
             return {"kind": "record", "type": spelling, "size": size, "align": align, "indirect": False, "union": False,
                     "leaves": [[0, leaf, part, element["align"]], [part, leaf, part, element["align"]]]}
