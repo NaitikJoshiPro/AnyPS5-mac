@@ -9,6 +9,7 @@
 // one-layer 2D array views, the replaced-view refusal, the two-layer and base-slice layer-pitch refusals (upstream
 // 696d1660c dd7d649c3), a store back of a storage image the surface did not hand out (a84afe931) and
 // MetalRunPairings, upstream's RunPairings: a store back goes into the newest pairing of the plane (b3e5acc8c).
+// Upstream sync 6 (6b6c701636): MetalDepthCopyCase, upstream's DepthCopyCase (DB depth copies, see there).
 
 #define main AgcDriverDepthStorageVulkanMain
 #include "../../../tests/execution/DepthStorage.cpp"
@@ -168,6 +169,68 @@ void MetalRunPairings(Context context, std::uint8_t* block) {
     recorder.Sync();
 }
 
+// Upstream DepthCopyCase (191c8a8d2b 120900a342 223e90289b 67cea1c314): a DB depth copy (RunDepthCopyPass) of
+// each sample of a cleared depth surface into an R32 float color target reaches guest memory exactly, its
+// refusals (no surface, a sample past the last, another extent) are upstream's. Device differences: every
+// Metal depth surface is shader-readable, so the sample counts are 2, 4 and 8 (8 is two 4x slices on Apple9,
+// DECISIONS D28, which exercises the slice addressing) and upstream's unsampleable two-sample refusal
+// (67cea1c314) has no Metal case; submit is Submit then Recorder::Sync.
+void MetalDepthCopyCase(Context context, std::uint8_t* block) {
+    const auto colorAddress = reinterpret_cast<std::uint64_t>(block);
+    const auto depthAddress = colorAddress + BlockBytes / 4;
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto submit = [&] {
+        recorder.Submit();
+        recorder.Sync();
+    };
+    ColorTarget color{};
+    color.address = colorAddress;
+    color.surfaceAddress = colorAddress;
+    color.extent = {Side, Side};
+    color.surfaceExtent = color.extent;
+    color.format = VK_FORMAT_R32_SFLOAT;
+    color.elementBytes = 4;
+    color.tileMode = ColorTileMode::RenderTarget;
+    color.bytes = ColorTargetLayout(Side, Side, ColorTileMode::RenderTarget, 4).Bytes();
+    const auto copy = [&](std::uint32_t samples, std::uint32_t sample, VkExtent2D extent) {
+        RunDepthCopyPass(context, DepthCopyPass{depthAddress, extent, samples, sample, color});
+        submit();
+        const auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+        resident->MarkDirty();
+        resident->WriteBack();
+        submit();
+    };
+    const auto countBlock = [&](float value) {
+        std::size_t count = 0;
+        for (std::size_t offset = 0; offset < BlockBytes; offset += sizeof(float)) {
+            float texel = 0;
+            std::memcpy(&texel, block + offset, sizeof(texel));
+            if (texel == value) ++count;
+        }
+        return count;
+    };
+    std::fill(block, block + BlockBytes, std::uint8_t{0});
+    ExpectFailure([&] { copy(1, 0, {Side, Side}); }, "no draw rendered", "a DB depth copy from memory without a depth surface was accepted");
+    for (const std::uint32_t samples : {2u, 4u, 8u}) {
+        Require(DepthSurfaceView(context, DepthTarget{depthAddress, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 0.375f, 0, 0, false, samples}) != VK_NULL_HANDLE, "the multisample depth surface was not created");
+        for (std::uint32_t sample = 0; sample < samples; ++sample) {
+            std::fill(block, block + BlockBytes, std::uint8_t{0});
+            copy(samples, sample, {Side, Side});
+            Require(countBlock(0.375f) == Side * Side, "the DB depth copy of sample " + std::to_string(sample) + " of " + std::to_string(samples) + " did not store the cleared depth in every texel of the R32 float target");
+        }
+        ExpectFailure([&] { copy(samples, samples, {Side, Side}); }, "does not have", "a DB depth copy of a sample past the last of a multisample surface was accepted");
+        ExpectFailure([&] { copy(samples, 0, {Side / 2, Side / 2}); }, "of another size", "a DB depth copy of another extent than the depth surface was accepted");
+        ClearDepthSurfaces(context.device);
+    }
+    Require(DepthSurfaceView(context, DepthTarget{depthAddress, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 0.625f, 0, 0, false, 1}) != VK_NULL_HANDLE, "the one-sample depth surface was not created");
+    std::fill(block, block + BlockBytes, std::uint8_t{0});
+    copy(1, 0, {Side, Side});
+    Require(countBlock(0.625f) == Side * Side, "the DB depth copy of a one-sample depth surface did not store the cleared depth in every texel of the R32 float target");
+    ExpectFailure([&] { copy(1, 1, {Side, Side}); }, "does not have", "a DB depth copy of a second sample of a one-sample surface was accepted");
+    recorder.Sync();
+}
+
 }
 
 // upstream main with the Metal device.
@@ -180,6 +243,11 @@ int main() {
         {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             MetalDepthStorageTwin::MetalRun(context, block);
+            auto* copyBlock = CopyStorage.data() + (BlockBytes - reinterpret_cast<std::uintptr_t>(CopyStorage.data()) % BlockBytes) % BlockBytes;
+            GuestAllocations::Mutation().Add(copyBlock, BlockBytes, true, true, true);
+            MetalDepthStorageTwin::MetalDepthCopyCase(context, copyBlock);
+            ClearCachedTextures(context.device);
+            GuestAllocations::Mutation().Remove(copyBlock);
             ClearDepthSurfaces(context.device);
             MetalDepthStorageTwin::MetalRunPairings(context, block);
             ClearDepthSurfaces(context.device);
