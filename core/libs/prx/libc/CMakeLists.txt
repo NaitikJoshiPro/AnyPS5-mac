@@ -716,7 +716,14 @@ if(BUILD_TESTING)
     target_include_directories(unwind_callback_abi_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(unwind_callback_abi_tests PRIVATE libc)
     configure_windows_unwind(unwind_callback_abi_tests)
-    foreach(callback IN ITEMS backtrace forced_unwind delete_exception end_catch end_catch_gnu)
+    # backtrace and forced_unwind walk the host program's own frames with libc's unwinder, which on the arm64 host
+    # walks the guest's x86 frames through the runner's register hooks (LibcCaptureRegisters) and has no arm64 frames
+    # to walk; a host program there has no hooks (TechnicalDebt: arm64 host-native unwinder tests).
+    set(unwind_callbacks delete_exception end_catch end_catch_gnu)
+    if(NOT (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+        list(PREPEND unwind_callbacks backtrace forced_unwind)
+    endif()
+    foreach(callback IN LISTS unwind_callbacks)
         add_test(NAME unwind_callback_abi_${callback} COMMAND unwind_callback_abi_tests ${callback})
         if(WIN32)
             set_tests_properties(unwind_callback_abi_${callback} PROPERTIES ENVIRONMENT_MODIFICATION
