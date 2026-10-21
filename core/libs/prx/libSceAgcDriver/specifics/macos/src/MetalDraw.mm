@@ -1953,11 +1953,26 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
         Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, 1u, destination.arraySlice));
         return;
     }
+    if (pass.mode == Graphics::ColorMetadataPass::Mode::FmaskDecompress) {
+        // Upstream Draw.cpp RunColorMetadataPass: an FMASK decompress expands a pending CMASK fast
+        // clear into the target's multisample host image.
+        const auto* imageContext = state->images->ImageContext();
+        if (imageContext == nullptr) Fail("a CB FMASK decompress without the device's image context");
+        for (const auto& color : pass.targets) Graphics::MaterializeMultisampleTargetClear(*imageContext, color);
+        return;
+    }
     // DCC targets (upstream Draw.cpp RunColorMetadataPass): fast-clear keys store the clear texel and comp-to-single
     // keys each block's first texel in guest memory, and the keys are left uncompressed, exactly as before a draw
     // (MaterializeDcc). The image cache's resident image of the target, if any, reloads from guest memory.
     const auto* imageContext = state->images->ImageContext();
     for (const auto& color : pass.targets) {
+        // A multisampled target is its host image (as in a draw above): its guest memory holds no
+        // samples, so the pass expands the pending CMASK clear into the host image instead.
+        if (color.samples > 1u) {
+            if (imageContext == nullptr) Fail("a CB metadata pass over a multisampled target without the device's image context");
+            Graphics::MaterializeMultisampleTargetClear(*imageContext, color);
+            continue;
+        }
         std::shared_ptr<Graphics::StorageTexture> resident;
         if (color.tileMode != Graphics::ColorTileMode::Linear && imageContext != nullptr) {
             resident = Graphics::CachedStorageSurface(*imageContext, Graphics::SurfaceForTarget(color));
