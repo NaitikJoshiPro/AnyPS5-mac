@@ -133,9 +133,13 @@ inline void PreciseSpinPause() {
 
 inline std::uint64_t PreciseMonotonicNanos() {
 #ifdef __APPLE__
-    // CLOCK_MONOTONIC has microsecond resolution on macOS, so a deadline taken from it ends up to 1 us before the
-    // same deadline on std::chrono::steady_clock; CLOCK_UPTIME_RAW is the nanosecond clock steady_clock reads.
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    // PreciseSleepUntil compares these nanoseconds with std::chrono::steady_clock deadlines, so read that clock
+    // itself. Which Mach clock libc++ uses differs between releases (CLOCK_UPTIME_RAW in older ones,
+    // CLOCK_MONOTONIC_RAW in newer ones); the two differ by the time the Mac has spent asleep, which turned a
+    // 50 us wait into a sleep of hours. CLOCK_MONOTONIC has only microsecond resolution on macOS.
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 #else
     struct timespec ts;
 #if defined(__APPLE__) && defined(_LIBCPP_VERSION) && defined(CLOCK_MONOTONIC_RAW)
