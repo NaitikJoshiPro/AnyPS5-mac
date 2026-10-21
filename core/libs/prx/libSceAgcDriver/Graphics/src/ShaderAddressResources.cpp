@@ -149,6 +149,11 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
 VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
     if (allocation.guest) return guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment);
     if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+#if defined(__APPLE__)
+        // The Metal device encodes buffer tables from the guest V#s (MetalDevice.mm: a null V#'s entry stays
+        // empty and accesses nothing), never from these descriptor infos, so a null V# needs no placeholder.
+        if (context.emptyBuffer == VK_NULL_HANDLE) return {VK_NULL_HANDLE, 0, allocation.size};
+#endif
         Require(context.emptyBuffer != VK_NULL_HANDLE, "no placeholder buffer for a null V#");
         return {context.emptyBuffer, 0, allocation.size};
     }
