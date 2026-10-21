@@ -1832,11 +1832,35 @@ int APS5_VABI sceNetInetPton(int af, const char* src, void* dst) {
     }
     const std::string text = af == NET_AF_INET ? std::string(src, std::strcspn(src, " \t\n\v\f\r")) : std::string(src);
     std::array<unsigned char, 16> address{};
+    int converted = 0;
+    if (af == NET_AF_INET) {
+        // Four dotted decimal octets, no leading zeros: the host parsers disagree here (macOS accepts "01.2.3.4").
+        std::size_t at = 0;
+        converted = 1;
+        for (int octet = 0; octet < 4 && converted == 1; ++octet) {
+            if (octet > 0 && (at >= text.size() || text[at++] != '.')) {
+                converted = 0;
+                break;
+            }
+            const std::size_t first = at;
+            unsigned value = 0;
+            while (at < text.size() && text[at] >= '0' && text[at] <= '9' && at - first < 3) {
+                value = value * 10 + static_cast<unsigned>(text[at++] - '0');
+            }
+            if (at == first || value > 255 || (text[first] == '0' && at - first > 1)) {
+                converted = 0;
+            } else {
+                address[octet] = static_cast<unsigned char>(value);
+            }
+        }
+        if (at != text.size()) converted = 0;
+    } else {
 #ifdef _WIN32
-    const int converted = InetPtonA(af == NET_AF_INET ? AF_INET : AF_INET6, text.c_str(), address.data());
+        converted = InetPtonA(AF_INET6, text.c_str(), address.data());
 #else
-    const int converted = ::inet_pton(af == NET_AF_INET ? AF_INET : AF_INET6, text.c_str(), address.data());
+        converted = ::inet_pton(AF_INET6, text.c_str(), address.data());
 #endif
+    }
     if (converted == 1) {
         std::memcpy(dst, address.data(), af == NET_AF_INET ? 4 : 16);
     }
