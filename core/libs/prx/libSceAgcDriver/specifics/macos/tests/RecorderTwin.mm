@@ -43,6 +43,10 @@ constexpr Mode Modes[] = {
     // Upstream 0d078f75d3 (UPSYNC3 round 3) modes: --device-selection-only and --sampled-storage-base-level-usage-only
     // are ported in Upsync3RecorderModesD.mm, --host-import-lifetime-only and --host-import-mutation-race-only in
     // HostImportLifetimeTwin.mm (the twin of tests/HostImportLifetime.cpp).
+    // Upstream 6b6c701636 (UPSYNC5) modes: --queued-write-groups-only gains QueuedWriteOrder's checks (eef987ae7b,
+    // Upsync3RecorderModesA.mm) and --idle-publish-wait-only (db3af40970) is ported in D3RecorderModes.mm. The DCC
+    // clear-key hand-over (92063916d2, b176274da1) belongs to the Texture twin's port.
+    {"--clear-hand-over-only", "agc_storage_clear_hand_over", "UPSYNC5 Texture (DCC clear-key hand-over, 92063916d2/b176274da1)", nullptr},
     {"--draw-descriptors-only", "agc_draw_descriptors", nullptr,
      "skipped, the device writes no Vulkan descriptor sets: the checks count vkUpdateDescriptorSets writes per set, and Metal descriptor tables are written into the per-batch upload ring"},
     // Modes upstream registers only under if(WIN32) (Windows host import settles, write-watch probes and mappings);
@@ -65,6 +69,14 @@ constexpr Mode Modes[] = {
      "skipped, a Windows-only mode (upstream registers agc_storage_cpu_snapshot under if(WIN32))"},
     {"--host-import-second-mapping-only", "agc_host_import_second_mapping (Windows only)", nullptr,
      "skipped, a Windows-only mode (upstream registers agc_host_import_second_mapping under if(WIN32))"},
+    {"--reimport-bench", "agc_reimport_bench (Windows only)", nullptr,
+     "skipped, a Windows-only mode (upstream registers agc_reimport_bench under if(WIN32))"},
+    {"--host-import-cut-only", "agc_host_import_cut_lifetime (Windows only)", nullptr,
+     "skipped, a Windows-only mode (upstream registers agc_host_import_cut_lifetime under if(WIN32), a9b14023dd)"},
+    {"--partial-watch-restoration-only", "agc_partial_watch_restoration (Windows only)", nullptr,
+     "skipped, a Windows-only mode (upstream registers agc_partial_watch_restoration under if(WIN32), 823c6a55e1)"},
+    {"--host-import-lifetime-other-family-only", "agc_driver_host_import_lifetime_other_family (Windows only)", nullptr,
+     "skipped, a Windows-only mode: host import lifetimes on another queue family exist only for Windows host imports (8a1e737182)"},
 };
 
 }
