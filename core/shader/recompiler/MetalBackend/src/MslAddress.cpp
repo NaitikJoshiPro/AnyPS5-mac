@@ -403,6 +403,7 @@ void StoreAddress(MslEmitterState& state, const IrValue& instruction, std::uint3
     const auto lane = MslUniformStoreLane(state, instruction, 0u, 2u);
     state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
+    state.reflection.storesThroughAddresses = true;
     const auto access = Prepare(state, instruction, memory);
     const auto address = GuestAddress(state, instruction, memory, access);
     const auto data = "uint(" + state.Arg(instruction, instruction.ArgumentCount() - 2u) + ")";
@@ -424,6 +425,7 @@ void StoreAddressWide(MslEmitterState& state, const IrValue& instruction, std::u
     const auto lane = MslUniformStoreLane(state, instruction, 0u, 2u);
     state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
+    state.reflection.storesThroughAddresses = true;
     const auto access = Prepare(state, instruction, memory);
     const auto base = GuestAddressBase(state, instruction, memory, access);
     const auto data = state.Arg(instruction, instruction.ArgumentCount() - 2u);
@@ -532,6 +534,7 @@ void AddressAtomic64(MslEmitterState& state, const IrValue& instruction, MslAtom
     state.RequirePrelude(MslPreludeChunk::Atomics64);
     const auto global = [&] {
         const auto physical = state.Temporary("aps5_pa");
+        state.reflection.storesThroughAddresses = true;
         state.Line("const ulong " + physical + " = aps5_bda_atomic_address(" + access.bda + ", " + address + ", 8u, 2u, " + access.pc + ");");
         state.Line("if (" + physical + " != 0ul) {");
         state.Indent();
@@ -589,6 +592,7 @@ void AddressAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomic
         // EmitBdaAtomic: the element must be aligned and mapped writable; the store is noted for
         // write-back.
         const auto physical = state.Temporary("aps5_pa");
+        state.reflection.storesThroughAddresses = true;
         state.Line("const ulong " + physical + " = aps5_bda_atomic_address(" + access.bda + ", " + address + ", 4u, 2u, " + access.pc + ");");
         state.Line("if (" + physical + " != 0ul) {");
         state.Indent();

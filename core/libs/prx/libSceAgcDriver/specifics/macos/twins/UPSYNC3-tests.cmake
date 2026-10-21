@@ -26,11 +26,11 @@ list(APPEND agcMetalTwins
         "tests/PresentationPass.cpp=specifics/macos/tests/PresentationPassTwin.mm"
         # Third round: upstream execution tests of Vulkan-only behaviour (DCC key presync and resource cache growth of
         # stage-A dispatch preparation, the pipeline journal) or of Metal driver features not written yet
-        # (render pass totals, GPU indirect draws): PendingTwins.mm skips each with its reason.
+        # (GPU indirect draws): PendingTwins.mm skips each with its reason. tests/execution/AddressPasses.cpp runs
+        # unchanged since SKIPFIX5 (MetalDraw.mm reports Graphics::DrawPassTotals).
         "tests/execution/DccKeyPresync.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/ResourceCacheGrowth.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/PipelineJournal.cpp=specifics/macos/tests/PendingTwins.mm"
-        "tests/execution/AddressPasses.cpp=specifics/macos/tests/PendingTwins.mm"
         "tests/execution/RectListIndirect.cpp=specifics/macos/tests/PendingTwins.mm"
         # Third round: Vulkan fault-injection tests (command batch submit/fence failures, descriptor layout/pool failures).
         "tests/CommandBatch.cpp=specifics/macos/tests/PendingTwins.mm"

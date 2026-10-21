@@ -502,6 +502,7 @@ void encodeMsl(Writer& writer, const SharedMsl& msl) {
     writer.Value(reflection.perVertexLocations);
     writer.Value(reflection.emulatedBarycentrics);
     writer.Value(reflection.cullDistances);
+    writer.Value(reflection.storesThroughAddresses);
 }
 
 void decodeMsl(Reader& reader, SharedMsl& msl) {
@@ -544,6 +545,7 @@ void decodeMsl(Reader& reader, SharedMsl& msl) {
     reader.Value(reflection.perVertexLocations);
     reader.Value(reflection.emulatedBarycentrics);
     reader.Value(reflection.cullDistances);
+    reader.Value(reflection.storesThroughAddresses);
     msl = SharedMsl(std::move(shader));
 }
 

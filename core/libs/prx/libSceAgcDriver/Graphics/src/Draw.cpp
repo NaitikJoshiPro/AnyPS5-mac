@@ -878,6 +878,19 @@ std::array<DrawPassCounts, 2> DrawPassTotals() {
     return stats.passTotals;
 }
 
+void CountDrawPass(bool addressDraw, bool passBegun, bool keyStoresFlushed, bool storesFlushed) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& stats = Profile();
+    std::lock_guard lock(stats.mutex);
+    ++(passBegun ? stats.passesBegun : stats.passesContinued);
+    auto& totals = stats.passTotals[addressDraw ? 1 : 0];
+    ++totals.draws;
+    ++(passBegun ? totals.passesBegun : totals.passesContinued);
+    if (keyStoresFlushed) ++totals.keyStoreFlushes;
+    if (storesFlushed) ++totals.storeFlushes;
+}
+
 void CountDrawSkip(DrawSkip kind, double us) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;

@@ -1369,6 +1369,22 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     access.writes = passWrites;
     access.anyReads = !passReads.empty();
     access.anyWrites = !passWrites.empty();
+    // Upstream b3e94a514 (Graphics/src/Draw.cpp): a draw that reaches guest memory through the BDA
+    // page table touches memory no range lists. It reads unknown memory; it writes unknown memory
+    // when one of its functions stores or runs atomics through guest addresses
+    // (Reflection::storesThroughAddresses), or always under APS5_NO_ADDRESS_READ_PASSES. Draws that
+    // only read through the table thus share a pass, and a store through it begins one.
+    bool addressDraw = false;
+    bool storesThroughAddresses = false;
+    for (const auto* plan : plans) addressDraw = addressDraw || plan->addressBased;
+    for (const auto* program : {&vertexResult, fragmentResult, tess ? tessellation->local->program : nullptr, tess ? tessellation->hull->program : nullptr}) {
+        if (program != nullptr && !program->msl.empty()) storesThroughAddresses = storesThroughAddresses || program->msl.Reflection().storesThroughAddresses;
+    }
+    static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
+    if (addressDraw) {
+        access.anyReads = true;
+        access.anyWrites = access.anyWrites || storesThroughAddresses || !addressReadPasses;
+    }
     auto held = std::make_shared<Held>();
     std::uint64_t recorded = 0;
     bool anyContinued = false;
@@ -1772,6 +1788,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
     for (std::uint32_t index = 0; index < slices; ++index) recordSlice((firstSlice + index) % slices);
     if (slices > 1u) emulatedDraws.fetch_add(1u, std::memory_order_relaxed);
+    // Graphics::DrawPassTotals (APS5_PROFILE_DRAW), split by address-based draws as upstream's.
+    Graphics::CountDrawPass(addressDraw, !anyContinued);
 
     // Resident targets: the results stay on the GPU until something reads the target's memory.
     for (const auto& attachment : colors) {

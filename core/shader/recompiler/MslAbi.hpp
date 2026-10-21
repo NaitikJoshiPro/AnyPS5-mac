@@ -621,6 +621,11 @@ struct Reflection {
     // CullPointsMacro, and refuses lines (Metal has no cull distances; the emulation needs every
     // vertex of the primitive).
     std::uint32_t cullDistances = 0;
+    // The function stores or runs atomics through guest addresses (flat/global stores and atomics,
+    // buffer stores and atomics through a V# read from GPU memory): the BDA page table's writes. The
+    // Metal draw path keeps draws that only read through addresses in one render pass (upstream
+    // b3e94a514, Graphics/src/ShaderAddressResources.cpp's SpirvStoresThroughAddresses).
+    bool storesThroughAddresses = false;
 
     bool operator==(const Reflection& other) const = default;
 };

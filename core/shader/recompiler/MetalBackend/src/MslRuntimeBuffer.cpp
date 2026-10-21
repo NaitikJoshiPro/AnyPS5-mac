@@ -841,6 +841,7 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t com
     state.Line("if (" + ActiveArgument(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
     const auto descriptor = MakeDescriptor(state, instruction, false);
+    if (descriptor.gpu) state.reflection.storesThroughAddresses = true;
     const auto stop = state.Temporary("aps5_st");
     state.Line("bool " + stop + " = false;");
     if (memory.formatted) {
@@ -1082,6 +1083,7 @@ void BufferAtomic(MslEmitterState& state, const IrValue& instruction, MslAtomicO
     state.Line("if (" + active + ") {");
     state.Indent();
     const auto descriptor = MakeDescriptor(state, instruction, true);
+    if (descriptor.gpu) state.reflection.storesThroughAddresses = true;
     const auto access = state.Temporary("aps5_a");
     state.Line("const Aps5BufferAccess " + access + " = " + AccessExpression(state, instruction, descriptor, 0u, bytes) + ";");
     state.Line("if (" + access + ".inBounds) {");
