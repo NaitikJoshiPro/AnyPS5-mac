@@ -611,7 +611,13 @@ void testSmallCopyBehindPendingSource() {
     AgcDriverWaitIdle_nid_postfix();
     check(std::equal(hostDestination.begin(), hostDestination.end(), produced), "a small copy into memory that is not imported did not see the GPU copy into its source");
     check(AgcDriver::DriverDetail::copiesBehindPendingSources.load() == hostCopies, "a small copy into memory that is not imported was recorded on the GPU");
+#if !defined(__APPLE__)
+    // Vulkan-internal: AliasCopy's no-source-image count; the Metal device has no alias copy (CopyAliasCounts is
+    // all zeros, TechnicalDebt metal-vulkan-internal-tests); the check above carries the behaviour.
     check(AgcDriver::VulkanDevice::CopyAliasCounts().noSource == aliasChecks + 1, "a small copy into memory that is not imported went through the GPU copy before its CPU path");
+#else
+    (void)aliasChecks;
+#endif
     GuestHeap::GuestHeapFree_nid_postfix(destination);
     GuestHeap::GuestHeapFree_nid_postfix(source);
     GuestHeap::GuestHeapFree_nid_postfix(produced);

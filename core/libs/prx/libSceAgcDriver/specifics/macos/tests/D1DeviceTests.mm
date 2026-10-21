@@ -475,7 +475,9 @@ void CheckResidency(AgcDriver::VulkanDevice& device) {
 // as on upstream's Vulkan device. A heap growing 16 KiB at a time re-imported the whole chain at every
 // growth before (SuperTuxKart: 106 GB of imports in 60 s, ~20 GiB of retired no-copy buffers in one
 // batch's residency, which Metal refused at commit with MTL4CommandQueueErrorTimeout). A retired
-// import's bytes now also count against the open batch's kept-byte budget.
+// import's bytes now also count against the open batch's kept-byte budget. Upstream a24aafb75c joins
+// adjacent ranges inside a window as aligned power-of-two blocks whose edges are range edges, so the
+// next window's 64 ranges (1 MiB from its aligned base) are one block.
 void CheckImportWindow(AgcDriver::VulkanDevice& device) {
     namespace Graphics = AgcDriver::Graphics;
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
@@ -518,7 +520,8 @@ void CheckImportWindow(AgcDriver::VulkanDevice& device) {
         joined = Graphics::HostImportFor(context, base, 16);
         next = Graphics::HostImportFor(context, base + window, 16);
         Require(joined != nullptr && joined->base == base && joined->bytes == window, "import window: a full 8 MiB window is not one import (" + std::to_string(joined != nullptr ? joined->bytes : 0) + " bytes)");
-        Require(next != nullptr && next->base == base + window && next->bytes == piece, "import window: a range of the next, partly filled window joined a span (" + std::to_string(next != nullptr ? next->bytes : 0) + " bytes)");
+        constexpr std::size_t tail = (pieces - window / piece) * piece;
+        Require(next != nullptr && next->base == base + window && next->bytes == tail, "import window: the next window's ranges did not join as one aligned power-of-two block inside the window (" + std::to_string(next != nullptr ? next->bytes : 0) + " bytes)");
         keptAfter = recorder->OpenKeptBytes();
     }
     // Unbounded spans re-import the front's whole chain at each growth: ~pieces^2 / 2 * 16 KiB (> 2 GiB).

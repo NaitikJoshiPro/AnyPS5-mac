@@ -1086,7 +1086,7 @@ void ShaderStageTests() {
         lines.context[0x2ce] = 5;
         for (const auto output : {3u, 0x80000001u, 0x101u}) {
             lines.context[0x29b] = output;
-            expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a point list or line strip from a geometry program, is unsupported");
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a point list or line strip from a geometry program, or a rect list from a vertex program, is unsupported");
         }
         lines.userConfig[0x242] = 4;
         lines.context[0x205] = 0x2a40;
@@ -1170,8 +1170,9 @@ void ShaderStageTests() {
             queue.context[0x2db] = parameters;
             const auto decoded = AgcDriver::Graphics::DecodeState(queue, false, all).stages.tessellation;
             Require(decoded && decoded->domain == domain && decoded->partitioning == partitioning && decoded->outputTopology == topology, "a tessellation configuration the target supports decoded differently");
-            // The reference path (upstream #4082) takes triangle and quad domains, fractional_odd, cw and ccw.
-            const bool reference = (domain == 1 || domain == 2) && partitioning == 2 && (topology == 2 || topology == 3);
+            // The reference path (upstream #4082) takes triangle and quad domains, integer, fractional_odd and
+            // fractional_even partitioning (State.cpp), cw and ccw.
+            const bool reference = (domain == 1 || domain == 2) && (partitioning == 0 || partitioning == 2 || partitioning == 3) && (topology == 2 || topology == 3);
             if (reference) Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation.has_value(), "the reference path refused a configuration it supports");
             else expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "only triangle and quad domains");
         }
@@ -1298,9 +1299,9 @@ void NggVertexWorkgroupTests() {
     }
     queue.context[0x2d5] = 0x12010;
     queue.context[0x29b] = 1;
-        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a point list or line strip from a geometry program, is unsupported");
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a point list or line strip from a geometry program, or a rect list from a vertex program, is unsupported");
     queue.context[0x29b] = 0;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a point list or line strip from a geometry program, is unsupported");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, a point list or line strip from a geometry program, or a rect list from a vertex program, is unsupported");
 }
 
 constexpr std::array<std::uint8_t, 8> IdentityExports{0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u};
