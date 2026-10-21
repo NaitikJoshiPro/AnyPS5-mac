@@ -400,8 +400,22 @@ void StoreAddress(MslEmitterState& state, const IrValue& instruction, std::uint3
         return;
     }
     if (memory.kind != ResourceKind::Flat && memory.kind != ResourceKind::Global) state.Fail(instruction, "must write a scratch or physical address resource");
+    // A wave-uniform store narrows to the highest active lane in the shared and global arms only:
+    // the private (scratch) aperture is per invocation, so every active lane writes its own copy
+    // (as per-invocation LDS in MslMemory.cpp Store). The ballot runs before any branch.
     const auto lane = MslUniformStoreLane(state, instruction, 0u, 2u);
-    state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
+    const auto uniformLane = [&](auto&& store) {
+        if (lane.empty()) {
+            store();
+            return;
+        }
+        state.Line("if (" + lane + ") {");
+        state.Indent();
+        store();
+        state.Outdent();
+        state.Line("}");
+    };
+    state.Line("if (" + Active(state, instruction) + ") {");
     state.Indent();
     const auto access = Prepare(state, instruction, memory);
     const auto address = GuestAddress(state, instruction, memory, access);
@@ -410,9 +424,9 @@ void StoreAddress(MslEmitterState& state, const IrValue& instruction, std::uint3
         state.Line("aps5_bda_store(" + access.bda + ", " + address + ", " + data + ", " + std::to_string(bits) + "u, " + access.pc + ", " + access.coherent + ");");
     };
     if (!RoutesApertures(state, memory)) {
-        global();
+        uniformLane(global);
     } else {
-        RouteFlat(state, address, [&] { ApertureStore(state, MslB5Lds(state), "uint(" + address + ")", bits, data); }, [&] { ApertureStore(state, MslB5Scratch(state), "uint(" + address + ")", bits, data); }, global);
+        RouteFlat(state, address, [&] { uniformLane([&] { ApertureStore(state, MslB5Lds(state), "uint(" + address + ")", bits, data); }); }, [&] { ApertureStore(state, MslB5Scratch(state), "uint(" + address + ")", bits, data); }, [&] { uniformLane(global); });
     }
     state.Outdent();
     state.Line("}");
@@ -421,8 +435,20 @@ void StoreAddress(MslEmitterState& state, const IrValue& instruction, std::uint3
 void StoreAddressWide(MslEmitterState& state, const IrValue& instruction, std::uint32_t components) {
     const auto& memory = state.Memory(instruction);
     if (memory.kind != ResourceKind::Flat && memory.kind != ResourceKind::Global) state.Fail(instruction, "must write a physical address resource");
+    // The uniform-lane narrowing applies to the shared and global arms only (see StoreAddress).
     const auto lane = MslUniformStoreLane(state, instruction, 0u, 2u);
-    state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
+    const auto uniformLane = [&](auto&& store) {
+        if (lane.empty()) {
+            store();
+            return;
+        }
+        state.Line("if (" + lane + ") {");
+        state.Indent();
+        store();
+        state.Outdent();
+        state.Line("}");
+    };
+    state.Line("if (" + Active(state, instruction) + ") {");
     state.Indent();
     const auto access = Prepare(state, instruction, memory);
     const auto base = GuestAddressBase(state, instruction, memory, access);
@@ -437,7 +463,7 @@ void StoreAddressWide(MslEmitterState& state, const IrValue& instruction, std::u
         MslB5StopIf(state, stop);
     };
     if (!RoutesApertures(state, memory)) {
-        global();
+        uniformLane(global);
     } else {
         const auto address = AddImmediate(state, base, static_cast<std::int32_t>(memory.offset), access);
         const auto aperture = [&](const MslB5Storage& storage) {
@@ -445,7 +471,7 @@ void StoreAddressWide(MslEmitterState& state, const IrValue& instruction, std::u
                 ApertureStore(state, storage, "(uint(" + address + ") + " + std::to_string(component * 4u) + "u)", 32u, data + "[" + std::to_string(component) + "]");
             }
         };
-        RouteFlat(state, address, [&] { aperture(MslB5Lds(state)); }, [&] { aperture(MslB5Scratch(state)); }, global);
+        RouteFlat(state, address, [&] { uniformLane([&] { aperture(MslB5Lds(state)); }); }, [&] { aperture(MslB5Scratch(state)); }, [&] { uniformLane(global); });
     }
     state.Outdent();
     state.Line("}");
