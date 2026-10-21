@@ -279,10 +279,9 @@ id<MTLTexture> LevelSource(id<MTLTexture> texture, std::uint32_t level, std::uin
     return extra[index];
 }
 
-namespace {
-
-// The Metal texture descriptor of a Vulkan image (CreateImage, CreateImageInMemory).
-MTLTextureDescriptor* ImageDescriptor(const VkImageCreateInfo* info) {
+VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
+    id<MTLDevice> device = DeviceOf(deviceHandle);
+    if (device == nil) FailImages("CreateImage needs a Metal device");
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
     // Multisampled images flagged 2D-array compatible are 2D multisample arrays even with one layer:
     // MSL reads sampled multisampled views as texture2d_ms_array (MslAbi Version 9) and Metal
@@ -334,11 +333,16 @@ MTLTextureDescriptor* ImageDescriptor(const VkImageCreateInfo* info) {
     // (Metal allows the usage only on R32Uint, R32Sint and RG32Uint textures.)
     if ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0u && !multisample && (descriptor.pixelFormat == MTLPixelFormatR32Uint || descriptor.pixelFormat == MTLPixelFormatR32Sint || descriptor.pixelFormat == MTLPixelFormatRG32Uint)) usage |= MTLTextureUsageShaderAtomic;
     descriptor.usage = usage;
-    return descriptor;
-}
-
-// The image's extra 1x1 levels (D64), its handle and the probe's report, once `texture` exists.
-VkResult FinishImage(id<MTLDevice> device, const VkImageCreateInfo* info, MTLTextureDescriptor* descriptor, id<MTLTexture> texture, VkImage* image) {
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    if (texture == nil && (usage & MTLTextureUsageShaderAtomic) != 0u) {
+        descriptor.usage = usage & ~MTLTextureUsageShaderAtomic;
+        texture = [device newTextureWithDescriptor:descriptor];
+    }
+    if (texture == nil) {
+        *image = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    if (auto* cache = ImageCache::For(device)) cache->Track(texture);
     if (const auto declared = std::max(info->mipLevels, 1u); declared > texture.mipmapLevelCount) {
         NSMutableArray<id<MTLTexture>>* extra = [NSMutableArray arrayWithCapacity:declared - texture.mipmapLevelCount];
         MTLTextureDescriptor* single = [descriptor copy];
@@ -361,57 +365,6 @@ VkResult FinishImage(id<MTLDevice> device, const VkImageCreateInfo* info, MTLTex
     *image = RetainImage(texture);
     if (auto* probe = imageProbe.load(std::memory_order_acquire)) probe->Created(*image);
     return VK_SUCCESS;
-}
-
-}
-
-VkResult CreateImage(VkDevice deviceHandle, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
-    id<MTLDevice> device = DeviceOf(deviceHandle);
-    if (device == nil) FailImages("CreateImage needs a Metal device");
-    MTLTextureDescriptor* descriptor = ImageDescriptor(info);
-    const auto usage = descriptor.usage;
-    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
-    if (texture == nil && (usage & MTLTextureUsageShaderAtomic) != 0u) {
-        descriptor.usage = usage & ~MTLTextureUsageShaderAtomic;
-        texture = [device newTextureWithDescriptor:descriptor];
-    }
-    if (texture == nil) {
-        *image = VK_NULL_HANDLE;
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-    if (auto* cache = ImageCache::For(device)) cache->Track(texture);
-    return FinishImage(device, info, descriptor, texture, image);
-}
-
-void GetImageCreateRequirements(VkDevice deviceHandle, const VkImageCreateInfo* info, VkMemoryRequirements* requirements) {
-    id<MTLDevice> device = DeviceOf(deviceHandle);
-    if (device == nil) FailImages("GetImageCreateRequirements needs a Metal device");
-    const MTLSizeAndAlign size = [device heapTextureSizeAndAlignWithDescriptor:ImageDescriptor(info)];
-    const auto align = std::max<VkDeviceSize>(size.align, 1u);
-    requirements->size = (static_cast<VkDeviceSize>(size.size) + align - 1u) / align * align;
-    requirements->alignment = align;
-    requirements->memoryTypeBits = 1u;
-}
-
-VkResult CreateImageInMemory(VkDevice deviceHandle, const VkImageCreateInfo* info, VkDeviceMemory memory, VkImage* image) {
-    id<MTLDevice> device = DeviceOf(deviceHandle);
-    if (device == nil) FailImages("CreateImageInMemory needs a Metal device");
-    if (memory == VK_NULL_HANDLE || IsMemoryToken(memory)) FailImages("CreateImageInMemory needs image memory from AllocateImageMemory (a placement heap)");
-    id<MTLHeap> heap = (__bridge id<MTLHeap>)reinterpret_cast<void*>(memory);
-    MTLTextureDescriptor* descriptor = ImageDescriptor(info);
-    descriptor.storageMode = heap.storageMode;
-    const auto usage = descriptor.usage;
-    id<MTLTexture> texture = [heap newTextureWithDescriptor:descriptor offset:0];
-    if (texture == nil && (usage & MTLTextureUsageShaderAtomic) != 0u) {
-        descriptor.usage = usage & ~MTLTextureUsageShaderAtomic;
-        texture = [heap newTextureWithDescriptor:descriptor offset:0];
-    }
-    if (texture == nil) {
-        *image = VK_NULL_HANDLE;
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-    // Not tracked: the heap is resident through the buffer pool's residency set while it lives.
-    return FinishImage(device, info, descriptor, texture, image);
 }
 
 void DestroyImage(VkDevice deviceHandle, VkImage image, const VkAllocationCallbacks*) {

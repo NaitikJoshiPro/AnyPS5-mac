@@ -846,12 +846,42 @@ void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t com
         state.Outdent();
         state.Line("}");
     } else {
-        for (std::uint32_t component = 0; component < components; ++component) {
-            const auto access = state.Temporary("aps5_a");
-            state.Line("const Aps5BufferAccess " + access + " = " + AccessExpression(state, instruction, descriptor, component * 4u, memory.dataBits / 8u) + ";");
-            const auto value = components == 1u ? "uint(" + data + ")" : data + "[" + std::to_string(component) + "]";
-            state.Line("if (" + access + ".inBounds) " + descriptor.memory + ".write(" + access + ".byte, " + value + ", " + std::to_string(memory.dataBits) + "u, " + stop + ");");
-            if (descriptor.gpu) MslB5StopIf(state, stop);
+        const auto writeComponents = [&] {
+            for (std::uint32_t component = 0; component < components; ++component) {
+                const auto access = state.Temporary("aps5_a");
+                state.Line("const Aps5BufferAccess " + access + " = " + AccessExpression(state, instruction, descriptor, component * 4u, memory.dataBits / 8u) + ";");
+                const auto value = components == 1u ? "uint(" + data + ")" : data + "[" + std::to_string(component) + "]";
+                state.Line("if (" + access + ".inBounds) " + descriptor.memory + ".write(" + access + ".byte, " + value + ", " + std::to_string(memory.dataBits) + "u, " + stop + ");");
+                if (descriptor.gpu) MslB5StopIf(state, stop);
+            }
+        };
+        if (components == 2u && memory.coherent && memory.dataBits == 32u && !descriptor.gpu) {
+            // Upstream e5b4bd72dd: a GLC/DLC dwordx2 is one 64-bit write on the GPU, so a workgroup
+            // polling a {flag, value} pair (a decoupled look-back scan) never sees the flag without
+            // its value. When both dwords are in bounds, adjacent and 8-byte aligned, the pair is one
+            // 64-bit swap under the lock table (MslDeviceAtomic64: Apple9 has no 64-bit atomic store;
+            // the lock holder commits with one atomic_max/min, which read2 never sees half of).
+            // Otherwise, or without the lock table, the dwords are written one by one.
+            const auto element = state.DescriptorElement(DescriptorBindingKind::Buffers, memory.resource);
+            const auto buffer = state.TableBuffer(DescriptorBindingKind::Buffers, element);
+            const auto first = state.Temporary("aps5_a");
+            const auto second = state.Temporary("aps5_a");
+            const auto byte = state.Temporary("aps5_ab");
+            state.Line("const Aps5BufferAccess " + first + " = " + AccessExpression(state, instruction, descriptor, 0u, 4u) + ";");
+            state.Line("const Aps5BufferAccess " + second + " = " + AccessExpression(state, instruction, descriptor, 4u, 4u) + ";");
+            state.Line("const uint " + byte + " = " + first + ".byte + " + state.MemoryByteOffset(element) + " + " + descriptor.memory + ".misalignment;");
+            state.Line("if (" + first + ".inBounds && " + second + ".inBounds && " + second + ".byte == " + first + ".byte + 4u && " + descriptor.memory + ".misalignment == 0u && (" + byte + " & 7u) == 0u && (" + byte + " >> 3u) < (" + buffer + ".bytes >> 3u) && aps5_driver.atomicLocks != 0ul) {");
+            state.Indent();
+            const auto pair = "(ulong(" + data + "[0]) | (ulong(" + data + "[1]) << 32u))";
+            state.Line("(void)" + MslDeviceAtomic64(state, instruction, MslAtomicOp::Swap, "(" + buffer + ".address + ulong(" + byte + "))", pair, {}) + ";");
+            state.Outdent();
+            state.Line("} else {");
+            state.Indent();
+            writeComponents();
+            state.Outdent();
+            state.Line("}");
+        } else {
+            writeComponents();
         }
     }
     state.Outdent();

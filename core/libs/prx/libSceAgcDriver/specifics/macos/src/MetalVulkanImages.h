@@ -60,19 +60,6 @@ void GetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirem
 VkResult AllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory);
 void FreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* allocator);
 VkResult BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize offset);
-// The memory handle AllocateMemory returns: a token (a Metal texture made by CreateImage owns its
-// memory). Image memory from AllocateImageMemory (BufferPool.mm, upstream 4513d47104) is instead a
-// retained placement id<MTLHeap>.
-inline bool IsMemoryToken(VkDeviceMemory memory) {
-    return reinterpret_cast<std::uintptr_t>(memory) == 1u;
-}
-// The placement-heap bytes and alignment an image of `info` takes (heapTextureSizeAndAlign), for
-// AllocateImageMemory before CreateImageInMemory.
-void GetImageCreateRequirements(VkDevice device, const VkImageCreateInfo* info, VkMemoryRequirements* requirements);
-// CreateImage with the texture placed at offset 0 of `memory` (a heap from AllocateImageMemory of
-// GetImageCreateRequirements' size). The texture is not added to the image residency set: the heap
-// is resident while it lives. DestroyImage releases the texture; the memory goes back separately.
-VkResult CreateImageInMemory(VkDevice device, const VkImageCreateInfo* info, VkDeviceMemory memory, VkImage* image);
 VkResult CreateImageView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* allocator, VkImageView* view);
 void DestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* allocator);
 // A VkBuffer made here carries a CF-retained private id<MTLBuffer> (unit shadow slabs), resident
