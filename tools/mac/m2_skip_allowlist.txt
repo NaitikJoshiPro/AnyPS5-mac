@@ -36,3 +36,10 @@ agc_driver_draw_cache_relocation | SKIP_RETURN_CODE=77 | metal-graphics-pipeline
 agc_command_batch_failure | the device has no Vulkan command batches | metal-vulkan-internal-tests
 agc_descriptor_cache_failure | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests
 agc_driver_indirect_arguments_pending_producer | Recorder::HoldNextSubmit holds a Vulkan timeline-semaphore submit | metal-vulkan-internal-tests
+agc_driver_host_import_failure_handles | Metal host imports have no vkCreateBuffer/vkAllocateMemory/vkBindBufferMemory steps to fail | metal-vulkan-internal-tests
+agc_driver_prepared_graphics_prebuild_0 | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_prepared_graphics_prebuild_1 | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_prepared_graphics_prebuild_unset | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_native_depth_bda_clear | the device does not retain guest write watching for native clear imports | metal-d3-import-watch
+agc_shadowed_key_stores | the device imports no watched host memory under a unit shadow | metal-d3-import-watch
+agc_driver_image_table_vouched_lookups | the Metal import write-protection probe \(not implemented\) | metal-d3-import-watch
