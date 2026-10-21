@@ -858,6 +858,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // backend has no remap, so the Metal device keeps passing the guest range to MTLViewport as it
             // did before (MetalDraw.mm) and Target().depthRangeRemap stays false.
             context.depthRangeUnrestricted = true;
+            // Depth clamping is MTLDepthClipModeClamp (MetalDraw.mm, from the guest's DB_RENDER_CONTROL clamp), and
+            // negative-one-to-one clip z is mapped in the vertex function (DepthNegativeOneToOneMacro): the features
+            // VK_EXT_depth_clip_control and depthClamp promise (agc_driver_depth_range_remap_draw, its Metal twin).
+            context.depthClamp = true;
+            context.depthClipControl = true;
             // The color sample counts the GPU renders (the twins' harness reports the same), and
             // multisampled storage images: Metal shaders cannot write texture2d_ms, so guest MSAA
             // storage goes through the target's storage shadow (DECISIONS D22/D28,
