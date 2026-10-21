@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "MetalVulkanImages.h"
 #include "MetalCommandStream.h"
@@ -51,6 +52,75 @@ bool FlushForGpuRead(std::uint64_t address, std::size_t bytes);
 }
 
 namespace AgcDriver::Graphics {
+
+namespace {
+
+// Upstream 4513d47104 keeps released image memory in the buffer pool for reuse by type and size. On
+// Metal an image's memory is a placement MTLHeap from the pool (AllocateImageMemory, BufferPool.mm)
+// and the texture is placed in it at creation (Metal::Vk::CreateImageInMemory), since a Metal
+// texture cannot be bound to memory after it is made; ReleaseImageMemory hands the heap back. A
+// texture made by Metal::Vk::CreateImage owns its memory (the VkDeviceMemory is a token).
+// APS5_NO_IMAGE_HEAPS=1 makes every texture own its memory as before.
+bool ImageHeapsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_IMAGE_HEAPS") != nullptr;
+    return !disabled;
+}
+
+// Creates the image of `info` with its memory: a pooled placement heap, or (heaps disabled) the
+// texture's own memory and a token.
+void CreatePlacedImage(const Context& context, const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory, VkDeviceSize& bytes, std::uint32_t& type, const char* operation) {
+    if (!ImageHeapsEnabled()) {
+        Check(Metal::Vk::CreateImage(context.device, &info, nullptr, &image), operation);
+        VkMemoryRequirements requirements{};
+        Metal::Vk::GetImageMemoryRequirements(context.device, image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &memory), operation);
+        bytes = requirements.size;
+        type = 0;
+        return;
+    }
+    VkMemoryRequirements requirements{};
+    Metal::Vk::GetImageCreateRequirements(context.device, &info, &requirements);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = BufferPool::PrivateImageMemory;
+    memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, operation, &type);
+    bytes = requirements.size;
+    const auto result = Metal::Vk::CreateImageInMemory(context.device, &info, memory, &image);
+    if (result != VK_SUCCESS) {
+        ReleaseImageMemory(context, memory, bytes, type);
+        memory = VK_NULL_HANDLE;
+        bytes = 0;
+        image = VK_NULL_HANDLE;
+    }
+    Check(result, operation);
+}
+
+// Releases memory CreatePlacedImage or Metal::Vk::AllocateMemory made (after the image placed in it).
+void ReleasePlacedMemory(const Context& context, VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t type) noexcept {
+    if (memory == VK_NULL_HANDLE) return;
+    if (Metal::Vk::IsMemoryToken(memory)) Metal::Vk::FreeMemory(context.device, memory, nullptr);
+    else ReleaseImageMemory(context, memory, bytes, type);
+}
+
+}
+
+OwnedImage::~OwnedImage() {
+    if (image) Metal::Vk::DestroyImage(context.device, image, nullptr);
+    ReleasePlacedMemory(context, memory, memoryBytes, memoryType);
+}
+
+// Memory placed with the image (CreateOwnedImage) is kept; otherwise the texture owns its memory
+// and this takes the token.
+void OwnedImage::Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation) {
+    static_cast<void>(mask);
+    context.bufferPool = device.bufferPool;
+    if (memory != VK_NULL_HANDLE) return;
+    Check(Metal::Vk::AllocateMemory(device.device, &allocation, nullptr, &memory), operation);
+    memoryBytes = allocation.allocationSize;
+    memoryType = 0;
+}
 
 namespace {
 
@@ -255,15 +325,23 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
     viewInfo.pNext = &minLod;
 }
 
-// OwnedImage's destructor calls Vulkan: on Metal the image is released here and the destructor
-// sees null handles.
-std::shared_ptr<OwnedImage> MetalOwnedImage(const Context& context, VkImage image) {
-    return std::shared_ptr<OwnedImage>(new OwnedImage(context, image, VK_NULL_HANDLE), [](OwnedImage* owned) {
-        Metal::Vk::DestroyImage(owned->context.device, owned->image, nullptr);
-        owned->image = VK_NULL_HANDLE;
-        owned->memory = VK_NULL_HANDLE;
-        delete owned;
-    });
+// Creates `image` of `info` in its own memory (CreatePlacedImage) and the owner that releases both.
+std::shared_ptr<OwnedImage> CreateOwnedImage(const Context& context, const VkImageCreateInfo& info, VkImage& image, const char* operation) {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize bytes = 0;
+    std::uint32_t type = 0;
+    CreatePlacedImage(context, info, image, memory, bytes, type, operation);
+    try {
+        auto owned = std::make_shared<OwnedImage>(context, image, memory);
+        owned->memoryBytes = bytes;
+        owned->memoryType = type;
+        return owned;
+    } catch (...) {
+        Metal::Vk::DestroyImage(context.device, image, nullptr);
+        image = VK_NULL_HANDLE;
+        ReleasePlacedMemory(context, memory, bytes, type);
+        throw;
+    }
 }
 
 struct ExpandImage {
@@ -286,14 +364,13 @@ ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource
     imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    Check(Metal::Vk::CreateImage(context.device, &imageInfo, nullptr, &result.image), "vkCreateImage sRGB copy");
-    result.owned = MetalOwnedImage(context, result.image);
+    result.owned = CreateOwnedImage(context, imageInfo, result.image, "vkCreateImage sRGB copy");
     VkMemoryRequirements requirements{};
     Metal::Vk::GetImageMemoryRequirements(context.device, result.image, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = 0u /* Metal: textures own their memory */;
-    Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &result.owned->memory), "vkAllocateMemory sRGB copy");
+    result.owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory sRGB copy");
     Check(Metal::Vk::BindImageMemory(context.device, result.image, result.owned->memory, 0), "vkBindImageMemory sRGB copy");
     result.bytes = requirements.size;
     return result;
@@ -369,8 +446,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (srgbExpand ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(Metal::Vk::CreateImage(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
-        owned = MetalOwnedImage(context, image);
+        owned = CreateOwnedImage(context, imageInfo, image, "vkCreateImage");
 
         VkMemoryRequirements requirements{};
         Metal::Vk::GetImageMemoryRequirements(context.device, image, &requirements);
@@ -378,7 +454,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = 0u /* Metal: textures own their memory */;
-        Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory texture");
         Check(Metal::Vk::BindImageMemory(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         const VkImage uploadImage = image;
@@ -646,15 +722,14 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(Metal::Vk::CreateImage(context.device, &imageInfo, nullptr, &image), "vkCreateImage repacked copy");
-        owned = MetalOwnedImage(context, image);
+        owned = CreateOwnedImage(context, imageInfo, image, "vkCreateImage repacked copy");
         VkMemoryRequirements requirements{};
         Metal::Vk::GetImageMemoryRequirements(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = 0u /* Metal: textures own their memory */;
-        Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory repacked copy");
+        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory repacked copy");
         Check(Metal::Vk::BindImageMemory(context.device, image, owned->memory, 0), "vkBindImageMemory repacked copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -704,15 +779,14 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(Metal::Vk::CreateImage(context.device, &imageInfo, nullptr, &image), "vkCreateImage block copy");
-        owned = MetalOwnedImage(context, image);
+        owned = CreateOwnedImage(context, imageInfo, image, "vkCreateImage block copy");
         VkMemoryRequirements requirements{};
         Metal::Vk::GetImageMemoryRequirements(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = 0u /* Metal: textures own their memory */;
-        Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory block copy");
+        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory block copy");
         Check(Metal::Vk::BindImageMemory(context.device, image, owned->memory, 0), "vkBindImageMemory block copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -762,15 +836,14 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(Metal::Vk::CreateImage(context.device, &imageInfo, nullptr, &image), "vkCreateImage depth copy");
-        owned = MetalOwnedImage(context, image);
+        owned = CreateOwnedImage(context, imageInfo, image, "vkCreateImage depth copy");
         VkMemoryRequirements requirements{};
         Metal::Vk::GetImageMemoryRequirements(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = 0u /* Metal: textures own their memory */;
-        Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory depth copy");
+        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth copy");
         Check(Metal::Vk::BindImageMemory(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -1470,14 +1543,8 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         }
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(Metal::Vk::CreateImage(context.device, &imageInfo, nullptr, &image), "vkCreateImage storage");
-        VkMemoryRequirements requirements{};
-        Metal::Vk::GetImageMemoryRequirements(context.device, image, &requirements);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        memoryBytes = requirements.size;
-        allocation.memoryTypeIndex = 0u /* Metal: textures own their memory */;
-        Check(Metal::Vk::AllocateMemory(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        // Upstream 4513d47104: the image's memory comes from the buffer pool (CreatePlacedImage).
+        CreatePlacedImage(context, imageInfo, image, memory, memoryBytes, memoryType, "vkCreateImage storage");
         Check(Metal::Vk::BindImageMemory(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {
         release();
@@ -5864,7 +5931,7 @@ void StorageTexture::release() noexcept {
     if (proxyMemory) Metal::Vk::FreeMemory(context.device, proxyMemory, nullptr);
     if (view) Metal::Vk::DestroyImageView(context.device, view, nullptr);
     if (image) Metal::Vk::DestroyImage(context.device, image, nullptr);
-    if (memory) Metal::Vk::FreeMemory(context.device, memory, nullptr);
+    ReleasePlacedMemory(context, memory, memoryBytes, memoryType);
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {
