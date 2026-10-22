@@ -3668,11 +3668,15 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             const auto* images = tableImages(shaders, table.stage);
             if (images == nullptr || images->count != table.elementTextures.size()) return finish(fast, false);
             std::vector<std::shared_ptr<Texture>> cached;
-            auto* reused = FindReusedTable(context.device, *images, CurrentTableState());
+            const auto tableState = CurrentTableState();
+            auto* reused = FindReusedTable(context.device, *images, tableState);
             if (reused == nullptr || !TableCurrent(*reused) || !CachedTableTextures(*reused, cached)) {
-                // No remembered table vouches for it: each element must still be the cache's texture
-                // for its descriptor (upstream's proof of an unremembered table, bde2a8f0af), or a
-                // fresh build resolves the table.
+                // In a collect epoch a fresh build resolves the table (and remembers it for the
+                // epoch's next uses, resolveImageTables).
+                if (tableState.epoch != 0) return finish(fast, false);
+                // Without one nothing can vouch for the table: each element must still be the cache's
+                // texture for its descriptor (upstream's proof of an unremembered table, bde2a8f0af),
+                // or a fresh build resolves it.
                 for (std::uint32_t element = 0; element < images->count; ++element) {
                     const auto index = table.elementTextures[element];
                     if (index == std::numeric_limits<std::size_t>::max()) continue;
