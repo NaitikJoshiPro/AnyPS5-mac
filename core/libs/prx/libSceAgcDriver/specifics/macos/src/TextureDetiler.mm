@@ -85,10 +85,19 @@ struct BufferParams {
     device uint* output;
 };
 
-struct ImageParams {
+// One access per direction: a retile reads the image, a detile writes it. read_write would limit the
+// element formats to the read-write texture tiers (tier 2 has no RG32Uint, the 8-byte element view),
+// while read and write access take every color format (Metal Feature Set Tables).
+struct ImageReadParams {
     Push push;
     device uint* tiled;
-    texture2d<uint, access::read_write> image;
+    texture2d<uint, access::read> image;
+};
+
+struct ImageWriteParams {
+    Push push;
+    device uint* tiled;
+    texture2d<uint, access::write> image;
 };
 
 static uint equationBit(uint mask, uint2 p, uint slice) {
@@ -187,49 +196,63 @@ kernel void detile(constant BufferParams& params [[buffer(0)]], uint2 id [[threa
     else copyElement(params.input, params.output, push.srcBase + tiledOffset, push.dstBase + linearOffset);
 }
 
-kernel void detile_image(constant ImageParams& params [[buffer(0)]], uint2 id [[thread_position_in_grid]]) {
-    constant Push& push = params.push;
-    const uint2 p = id + uint2(push.columnBegin, push.rowBegin);
-    if (p.x >= push.width || p.y >= push.height) return;
+static bool imageElement(uint2 id, constant Push& push, thread uint2& p, thread uint& at) {
+    p = id + uint2(push.columnBegin, push.rowBegin);
+    if (p.x >= push.width || p.y >= push.height) return false;
     uint linearOffset;
     uint tiledOffset = tiledOffsetOf(p, push, linearOffset);
-    if (tiledOffset < push.rangeBegin || tiledOffset >= push.rangeEnd) return;
-    const uint at = (TILE_FAMILY == 0u ? linearOffset : tiledOffset) - push.tiledBase;
+    if (tiledOffset < push.rangeBegin || tiledOffset >= push.rangeEnd) return false;
+    at = (TILE_FAMILY == 0u ? linearOffset : tiledOffset) - push.tiledBase;
+    return true;
+}
+
+// Retile: the image's texel into the tiled buffer.
+kernel void detile_image_read(constant ImageReadParams& params [[buffer(0)]], uint2 id [[thread_position_in_grid]]) {
+    constant Push& push = params.push;
+    uint2 p;
+    uint at;
+    if (!imageElement(id, push, p, at)) return;
     device uint* tiled = params.tiled;
-    if (RETILE != 0u) {
-        const uint4 value = params.image.read(p);
-        const uint dst = push.dstBase + at;
-        const uint word = dst >> 2;
-        if (ELEMENT_BYTES >= 4u) {
-            tiled[word] = value.x;
-            if (ELEMENT_BYTES >= 8u) tiled[word + 1u] = value.y;
-            if (ELEMENT_BYTES >= 16u) {
-                tiled[word + 2u] = value.z;
-                tiled[word + 3u] = value.w;
-            }
-        } else {
-            const uint mask = ELEMENT_BYTES == 1u ? 0xffu : 0xffffu;
-            const uint shift = (dst & 3u) * 8u;
-            device atomic_uint* target = reinterpret_cast<device atomic_uint*>(tiled + word);
-            atomic_fetch_and_explicit(target, ~(mask << shift), memory_order_relaxed);
-            atomic_fetch_or_explicit(target, (value.x & mask) << shift, memory_order_relaxed);
+    const uint4 value = params.image.read(p);
+    const uint dst = push.dstBase + at;
+    const uint word = dst >> 2;
+    if (ELEMENT_BYTES >= 4u) {
+        tiled[word] = value.x;
+        if (ELEMENT_BYTES >= 8u) tiled[word + 1u] = value.y;
+        if (ELEMENT_BYTES >= 16u) {
+            tiled[word + 2u] = value.z;
+            tiled[word + 3u] = value.w;
         }
     } else {
-        const uint src = push.srcBase + at;
-        const uint word = src >> 2;
-        uint4 value = uint4(0u);
-        if (ELEMENT_BYTES == 1u) value.x = (tiled[word] >> ((src & 3u) * 8u)) & 0xffu;
-        else if (ELEMENT_BYTES == 2u) value.x = (tiled[word] >> ((src & 3u) * 8u)) & 0xffffu;
-        else {
-            value.x = tiled[word];
-            if (ELEMENT_BYTES >= 8u) value.y = tiled[word + 1u];
-            if (ELEMENT_BYTES >= 16u) {
-                value.z = tiled[word + 2u];
-                value.w = tiled[word + 3u];
-            }
-        }
-        params.image.write(value, p);
+        const uint mask = ELEMENT_BYTES == 1u ? 0xffu : 0xffffu;
+        const uint shift = (dst & 3u) * 8u;
+        device atomic_uint* target = reinterpret_cast<device atomic_uint*>(tiled + word);
+        atomic_fetch_and_explicit(target, ~(mask << shift), memory_order_relaxed);
+        atomic_fetch_or_explicit(target, (value.x & mask) << shift, memory_order_relaxed);
     }
+}
+
+// Detile: the tiled buffer's element into the image.
+kernel void detile_image_write(constant ImageWriteParams& params [[buffer(0)]], uint2 id [[thread_position_in_grid]]) {
+    constant Push& push = params.push;
+    uint2 p;
+    uint at;
+    if (!imageElement(id, push, p, at)) return;
+    device uint* tiled = params.tiled;
+    const uint src = push.srcBase + at;
+    const uint word = src >> 2;
+    uint4 value = uint4(0u);
+    if (ELEMENT_BYTES == 1u) value.x = (tiled[word] >> ((src & 3u) * 8u)) & 0xffu;
+    else if (ELEMENT_BYTES == 2u) value.x = (tiled[word] >> ((src & 3u) * 8u)) & 0xffffu;
+    else {
+        value.x = tiled[word];
+        if (ELEMENT_BYTES >= 8u) value.y = tiled[word + 1u];
+        if (ELEMENT_BYTES >= 16u) {
+            value.z = tiled[word + 2u];
+            value.w = tiled[word + 3u];
+        }
+    }
+    params.image.write(value, p);
 }
 
 struct CmaskParams {
@@ -508,7 +531,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
     for (std::uint32_t index = 0; index < values.size(); ++index) [constants setConstantValue:&values[index] type:MTLDataTypeUInt atIndex:index];
     NSError* error = nil;
-    id<MTLFunction> function = [LibraryOf(module) newFunctionWithName:(image ? @"detile_image" : @"detile") constantValues:constants error:&error];
+    id<MTLFunction> function = [LibraryOf(module) newFunctionWithName:(image ? (retile ? @"detile_image_read" : @"detile_image_write") : @"detile") constantValues:constants error:&error];
     if (function == nil) Fail("cannot specialize the detile kernel: " + Metal::Describe(error));
     id<MTLComputePipelineState> state = [device newComputePipelineStateWithFunction:function error:&error];
     if (state == nil) Fail("cannot build the detile pipeline: " + Metal::Describe(error));
