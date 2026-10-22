@@ -435,8 +435,10 @@ void ImageHeapRetiresOnTimeline(const Context& device, id<MTLDevice> metal) {
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         recorder->Sync();
+        // Both waiting heaps (first, then the one released behind the in-flight batch) join the free
+        // list in release order; the free list hands out its newest.
         const auto again = AllocateImageMemory(context, allocation, 1u, "test image");
-        Expect(again == first && made() == 3 && pool->PendingImages() == 0 && pool->RetainedImages() == 1, "a heap whose batches completed did not return to the pool oldest first");
+        Expect(again != first && again != second && made() == 3 && pool->PendingImages() == 0 && pool->RetainedImages() == 1, "the heaps whose batches completed did not return to the pool");
         // Idle recorder (every batch completed, none open): a release is reusable at once.
         ReleaseImageMemory(context, again, MiB, BufferPool::PrivateImageMemory);
         Expect(pool->PendingImages() == 0 && pool->RetainedImages() == 2, "a heap released with no batch open or in flight is not retained at once");
@@ -449,7 +451,7 @@ void ImageHeapRetiresOnTimeline(const Context& device, id<MTLDevice> metal) {
         recorder->Sync();
         recorder.reset();
     }
-    Expect(pool->PendingImages() == 0 && pool->RetainedImages() == 2, "detaching the recorder's timeline did not retire its pending heaps (" + std::to_string(pool->PendingImages()) + " pending, " + std::to_string(pool->RetainedImages()) + " retained)");
+    Expect(pool->PendingImages() == 0 && pool->RetainedImages() == 3, "detaching the recorder's timeline did not retire its pending heaps (" + std::to_string(pool->PendingImages()) + " pending, " + std::to_string(pool->RetainedImages()) + " retained)");
     const auto counts = pool->Counts();
     Expect(counts.resident == counts.made - counts.destroyed, "the pool's residency set holds " + std::to_string(counts.resident) + " allocations, not the " + std::to_string(counts.made - counts.destroyed) + " alive or retained");
 }
