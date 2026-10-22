@@ -1694,6 +1694,9 @@ id<MTLTexture> MakeSurfaceTexture(id<MTLDevice> device, const DepthTarget& targe
         descriptor.textureType = MTLTextureType2DMultisampleArray;
         descriptor.sampleCount = host.samples;
         descriptor.arrayLength = host.slices;
+        // The guest sample order's reorder passes read a combined surface's stencil through an
+        // X32_Stencil8 view, which Metal makes only of a texture with this usage (MetalSampleOrder.mm).
+        if (format == MTLPixelFormatDepth32Float_Stencil8) descriptor.usage |= MTLTextureUsagePixelFormatView;
     }
     id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
     if (texture == nil) Fail("cannot create a depth surface");

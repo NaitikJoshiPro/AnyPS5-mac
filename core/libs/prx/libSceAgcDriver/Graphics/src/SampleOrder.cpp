@@ -13,6 +13,10 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleOrderStencilBits_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleOrderStencilExport_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleOrderVertex_spv.h"
+#if defined(__APPLE__)
+// The Metal device's reorder passes (specifics/macos overlay; TechnicalDebt metal-sample-order).
+#include "prx/libSceAgcDriver/Graphics/include/MetalSampleOrder.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -581,6 +585,9 @@ bool MayReorderSamples(const Context& context, std::uint32_t samples) {
 }
 
 VkFormat SampleOrderStorageFormat(const Context& context, VkFormat format, std::uint32_t elementBytes, std::uint32_t samples) {
+#if defined(__APPLE__)
+    if (Metal::SampleOrderContext(context) && context.imageFormatProperties == nullptr) return Metal::SampleOrderStorageFormat(context, format, elementBytes, samples);
+#endif
     if (!context.storageImageMultisample || context.imageFormatProperties == nullptr || samples <= 1u) return VK_FORMAT_UNDEFINED;
     const auto alias = TextureDetiler::ImageElementFormat(elementBytes);
     if (alias == VK_FORMAT_UNDEFINED) return VK_FORMAT_UNDEFINED;
@@ -599,6 +606,12 @@ std::string SampleOrderRefusal(const Context& context, const State& state) {
         if (color.samples > 1u && SampleOrderStorageFormat(context, color.format, color.elementBytes, color.samples) == VK_FORMAT_UNDEFINED) return "color format " + std::to_string(color.format) + " has no storage view at " + std::to_string(color.samples) + " samples";
     }
     if (state.depth && state.depth->samples > 1u) {
+#if defined(__APPLE__)
+        if (Metal::SampleOrderContext(context) && context.imageFormatProperties == nullptr) {
+            if (!Metal::SampleOrderDepthExact(state.depth->format)) return "depth format " + std::to_string(state.depth->format) + " has no Metal surface written back exactly through [[depth]] and [[stencil]]";
+            return {};
+        }
+#endif
         const auto host = HostDepthFormat(context, state.depth->format);
         if (!exactDepth(host)) return "depth format " + std::to_string(host) + " is not written back exactly through FragDepth";
         if (!depthSampleable(context, host, state.depth->samples)) return "depth format " + std::to_string(host) + " cannot be sampled at " + std::to_string(state.depth->samples) + " samples";
@@ -638,6 +651,12 @@ SampleOrderPass SampleOrderPassFor(const Context& context, const State& state, c
 
 void RecordSampleOrder(const Context& context, VkCommandBuffer commands, const SampleOrderPass& pass, std::span<const SampleOrderTarget> targets, bool toHost, std::vector<std::shared_ptr<void>>& kept) {
     if (targets.empty() || !ReordersSamples(pass.order)) return;
+#if defined(__APPLE__)
+    if (Metal::SampleOrderContext(context)) {
+        Metal::RecordSampleOrder(context, commands, pass, targets, toHost, kept);
+        return;
+    }
+#endif
     auto& reorder = ordersFor(context);
     const auto map = mapFor(pass.order, toHost);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, reorderStages, anyWrite, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
