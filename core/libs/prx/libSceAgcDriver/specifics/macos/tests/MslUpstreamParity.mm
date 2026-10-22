@@ -242,6 +242,20 @@ void FlatP10(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) 
     std::puts("flat P10: provoking-vertex value, flatP10 recorded");
 }
 
+// Upstream 377301ef36 / c32c26edb2: v_interp_mov of input 0 while SPI_PS_IN_CONTROL.NUM_INTERP is 0
+// reads OFFSET 0x20's default (0.0 for every component) instead of failing.
+void MissingInterpolator(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto inputs = PixelInputBit(PixelInput::PerspectiveCenter);
+    const auto p10 = RecompilePixel(target, FlatP10PixelCode, 0u, inputs);
+    const auto p0 = RecompilePixel(target, FlatP0PixelCode, 0u, inputs);
+    for (const auto* result : {&p10, &p0}) {
+        Require(result->fragmentParameters.empty() && result->msl.Reflection().perVertexLocations == 0u, "missing interpolator: a defaulted input became a fragment input");
+        Require(!Has(result->msl.Source(), "[[user(locn0)"), "missing interpolator: input 0 is declared as a fragment input");
+        static_cast<void>(MustCompile(device, "missing interpolator", *result, @{}));
+    }
+    std::puts("missing interpolator: OFFSET 0x20 default");
+}
+
 void CullDistances(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
     // Clip plane 0 from component 0, cull plane 0 from component 2 (VertexClipCullDistances rows).
     const auto clipped = RecompileVertex(target, DistanceVertexCode, 64u, DistanceVector | 0x1u);
@@ -451,6 +465,7 @@ int main() {
             const auto target = device.Target();
             Require(target.backend == ShaderRecompiler::ShaderBackend::Msl, "the Metal device's target is not the MSL backend");
             FlatP10(metal, target);
+            MissingInterpolator(metal, target);
             CullDistances(metal, target);
             SingleLane(metal, target);
             NativeF16(metal, target);
