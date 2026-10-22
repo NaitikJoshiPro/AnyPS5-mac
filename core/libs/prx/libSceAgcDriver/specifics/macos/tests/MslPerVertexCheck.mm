@@ -354,7 +354,9 @@ int main() {
             // interpolate_at_offset takes them from the pixel's upper-left corner.
             const std::array<std::uint8_t, 4> standard{0xaeu, 0xe6u, 0x2au, 0x62u};
             PixelCase sampleZero{"exact PERSP_SAMPLE I/J once per pixel", BarycentricPixelCode, PixelInputBit(PixelInput::PerspectiveSample), false, 64u, 0u, 1u};
-            sampleZero.sampleLocations[0] = standard[0];
+            // Graphics::PixelSampleLocations carries sample 0 at every pixel of the 2x2 grid
+            // (index pixel * 8): the same location everywhere is a constant offset, not a table.
+            for (std::uint32_t quad = 0; quad < 4u; ++quad) sampleZero.sampleLocations[quad * 8u] = standard[0];
             sampleZero.weightsRead = "aps5_bw_at_offset(float2(0.375000f, 0.125000f))";
             PixelCase linearZero{"exact LINEAR_SAMPLE I/J once per pixel", BarycentricPixelCode, PixelInputBit(PixelInput::LinearSample), false, 64u, 0u, 2u};
             linearZero.sampleLocations = sampleZero.sampleLocations;
