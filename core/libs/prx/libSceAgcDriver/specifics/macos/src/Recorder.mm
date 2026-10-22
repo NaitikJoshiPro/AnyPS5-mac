@@ -46,6 +46,8 @@
 #include <tuple>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "MetalResidency.h"
+#include <execinfo.h>
+#include <dlfcn.h>
 
 namespace AgcDriver::Graphics {
 
@@ -1531,10 +1533,35 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+namespace {
+// APS5_TRACE_PASS_ENDS=1: why a render pass ended (the caller's return addresses, unslid for atos).
+bool TracePassEnds() {
+    static const bool trace = std::getenv("APS5_TRACE_PASS_ENDS") != nullptr;
+    return trace;
+}
+
+void TracePassEnd(const char* what) {
+    if (!TracePassEnds()) return;
+    void* frames[12];
+    const int count = backtrace(frames, 12);
+    std::string line = std::string("[pass-end] ") + what + ":";
+    for (int i = 1; i < count; ++i) {
+        Dl_info info{};
+        const auto address = reinterpret_cast<std::uintptr_t>(frames[i]);
+        const auto base = dladdr(frames[i], &info) != 0 ? reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0u;
+        char text[48];
+        std::snprintf(text, sizeof(text), " %s+0x%llx", base != 0u && info.dli_fname != nullptr && std::strstr(info.dli_fname, ".prx") != nullptr ? "prx" : "exe", static_cast<unsigned long long>(address - base));
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        if (TracePassEnds()) std::fprintf(stderr, "[pass-end] draw pass begins: open %d, forced %d\n", pass.open ? 1 : 0, forced ? 1 : 0);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
@@ -1542,6 +1569,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {CommandsOf(open->metal), true, false};
+    if (TracePassEnds()) std::fprintf(stderr, "[pass-end] draw pass breaks: hazard %d, same key %d\n", static_cast<int>(hazard), pass.key == key ? 1 : 0);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
@@ -1571,6 +1599,7 @@ void Recorder::SealPassWriteOnly() {
 
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    TracePassEnd("render pass ended");
     if (open->segmentActive) endSegment(*open);
     // macOS: the pass is the stream's render encoder (the draw that began it opened it).
     open->metal->stream->EndEncoder();
