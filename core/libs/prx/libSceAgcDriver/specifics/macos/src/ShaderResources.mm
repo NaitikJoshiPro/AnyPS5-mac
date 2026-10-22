@@ -3684,6 +3684,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
                     if (index >= textures.size() || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[index]) return finish(fast, false);
                 }
+                // Each element was looked up in the cache again: the table was resolved (upstream's
+                // count for a table no epoch remembers), only the set around it was kept.
+                TextureCounts().tablesResolved.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             auto next = cached.begin();
