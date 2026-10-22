@@ -129,6 +129,8 @@ std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibra
     id<MTLCommandBuffer> commands = [queue commandBuffer];
     id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
     [encoder setRenderPipelineState:pipeline];
+    [encoder setViewport:(MTLViewport){0.0, 0.0, double(TargetSize), double(TargetSize), 0.0, 1.0}];
+    [encoder setScissorRect:(MTLScissorRect){0, 0, TargetSize, TargetSize}];
     [encoder setFragmentBuffer:counter offset:0 atIndex:0];
     [encoder setFragmentBuffer:sink offset:0 atIndex:1];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
