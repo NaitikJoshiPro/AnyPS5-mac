@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <dlfcn.h>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -11,6 +10,10 @@
 #include <shared_mutex>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 #if defined(__linux__)
 #include <cerrno>
@@ -31,7 +34,7 @@
 #include <cstring>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <sched.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
@@ -50,8 +53,8 @@ constexpr std::uintptr_t PageBytes = 4096;
 class Watch {
 public:
     static Watch& Get() {
-        static Watch watch;
-        return watch;
+        static auto* watch = new Watch;
+        return *watch;
     }
 
     bool Available() const {
@@ -91,6 +94,13 @@ public:
         if (!Available()) return false;
         std::shared_lock lock(_lock);
         return covers(begin, end);
+    }
+
+    bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
+        if (!Available()) return false;
+        std::shared_lock lock(_lock);
+        const auto next = _ranges.upper_bound(begin);
+        return (next != _ranges.begin() && std::prev(next)->second > begin) || (next != _ranges.end() && next->first < end);
     }
 
     bool Collect(std::uintptr_t begin, std::uintptr_t end, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
@@ -339,8 +349,8 @@ bool IsAlignmentFault(const void* context) {
 class Watch {
 public:
     static Watch& Get() {
-        static Watch watch;
-        return watch;
+        static auto* watch = new Watch;
+        return *watch;
     }
 
     bool Available() const {
@@ -348,9 +358,10 @@ public:
     }
 
     void Register(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         std::vector<std::uint8_t> pages((end - begin) / _page, Written | Fresh);
         std::vector<bool> queried(pages.size(), false);
         const Lock lock(_lock);
@@ -384,9 +395,10 @@ public:
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return false;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return false;
+        if (end <= begin) return false;
         const Lock lock(_lock);
         return erase(begin, end);
     }
@@ -395,6 +407,13 @@ public:
         if (!_available) return false;
         const Lock lock(_lock);
         return covers(begin, end);
+    }
+
+    bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available) return false;
+        const Lock lock(_lock);
+        const auto next = _ranges.upper_bound(begin);
+        return (next != _ranges.begin() && std::prev(next)->second.end > begin) || (next != _ranges.end() && next->first < end);
     }
 
     enum class Take { All, Armed, Fresh };
@@ -427,9 +446,10 @@ public:
     }
 
     void ProtectionChanged(std::uintptr_t begin, std::uintptr_t end, int protection) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         const Lock lock(_lock);
         forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
             state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
@@ -437,9 +457,10 @@ public:
     }
 
     void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         const Lock lock(_lock);
         _hostWrites.emplace_back(begin, end);
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
@@ -449,9 +470,10 @@ public:
     }
 
     void EndHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         const Lock lock(_lock);
         const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{begin, end});
         if (found != _hostWrites.end()) _hostWrites.erase(found);
@@ -485,20 +507,41 @@ private:
         std::vector<std::uint8_t> pages;
     };
 
-    struct Turns {
-        std::atomic<std::uint64_t> next{0};
-        std::atomic<std::uint64_t> serving{0};
+    struct Mutex {
+        Mutex() {
+            pthread_mutexattr_t attributes;
+            pthread_mutexattr_init(&attributes);
+            pthread_mutexattr_setpolicy_np(&attributes, PTHREAD_MUTEX_POLICY_FIRSTFIT_NP);
+            pthread_mutex_init(&mutex, &attributes);
+            pthread_mutexattr_destroy(&attributes);
+            pthread_cond_init(&idle, nullptr);
+        }
+        pthread_mutex_t mutex;
+        pthread_cond_t idle;
+        std::atomic<unsigned> faulting{0};
     };
 
     struct Lock {
-        explicit Lock(Turns& turns) : _turns(turns), _turn(turns.next.fetch_add(1, std::memory_order_relaxed)) {
-            while (_turns.serving.load(std::memory_order_acquire) != _turn) ::sched_yield();
+        explicit Lock(Mutex& mutex) : _mutex(mutex) {
+            pthread_mutex_lock(&_mutex.mutex);
+            while (_mutex.faulting.load(std::memory_order_acquire) != 0) pthread_cond_wait(&_mutex.idle, &_mutex.mutex);
         }
         ~Lock() {
-            _turns.serving.store(_turn + 1, std::memory_order_release);
+            pthread_mutex_unlock(&_mutex.mutex);
         }
-        Turns& _turns;
-        std::uint64_t _turn;
+        Mutex& _mutex;
+    };
+
+    struct FaultLock {
+        explicit FaultLock(Mutex& mutex) : _mutex(mutex) {
+            _mutex.faulting.fetch_add(1, std::memory_order_acq_rel);
+            pthread_mutex_lock(&_mutex.mutex);
+        }
+        ~FaultLock() {
+            if (_mutex.faulting.fetch_sub(1, std::memory_order_acq_rel) == 1) pthread_cond_broadcast(&_mutex.idle);
+            pthread_mutex_unlock(&_mutex.mutex);
+        }
+        Mutex& _mutex;
     };
 
     Watch() {
@@ -534,7 +577,7 @@ private:
         // it to the alias, where a write to an armed page faults again (at the alias) and lands here.
         if (GuestArena::IsDisplaced(address)) return false;
         const auto page = pageStart(GuestArena::GuestAddress(address));
-        const Lock lock(_lock);
+        const FaultLock lock(_lock);
         auto it = _ranges.upper_bound(page);
         if (it == _ranges.begin()) return false;
         --it;
@@ -627,7 +670,7 @@ private:
 
     const std::uintptr_t _page = static_cast<std::uintptr_t>(::getpagesize());
     bool _available = false;
-    Turns _lock;
+    Mutex _lock;
     std::map<std::uintptr_t, Range> _ranges;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
     struct sigaction _previousBus {};
@@ -682,6 +725,16 @@ bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t byte
 bool GuestWriteWatchCovers_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     return bytes != 0 && address + bytes > address && Watch::Get().Covers(address, address + bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+bool GuestWriteWatchOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+#ifdef APS5_GUEST_WRITE_WATCH
+    return bytes != 0 && address + bytes > address && Watch::Get().Overlaps(address, address + bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

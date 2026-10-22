@@ -29,6 +29,8 @@ struct PreparedDispatch;
 struct RecipeHit;
 // The record tail shared by an ordinary dispatch and a recipe hit (VulkanDevice::recordDispatch).
 struct RecordedDispatch;
+// The module, layout and pipeline a compute dispatch binds (VulkanDevice::createComputePipeline).
+struct ComputePipelineObjects;
 
 // macOS: the same API implemented on Metal (specifics/macos/src/MetalDevice.mm). The class keeps
 // its name so the PM4 driver core and the GPU tests compile unchanged; MetalDevice names it in
@@ -39,6 +41,16 @@ public:
     struct CompileOnly {};
     explicit VulkanDevice(CompileOnly);
     ComputePipelineReplayResult ReplayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache = {});
+    // Builds the pipeline of a journaled compute result ahead of its first dispatch (the journal
+    // replay's hook, on its threads): false when the device already holds a pipeline for the module.
+    bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
+    // Starts the journal replay if the device has not (a headless device starts it at its first
+    // draw or dispatch) and joins it (tests; the teardown joins it anyway).
+    void WaitForPipelineJournalReplay();
+    // Compute pipelines this device built, by dispatches and by the journal replay (tests).
+    // macOS: the Metal pipeline cache's archive takes the journal's place (MetalDevice.mm: no
+    // replay starts; ReplayComputePipeline builds through the pipeline cache).
+    std::uint64_t ComputePipelinesCreated() const;
     ~VulkanDevice();
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
@@ -47,9 +59,11 @@ public:
     bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
     std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;
+    std::uint32_t MaxFragmentInputComponents() const;
     const std::uint32_t* WorkGroupCountLimit() const;
     std::uint32_t VendorId() const;
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
+    bool ComputeFullSubgroups() const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).
     std::uint64_t Serial() const { return serial; }
@@ -60,6 +74,7 @@ public:
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
     void PrepareForReplacement();
+    void startJournalReplay();
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
@@ -156,6 +171,9 @@ public:
     };
     using CopyWriterNote = std::function<void(std::span<const std::byte> value, std::uint64_t generation)>;
     CopyOutcome CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter);
+    // Upstream e04111bb5: whether CopyBuffer would record this copy on the GPU (path 1) rather than
+    // wait for a completion store over either range (PacketMemory's DMA copy behind a pending source).
+    bool GpuCopyPossible(std::uint64_t destination, std::uint64_t source, std::size_t bytes) const;
     // APS5_COPY_VERIFY=1 totals: CPU copies verified, whose source bytes changed over the sync (a
     // producer the rule missed), whose destination bytes were overwritten (a store the rule
     // missed), and whose destination an unsignaled batch read in place (the rule's own answer
@@ -171,9 +189,24 @@ public:
         std::uint64_t aliased, created, noSource, shape, refused;
     };
     static CopyAliasing CopyAliasCounts();
+    // Compute pipelines created, and those created by a thread holding the GPU mutex (upstream
+    // 7fae4549e; on Metal the pipeline cache's background workers build them, PipelineCache.mm).
+    struct ComputePipelineCreation {
+        std::uint64_t created, underGpuMutex;
+    };
+    static ComputePipelineCreation ComputePipelineCounts();
+    // macOS: the Metal device keeps no compute templates (PrepareDispatch prepares no resources),
+    // so it moves no dispatch buffers and pre-syncs nothing: both counts stay zero.
+    struct DispatchMoveCount {
+        std::uint64_t checked, exact, moved, refused, filtered, rebuilt, kept, served;
+    };
+    static DispatchMoveCount DispatchMoveCounts();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
+    // Upstream's HDR10 swapchain selection (c9ba43bfb). Metal presents SDR: PQ display buffers are
+    // tone-mapped on the CPU decode (DisplayBuffer.cpp, PqToSdr.hpp); see docs/dev/TechnicalDebt.md.
+    void SelectDynamicRange(const DisplayBuffer* buffer);
     bool Presentable() const;
     bool DualSrcBlend() const;
     bool PrimitiveListRestart() const;
@@ -230,6 +263,10 @@ public:
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
     };
     static PresentStatistics PresentCounts();
+    struct PresyncStatistics {
+        std::uint64_t checked, presyncs, keyChecks, keyWaits;
+    };
+    static PresyncStatistics PresyncCounts();
     // Stage A of a dispatch's resource build, run WITHOUT GuestMemory::GpuMutex before Dispatch or
     // DispatchIndirect: the binding plan, data buffers, imports already serving the guest buffers,
     // read-only copies and the descriptor set (see ShaderResources). The dispatch completes it
@@ -237,7 +274,7 @@ public:
     // records. Null when nothing is prepared: the resource cache may serve the dispatch (its
     // Revalidate stays under the mutex), or APS5_LOCKED_BUILD=1 keeps the whole build under it as
     // before. `shader` and `snapshots` must outlive the dispatch.
-    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0);
+    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0);
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
@@ -308,14 +345,20 @@ public:
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
 
+    // Public as upstream (tests call graphicsContext() directly): the device's Graphics::Context
+    // (MetalDevice.mm); a compile-only device has none and throws.
+    Graphics::Context graphicsContext() const;
+    // A store a batch's completion makes on the CPU over the range, and whether a copy touching the
+    // range must wait for that batch (a pending write whose completion stores over it).
+    bool completionStoresOver(std::uint64_t address, std::size_t bytes) const;
+    bool copyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const;
+
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
     // Records and submits one frame into the next present slot (MetalPresentation.mm): `pixels`
     // (BGRA8, width x height) drawn aspect-fit over a clear, or the clear alone when empty.
     bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels);
-    // Vulkan-only test hook (tests/execution/PipelineOptimizedReadback.cpp); throws on Metal.
-    Graphics::Context graphicsContext() const;
     // The Metal state (MTLDevice, queue, compiler, pipelines, guest-memory wrappers, in-flight
     // command buffers), defined in specifics/macos/src/MetalDevice.mm.
     struct State;

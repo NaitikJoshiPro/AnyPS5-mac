@@ -19,6 +19,7 @@ int APS5_VABI sigdelset_nid_postfix(GuestSignalSet*, int);
 int APS5_VABI sigismember_nid_postfix(const GuestSignalSet*, int);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI _sigprocmask_nid_postfix(int, const GuestSignalSet*, GuestSignalSet*);
+int APS5_VABI sigprocmask_nid_postfix(int, const void*, void*);
 [[gnu::returns_twice]] int APS5_VABI sigsetjmp_nid_postfix(std::uint64_t* buffer, int saveMask);
 [[noreturn]] void APS5_VABI siglongjmp_nid_postfix(std::uint64_t* buffer, int value);
 int APS5_VABI JumpKeepingCalleeSaved(std::uint64_t* buffer);
@@ -98,7 +99,6 @@ static bool Equals(const GuestSignalSet& set, std::uint32_t w0, std::uint32_t w1
     return set.bits[0] == w0 && set.bits[1] == w1 && set.bits[2] == w2 && set.bits[3] == w3;
 }
 
-#if defined(__x86_64__)
 static std::uint32_t BlockedMask() {
     GuestSignalSet current{};
     Require(_sigprocmask_nid_postfix(1, nullptr, &current) == 0);
@@ -110,6 +110,7 @@ static void SetBlockedMask(std::uint32_t mask) {
     Require(_sigprocmask_nid_postfix(3, &set, nullptr) == 0);
 }
 
+#if defined(__x86_64__)
 static int JumpBack(int saveMask, int value, std::uint32_t maskAtSet, std::uint32_t maskAtJump) {
     std::uint64_t buffer[12]{};
     volatile int jumped = 0;
@@ -168,13 +169,32 @@ static void CheckSigsetjmp() {
 }
 #endif
 
+static void CheckInvalidHow() {
+    SetBlockedMask(0x5u);
+    const GuestSignalSet blocked{{0x30u, 0, 0, 0}};
+    for (const int how : {0, 4, -1, 1000}) {
+        GuestSignalSet previous{{0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u}};
+        *__error_nid_postfix() = 0;
+        Require(_sigprocmask_nid_postfix(how, &blocked, &previous) == -1 && *__error_nid_postfix() == 22);
+        Require(Equals(previous, 0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u));
+        *__error_nid_postfix() = 0;
+        Require(sigprocmask_nid_postfix(how, &blocked, &previous) == -1 && *__error_nid_postfix() == 22);
+        Require(Equals(previous, 0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u));
+        Require(BlockedMask() == 0x5u);
+        Require(_sigprocmask_nid_postfix(how, nullptr, &previous) == 0);
+        Require(Equals(previous, 0x5u, 0, 0, 0));
+    }
+    SetBlockedMask(0);
+}
+
 int main() {
 #if defined(__x86_64__)
     CheckSigsetjmp();
     CheckSiglongjmp();
 #endif
+    CheckInvalidHow();
     // On arm64 sigsetjmp and siglongjmp reach the guest's registers through the guest runner's bridge hooks, which a
-    // host caller does not have, so only the set operations are checked there.
+    // host caller does not have, so only the mask and set operations are checked there.
     static constexpr int Untouched = 5;
     GuestSignalSet set{{0x12345678u, 0x9abcdef0u, 0xffffffffu, 1u}};
     *__error_nid_postfix() = Untouched;

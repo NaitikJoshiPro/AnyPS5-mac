@@ -28,8 +28,7 @@ void TranslationContext::sSubvectorLoop(const RdnaInstruction& inst, bool begin)
     IrU32 newCounter = counter;
     if (begin) {
         const IrU1 lowZero(ir.IEqual(execLo.Value(), zero.Value()));
-        const IrU1 highZero(ir.IEqual(execHi.Value(), zero.Value()));
-        const IrU1 execZero(ir.LogicalAnd(lowZero.Value(), highZero.Value()));
+        const IrU1 execZero(ir.IEqual(ir.Emit(IrOpcode::BitwiseOr32, IrType::U32, {&execLo.Value(), &execHi.Value()}), zero.Value()));
         const IrU32 entered(ir.Select(lowZero.Value(), execLo.Value(), execHi.Value()));
         newCounter = IrU32(ir.Select(execZero.Value(), counter.Value(), entered.Value()));
         newExecHi = IrU32(ir.Select(ir.LogicalOr(execZero.Value(), lowZero.Value()), execHi.Value(), zero.Value()));
@@ -281,6 +280,13 @@ void TranslationContext::sSwappcB64(const RdnaInstruction& inst) {
     IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
     const IrU64 link(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
     writeU32Pair(inst.destination, extractU64(link));
+}
+
+void TranslationContext::TranslateUnlinkedCall(const RdnaInstruction& inst) {
+    const std::array<IrU32, 2> target = readU32Pair(inst.source0);
+    (void)ir.Emit(IrOpcode::UnlinkedCall, IrType::Void, {&target[0].Value(), &target[1].Value(), &ir.Constant(inst.programCounter)});
+    program.Info().usesFaultBuffer = true;
+    sSwappcB64(inst);
 }
 
 void TranslationContext::sCselectB32(const RdnaInstruction& inst) {

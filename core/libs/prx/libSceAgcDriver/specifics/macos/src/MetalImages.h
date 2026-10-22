@@ -113,14 +113,18 @@ public:
     // images pending (ShaderResources::MarkGpuWrites) and keeps the build with the batch.
     void Commit(Recorder& recorder);
 
-    bool Empty() const { return resources == nullptr; }
+    bool Empty() const { return builds.empty(); }
+    // The build's image table ranges (ShaderResources::ImageTableRanges; empty without a build).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> TableRanges() const;
 
 private:
     ImageCache& cache;
     // The upstream build (ShaderResources twin, MetalImagesOnly) over the cache's attached Context:
     // the image and sampler entries come from it, and the pending/live storage registries, the
     // texture caches and the resource cache are upstream's (Texture.mm, ShaderResources.mm).
+    // The build of the stage being written (Prepare), and every stage's build of the command.
     std::shared_ptr<ShaderResources> resources;
+    std::vector<std::shared_ptr<ShaderResources>> builds;
     bool committed = false;
 };
 

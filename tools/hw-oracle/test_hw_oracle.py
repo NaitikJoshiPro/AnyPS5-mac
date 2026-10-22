@@ -1,5 +1,7 @@
 import contextlib
+import hashlib
 import io
+import json
 import os
 import shlex
 import shutil
@@ -27,12 +29,12 @@ class OracleCacheTests(unittest.TestCase):
                     binary.write_bytes(previous)
                     os.utime(binary, (0, 0))
 
-                def fail(command, *, check):
+                def fail(command, *, check, stdout):
                     self.assertTrue(check)
                     Path(command[command.index("-o") + 1]).write_bytes(b"partial executable")
                     raise subprocess.CalledProcessError(1, command)
 
-                def succeed(command, *, check):
+                def succeed(command, *, check, stdout):
                     self.assertTrue(check)
                     Path(command[command.index("-o") + 1]).write_bytes(b"complete executable")
 
@@ -56,7 +58,7 @@ class OracleCacheTests(unittest.TestCase):
             cache = Path(tmp) / "cache"
             outputs = []
 
-            def compile(command, *, check):
+            def compile(command, *, check, stdout):
                 self.assertTrue(check)
                 output = Path(command[command.index("-o") + 1])
                 outputs.append(output)
@@ -77,6 +79,59 @@ class OracleCacheTests(unittest.TestCase):
 
 
 class InputRowsTests(unittest.TestCase):
+    def test_cli_reports_invalid_input_before_tool_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body, rows = Path(tmp) / "body.s", Path(tmp) / "rows.txt"
+            body.write_text("s_nop 0", encoding="utf-8")
+            argv = ["hw_oracle.py", str(body), str(rows)]
+            argv += [part for name, value in MODES.items()
+                     for part in ["--" + name.replace("_", "-"), str(value)]]
+            for contents in (None, b"not a number\n", b"1 2 3\n", b"-1 0 0 0\n", b"4294967296 0 0 0\n", b"\xff"):
+                with self.subTest(contents=contents):
+                    rows.unlink(missing_ok=True)
+                    if contents is not None:
+                        rows.write_bytes(contents)
+                    with patch("sys.argv", argv), patch.object(hw_oracle, "assemble") as assemble, \
+                            patch.object(hw_oracle, "oracle") as oracle, \
+                            contextlib.redirect_stdout(io.StringIO()) as output, \
+                            contextlib.redirect_stderr(io.StringIO()) as errors, \
+                            self.assertRaises(SystemExit) as exited:
+                        hw_oracle.main()
+                    self.assertEqual(exited.exception.code, 2)
+                    self.assertIn("error:", errors.getvalue())
+                    self.assertEqual(output.getvalue(), "")
+                    assemble.assert_not_called()
+                    oracle.assert_not_called()
+
+    def test_successful_dispatch_without_output_cannot_reuse_previous_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "runner.py"
+            runner.write_text(
+                "import sys\nfrom pathlib import Path\n"
+                "output = Path(sys.argv[3])\n"
+                "marker = output.with_suffix('.seen')\n"
+                "if not marker.exists():\n"
+                "    output.write_bytes(bytes(int(sys.argv[1]) * 64))\n"
+                "    marker.touch()\n", encoding="utf-8")
+            for wave64 in (False, True):
+                with self.subTest(wave64=wave64), patch.object(hw_oracle, "assemble", return_value=runner), \
+                        patch.object(hw_oracle, "oracle", return_value=sys.executable):
+                    with self.assertRaises(FileNotFoundError):
+                        hw_oracle.run("s_nop 0", [(0, 0, 0, 0)] * 1025, wave64=wave64, **MODES)
+
+
+    def test_oracle_output_must_match_the_padded_dispatch_size(self):
+        for delta in (-1, 1, 64):
+            def dispatch(command, **kwargs):
+                Path(command[4]).write_bytes(bytes(int(command[2]) * 64 + delta))
+
+            with self.subTest(delta=delta), patch.object(hw_oracle, "assemble", return_value="kernel.co"), \
+                    patch.object(hw_oracle, "oracle", return_value="oracle"), \
+                    patch.object(hw_oracle.subprocess, "run", side_effect=dispatch):
+                with self.assertRaisesRegex(ValueError, "Oracle output size"):
+                    hw_oracle.run("s_nop 0", [(0, 0, 0, 0)], **MODES)
+
+
     def test_invalid_rows_fail_before_assembler_or_gpu_lookup(self):
         for row in ((1, 2, 3), (1, 2, 3, 4, 5), (-1, 0, 0, 0),
                     (0x100000000, 0, 0, 0), (1.5, 0, 0, 0), ("1", 0, 0, 0)):
@@ -84,6 +139,28 @@ class InputRowsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "row 1"):
                     hw_oracle.run("s_nop 0", [row], **MODES)
                 assemble.assert_not_called()
+
+    def test_cli_rejects_empty_rows_before_running_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body, rows = Path(tmp) / "body.s", Path(tmp) / "rows.txt"
+            body.write_text("s_nop 0", encoding="utf-8")
+            argv = ["hw_oracle.py", str(body), str(rows), "--json"]
+            argv += [part for name, value in MODES.items()
+                     for part in ["--" + name.replace("_", "-"), str(value)]]
+            for contents in ("", "\n \t\n"):
+                with self.subTest(contents=contents):
+                    rows.write_text(contents, encoding="utf-8")
+                    with patch("sys.argv", argv), patch.object(hw_oracle, "run", return_value=[]) as run, \
+                            patch.object(hw_oracle, "target", return_value="gfx1030") as target, \
+                            contextlib.redirect_stdout(io.StringIO()) as output, \
+                            contextlib.redirect_stderr(io.StringIO()) as errors, \
+                            self.assertRaises(SystemExit) as exited:
+                        hw_oracle.main()
+                    self.assertEqual(exited.exception.code, 2)
+                    self.assertIn("at least one input row", errors.getvalue())
+                    self.assertEqual(output.getvalue(), "")
+                    run.assert_not_called()
+                    target.assert_not_called()
 
     def test_unsigned_bits_and_indexable_values_are_preserved(self):
         class Indexable:
@@ -113,6 +190,136 @@ class InputRowsTests(unittest.TestCase):
             with patch("sys.argv", argv), patch.object(hw_oracle, "run", return_value=[]) as run:
                 hw_oracle.main()
             self.assertEqual(run.call_args.args[1], [(1, 8, 0xffffffff, 2)])
+
+    def test_validation_only_reports_dispatch_shape_without_running_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            body, rows, extra = (Path(directory) / name for name in ("body.s", "rows.txt", "extra.bin"))
+            body.write_text("v_mov_b32 v10, v4", encoding="utf-8")
+            extra.write_bytes(b"abc")
+            options = [part for name, value in MODES.items() for part in ["--" + name.replace("_", "-"), str(value)]]
+            for count in (1, 33, 513, 1025):
+                rows.write_text("1 2 3 4\n" * count, encoding="utf-8")
+                for wave64 in (False, True):
+                    argv = ["hw_oracle.py", str(body), str(rows), *options, "--validate-only", "--json", "--extra", str(extra)]
+                    if wave64:
+                        argv.append("--wave64")
+                    with self.subTest(count=count, wave64=wave64), patch("sys.argv", argv), \
+                            patch.object(hw_oracle, "run", side_effect=AssertionError("GPU run")), \
+                            patch.object(hw_oracle, "target", side_effect=AssertionError("target lookup")), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(hw_oracle.main(), 0)
+                    report = json.loads(output.getvalue())
+                    wave = 64 if wave64 else 32
+                    padded = (count + wave - 1) // wave * wave
+                    dispatch = 512 if wave64 else 1024
+                    self.assertTrue(report["validation_only"])
+                    self.assertEqual((report["rows"], report["padded_rows"], report["dispatches"]),
+                                     (count, padded, (padded + dispatch - 1) // dispatch))
+                    self.assertEqual(report["extra_bytes"], 3)
+                    self.assertEqual(report["floating_point_modes"], MODES)
+                    self.assertNotIn("assembly_target", report)
+            for lds in (-1, 65537):
+                with self.subTest(lds=lds), patch("sys.argv", [*argv, "--lds", str(lds)]), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited:
+                    hw_oracle.main()
+                self.assertEqual(exited.exception.code, 2)
+
+
+
+class JsonReportTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.body = self.root / "body.s"
+        self.body.write_text("v_mov_b32 v10, v4\n", encoding="utf-8")
+        self.rows = self.root / "rows.txt"
+        self.rows.write_text("0xffffffff 0x80000000 08 0\n1 2 3 4\n", encoding="utf-8")
+        self.extra = self.root / "extra.bin"
+        self.extra.write_bytes(b"\x00\xff\x01")
+        self.runner = self.root / "runner.py"
+        self.runner.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "count = int(sys.argv[1])\n"
+            "data = Path(sys.argv[2]).read_bytes()\n"
+            "Path(sys.argv[3]).write_bytes(b''.join(data[i*16:i*16+16] * 4 for i in range(count)))\n"
+            "print('fixture tool diagnostic')\n", encoding="utf-8")
+
+    def cli(self, *options, output=None):
+        argv = ["hw_oracle.py", str(self.body), str(self.rows), *options]
+        argv += [item for name, value in MODES.items() for item in ["--" + name.replace("_", "-"), str(value)]]
+        if output is None:
+            output = io.StringIO()
+        with patch("sys.argv", argv), patch.object(hw_oracle, "assemble", return_value=self.runner), \
+                patch.object(hw_oracle, "oracle", return_value=sys.executable), \
+                patch.dict(os.environ, {"HW_ORACLE_TARGET": "gfx1030"}), \
+                contextlib.redirect_stdout(output), tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
+            with contextlib.redirect_stderr(errors):
+                hw_oracle.main()
+            errors.seek(0)
+            return output.getvalue(), errors.read()
+
+    def test_json_preserves_unsigned_words_and_explicit_run_settings(self):
+        output, errors = self.cli("--json", "--wave64", "--coarse", "--lds", "8192", "--outs", "3", "--extra", str(self.extra))
+        report = json.loads(output)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["assembly_target"], "gfx1030")
+        self.assertEqual(report["wave_size"], 64)
+        self.assertEqual(report["floating_point_modes"], MODES)
+        self.assertEqual(report["lds_bytes"], 8192)
+        self.assertEqual(report["memory"], "coarse")
+        self.assertEqual(report["output_registers"], ["v10", "v11", "v12"])
+        self.assertEqual(report["body"], "v_mov_b32 v10, v4\n")
+        self.assertEqual(report["extra_bytes"], 3)
+        self.assertEqual(report["extra_sha256"], hashlib.sha256(b"\x00\xff\x01").hexdigest())
+        self.assertEqual(report["rows"], [
+            {"input": [0xffffffff, 0x80000000, 8, 0], "output": [0xffffffff, 0x80000000, 8]},
+            {"input": [1, 2, 3, 4], "output": [1, 2, 3]},
+        ])
+        self.assertIn("fixture tool diagnostic", errors)
+
+    def test_defaults_include_all_registers_and_empty_extra_identity(self):
+        output, _ = self.cli("--json")
+        report = json.loads(output)
+        self.assertEqual(report["wave_size"], 32)
+        self.assertEqual(report["memory"], "fine")
+        self.assertEqual(report["lds_bytes"], 4096)
+        self.assertEqual(report["extra_bytes"], 0)
+        self.assertEqual(report["extra_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertEqual(report["output_registers"], [f"v{index}" for index in range(10, 26)])
+        self.assertEqual(report["rows"][1]["output"], [1, 2, 3, 4] * 4)
+
+    def test_json_keeps_input_order_across_dispatches_and_omits_padding(self):
+        self.rows.write_text("\n".join(f"{index} 0 0 0" for index in range(1025)), encoding="utf-8")
+        for options, dispatches in (([], 2), (["--wave64"], 3)):
+            with self.subTest(options=options):
+                output, errors = self.cli("--json", "--outs", "1", *options)
+                report = json.loads(output)
+                self.assertEqual(report["rows"], [{"input": [index, 0, 0, 0], "output": [index]} for index in range(1025)])
+                self.assertEqual(errors.count("fixture tool diagnostic"), dispatches)
+
+    def test_plain_hex_output_remains_unchanged(self):
+        output, errors = self.cli("--outs", "2")
+        self.assertEqual(output, "ffffffff 80000000\n00000001 00000002\n")
+        self.assertIn("fixture tool diagnostic", errors)
+
+    def test_failed_dispatch_emits_no_json_report(self):
+        self.runner.write_text("import sys\nprint('fixture dispatch failed')\nsys.exit(7)\n", encoding="utf-8")
+        output = io.StringIO()
+        with self.assertRaises(subprocess.CalledProcessError) as error:
+            self.cli("--json", output=output)
+        self.assertEqual(error.exception.returncode, 7)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_invalid_json_input_fails_before_tool_lookup(self):
+        self.rows.write_text("0x100000000 0 0 0\n", encoding="utf-8")
+        output = io.StringIO()
+        with patch.object(hw_oracle, "target", side_effect=AssertionError("target lookup")) as target:
+            with self.assertRaises(SystemExit) as exited:
+                self.cli("--json", output=output)
+            self.assertEqual(exited.exception.code, 2)
+            target.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
 
 
 class FloatModeTests(unittest.TestCase):
@@ -182,6 +389,39 @@ class TargetOverrideTests(unittest.TestCase):
             with patch.dict(os.environ, {"HW_ORACLE_TARGET": "gfx1100"}):
                 self.assertEqual(hw_oracle.target(), "gfx1100")
 
+    def test_device_selection_uses_its_own_cached_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = root / "probe.py"
+            runner.write_text(
+                "import os\nfrom pathlib import Path\n"
+                "visible = os.environ.get('ROCR_VISIBLE_DEVICES', 'unset')\n"
+                "with Path(__file__).with_name('probes.txt').open('a', encoding='utf-8') as log:\n"
+                "    log.write(visible + '\\n')\n"
+                "print({'0': 'gfx1030', '1': 'gfx1100', 'unset': 'gfx900'}[visible])\n",
+                encoding="utf-8")
+            binary = root / ("oracle.cmd" if os.name == "nt" else "oracle")
+            if os.name == "nt":
+                binary.write_text(f'@"{sys.executable}" "{runner}" %*\n', encoding="utf-8")
+            else:
+                binary.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(runner))} "$@"\n',
+                                  encoding="utf-8")
+                binary.chmod(0o755)
+            with patch.object(hw_oracle, "oracle", return_value=binary), \
+                    patch.dict(os.environ, {"HW_ORACLE_TARGET": ""}):
+                os.environ["ROCR_VISIBLE_DEVICES"] = "0"
+                self.assertEqual(hw_oracle.detected_target(binary, "1"), "gfx1100")
+                for visible, expected in (("0", "gfx1030"), ("0", "gfx1030"),
+                                          ("1", "gfx1100"), ("1", "gfx1100"),
+                                          ("0", "gfx1030"), (None, "gfx900"), (None, "gfx900")):
+                    if visible is None:
+                        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+                    else:
+                        os.environ["ROCR_VISIBLE_DEVICES"] = visible
+                    self.assertEqual(hw_oracle.target(), expected)
+            self.assertEqual((root / "probes.txt").read_text(encoding="utf-8").splitlines(),
+                             ["1", "0", "unset"])
+
     def test_removing_override_restores_cached_detection_for_that_binary(self):
         reply = subprocess.CompletedProcess([], 0, "gfx1030\n", "")
         with patch.object(hw_oracle, "oracle", return_value=Path("oracle-a")), \
@@ -202,6 +442,30 @@ class TargetOverrideTests(unittest.TestCase):
 
 
 class OracleConfigurationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX executable compiler fixture")
+    def test_path_selecting_another_compiler_invalidates_the_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("first", "second"):
+                compiler = root / name / "fixture-cc"
+                compiler.parent.mkdir()
+                compiler.write_text(
+                    "#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n"
+                    "Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(" + repr(name.encode()) + ")\n",
+                    encoding="utf-8")
+                compiler.chmod(0o755)
+            with patch.object(hw_oracle, "CACHE", root / "cache"), \
+                    patch.object(hw_oracle, "rocm_root", return_value=None):
+                with patch.dict(os.environ, {"CC": "fixture-cc", "PATH": str(root / "first")}):
+                    first = hw_oracle.oracle()
+                    self.assertEqual(first.read_bytes(), b"first")
+                    self.assertEqual(hw_oracle.oracle(), first)
+                with patch.dict(os.environ, {"CC": "fixture-cc", "PATH": str(root / "second")}):
+                    second = hw_oracle.oracle()
+                    self.assertEqual(second.read_bytes(), b"second")
+                    self.assertNotEqual(first, second)
+
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux compiler and shared-library fixture")
     def test_cache_and_compiler_command_with_host_toolchain(self):
         compiler = shutil.which("cc")
@@ -240,7 +504,7 @@ class OracleConfigurationTests(unittest.TestCase):
 
     def test_compiler_command_supports_wrapper_and_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
-            def compile(command, *, check):
+            def compile(command, *, check, stdout):
                 self.assertEqual(command[:3], ["ccache", "cc", "-fno-omit-frame-pointer"])
                 Path(command[command.index("-o") + 1]).write_bytes(b"executable")
 
@@ -258,7 +522,7 @@ class OracleConfigurationTests(unittest.TestCase):
             source_file.write_text("first", encoding="utf-8")
             os.utime(source_file, (0, 0))
 
-            def compile(command, *, check):
+            def compile(command, *, check, stdout):
                 Path(command[command.index("-o") + 1]).write_bytes(source_file.read_bytes())
 
             with patch.object(hw_oracle, "HERE", source), patch.object(hw_oracle, "CACHE", root / "cache"), \
@@ -272,7 +536,7 @@ class OracleConfigurationTests(unittest.TestCase):
 
     def test_compiler_change_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
-            def compile(command, *, check):
+            def compile(command, *, check, stdout):
                 Path(command[command.index("-o") + 1]).write_bytes(command[0].encode())
 
             with patch.object(hw_oracle, "CACHE", Path(tmp)), patch.object(hw_oracle, "rocm_root", return_value=None), \
@@ -287,7 +551,7 @@ class OracleConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
-            def compile(command, *, check):
+            def compile(command, *, check, stdout):
                 library_path = next(option for option in command if option.startswith("-L"))
                 Path(command[command.index("-o") + 1]).write_bytes(library_path.encode())
 
@@ -310,7 +574,7 @@ class GroupSegmentTests(unittest.TestCase):
             with self.subTest(wave64=wave64), tempfile.TemporaryDirectory() as tmp:
                 dispatch_sizes = []
 
-                def dispatch(command, *, check, env):
+                def dispatch(command, *, check, env, stdout):
                     self.assertTrue(check)
                     dispatch_sizes.append(int(command[2]))
                     Path(command[4]).write_bytes(bytes(int(command[2]) * 64))

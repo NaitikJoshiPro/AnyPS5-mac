@@ -8,8 +8,11 @@
 // Store runs (labels) are uploads copied into the host imports; [gputime] ranges are MTL4 counter
 // heap timestamps; occlusion samples are visibility-result counters of the render passes, folded
 // by the MSL twins of the SampleCounter/SampleDumps kernels (RecorderKernels.h).
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "MetalCommandStream.h"
 #include "MetalVmTrace.h"
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "MetalVulkanImages.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
@@ -19,6 +22,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -202,7 +206,7 @@ constexpr std::uint32_t SegmentFoldCapacity = 1024;
 constexpr std::uint32_t DumpFoldCapacity = 1024;
 constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
-constexpr std::uint32_t SampleDumpPushBytes = 32;
+constexpr std::uint32_t SampleDumpPushBytes = 40;
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
 
 // macOS: an occlusion segment pool is a visibility result buffer of SegmentSlots 8-byte counters
@@ -335,9 +339,32 @@ void ObjectsDeleter::operator()(BatchObjects* objects) const noexcept {
     delete objects;
 }
 
+namespace {
+thread_local const char* failNextSubmit = nullptr;
+thread_local bool failSubmitBeforeCommit = false;
+}
+
+void FailNextRecorderSubmit(const char* what, bool beforeCommit) {
+    failNextSubmit = what;
+    failSubmitBeforeCommit = beforeCommit;
+}
+
 }
 
 namespace {
+
+// One listener for every recorder's timeline notifications (D80), on a serial user-interactive queue: its blocks only
+// raise a progress event.
+MTLSharedEventListener* ProgressListener() {
+    static MTLSharedEventListener* listener = [[MTLSharedEventListener alloc]
+        initWithDispatchQueue:dispatch_queue_create("aps5.gpu-progress", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0))];
+    return listener;
+}
+
+MTLSharedEventNotificationBlock ProgressBlock() {
+    static MTLSharedEventNotificationBlock block = ^(MetalEvent, uint64_t) { ::AgcDriver::Progress::Notify(); };
+    return block;
+}
 
 // The handle the shared code passes around for a batch's commands (a CommandStream's address).
 VkCommandBuffer CommandsOf(const std::unique_ptr<Metal::BatchObjects, Metal::ObjectsDeleter>& objects) {
@@ -770,11 +797,15 @@ bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
 }
 
 // Whether one merged range of the snapshot contains [address, end) entirely.
-bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+bool SnapshotCovers(const WriteRanges* snapshot, std::uint64_t address, std::uint64_t end) {
     if (snapshot == nullptr || snapshot->empty()) return false;
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first <= address && end <= it->second;
+}
+
+bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
+    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+    return SnapshotCovers(snapshot.get(), address, end);
 }
 
 // Attribution of the pending-write syncs the hook makes (the [hooksync] line every 10 s, under
@@ -1165,6 +1196,8 @@ void FlushForAccessImpl(std::uint64_t address, std::size_t bytes, bool gpuReader
     std::size_t images = 0, evicted = 0;
     const bool kept = !HookFlushCpuBlocks() && StorageTexture::AccessKeptByCpu(address, bytes, &images, &evicted);
     if (kept || (images == 0 && !HookFlushCpuBlocks())) {
+        // 5937ef03ef: an image another thread is storing over the range lands before the host read.
+        stored = StorageTexture::WaitForFlushing(address, bytes);
         published = StorageTexture::PublishShadowsOnly(address, bytes, scope);
         if (kept && HookSyncProfiled()) CountRecordedStoreSkip(RecordedStoreKey(), evicted);
     } else {
@@ -1388,6 +1421,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     }
     // A poller that refused the group as unclosed re-consults the table on the next generation.
     writeGeneration.fetch_add(1, std::memory_order_release);
+    ::AgcDriver::Progress::Notify();
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
@@ -1636,6 +1670,11 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        if (PerformanceTrace::Recording()) {
+            static std::atomic<std::uint64_t> traceIds{0};
+            open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
+        }
+        TraceBatchTag = open->traceId;
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
@@ -1860,7 +1899,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
             }
             const auto before = dumpIndex;
             foldQueuedDumps(commands, stores, first, end, dumpIndex, consumed);
-            if (dumpIndex != before) ++barriers;
+            if (dumpIndex != before) barriers += 3;
             first = end;
         }
         if (dumps) {
@@ -2200,7 +2239,7 @@ std::vector<std::size_t> Recorder::QueuedWriteGroups(std::span<const QueuedWrite
     std::vector<std::pair<std::uint64_t, std::uint64_t>> computed;
     for (std::size_t i = 0; i < writes.size(); ++i) {
         const auto& write = writes[i];
-        if (!write.computed && std::any_of(computed.begin(), computed.end(), [&](const auto& range) { return write.begin < range.second && range.first < write.end; })) {
+        if (!write.computed && !computed.empty()) {
             ends.push_back(i);
             computed.clear();
         }
@@ -2337,9 +2376,21 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
         std::uint32_t dumps;
         std::uint32_t firstSegment;
         std::uint32_t lastSegment;
-    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment};
+        std::uint32_t phase;
+    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment, 0u};
     static_assert(sizeof(parameters) == SampleDumpPushBytes);
-    Metal::Stream(commands).DispatchHelper(Metal::HelperPipeline(metal->device, Metal::HelperKernel::SampleDumps), std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    auto& stream = Metal::Stream(commands);
+    MetalPipeline pipeline = Metal::HelperPipeline(metal->device, Metal::HelperKernel::SampleDumps);
+    stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    if (dumps == 0) return;
+    // The counts land before the ready bit (phases 1 then 2, each behind a barrier).
+    const auto publish = [&](std::uint32_t phase) {
+        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        parameters.phase = phase;
+        stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    };
+    publish(1u);
+    publish(2u);
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
@@ -2399,9 +2450,19 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         } parameters{sampleCounter->DeviceAddress(), target, count, last && target != 0 ? 1u : 0u};
         static_assert(sizeof(parameters) == SampleCounterPushBytes);
         stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+        if (parameters.store == 1u) {
+            // The counts land before the ready bit (stores 3 then 2, each behind a barrier).
+            const auto publish = [&](std::uint32_t store) {
+                recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                parameters.store = store;
+                stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+            };
+            publish(3u);
+            publish(2u);
+        }
     } while (done < pendingSamples.size());
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT);
-    CountBarriers(CommandClass::Copy, 2);
+    CountBarriers(CommandClass::Copy, target != 0 ? 4u : 2u);
     pendingSamples.clear();
 }
 
@@ -2457,6 +2518,36 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     return true;
 }
 
+// e54d2f35fe: an indirect dispatch's group counts checked against the device limit on the GPU
+// (DispatchArguments in RecorderKernels.h); the caller dispatches from `arguments` (12 bytes). False:
+// the kernel did not build, and the caller reads the counts from the import unchecked, as before.
+bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments) {
+    constexpr std::uint32_t PushBytes = 32;
+    MetalPipeline pipeline = nil;
+    if (dispatchArgumentState >= 0) {
+        try {
+            pipeline = Metal::HelperPipeline(metal->device, Metal::HelperKernel::DispatchArguments);
+            dispatchArgumentState = 1;
+        } catch (const std::exception& error) {
+            dispatchArgumentState = -1;
+            std::fprintf(stderr, "[gpu] indirect dispatches read their group counts unchecked: %s\n", error.what());
+        }
+    }
+    if (dispatchArgumentState < 0) return false;
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    const auto* limit = context.limits.maxComputeWorkGroupCount;
+    struct {
+        VkDeviceAddress source;
+        VkDeviceAddress arguments;
+        std::array<std::uint32_t, 4> limits;
+    } parameters{source, arguments, {limit[0], limit[1], limit[2], 0u}};
+    static_assert(sizeof(parameters) == PushBytes);
+    Metal::Stream(commands).DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    CountBarriers(CommandClass::DispatchLeading, 2);
+    return true;
+}
+
 void Recorder::beginSamples(Batch&) {
     // macOS: occlusion counting runs only through the fold kernels (segment mode); without them
     // there is no whole-batch query to fall back to.
@@ -2478,7 +2569,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         if (batch.batchTiming == 0 && Metal::TimestampPairValid(stamps[0], stamps[1])) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
-            PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs);
+            PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
         }
         return;
     }
@@ -2487,6 +2578,17 @@ void Recorder::readGpuTiming(Batch& batch) {
     // its class range) against the batch span gives what no range covers.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
     intervals.reserve(batch.timedKeys.size());
+    // A range begun and never ended (its end stamp unwritten: MTLCounterErrorValue, or 0 in a fresh
+    // heap): upstream's vkGetQueryPoolResults returns VK_NOT_READY and the batch publishes no
+    // timings at all (agc_gpu_timing_incomplete); so does this one.
+    for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+        const auto begin = stamps[i * 2];
+        const auto end = stamps[i * 2 + 1];
+        if (begin != 0u && begin != MTLCounterErrorValue && (end == 0u || end == MTLCounterErrorValue)) {
+            timingInvalid.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
         // A stamp the GPU never wrote (MTLCounterErrorValue) or a pair out of order is left out and
@@ -2500,12 +2602,13 @@ void Recorder::readGpuTiming(Batch& batch) {
             // The whole batch: apart from the per-program totals it contains.
             batch.gpuStartNs = static_cast<double>(stamps[i * 2]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[i * 2 + 1]) * period;
-            PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs);
+            PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
             timingBatchMs += ns / 1e6;
+            AgcDriver::PerformanceCounters::AddGpuNanoseconds(static_cast<std::uint64_t>(ns));
             continue;
         }
         const auto key = batch.timedKeys[i];
-        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period);
+        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId);
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;
@@ -2548,6 +2651,13 @@ void Recorder::readGpuTiming(Batch& batch) {
     timingBatches = 0;
     lock.unlock();
     reportBarriers();
+    // D80: progress events and the waits they served, per 10 s.
+    static ::AgcDriver::Progress::Counters lastProgress{};
+    const auto progress = ::AgcDriver::Progress::Read();
+    AgcDriver::ProfilePrint_nid_no_patch("[progress] %llu events, %llu waits over 10 s: %llu woken by an event, %llu timed out\n",
+        static_cast<unsigned long long>(progress.notifies - lastProgress.notifies), static_cast<unsigned long long>(progress.waits - lastProgress.waits),
+        static_cast<unsigned long long>(progress.wokenByEvent - lastProgress.wokenByEvent), static_cast<unsigned long long>(progress.timedOut - lastProgress.timedOut));
+    lastProgress = progress;
 }
 
 bool Recorder::FlipReadCheck() {
@@ -2626,6 +2736,45 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
+}
+
+// 3518eb8ded: small draw snapshots are copied into slices of one shared-storage chunk per recorder
+// instead of a buffer each; a full chunk is replaced and lives on through the slices that hold it.
+Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
+    if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
+        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        offset = 0;
+    }
+    drawUploadUsed = offset + bytes;
+    return {drawUpload, offset, drawUpload->Bytes().data() + offset};
+}
+
+void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
+    if (stamp == unwrittenStamp) return;
+    unwrittenSnapshots.clear();
+    unwrittenBytes = 0;
+    unwrittenStamp = stamp;
+}
+
+std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+    retireUnwrittenSnapshots(stamp);
+    const auto found = unwrittenSnapshots.find(address);
+    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    if (offset != nullptr) *offset = found->second.offset;
+    return found->second.buffer;
+}
+
+void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
+    retireUnwrittenSnapshots(stamp);
+    if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
+        unwrittenBytes -= found->second.bytes;
+        unwrittenSnapshots.erase(found);
+    }
+    if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
+    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
+    unwrittenBytes += bytes;
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
@@ -2756,17 +2905,24 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
+bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    // 5234ab2f4a: the recorder's own last published union stays a superset of its pending writes
+    // while every new range falls inside it; PendingWriteOverlaps rules out misses against it.
+    if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
+    open->writeWords.push_back(word);
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
+    if (activeRecorder == this) {
+        writeGeneration.fetch_add(1, std::memory_order_release);
+        ::AgcDriver::Progress::Notify();
+    }
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
     if (SnapshotCovers(address, end)) {
@@ -2780,7 +2936,8 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
-        publishPendingWrites();
+        const std::array ranges{std::pair{address, address + bytes}};
+        publishPendingWrites(ranges);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
@@ -2789,10 +2946,18 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
+    batch.writeWords.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
+    if (activeRecorder == this) {
+        writeGeneration.fetch_add(1, std::memory_order_release);
+        ::AgcDriver::Progress::Notify();
+    }
+    if (!SnapshotCovers(address, address + bytes)) {
+        const std::array ranges{std::pair{address, address + bytes}};
+        publishPendingWrites(ranges);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2805,15 +2970,25 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
     if (!noteWrite(address, bytes)) return;
-    publishPendingWrites();
+    const std::array ranges{std::pair{address, address + bytes}};
+    publishPendingWrites(ranges);
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
-    if (!noteWrite(address, bytes, false, value)) return;
-    publishPendingWrites();
+    if (!noteWrite(address, bytes, false, value, value * std::int64_t{0x01010101})) return;
+    const std::array ranges{std::pair{address, address + bytes}};
+    publishPendingWrites(ranges);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+    const int value = word == (word & 0xffu) * 0x01010101u ? static_cast<int>(word & 0xffu) : -1;
+    if (!noteWrite(address, bytes, false, value, word)) return;
+    const std::array ranges{std::pair{address, address + bytes}};
+    publishPendingWrites(ranges);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2823,26 +2998,56 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
     }
     if (!publish) return;
-    publishPendingWrites();
+    publishPendingWrites(ranges);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
-void Recorder::publishPendingWrites() const {
-    // Only the active recorder owns the snapshot: one torn down after its successor was activated,
-    // or one a worker still dispatches into after device.reset(), must not publish its ranges.
-    if (activeRecorder != this) return;
-    const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto merged = std::make_shared<WriteRanges>();
-    if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
-    for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-    for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-    std::sort(merged->begin(), merged->end());
-    std::size_t out = 0;
-    for (const auto& [begin, end] : *merged) {
-        if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
-        else (*merged)[out++] = {begin, end};
+void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
+    if (activeRecorder != this) {
+        publishedWriteRangesValid = false;
+        return;
     }
-    merged->resize(out);
+    const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto previous = pendingWrites.load(std::memory_order_acquire);
+    const auto owned = publishedWriteRanges.lock();
+    const bool extend = !additions.empty() && previous != nullptr && previous == owned && publishedWriteRangesValid &&
+        std::all_of(additions.begin(), additions.end(), [](const auto& range) { return range.second > range.first; });
+    publishedWriteRangesValid = false;
+    auto merged = std::make_shared<WriteRanges>();
+    if (extend && additions.size() == 1) {
+        auto range = additions.front();
+        const auto first = std::partition_point(previous->begin(), previous->end(), [&](const auto& entry) { return entry.second < range.first; });
+        auto last = first;
+        while (last != previous->end() && last->first <= range.second) {
+            range.first = std::min(range.first, last->first);
+            range.second = std::max(range.second, last->second);
+            ++last;
+        }
+        merged->reserve(previous->size() - static_cast<std::size_t>(last - first) + 1);
+        merged->insert(merged->end(), previous->begin(), first);
+        merged->push_back(range);
+        merged->insert(merged->end(), last, previous->end());
+    } else {
+        if (extend) {
+            merged->reserve(previous->size() + additions.size());
+            merged->insert(merged->end(), previous->begin(), previous->end());
+            merged->insert(merged->end(), additions.begin(), additions.end());
+        } else {
+            if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
+            for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
+            for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
+        }
+        std::sort(merged->begin(), merged->end());
+        std::size_t out = 0;
+        for (const auto& [begin, end] : *merged) {
+            if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
+            else (*merged)[out++] = {begin, end};
+        }
+        merged->resize(out);
+    }
+    publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
+    publishedWriteRanges = merged;
+    published = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
@@ -2858,6 +3063,7 @@ bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t
 
 bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return false;
+    if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return true;
     for (const auto& batch : inFlight) {
@@ -2881,6 +3087,19 @@ bool Recorder::CompletionWriteOverlaps(std::uint64_t address, std::size_t bytes)
 
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
+}
+
+// 9fffceaa9a: the newest unfinished batch that writes the range or holds it in an address-based
+// lease (its stores are marked only when its completion runs); 0 when none does.
+std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    const auto writes = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value(); };
+    if (open != nullptr && writes(*open)) return OpenSerial();
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (writes(**it)) return (*it)->serial;
+    }
+    return 0;
 }
 
 bool Recorder::signaled(const Batch& batch) const {
@@ -2924,12 +3143,18 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
     const auto end = address + bytes;
     const auto scan = [&](const Batch& batch) {
         for (std::size_t i = 0; i < batch.writes.size(); ++i) {
-            if (address < batch.writes[i].second && batch.writes[i].first < end) found.push_back({batch.writes[i].first, batch.writes[i].second, batch.writeNotes[i], batch.writeValues[i]});
+            if (address < batch.writes[i].second && batch.writes[i].first < end) found.push_back({batch.writes[i].first, batch.writes[i].second, batch.writeNotes[i], batch.writeValues[i], batch.writeWords[i]});
         }
     };
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
     return found;
+}
+
+void Recorder::PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    ranges.clear();
+    if (open != nullptr) ranges.insert(ranges.end(), open->writes.begin(), open->writes.end());
+    for (const auto& batch : inFlight) ranges.insert(ranges.end(), batch->writes.begin(), batch->writes.end());
 }
 
 bool Recorder::ReadTracking() {
@@ -2954,11 +3179,61 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
-const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
-    for (const auto& read : batch.reads) {
-        if (address < read.end && read.begin < end) return &read;
+bool Recorder::ValidReadList(const ReadList& ranges) {
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        if (ranges[index].second <= ranges[index].first) return false;
+        if (index != 0 && ranges[index].first < ranges[index - 1].second) return false;
     }
-    return nullptr;
+    return true;
+}
+
+void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+    if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
+    if (CaptureTrace::Enabled() || FlipReadCheck()) {
+        NotePendingReads(*ranges, kind);
+        return;
+    }
+    ensureOpen();
+    readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
+    for (const auto& note : open->readLists) {
+        if (note.ranges == ranges && note.kind == kind) return;
+    }
+    open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+}
+
+std::optional<Recorder::ReadKind> Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only) {
+    const auto listOverlaps = [&](const Batch::ReadListNote& note) {
+        if (only.has_value() && note.kind != *only) return false;
+        const auto& list = *note.ranges;
+        const auto found = std::partition_point(list.begin(), list.end(), [&](const auto& range) { return range.second <= address; });
+        return found != list.end() && found->first < end;
+    };
+    std::size_t next = 0;
+    for (std::size_t index = 0; index < batch.reads.size(); ++index) {
+        for (; next < batch.readLists.size() && batch.readLists[next].position == index; ++next) {
+            if (listOverlaps(batch.readLists[next])) return batch.readLists[next].kind;
+        }
+        const auto& read = batch.reads[index];
+        if ((!only.has_value() || read.kind == *only) && address < read.end && read.begin < end) return read.kind;
+    }
+    for (; next < batch.readLists.size(); ++next) {
+        if (listOverlaps(batch.readLists[next])) return batch.readLists[next].kind;
+    }
+    return std::nullopt;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::notedReads(const Batch& batch) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    std::size_t next = 0;
+    const auto expand = [&](std::size_t position) {
+        for (; next < batch.readLists.size() && batch.readLists[next].position == position; ++next) result.insert(result.end(), batch.readLists[next].ranges->begin(), batch.readLists[next].ranges->end());
+    };
+    for (std::size_t index = 0; index < batch.reads.size(); ++index) {
+        expand(index);
+        result.emplace_back(batch.reads[index].begin, batch.reads[index].end);
+    }
+    expand(batch.reads.size());
+    return result;
 }
 
 bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, bool ignoreSignaled) const {
@@ -2966,20 +3241,20 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
     readQueries.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) {
-            readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        if (const auto kind = readOverlap(*open, address, end)) {
+            readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
     // Newest first: the batch most likely still running decides without a status query per batch.
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        const auto* read = readOverlap(**it, address, end);
-        if (read == nullptr) continue;
+        const auto kind = readOverlap(**it, address, end);
+        if (!kind.has_value()) continue;
         if (ignoreSignaled && signaled(**it)) {
             readStaleIgnored.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
@@ -2989,10 +3264,10 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, read->kind, true, false};
+        if (const auto kind = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, *kind, true, false};
     }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        if (const auto* read = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, read->kind, false, signaled(**it)};
+        if (const auto kind = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, *kind, false, signaled(**it)};
     }
     return std::nullopt;
 }
@@ -3300,10 +3575,21 @@ void Recorder::Submit() {
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
-        for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
+        for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
     auto batch = std::move(open);
+    // A batch that fails before its commit is discarded (its labels and completion counts leave
+    // the tables) instead of leaking (upstream 72d6c9e16b). Metal's commit reports no device loss
+    // (that arrives in the commit feedback), so there is no vkDeviceWaitIdle step here.
+    struct DiscardUnsubmitted {
+        Recorder& recorder;
+        std::unique_ptr<Batch>& batch;
+        ~DiscardUnsubmitted() {
+            if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
+        }
+    } discardUnsubmitted{*this, batch};
     MetalCommandBuffer commandBuffer = batch->metal->stream->End();
+    if (Metal::failNextSubmit != nullptr && Metal::failSubmitBeforeCommit) throw std::runtime_error(std::exchange(Metal::failNextSubmit, nullptr));
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
@@ -3331,6 +3617,7 @@ void Recorder::Submit() {
         feedback->delivered.store(true, std::memory_order_release);
     }];
     const auto submitStart = std::chrono::steady_clock::now();
+    if (Metal::failNextSubmit != nullptr) throw std::runtime_error(std::exchange(Metal::failNextSubmit, nullptr));
     MetalCommandBuffer commandBuffers[1] = {commandBuffer};
     // Under the residency lock: the commit walks the queue's residency sets, which the release
     // thread changes (MetalResidency.h, D44).
@@ -3338,6 +3625,9 @@ void Recorder::Submit() {
         [metal->queue commit:commandBuffers count:1 options:options];
         [metal->queue signalEvent:metal->timeline value:serial];
     });
+    // D80: when the timeline reaches this batch, wake the threads waiting for completions or labels instead of
+    // letting them find it on their next poll.
+    [metal->timeline notifyListener:ProgressListener() atValue:serial block:ProgressBlock()];
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3775,6 +4065,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    const auto expansions = Metal::IndexExpansionCounts();
+                    const auto snapshots = StorageTexture::TakeSnapshotCounts();
+                    AgcDriver::ProfilePrint_nid_no_patch("[cpuwaits] index expansions: %llu gathered on the GPU, %llu read on the CPU after a sync (D81); storage snapshots: %llu copied on the GPU, %llu waited for by a reader, uploads kept on the CPU: shadowed %llu, CPU write-back %llu, no import %llu (D82); cumulative\n", static_cast<unsigned long long>(expansions.gathered), static_cast<unsigned long long>(expansions.settled), static_cast<unsigned long long>(snapshots.gpu), static_cast<unsigned long long>(snapshots.settled), static_cast<unsigned long long>(snapshots.refused[0]), static_cast<unsigned long long>(snapshots.refused[1]), static_cast<unsigned long long>(snapshots.refused[2]));
                     const auto reads = Recorder::ReadCounts();
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
@@ -3828,7 +4121,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.readGeneration = batch->readGeneration;
         entry.reads.clear();
         if (FlipReadCheck()) {
-            for (const auto& read : batch->reads) entry.reads.emplace_back(read.begin, read.end);
+            entry.reads = notedReads(*batch);
         }
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
@@ -3844,8 +4137,19 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         for (auto& action : batch->completions) {
             try {
                 action();
+            } catch (const BdaUnalignedAccess& error) {
+                // 0f0197c16d, 69b683a901: the unaligned BDA reports are rate-limited per instruction.
+                static std::mutex failuresMutex;
+                static std::unordered_map<std::uint32_t, std::uint64_t> failures;
+                constexpr std::uint64_t kDeferredFailureFirst = 8, kDeferredFailureEvery = 1024;
+                const auto count = [&] {
+                    std::lock_guard lock(failuresMutex);
+                    return ++failures[error.instruction];
+                }();
+                if (count <= kDeferredFailureFirst) std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
+                else if (count % kDeferredFailureEvery == 0) std::fprintf(stderr, "[gpu] deferred write-back failed with an unaligned BDA access at pc 0x%x %llu times so far; latest: %s\n", error.instruction, static_cast<unsigned long long>(count), error.what());
             } catch (const std::exception& error) {
-                std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
+                AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
     }
@@ -3877,18 +4181,34 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     // The batch's label entries leave the table (a later label to the same dword already replaced
     // its entry and belongs to another batch). Correctness never depended on this removal.
-    if (!batch->labelDwords.empty() || !batch->wideLabels.empty()) {
+    removeLabels(*batch);
+    release(*batch);
+}
+
+void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    removeLabels(*batch);
+    if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
+    if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
+    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    release(*batch);
+    try {
+        publishPendingWrites();
+    } catch (...) {
+    }
+}
+
+void Recorder::removeLabels(Batch& batch) {
+    if (!batch.labelDwords.empty() || !batch.wideLabels.empty()) {
         std::lock_guard tableLock(labelTableMutex);
-        for (const auto dword : batch->labelDwords) {
+        for (const auto dword : batch.labelDwords) {
             const auto found = labels.find(dword);
-            if (found != labels.end() && found->second.batch == batch.get()) labels.erase(found);
+            if (found != labels.end() && found->second.batch == &batch) labels.erase(found);
         }
-        for (const auto entry : batch->wideLabels) wideLabels.erase(entry);
+        for (const auto entry : batch.wideLabels) wideLabels.erase(entry);
         recordedLabels.store(labels.size(), std::memory_order_relaxed);
     }
-    batch->labelDwords.clear();
-    batch->wideLabels.clear();
-    release(*batch);
+    batch.labelDwords.clear();
+    batch.wideLabels.clear();
 }
 
 void Recorder::release(Batch& batch) noexcept {

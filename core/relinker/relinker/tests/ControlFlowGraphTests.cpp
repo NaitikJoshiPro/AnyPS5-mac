@@ -1,4 +1,5 @@
 #include <relinker/analysis/UnusedNidFilter/IControlFlowGraph.hpp>
+#include <relinker/analysis/RelativeJumpTables.hpp>
 #include <codegen/CodegenException.hpp>
 #include <cstring>
 #include <iostream>
@@ -6,11 +7,13 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <limits>
 
 namespace {
 
 using namespace Relinker::UnusedNidFilter;
 using Relinker::VirtualAddress;
+using Relinker::RelinkerException;
 using Bytes = std::vector<std::uint8_t>;
 constexpr VirtualAddress TextAddress = 0xec00001000;
 
@@ -138,6 +141,44 @@ void CheckSpeculativeRoots() {
     Require(threw, "Malformed mandatory root was treated as speculative");
 }
 
+void CheckTrailingZeroRoots() {
+    const Pointers pointers;
+    const Bytes lone{0x00};
+    bool threw = false;
+    try {
+        BuildControlFlowGraph(lone, TextAddress, TextAddress, {}, pointers);
+    } catch (const Codegen::CodegenException&) {
+        threw = true;
+    }
+    Require(threw, "A lone zero instruction at the entry was not decoded");
+
+    const Bytes trailing{0xc3, 0x00};
+    threw = false;
+    try {
+        BuildControlFlowGraph(trailing, TextAddress, TextAddress, {TextAddress + 1}, pointers);
+    } catch (const Codegen::CodegenException&) {
+        threw = true;
+    }
+    Require(threw, "A zero instruction at an extra entry was not decoded");
+
+    const Bytes jump{0xeb, 0x00, 0x00};
+    threw = false;
+    try {
+        BuildControlFlowGraph(jump, TextAddress, TextAddress, {}, pointers);
+    } catch (const Codegen::CodegenException&) {
+        threw = true;
+    }
+    Require(threw, "A branch into a truncated zero instruction was not decoded");
+
+    const Bytes pair{0x00, 0x00};
+    const auto complete = BuildControlFlowGraph(pair, TextAddress, TextAddress, {}, pointers);
+    RequireOffsets(*complete, {0});
+
+    const Bytes immediate{0xb8, 0x00, 0x00, 0x00, 0x00};
+    const auto zeroImmediate = BuildControlFlowGraph(immediate, TextAddress, TextAddress, {}, pointers);
+    RequireOffsets(*zeroImmediate, {0});
+}
+
 void CheckBorrowedReachability() {
     const Pointers pointers;
     const Bytes text{0x90, 0x90, 0xc3, 0x90, 0xc3};
@@ -151,6 +192,65 @@ void CheckBorrowedReachability() {
     RequireOffsets(*first, {0, 1, 3, 4});
 }
 
+void CheckAddressOverflow() {
+    const Pointers pointers;
+    const Bytes text{0x90, 0xc3};
+    bool threw = false;
+    try {
+        BuildControlFlowGraph(text, std::numeric_limits<VirtualAddress>::max(), std::numeric_limits<VirtualAddress>::max(), {}, pointers);
+    } catch (const RelinkerException&) {
+        threw = true;
+    }
+    Require(threw, "Text section address space overflow was not rejected");
+}
+
+void CheckHighVirtualAddress() {
+    constexpr VirtualAddress highVaddr = 0xf00000001000;
+    const Pointers pointers;
+    Bytes text{0xeb, 0x02, 0x90, 0x90, 0xc3};
+    const auto graph = BuildControlFlowGraph(text, highVaddr, highVaddr, {}, pointers);
+    std::unordered_set<VirtualAddress> expected{highVaddr, highVaddr + 4};
+    Require(graph->ReachableVaddrs() == expected, "Unexpected reachable instruction set at high virtual address");
+    Require(graph->IsReachable(highVaddr), "Missing high entry address");
+    Require(graph->IsReachable(highVaddr + 4), "Missing high branch target address");
+}
+
+void CheckRelativeJumpTables() {
+    constexpr std::size_t tableOffset = 16;
+    Bytes text(32, 0x90);
+    text[0] = 0x48;
+    text[1] = 0x8d;
+    text[2] = 0x05;
+    SetDisplacement(text, 3, 7, TextAddress + tableOffset);
+    text[7] = 0xff;
+    text[8] = 0xe0;
+    const std::int32_t targets[]{-16, -9};
+    std::memcpy(text.data() + tableOffset, targets, sizeof(targets));
+    Require(Relinker::FindTrailingRelativeJumpTable(text) == tableOffset, "Relative jump table was not found");
+
+    const std::vector<std::pair<VirtualAddress, VirtualAddress>> functions{{TextAddress, TextAddress + 9}, {TextAddress + text.size(), TextAddress + text.size() + 8}};
+    const auto tables = Relinker::FindRelativeJumpTables(text, TextAddress, functions);
+    Require(tables.size() == 1, "Expected one relative jump table");
+    Require(tables[0].Function == TextAddress && tables[0].Begin == TextAddress + tableOffset && tables[0].End == TextAddress + text.size(), "Relative jump table range was incorrect");
+
+    Bytes oneEntry = text;
+    const std::int32_t singleTarget[]{-16};
+    std::memcpy(oneEntry.data() + tableOffset, singleTarget, sizeof(singleTarget));
+    const std::int32_t invalidSecondTarget[]{0x100};
+    std::memcpy(oneEntry.data() + tableOffset + 4, invalidSecondTarget, sizeof(invalidSecondTarget));
+    Require(Relinker::FindTrailingRelativeJumpTable(oneEntry) == oneEntry.size(), "Single-entry table was accepted");
+
+    Bytes invalidTarget = text;
+    const std::int32_t invalidTargets[]{0x100, 0x104};
+    std::memcpy(invalidTarget.data() + tableOffset, invalidTargets, sizeof(invalidTargets));
+    Require(Relinker::FindTrailingRelativeJumpTable(invalidTarget) == invalidTarget.size(), "Table with non-instruction targets was accepted");
+
+    Bytes nonPadding = text;
+    nonPadding.back() = 0x55;
+    Require(Relinker::FindTrailingRelativeJumpTable(nonPadding) == nonPadding.size(), "Table followed by non-padding bytes was accepted");
+
+}
+
 }
 
 int main() {
@@ -161,7 +261,11 @@ int main() {
         CheckRelocatedTransfers();
         CheckCodeAddresses();
         CheckSpeculativeRoots();
+        CheckTrailingZeroRoots();
         CheckBorrowedReachability();
+        CheckAddressOverflow();
+        CheckHighVirtualAddress();
+        CheckRelativeJumpTables();
         std::cout << "Control-flow graph tests passed\n";
         return 0;
     } catch (const std::exception& error) {

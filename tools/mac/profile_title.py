@@ -79,6 +79,7 @@ def collect(pid, base, window, sample_seconds, use_powermetrics, started):
         time.sleep(delay)
     counts = {"ns_per_tick": pp.mach_timebase_ns()}
     try:
+        counts["process_before"] = pp.read_process_counters(pid)
         counts["before"] = {str(k): v for k, v in pp.read_thread_counts(pid).items()}
     except OSError as error:
         counts["error"] = str(error)
@@ -96,6 +97,7 @@ def collect(pid, base, window, sample_seconds, use_powermetrics, started):
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     time.sleep(max(started + start + length - time.monotonic(), 0.0))
     try:
+        counts["process_after"] = pp.read_process_counters(pid)
         counts["after"] = {str(k): v for k, v in pp.read_thread_counts(pid).items()}
     except OSError as error:
         counts["error"] = str(error)
@@ -117,6 +119,8 @@ def cmd_run(args):
         raise SystemExit(f"--seconds {args.seconds} ends before the window {window[0]:g}:{window[1]:g} closes")
     env = dict(os.environ)
     env.update(DEFAULT_ENV)
+    if args.no_gputime:
+        env.pop("APS5_PROFILE_GPU", None)  # the driver enables [gputime] on any value, so the variable must be absent
     trace_dir = Path(f"{base}-trace")
     trace_dir.mkdir(exist_ok=True)
     env.update({"APS5_TRACE_SECONDS": f"{int(window[0])}:{int(window[1])}", "APS5_TRACE_DIR": str(trace_dir)})
@@ -128,6 +132,15 @@ def cmd_run(args):
                "--frames", str(args.frames), "--max-load", str(args.max_load)]
     if args.validation:
         command.append("--validation")
+    # Silent by default: the audio goes to SDL's dummy driver, or with --audio-file to a file (title_run's disk
+    # driver). Either changes how the title's audio thread is paced, so the report records which one ran.
+    if args.audio_file:
+        command += ["--audio-file", args.audio_file]
+    elif not args.audio_device:
+        env["SDL_AUDIODRIVER"] = "dummy"
+    audio = args.audio_file or ("device" if args.audio_device else "dummy")
+    Path(f"{base}-profile-args.json").write_text(json.dumps({"audio": audio, "env": parse_env(args.env),
+                                                             "window": list(window), "build": args.build}))
     print("profile:", " ".join(command), flush=True)
     runner = subprocess.Popen(command, env=env)
     stop = threading.Event()
@@ -157,6 +170,9 @@ def build_report(log_dir, title, tag):
     summary_path = Path(f"{base}-summary.json")
     if summary_path.exists():
         result["run"] = json.loads(summary_path.read_text())
+    args_path = Path(f"{base}-profile-args.json")
+    if args_path.exists():
+        result["args"] = json.loads(args_path.read_text())
     log_text = Path(f"{base}.log").read_text(errors="replace") if Path(f"{base}.log").exists() else ""
 
     trace_dir = Path(f"{base}-trace")
@@ -174,6 +190,8 @@ def build_report(log_dir, title, tag):
             seconds = counts["t1"] - counts["t0"]
             rows = pp.diff_thread_counts(counts["before"], counts["after"], counts["ns_per_tick"], seconds)
             result["threads_cpu"] = {"seconds": seconds, "rows": rows}
+            result["process"] = pp.diff_process_counters(counts.get("process_before"), counts.get("process_after"),
+                                                         counts["ns_per_tick"], seconds)
 
     sample_path = Path(f"{base}-sample.txt")
     if sample_path.exists():
@@ -183,6 +201,7 @@ def build_report(log_dir, title, tag):
             "totals": dict(sampled["totals"].most_common()),
             "details": {category: details.most_common(8) for category, details in sampled["details"].items()},
             "threads": sampled["threads"][:24],
+            "all_threads": [{"tid": entry["tid"], "busy": entry["busy"], "total": entry["total"]} for entry in sampled["threads"]],
         }
 
     pm_path = Path(f"{base}-pm.txt")
@@ -192,6 +211,9 @@ def build_report(log_dir, title, tag):
     gputime = pp.parse_gputime(log_text)
     if gputime:
         result["gputime"] = gputime
+    fex_stats = pp.parse_fex_stats(log_text)
+    if fex_stats:
+        result["fex_stats"] = fex_stats
     windows = pp.parse_fex_sample(log_text)
     if windows:
         result["fex_sample"] = pp.summarize_fex_sample(windows)
@@ -199,6 +221,47 @@ def build_report(log_dir, title, tag):
     Path(f"{base}-profile.json").write_text(json.dumps(result, indent=1, default=str))
     Path(f"{base}-profile.md").write_text(markdown(result))
     return result
+
+
+def compare_row(result):
+    """The numbers one A/B line needs, from a build_report result."""
+    summary = result.get("trace_summary") or {}
+    frame = summary.get("frame_ms", {})
+    power = result.get("power") or {}
+    row = {"tag": result["tag"], "presents": summary.get("presents"), "p50": frame.get("p50"), "p99": frame.get("p99"),
+           "p_mhz": power.get("p_active_mhz"), "e_mhz": power.get("e_active_mhz"), "gpu_mhz": power.get("gpu_mhz"),
+           "gpu_active": power.get("gpu_active_pct"), "pressure": "/".join(sorted(power.get("pressure", {}))) or "-",
+           "audio": (result.get("args") or {}).get("audio", "device"),
+           "csw_per_s": (result.get("process") or {}).get("csw_per_s")}
+    threads = (result.get("threads_cpu") or {}).get("rows", [])
+    seconds = (result.get("threads_cpu") or {}).get("seconds") or 1.0
+    total = sum(entry["cpu_ms"] for entry in threads)
+    row["cores"] = total / 1000.0 / seconds if threads else None
+    row["p_share"] = sum(entry["p_ms"] for entry in threads) / total if total else None
+    if threads:
+        top = threads[0]
+        row["top_thread"] = f"{top['name'] or top['tid']} {top['cpu_pct']:.0f}% P{100 * top['p_share']:.0f}%"
+    stats = result.get("fex_stats") or []
+    if stats:
+        last = stats[-2] if len(stats) > 1 else stats[-1]
+        row["jit"] = f"{last['jit_blocks']} blk {last['jit_ms']:.0f} ms, {last['cache_misses']} misses"
+    return row
+
+
+def compare(log_dir, title, tags):
+    rows = [compare_row(build_report(Path(log_dir), title, tag)) for tag in tags]
+    columns = ["tag", "presents", "p50", "p99", "cores", "p_share", "top_thread", "p_mhz", "e_mhz", "gpu_mhz", "gpu_active",
+               "pressure", "audio", "csw_per_s", "jit"]
+    lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    for row in rows:
+        cells = []
+        for column in columns:
+            value = row.get(column)
+            if isinstance(value, float):
+                value = f"{100 * value:.0f}%" if column == "p_share" else f"{value:.1f}" if column in ("p50", "p99", "cores", "gpu_active") else f"{value:.0f}"
+            cells.append("-" if value is None else str(value))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
 
 
 def _fmt(value, digits=1):
@@ -210,6 +273,8 @@ def markdown(result):
     run = result.get("run", {})
     if run:
         out.append(f"Run: verdict {run.get('verdict')}, {run.get('wall_s')} s, validation {run.get('validation')}.")
+    if result.get("args"):
+        out.append(f"Audio output: {result['args'].get('audio')}; extra environment: {result['args'].get('env')}.")
     summary = result.get("trace_summary") or {}
     if summary:
         frame = summary.get("frame_ms", {})
@@ -232,13 +297,36 @@ def markdown(result):
         rows = threads["rows"]
         total = sum(row["cpu_ms"] for row in rows)
         p_total = sum(row["p_ms"] for row in rows)
+        # sample(1) lists a thread again under each dispatch queue it served: sum them per thread id.
+        busy_total = {}
+        for entry in (result.get("sample") or {}).get("all_threads", []):
+            busy, total = busy_total.get(str(entry["tid"]), (0, 0))
+            busy_total[str(entry["tid"])] = (busy + entry["busy"], total + entry["total"])
+        sampled = {tid: 100.0 * busy / total for tid, (busy, total) in busy_total.items() if total}
         out += ["", f"## CPU per thread over {threads['seconds']:.1f} s (P/E time from the kernel's per-thread counters)", "",
                 f"Process: {total / 1000.0 / threads['seconds']:.2f} cores, {100.0 * p_total / total if total else 0:.0f}% "
                 "of it on P cores.", "",
-                "| thread | name | CPU % of a core | P share | P GHz | P IPC | E GHz | E IPC |", "|---|---|---|---|---|---|---|---|"]
+                "\"Sampled busy\" is the share of `sample`'s samples outside a wait. Well above the CPU % it means the "
+                "thread was runnable but not running (the cores were busy with other work) or suspended.", "",
+                "| thread | name | CPU % of a core | sampled busy % | P share | P GHz | P IPC | E GHz | E IPC |",
+                "|---|---|---|---|---|---|---|---|---|"]
+        starved = []
         for row in rows[:16]:
-            out.append(f"| {row['tid']} | {row['name'] or '-'} | {row['cpu_pct']:.1f} | {100 * row['p_share']:.0f}% | "
-                       f"{row['p_ghz']:.2f} | {row['p_ipc']:.2f} | {row['e_ghz']:.2f} | {row['e_ipc']:.2f} |")
+            busy = sampled.get(str(row["tid"]))
+            if busy is not None and busy > row["cpu_pct"] + 20.0:
+                starved.append(f"{row['name'] or row['tid']} ({busy:.0f}% sampled busy, {row['cpu_pct']:.0f}% CPU)")
+            out.append(f"| {row['tid']} | {row['name'] or '-'} | {row['cpu_pct']:.1f} | {'-' if busy is None else f'{busy:.0f}'} | "
+                       f"{100 * row['p_share']:.0f}% | {row['p_ghz']:.2f} | {row['p_ipc']:.2f} | {row['e_ghz']:.2f} | {row['e_ipc']:.2f} |")
+        if starved:
+            out += ["", "CPU contention: " + "; ".join(starved) + "."]
+        process = result.get("process") or {}
+        if process:
+            cpu = process.get("cpu_ms") or 0.0
+            out += ["", f"Process: {process.get('csw_per_s', 0):.0f} context switches/s (wake-ups), "
+                        f"{process.get('syscalls_unix_per_s', 0):.0f} Unix + {process.get('syscalls_mach_per_s', 0):.0f} Mach system calls/s, "
+                        f"{process.get('faults_per_s', 0):.0f} faults/s; waited for a core {process.get('runnable_wait_ms', 0) / 1000.0 / threads['seconds'] * 100:.0f}% "
+                        f"of a core-second per second; CPU by QoS: " +
+                        ", ".join(f"{name} {100.0 * value / cpu:.0f}%" for name, value in sorted(process.get("qos_ms", {}).items(), key=lambda kv: -kv[1]) if cpu) + "."]
     sample = result.get("sample")
     if sample:
         total = sum(sample["totals"].values())
@@ -253,7 +341,8 @@ def markdown(result):
         for category, count in sample["totals"].items():
             share = f"{100.0 * count / busy:.1f}" if busy and not category.startswith(("wait", "idle")) else "-"
             cores = count / per_thread
-            per_frame = f"{cores * frame_ms:.1f}" if frame_ms else "-"
+            # Parked threads are not time on the frame: ms per frame is shown for CPU work only.
+            per_frame = f"{cores * frame_ms:.1f}" if frame_ms and not category.startswith(("wait", "idle")) else "-"
             top = "; ".join(f"{detail} {n}" for detail, n in sample["details"].get(category, [])[:4])
             out.append(f"| {category} | {count} | {cores:.2f} | {per_frame} | {share} | {top} |")
         out += ["", "### Busiest threads", ""]
@@ -285,6 +374,14 @@ def markdown(result):
         out += ["", "## Guest time (guest sampler, top RIPs)", "",
                 f"{fex['samples']} samples over {fex['threads']} guest threads; of the top RIPs: " +
                 ", ".join(f"{kind} {100.0 * value / total:.0f}%" for kind, value in sorted(kinds.items(), key=lambda kv: -kv[1])), ""]
+        exact = fex.get("exact_kinds") or {}
+        if exact:
+            all_samples = sum(exact.values()) or 1.0
+            out.append("All guest-thread samples by where the host PC was: " + ", ".join(
+                f"{kind} {100.0 * value / all_samples:.1f}%" for kind, value in sorted(exact.items(), key=lambda kv: -kv[1])) + ".")
+            for share, thread, window, kinds in fex.get("busiest_translated", []):
+                out.append(f"- guest thread {thread} (window {window}): " + ", ".join(f"{k} {v:.1f}%" for k, v in kinds.items()))
+            out.append("")
         for module, offset, kind, host, samples in fex["hot"][:8]:
             out.append(f"- {module}+0x{offset:x} {kind} {host}: {samples:.0f}")
     out.append("")
@@ -308,6 +405,13 @@ def main(argv=None):
     run.add_argument("--max-load", type=float, default=8.0)
     run.add_argument("--validation", action="store_true")
     run.add_argument("--no-powermetrics", action="store_true")
+    run.add_argument("--no-gputime", action="store_true", help="leave APS5_PROFILE_GPU unset (timestamps cost ~1%% of queue 0)")
+    run.add_argument("--audio-file", help="capture the title's audio to this file (SDL disk driver)")
+    run.add_argument("--audio-device", action="store_true", help="play through the real audio device (default: SDL dummy driver)")
+    comparison = sub.add_parser("compare", help="one table of several runs' frame times, clocks, CPU and JIT numbers")
+    comparison.add_argument("log_dir")
+    comparison.add_argument("title")
+    comparison.add_argument("tags", nargs="+")
     report = sub.add_parser("report")
     report.add_argument("log_dir")
     report.add_argument("title")
@@ -315,6 +419,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "run":
         return cmd_run(args)
+    if args.command == "compare":
+        print(compare(args.log_dir, args.title, args.tags))
+        return 0
     result = build_report(Path(args.log_dir), args.title, args.tag)
     print(Path(f"{stem(args.log_dir, args.title, args.tag)}-profile.md").read_text())
     return 0 if result else 1

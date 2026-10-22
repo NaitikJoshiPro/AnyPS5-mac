@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -22,6 +24,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -70,7 +73,7 @@ char* GuestString(std::uint8_t* guest, std::uint8_t* alias, std::size_t offset, 
 }
 
 // Calls beyond read/write: paths, out-structs, socket options, arrays, ioctl/fcntl, sysctl, stdio.
-// Returns the faults fprintf took: its %s argument is read in userspace (correct through the fault path, not EFAULT).
+// Returns the faults fprintf and printf took: their %s argument is read in userspace (correct through the fault path, not EFAULT).
 std::uint64_t RunKernelStructs(std::uintptr_t base, std::uint8_t* guest, std::uint8_t* alias, const std::filesystem::path& file) {
     constexpr std::size_t Scratch = 3 * Size; // [3 * Size, Bytes) is free for this function
     std::memset(alias + Scratch, 0, Bytes - Scratch);
@@ -122,6 +125,16 @@ std::uint64_t RunKernelStructs(std::uintptr_t base, std::uint8_t* guest, std::ui
     Require(std::fgets(line, 64, stream) == line && std::strcmp(reinterpret_cast<char*>(host(0x9000)), "tail line\n") == 0, base,
         "fgets into a displaced buffer returns the guest pointer");
     std::fclose(stream);
+    // setbuf retains a BUFSIZ buffer like setvbuf (mbedtls in libSceSsl); printf formats a displaced %s on the host.
+    FILE* buffered = std::fopen(guestRenamed, "r");
+    Require(buffered != nullptr, base, "fopen for setbuf");
+    std::setbuf(buffered, reinterpret_cast<char*>(at(0x9800)));
+    Require(std::fgetc(buffered) == 'x' && host(0x9800)[0] == 'x', base, "setbuf with a displaced buffer reads through its alias");
+    std::fclose(buffered);
+    char* printed = GuestString(guest, alias, Scratch + 0x9c00, "host system call shim: displaced printf\n");
+    const auto printBefore = Faults();
+    Require(std::printf("%s", printed) == 40, base, "printf of a displaced string");
+    const auto printFaults = Faults() - printBefore;
     Require(::unlink(guestRenamed) == 0 && ::rmdir(guestDirectory) == 0, base, "unlink and rmdir with displaced paths");
 
     // Sockets: name, options, poll/select/kevent arrays.
@@ -186,7 +199,23 @@ std::uint64_t RunKernelStructs(std::uintptr_t base, std::uint8_t* guest, std::ui
     Require(::getrlimit(RLIMIT_NOFILE, reinterpret_cast<rlimit*>(at(0x10200))) == 0 &&
             reinterpret_cast<rlimit*>(host(0x10200))->rlim_cur > 0,
         base, "getrlimit into a displaced struct");
-    return formatFaults;
+    Require(::statvfs(GuestString(guest, alias, Scratch + 0x10400, file.string()), reinterpret_cast<struct statvfs*>(at(0x10800))) == 0 &&
+            reinterpret_cast<struct statvfs*>(host(0x10800))->f_bsize > 0,
+        base, "statvfs with a displaced path and struct");
+
+    // libkernel's fault-safe guest copies (Socket/Udp.cpp ReadGuest/WriteGuest) go through the task's VM map.
+    for (std::size_t index = 0; index < 0x40; ++index) host(0x11100)[index] = Pattern(index);
+    Require(::mach_vm_write(mach_task_self(), reinterpret_cast<mach_vm_address_t>(at(0x11000)),
+                reinterpret_cast<vm_offset_t>(at(0x11100)), 0x40) == KERN_SUCCESS &&
+            std::memcmp(host(0x11000), host(0x11100), 0x40) == 0,
+        base, "mach_vm_write between displaced ranges");
+    std::uint8_t copy[0x40]{};
+    mach_vm_size_t copied = 0;
+    Require(::mach_vm_read_overwrite(mach_task_self(), reinterpret_cast<mach_vm_address_t>(at(0x11000)), sizeof(copy),
+                reinterpret_cast<mach_vm_address_t>(copy), &copied) == KERN_SUCCESS &&
+            copied == sizeof(copy) && std::memcmp(copy, host(0x11100), sizeof(copy)) == 0,
+        base, "mach_vm_read_overwrite from a displaced range");
+    return formatFaults + printFaults;
 }
 
 void Run(std::uintptr_t base, const std::filesystem::path& file) {

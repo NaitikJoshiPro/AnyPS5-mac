@@ -13,6 +13,13 @@
 // counterpart: pooled buffers never reach a guest shader through a sized descriptor (guest buffers are
 // bound by guest address, bounded by their V# and the device page table; MetalDevice.mm AddressExtras), so
 // it is excluded with that reason (TechnicalDebt metal-vulkan-internal-tests).
+// Upstream's later cases (5d9dcc42d2..0d078f75d3) intercept Vulkan entry points through Context.deviceProc and have
+// no Metal counterpart either: SlabMetadataFailures (a4485bd82: slab metadata allocation failures after
+// vkAllocateMemory/vkMapMemory; the Metal pool has no slabs), DeviceBindingFailures (432fe5cf9: a failed
+// vkBindBufferMemory; a Metal buffer is created with its memory in one call) and RunCommandBatchFailureTests
+// (tests/CommandBatchFailure.cpp: vkEndCommandBuffer/vkQueueSubmit faults and fence waits counted through
+// deviceProc). The Metal pool's allocation-failure path (trim, then Context::cacheReclaim) is checked by
+// agc_buffer_pool (BufferPoolMetal.mm CacheReclaimRecovery).
 
 #include "MetalTestDevice.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"

@@ -2,18 +2,25 @@
 // (Keep, KeepBytes, BoundKeptBytes) on the Metal recorder. The upstream test counts vkQueueSubmit
 // and fence waits through a mock Vulkan device; here batches are real (empty) MTL4 command buffers,
 // submissions come from Recorder::Submissions() and a batch the recorder waited for is one whose
-// kept objects it released.
+// kept objects it released. FailedSubmission ports upstream's mocked vkEndCommandBuffer and
+// vkQueueSubmit failures through Metal::FailNextRecorderSubmit (a batch failing after its command
+// buffer ended, or at its commit); Metal's commit reports no device loss, so upstream's
+// VK_ERROR_DEVICE_LOST idle-wait cases have no counterpart. The earlier batch is held in flight by
+// a GPU event wait on the queue (upstream leaves its mock fence unsignaled).
 
 #include "MetalTestDevice.h"
+#include "../src/MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
@@ -121,6 +128,69 @@ void SharedOwnerCountsOncePerBatch(const Context& context) {
     recorder.Sync();
 }
 
+void FailedSubmission(const MetalTest::Device& device, bool beforeCommit) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    alignas(8) std::array<std::byte, 128> memory{};
+    const auto address = reinterpret_cast<std::uint64_t>(memory.data());
+    const char* operation = beforeCommit ? "MTL4 command buffer end (test failure)" : "MTL4 commit (test failure)";
+    bool completed = false;
+    bool earlierCompleted = false;
+    bool earlierWrittenBack = false;
+    id<MTLSharedEvent> gate = [device.device newSharedEvent];
+    if (gate == nil) {
+        Expect(false, "cannot make the queue gate");
+        return;
+    }
+    [device.queue waitForEvent:gate value:1];
+    {
+        Recorder recorder(device.context);
+        // Declared after the recorder: an exception opens the gate before the recorder waits for its batches.
+        struct OpenGate {
+            id<MTLSharedEvent> gate;
+            ~OpenGate() { gate.signaledValue = 1; }
+        } openGate{gate};
+        recorder.Activate();
+        recorder.Keep(std::make_shared<int>(0), 17);
+        recorder.NoteLabel(address, std::span<const std::byte>(memory).first(4), 1, 0);
+        recorder.OnComplete([&] { earlierWrittenBack = true; });
+        Expect(recorder.AfterRecordedWork([&] { earlierCompleted = true; }), "the earlier batch did not accept its completion");
+        recorder.Submit();
+        auto kept = std::make_shared<int>(1);
+        std::weak_ptr<int> released = kept;
+        recorder.Keep(std::move(kept), Budget);
+        recorder.NoteLabel(address + 8, std::span<const std::byte>(memory).first(4), 2, 0);
+        recorder.NoteLabel(address + 16, std::span<const std::byte>(memory).first(Recorder::LabelTableBytes + 4), 3, 0);
+        recorder.AfterCompletions(address + 96, std::span<const std::byte>(memory).first(4), 4, 0, false);
+        recorder.OnComplete([&] { completed = true; });
+        Expect(recorder.AfterRecordedWork([&] { completed = true; }), "the failed batch did not accept its completion");
+        Metal::FailNextRecorderSubmit(operation, beforeCommit);
+        bool failed = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            failed = std::string_view(error.what()).find(operation) != std::string_view::npos;
+        }
+        Expect(failed, std::string("submission did not report its failure: ") + operation);
+        Expect(released.expired() && !completed, "a failed batch retained objects or ran its completions");
+        Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17,
+            "the failed batch changed the earlier in-flight submission");
+        Expect(recorder.PendingLabels() == 1 && recorder.PendingLabelIn(address, 4), "a failed batch retained labels or removed the earlier batch's label");
+        Expect(!recorder.PendingLabelIn(address + 8, 4) && !recorder.PendingLabelIn(address + 16, Recorder::LabelTableBytes + 4),
+            "a failed batch retained a narrow or wide label");
+        Expect(!recorder.CompletionLabelIn(address + 96, 4) && Recorder::PendingCompletionLabels() == 1 && Recorder::PendingWriteBackCompletions() == 1,
+            "a failed batch retained pending completions or removed earlier ones");
+        Expect(!Recorder::PendingLabelSince().has_value(), "a failed batch left its label flush deadline pending");
+        Expect(Recorder::SnapshotWriteOverlaps(address, 4) && !Recorder::SnapshotWriteOverlaps(address + 8, 100),
+            "a failed batch left stale writes in the pending snapshot or removed an earlier write");
+        gate.signaledValue = 1;
+        recorder.Sync();
+        Expect(recorder.Idle() && !completed && earlierCompleted && earlierWrittenBack,
+            "sync ran the failed batch's completions or lost the earlier batch's completions");
+        Expect(Recorder::PendingCompletionLabels() == 0 && Recorder::PendingWriteBackCompletions() == 0,
+            "sync left stale completion counts after submission failure");
+    }
+}
+
 }
 
 int main() {
@@ -132,6 +202,8 @@ int main() {
             SyncedWithinTwiceTheBudget(device.context);
             CountFollowsEveryPath(device.context);
             SharedOwnerCountsOncePerBatch(device.context);
+            FailedSubmission(device, true);
+            FailedSubmission(device, false);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "%s\n", error.what());
             return 1;

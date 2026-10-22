@@ -111,19 +111,19 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             }
             pixelStorage.psInputVgpr[static_cast<std::uint32_t>(input)] = PixelInputVgpr(pixel.inputAddr, input);
         };
+        place(PixelInput::PerspectiveSample, (pixel.inputAddr & PixelInputBit(PixelInput::PerspectiveSample)) != 0u);
         place(PixelInput::PerspectiveCenter, pixel.hasPerspectiveCenterVgpr);
         place(PixelInput::PerspectiveCentroid, pixel.perspectiveCentroid);
+        place(PixelInput::LinearSample, (pixel.inputAddr & PixelInputBit(PixelInput::LinearSample)) != 0u);
         place(PixelInput::LinearCenter, pixel.noPerspective);
         place(PixelInput::LinearCentroid, pixel.linearCentroid);
-        // PERSP/LINEAR_SAMPLE: their VGPRs exist whenever SPI_PS_INPUT_ADDR lays them out.
-        place(PixelInput::PerspectiveSample, (pixel.inputAddr & PixelInputBit(PixelInput::PerspectiveSample)) != 0u);
-        place(PixelInput::LinearSample, (pixel.inputAddr & PixelInputBit(PixelInput::LinearSample)) != 0u);
         place(PixelInput::PositionX, pixel.posX);
         place(PixelInput::PositionY, pixel.posY);
         place(PixelInput::PositionZ, pixel.posZ);
         place(PixelInput::PositionW, pixel.posW);
         place(PixelInput::FrontFace, pixel.frontFace);
         place(PixelInput::Ancillary, pixel.ancillary);
+        place(PixelInput::SampleCoverage, (pixel.inputAddr & PixelInputBit(PixelInput::SampleCoverage)) != 0u);
         place(PixelInput::LineStipple, (pixel.inputAddr & PixelInputBit(PixelInput::LineStipple)) != 0u);
         place(PixelInput::PositionFixedPoint, (pixel.inputAddr & PixelInputBit(PixelInput::PositionFixedPoint)) != 0u);
         for (std::uint32_t i = 0; i < 8; ++i) {
@@ -134,18 +134,27 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psPosZ = pixel.posZ;
         pixelStorage.psPosW = pixel.posW;
         pixelStorage.psFrontFace = pixel.frontFace;
+        pixelStorage.psFrontFaceAllBits = pixel.frontFaceAllBits;
         pixelStorage.psAncillary = pixel.ancillary;
         pixelStorage.psNoPerspective = pixel.noPerspective;
         pixelStorage.psPixelKillEnable = pixel.pixelKillEnable;
         pixelStorage.psDepthExportEnable = pixel.depthExportEnable;
         pixelStorage.psSampleMaskExportEnable = pixel.sampleMaskExportEnable;
         pixelStorage.psStencilRefExportEnable = pixel.stencilRefExportEnable;
+        pixelStorage.psStencilOperationValueExport = pixel.stencilOperationValueExport;
         pixelStorage.psSampleShading = pixel.sampleShading;
         pixelStorage.psEarlyZ = pixel.earlyZ;
         pixelStorage.psExecuteOnNoop = pixel.executeOnNoop;
         pixelStorage.psConservativeZExport = pixel.conservativeZExport;
         pixelStorage.psOrderedPixelShader = pixel.orderedPixelShader;
+        if (pixel.ditheredAlphaToCoverage && !pixel.alphaToCoverage) throw std::runtime_error("dithered alpha-to-coverage requires enabled coverage");
         pixelStorage.psAlphaToCoverage = pixel.alphaToCoverage;
+        pixelStorage.psDitheredAlphaToCoverage = pixel.ditheredAlphaToCoverage;
+        pixelStorage.quadPixelMask = pixel.quadPixelMask;
+        pixelStorage.quadSampleMask = pixel.quadSampleMask;
+        pixelStorage.psIteratesSamples = pixel.iteratesSamples;
+        pixelStorage.psPositionLocation = pixel.positionLocation;
+        pixelStorage.sampleLocations = pixel.sampleLocations;
         ShaderStageInputInfo result;
         result.pixel = &pixelStorage;
         return result;
@@ -167,6 +176,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         vertexStorage.hostSubgroupSize = hostSubgroupSize;
         vertexStorage.fetchEmbedded = vertex.fetchEmbedded;
         vertexStorage.paClVsOutCntl = vertex.paClVsOutCntl;
+        vertexStorage.depthRemap = {vertex.depthRemapMode};
         vertexStorage.fetchExternal = false;
         vertexStorage.fetchAttribReg = static_cast<int>(vertex.fetchAttribReg);
         vertexStorage.fetchBufferReg = static_cast<int>(vertex.fetchBufferReg);
@@ -194,6 +204,10 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             target.partitioning = tessellation->partitioning;
             target.outputTopology = tessellation->outputTopology;
             target.patchesPerGroup = tessellation->patchesPerGroup;
+            target.primitiveGroupSize = tessellation->primitiveGroupSize;
+            target.breakAtInstance = tessellation->breakAtInstance;
+            target.instancePatches = tessellation->instancePatches;
+            target.drawParameters = tessellation->drawParameters;
         }
         if (stage == ShaderStageKind::Mesh) {
             if (mesh == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: a mesh-stage program has no mesh configuration");
@@ -211,7 +225,8 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             target.maxPrimitives = mesh->maxPrimitives;
             target.provokingVertex = mesh->provokingVertex;
             target.esgsItemSize = mesh->esgsItemSize;
-            if (target.threadsNum[0] == 0u || target.maxVertices == 0u || target.maxPrimitives == 0u || target.provokingVertex > 2u) throw std::runtime_error("ShaderInputInfoBuilder: invalid mesh configuration");
+            target.outputPrimitiveSize = mesh->outputPrimitiveSize;
+            if (target.threadsNum[0] == 0u || target.maxVertices == 0u || target.maxPrimitives == 0u || (target.outputPrimitiveSize != 2u && target.outputPrimitiveSize != 3u) || target.provokingVertex >= target.outputPrimitiveSize) throw std::runtime_error("ShaderInputInfoBuilder: invalid mesh configuration");
         }
         ShaderStageInputInfo result;
         result.vertex = &vertexStorage;

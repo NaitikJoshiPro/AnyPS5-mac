@@ -12,6 +12,7 @@ static constexpr int ORBIS_NP_AUTH_ERROR_ABORTED = static_cast<int>(0x80550304);
 static constexpr int ORBIS_NP_AUTH_ERROR_REQUEST_NOT_FOUND = static_cast<int>(0x80550306);
 static constexpr int ORBIS_NP_AUTH_ERROR_INVALID_ID = static_cast<int>(0x80550307);
 static constexpr int NP_POLL_ASYNC_FINISHED = 0;
+static constexpr int NP_POLL_ASYNC_RUNNING = 1;
 
 namespace {
 
@@ -19,6 +20,7 @@ struct RequestInfo {
  bool isAsync = false;
  bool processed = false;
  bool aborted = false;
+ bool polled = false;
  int result = SCE_NP_ERROR_SIGNED_OUT;
 };
 
@@ -29,7 +31,7 @@ std::atomic<int> g_nextRequest{1};
 int CreateRequest(bool isAsync) {
  const int reqId = g_nextRequest.fetch_add(1, std::memory_order_relaxed);
  std::lock_guard lock(g_requestMutex);
- g_requests[reqId] = {isAsync, false, false, SCE_NP_ERROR_SIGNED_OUT};
+ g_requests[reqId] = {isAsync, false, false, false, SCE_NP_ERROR_SIGNED_OUT};
  return reqId;
 }
 
@@ -101,11 +103,23 @@ int APS5_VABI sceNpAuthGetIdTokenV3(int req_id, const void* param, void* id_toke
  return SCE_NP_ERROR_SIGNED_OUT;
 }
 
+int APS5_VABI sceNpAuthGetAuthorizationCode(int req_id, const void* param, void* auth_code) {
+ return sceNpAuthGetAuthorizationCodeV3(req_id, param, auth_code, nullptr);
+}
+
+int APS5_VABI sceNpAuthGetIdToken(int req_id, const void* param, void* id_token) {
+ return sceNpAuthGetIdTokenV3(req_id, param, id_token);
+}
+
 int APS5_VABI sceNpAuthPollAsync(int req_id, int* result) {
  std::lock_guard lock(g_requestMutex);
  auto it = g_requests.find(req_id);
  if (it == g_requests.end()) return ORBIS_NP_AUTH_ERROR_REQUEST_NOT_FOUND;
  if (!it->second.isAsync || (!it->second.processed && !it->second.aborted)) return ORBIS_NP_AUTH_ERROR_INVALID_ID;
+ if (!it->second.polled) {
+  it->second.polled = true;
+  return NP_POLL_ASYNC_RUNNING;
+ }
  if (result) *result = it->second.result;
  return NP_POLL_ASYNC_FINISHED;
 }
@@ -128,6 +142,16 @@ int APS5_VABI sceNpAuthWaitAsync(int req_id, int* result) {
  if (!it->second.isAsync || (!it->second.processed && !it->second.aborted)) return ORBIS_NP_AUTH_ERROR_INVALID_ID;
  *result = it->second.result;
  return NP_POLL_ASYNC_FINISHED;
+}
+
+int APS5_VABI sceNpAuthGetAuthorizationCodeA(int req_id, const void* param, void* auth_code, int* issuer_id) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpAuthGetIdTokenA(int req_id, const void* param, void* token) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 }

@@ -205,9 +205,9 @@ void CommandBatch::Submit() {
         [metal->queue commit:commandBuffers count:1 options:options];
         [metal->queue signalEvent:metal->event value:1];
     });
-    timing.Mark("queue_submit");
     pending = true;
     submitted = true;
+    timing.Mark("queue_submit");
 }
 
 void CommandBatch::Wait() {

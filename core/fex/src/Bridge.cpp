@@ -290,6 +290,9 @@ constexpr std::uint8_t Unsupported = 3;
 
 constexpr VariadicExport VariadicExports[] = {
     {"asprintf_nid_postfix", GuestList, 2},
+    {"err_nid_postfix", GuestList, 2},
+    {"errc_nid_postfix", GuestList, 3},
+    {"errx_nid_postfix", GuestList, 2},
     {"fprintf_nid_postfix", GuestList, 2},
     {"fscanf_nid_postfix", GuestList, 2},
     {"libc_printf_nid_postfix", GuestList, 1},
@@ -306,15 +309,21 @@ constexpr VariadicExport VariadicExports[] = {
     {"sscanf_nid_postfix", GuestList, 2},
     {"sscanf_s_nid_postfix", GuestList, 2},
     {"swprintf_nid_postfix", GuestList, 3},
+    {"swprintf_s_nid_postfix", GuestList, 3},
+    {"swscanf_nid_postfix", GuestList, 2},
     {"swscanf_s_nid_postfix", GuestList, 2},
     {"syslog_nid_postfix", GuestList, 2},
+    {"warn_nid_postfix", GuestList, 1},
+    {"warnc_nid_postfix", GuestList, 2},
+    {"warnx_nid_postfix", GuestList, 1},
     {"wprintf_nid_postfix", GuestList, 1},
     {"_open_nid_postfix", Integers, 2},
     {"fcntl_nid_postfix", Integers, 2},
     {"_fcntl_nid_postfix", Integers, 2},
 };
 
-constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix"};
+constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix", "__floatdixf_nid_postfix",
+                                           "__floatundixf_nid_postfix", "__floattixf_nid_postfix", "__floatuntixf_nid_postfix"};
 
 template <std::size_t... Sizes>
 constexpr std::array<std::uint8_t, (Sizes + ...)> Join(const std::array<std::uint8_t, Sizes>&... parts) {

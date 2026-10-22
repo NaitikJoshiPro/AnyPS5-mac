@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import time
 
@@ -11,7 +12,8 @@ BUTTONS = {
     "up": 0x10, "right": 0x20, "down": 0x40, "left": 0x80,
     "l2": 0x100, "r2": 0x200, "l1": 0x400, "r1": 0x800,
     "triangle": 0x1000, "circle": 0x2000, "cross": 0x4000,
-    "square": 0x8000, "touchpad": 0x100000, "release": 0,
+    "square": 0x8000, "touchpad": 0x100000,
+    "touch-left": 0x200000, "touch-right": 0x400000, "release": 0,
 }
 
 
@@ -31,7 +33,7 @@ def previous_sequence(path):
     values = [int(token) for token in tokens]
     if any(value > 2**64 - 1 for value in values):
         return 0
-    if values[0] == 0 or values[1] & ~0x10fffe or not 1 <= values[2] <= 5000:
+    if values[0] == 0 or values[1] & ~0x70fffe or not 1 <= values[2] <= 5000:
         return 0
     if any(axis > 255 for axis in values[3:]):
         return 0
@@ -65,10 +67,20 @@ def main():
         sequence = next_sequence(args.path)
     except ValueError as error:
         parser.error(str(error))
+    metadata = None
+    if os.name == "posix":
+        try:
+            metadata = args.path.stat()
+        except FileNotFoundError:
+            pass
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", dir=args.path.parent, delete=False) as output:
             temporary = Path(output.name)
+            if metadata is not None:
+                if os.geteuid() == 0:
+                    os.fchown(output.fileno(), metadata.st_uid, metadata.st_gid)
+                os.fchmod(output.fileno(), stat.S_IMODE(metadata.st_mode))
             output.write(f"{sequence} {BUTTONS[args.button]} {args.hold_ms}{sticks}\n")
         os.replace(temporary, args.path)
     finally:

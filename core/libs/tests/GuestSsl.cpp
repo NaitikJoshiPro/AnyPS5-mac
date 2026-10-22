@@ -12,8 +12,19 @@ int APS5_VABI sceSslFreeCaCerts(int, void*);
 int APS5_VABI sceSslGetCaList(int, void*);
 int APS5_VABI sceSslFreeCaList(int, void*);
 int APS5_VABI sceSslUnloadCert(int);
-int APS5_VABI sceSslSetVerifyCallback(void);
+int APS5_VABI sceSslCreateConnection(int, int, const char*);
+int APS5_VABI sceSslDeleteConnection(int);
+int APS5_VABI sceSslSetVerifyCallback(int, int (APS5_VABI *)(int, unsigned int, void**, int, void*), void*);
+int APS5_VABI sceSslConnect(int);
+int APS5_VABI sceSslRead(int, void*, std::size_t, int);
+int APS5_VABI sceSslWrite(int, void*, std::size_t, int);
 int APS5_VABI sceSslGetSerialNumber(int, void*, std::uint8_t*, std::size_t*);
+int APS5_VABI sceSslClose(int);
+int APS5_VABI sceSslEnableVerifyOption(int, std::uint32_t);
+int APS5_VABI sceSslDisableVerifyOption(int, std::uint32_t);
+int APS5_VABI sceSslSetMinSslVersion(int, int);
+int APS5_VABI sceSslSetAlpn(int, const char*);
+const char* APS5_VABI sceSslGetAlpnSelected(int);
 }
 
 struct SslMemoryPoolStats {
@@ -37,6 +48,8 @@ static bool Throws(TCall call) {
     return false;
 }
 
+static int APS5_VABI VerifyCallback(int, unsigned int, void**, int, void*) { return 0; }
+
 struct SslCaCerts {
     void* certs;
     std::size_t num;
@@ -52,8 +65,6 @@ int main() {
     constexpr int notFound = static_cast<int>(0x8095F004);
     constexpr int invalidArg = static_cast<int>(0x8095177A);
     int marker = 0;
-    Require(Throws([] { sceSslSetVerifyCallback(); }));
-
     const int context = sceSslInit_nid_postfix(0x10000);
     Require(context > 0);
     SslMemoryPoolStats stats{1, 1, 1, 1};
@@ -93,13 +104,74 @@ int main() {
 
     std::uint8_t serial[32] = {};
     std::size_t serialLength = sizeof(serial);
-    Require(sceSslGetSerialNumber(context, nullptr, serial, &serialLength) == invalidArg);
+    Require(Throws([&] { sceSslGetSerialNumber(context, nullptr, serial, &serialLength); })); // upstream: a null certificate throws
     Require(sceSslGetSerialNumber(context, &handle, serial, nullptr) == invalidArg);
     Require(Throws([&] { sceSslGetSerialNumber(context, &handle, serial, &serialLength); }));
     Require(serialLength == sizeof(serial) && serial[0] == 0);
 
+    constexpr int invalidId = static_cast<int>(0x8095F006);
+    constexpr int invalidValue = static_cast<int>(0x8095F007);
+    constexpr int badLength = static_cast<int>(0x80951773);
+    constexpr int badDescriptor = static_cast<int>(0x80410109);
+    Require(sceSslInit_nid_postfix(0) == static_cast<int>(0x80020016));
+    Require(sceSslCreateConnection(context, 0, nullptr) == invalidValue);
+    Require(sceSslCreateConnection(context + 1000, 0, "example.com") == invalidId);
+
+    const int connection = sceSslCreateConnection(context, 0, "example.com");
+    Require(connection > 0 && connection != context);
+    Require(sceSslSetVerifyCallback(connection, VerifyCallback, &marker) == 0);
+    Require(sceSslSetVerifyCallback(connection, nullptr, nullptr) == 0);
+    constexpr std::uint32_t serverVerify = 0x1;
+    constexpr std::uint32_t cnCheck = 0x4;
+    Require(sceSslEnableVerifyOption(connection, serverVerify | cnCheck) == 0);
+    Require(sceSslDisableVerifyOption(connection, cnCheck) == 0);
+    Require(sceSslDisableVerifyOption(connection, serverVerify | cnCheck) == 0);
+    Require(sceSslEnableVerifyOption(connection, 0x40) == invalidValue);
+    Require(sceSslDisableVerifyOption(connection, 0x1000) == invalidValue);
+    Require(sceSslSetMinSslVersion(connection, 0) == invalidValue);
+    Require(sceSslSetMinSslVersion(connection, 1) == invalidValue);
+    Require(sceSslSetMinSslVersion(connection, 2) == 0);
+    Require(sceSslSetMinSslVersion(connection, 5) == 0);
+    Require(sceSslSetMinSslVersion(connection, -1) == invalidValue);
+    Require(sceSslSetMinSslVersion(connection, 6) == invalidValue);
+    Require(sceSslGetAlpnSelected(connection) == nullptr);
+    Require(sceSslSetAlpn(connection, "http/1.1") == 0);
+    Require(sceSslSetAlpn(connection, "") == badLength);
+    Require(Throws([&] { sceSslSetAlpn(connection, nullptr); }));
+    Require(sceSslGetAlpnSelected(connection) == nullptr);
+    char buffer[4]{};
+    Require(sceSslConnect(connection) == badDescriptor);
+    Require(sceSslRead(connection, buffer, sizeof(buffer), 0) == badDescriptor);
+    Require(sceSslWrite(connection, buffer, sizeof(buffer), 0) == badDescriptor);
+    Require(sceSslWrite(connection, buffer, sizeof(buffer), 1) == invalidValue);
+    Require(sceSslClose(connection) == 0);
+
+    const int unknown = connection + 1000;
+    Require(sceSslSetVerifyCallback(unknown, nullptr, nullptr) == invalidId);
+    Require(sceSslEnableVerifyOption(unknown, serverVerify) == invalidId);
+    Require(sceSslDisableVerifyOption(unknown, serverVerify) == invalidId);
+    Require(sceSslSetMinSslVersion(unknown, 5) == invalidId);
+    Require(sceSslSetAlpn(unknown, "http/1.1") == invalidId);
+    Require(Throws([&] { sceSslGetAlpnSelected(unknown); }));
+    Require(sceSslConnect(unknown) == invalidId);
+    Require(sceSslRead(unknown, buffer, sizeof(buffer), 0) == invalidId);
+    Require(sceSslWrite(unknown, buffer, sizeof(buffer), 0) == invalidId);
+    Require(sceSslClose(unknown) == invalidId);
+    Require(sceSslDeleteConnection(unknown) == invalidId);
+
     Require(sceSslTerm_nid_postfix(context) == 0);
-    Require(Throws([&] { sceSslGetSerialNumber(context, &handle, serial, &serialLength); }));
+    Require(sceSslTerm_nid_postfix(context) == invalidId);
+    Require(sceSslSetVerifyCallback(connection, nullptr, nullptr) == invalidId);
+    Require(sceSslEnableVerifyOption(connection, serverVerify) == invalidId);
+    Require(sceSslDisableVerifyOption(connection, serverVerify) == invalidId);
+    Require(sceSslSetMinSslVersion(connection, 5) == invalidId);
+    Require(sceSslSetAlpn(connection, "http/1.1") == invalidId);
+    Require(Throws([&] { sceSslGetAlpnSelected(connection); }));
+    Require(sceSslConnect(connection) == invalidId);
+    Require(sceSslClose(connection) == invalidId);
+    Require(sceSslCreateConnection(context, 0, "example.com") == invalidId);
+    Require(sceSslDeleteConnection(connection) == invalidId);
+
     Require(sceSslGetCaList(context, nullptr) == invalidArg);
     Require(sceSslFreeCaList(context, nullptr) == invalidArg);
     list = {&handle, 3};

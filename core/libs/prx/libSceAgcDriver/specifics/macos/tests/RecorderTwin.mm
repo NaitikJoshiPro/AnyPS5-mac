@@ -1,5 +1,5 @@
 // Metal twin of tests/Recorder.cpp and tests/ResidentPresent.cpp (agc_driver_recorder_tests), swapped in by
-// twins/T1-tests.cmake. Upstream, each registered mode builds its own Vulkan instance and drives Vulkan objects
+// twins/T1-tests.cmake (tests/HostImportLifetime.cpp has a twin of its own, HostImportLifetimeTwin.mm). Upstream, each registered mode builds its own Vulkan instance and drives Vulkan objects
 // through the recorder; on Metal a mode runs the Metal port that a work package registered (RecorderTwins.h),
 // skips with the allowlisted reason when the behaviour exists only in Vulkan (graphics pipeline libraries,
 // descriptor pools), and otherwise skips naming the package that owns its port, which tools/check_skips.py
@@ -40,6 +40,31 @@ constexpr Mode Modes[] = {
     // Upstream 0f2683cb7 modes: --integer-clear-only, --written-buffer-order-only, --parked-import-unmap-only and
     // --host-import-retirement-only are ported in UpsyncRecorderModes.mm, --copied-direct-only in
     // CopiedDirectOrderingTwin.mm.
+    // Upstream 0d078f75d3 (UPSYNC3 round 3) modes: --device-selection-only and --sampled-storage-base-level-usage-only
+    // are ported in Upsync3RecorderModesD.mm, --host-import-lifetime-only and --host-import-mutation-race-only in
+    // HostImportLifetimeTwin.mm (the twin of tests/HostImportLifetime.cpp).
+    {"--draw-descriptors-only", "agc_draw_descriptors", nullptr,
+     "skipped, the device writes no Vulkan descriptor sets: the checks count vkUpdateDescriptorSets writes per set, and Metal descriptor tables are written into the per-batch upload ring"},
+    // Modes upstream registers only under if(WIN32) (Windows host import settles, write-watch probes and mappings);
+    // listed so that a manual run says why instead of failing as an unknown mode.
+    {"--import-watch-other-family-only", "agc_import_watch_other_family (Windows only)", nullptr,
+     "skipped, a Windows-only mode: import settles on another queue family exist only for Windows host imports"},
+    {"--deferred-settle-only", "agc_import_settle_deferred (Windows only)", nullptr,
+     "skipped, a Windows-only mode: deferred host import settles exist only for Windows host imports (tests/Recorder.cpp #ifdef _WIN32)"},
+    {"--deferred-settle-other-family-only", "agc_import_settle_deferred_other_family (Windows only)", nullptr,
+     "skipped, a Windows-only mode: deferred host import settles exist only for Windows host imports (tests/Recorder.cpp #ifdef _WIN32)"},
+    {"--settle-first-use-only", "agc_import_settle_first_use (Windows only)", nullptr,
+     "skipped, a Windows-only mode: host import settles exist only for Windows host imports (tests/Recorder.cpp #ifdef _WIN32)"},
+    {"--settle-earlier-import-only", "agc_import_settle_earlier_import (Windows only)", nullptr,
+     "skipped, a Windows-only mode: host import settles exist only for Windows host imports (tests/Recorder.cpp #ifdef _WIN32)"},
+    {"--settle-retire-only", "agc_import_settle_retire (Windows only)", nullptr,
+     "skipped, a Windows-only mode: host import settles exist only for Windows host imports (tests/Recorder.cpp #ifdef _WIN32)"},
+    {"--settle-storage-image-only", "agc_import_settle_storage_image (Windows only)", nullptr,
+     "skipped, a Windows-only mode: host import settles exist only for Windows host imports (tests/Recorder.cpp #ifdef _WIN32)"},
+    {"--storage-cpu-snapshot-only", "agc_storage_cpu_snapshot (Windows only)", nullptr,
+     "skipped, a Windows-only mode (upstream registers agc_storage_cpu_snapshot under if(WIN32))"},
+    {"--host-import-second-mapping-only", "agc_host_import_second_mapping (Windows only)", nullptr,
+     "skipped, a Windows-only mode (upstream registers agc_host_import_second_mapping under if(WIN32))"},
 };
 
 }

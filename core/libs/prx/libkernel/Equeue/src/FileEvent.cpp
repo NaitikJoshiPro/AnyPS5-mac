@@ -36,6 +36,8 @@ namespace {
 
 constexpr int GUEST_EBADF = 9;
 constexpr int GUEST_EINVAL = 22;
+// Guest values. On macOS this file does not include <sys/event.h> (its macros collide with Equeue.hpp's guest
+// constants); the host kqueue lives in specifics/macos/HostVnodeWatch.cpp (D29).
 constexpr std::uint32_t NOTE_DELETE = 0x0001;
 constexpr std::uint32_t NOTE_WRITE = 0x0002;
 constexpr std::uint32_t NOTE_EXTEND = 0x0004;
@@ -191,6 +193,10 @@ bool TakeSnapshot(HANDLE handle, Snapshot& snapshot) {
     return true;
 }
 
+bool IsDeleted(const Snapshot& snapshot) {
+    return snapshot.deletePending || snapshot.links == 0;
+}
+
 std::vector<std::uint32_t> SnapshotHints(const Snapshot& before, const Snapshot& after, bool directory) {
     std::vector<std::uint32_t> hints;
     if (!directory) {
@@ -211,10 +217,28 @@ std::vector<std::uint32_t> SnapshotHints(const Snapshot& before, const Snapshot&
     if ((after.deletePending && !before.deletePending) || after.links < before.links) {
         hints.push_back(NOTE_DELETE);
     }
-    if (!after.path.empty() && after.path != before.path) {
+    if (!after.path.empty() && after.path != before.path && !IsDeleted(after)) {
         hints.push_back(NOTE_RENAME);
     }
     return hints;
+}
+
+std::string hostPathText(const std::wstring& path) {
+    const int size = ::WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return "<unprintable host path>";
+    }
+    std::string text(static_cast<std::size_t>(size), '\0');
+    if (::WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, text.data(), size, nullptr, nullptr) != size) {
+        return "<unprintable host path>";
+    }
+    text.pop_back();
+    return text;
+}
+
+std::string changeNotificationFailure(const char* watcher, const std::wstring& path, DWORD error) {
+    return "EVFILT_VNODE: the " + std::string(watcher) + " watch of \"" + hostPathText(path) +
+        "\" failed, FindFirstChangeNotification error=" + std::to_string(error);
 }
 
 HANDLE WatchParent(const std::wstring& path) {
@@ -226,16 +250,16 @@ HANDLE WatchParent(const std::wstring& path) {
     const HANDLE handle = ::FindFirstChangeNotificationW(parent.c_str(), FALSE, PARENT_CHANGES);
     const DWORD error = handle == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
     if (handle == INVALID_HANDLE_VALUE && error != ERROR_INVALID_FUNCTION) {
-        throw std::runtime_error("EVFILT_VNODE: FindFirstChangeNotification failed, error=" + std::to_string(error));
+        throw std::runtime_error(changeNotificationFailure("parent", parent, error));
     }
     return handle;
 }
 
-HANDLE WatchContents(const std::wstring& path, DWORD changes) {
+HANDLE WatchContents(const std::wstring& path, DWORD changes, const char* watcher) {
     const HANDLE handle = ::FindFirstChangeNotificationW(path.c_str(), FALSE, changes);
     if (handle == INVALID_HANDLE_VALUE) {
         const DWORD error = ::GetLastError();
-        throw std::runtime_error("EVFILT_VNODE: FindFirstChangeNotification failed, error=" + std::to_string(error));
+        throw std::runtime_error(changeNotificationFailure(watcher, path, error));
     }
     return handle;
 }
@@ -305,7 +329,9 @@ void RunHostWatch(std::shared_ptr<VnodeWatch> watch, HostWatch host) {
             }
             if (current.path != host.last.path) {
                 CloseChange(host.parent);
-                host.parent = WatchParent(current.path);
+                if (!IsDeleted(current)) {
+                    host.parent = WatchParent(current.path);
+                }
             }
             host.last = std::move(current);
         }
@@ -346,8 +372,8 @@ int OpenHostWatch(int descriptor, std::uint32_t notes, HostWatch& host) {
     try {
         host.parent = WatchParent(host.last.path);
         if (host.directory) {
-            host.entries = WatchContents(host.last.path, FILE_NOTIFY_CHANGE_FILE_NAME);
-            host.subdirectories = WatchContents(host.last.path, FILE_NOTIFY_CHANGE_DIR_NAME);
+            host.entries = WatchContents(host.last.path, FILE_NOTIFY_CHANGE_FILE_NAME, "entries");
+            host.subdirectories = WatchContents(host.last.path, FILE_NOTIFY_CHANGE_DIR_NAME, "subdirectories");
         }
     } catch (...) {
         CloseHostWatch(host);

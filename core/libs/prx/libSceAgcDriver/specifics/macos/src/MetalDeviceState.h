@@ -18,6 +18,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -163,6 +164,14 @@ struct VulkanDevice::State {
     std::mutex drawFaultMutex;
     std::exception_ptr drawFault;
     std::uint32_t lastFaultStage = 0;
+    // Upstream's BdaResources::markWrittenPages check on the device's one written-page record: the
+    // image table ranges of the commands of each batch (keyed by the recorder's serial of the batch
+    // they were recorded into), consumed by the batch's first completion. A store of the batch that
+    // overlaps one is "written by its own dispatch". The record is batch-wide, so a later command
+    // of the same batch storing over a table an earlier one read is reported too (upstream checks
+    // per build): docs/dev/TechnicalDebt.md#metal-image-table-self-write-batch.
+    std::mutex tableRangeMutex;
+    std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> batchTableRanges;
     // Teardown() ran (from ~VulkanDevice or from the exit handler, whichever came first).
     bool tornDown = false;
     // Releases everything in the order the GPU driver needs (D19.5): waits for every submitted
@@ -203,6 +212,9 @@ struct VulkanDevice::State {
     // D5's shader library and pipeline cache (MTL4Compiler + MTL4Archive, background builds); it
     // owns `compiler`. Destroyed in Teardown after the recorder is idle (joins its workers, saves).
     std::unique_ptr<Graphics::Metal::PipelineCache> pipelines;
+    // The process-wide guest compute pipeline count when `pipelines` was created: the base of
+    // VulkanDevice::ComputePipelinesCreated (upstream 4aafda8e3 counts per device).
+    std::uint64_t computePipelinesAtStart = 0;
     // D4/D5's image cache: textures and samplers of dispatch bindings, its residency set on the queue.
     std::unique_ptr<Graphics::Metal::ImageCache> images;
     // D6's draw objects (MetalDraw.mm): argument tables, depth surfaces, tiled target textures.
@@ -250,6 +262,9 @@ struct VulkanDevice::State {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         bool addressBased = false;
         std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> imageEntries;
+        // MslAbi Version 15: the image table, sampler table and table map arrays (WriteTable uploads
+        // each and points its table entries at it).
+        std::vector<std::pair<ShaderRecompiler::RuntimeAbi::Binding, std::vector<std::uint64_t>>> tableArrays;
     };
     void PlanBindings(const ShaderRecompiler::RecompileResult& shader, StageBindings& plan);
     void PlanImages(const ShaderRecompiler::RecompileResult& shader, Graphics::Metal::ImageBindings& images, StageBindings& plan);
@@ -268,7 +283,7 @@ struct VulkanDevice::State {
     // After the command was recorded: pending reads and writes of the planned ranges, and the
     // fault check of the batch.
     void NoteBindings(const StageBindings& plan);
-    void CheckFaultsOnComplete(bool draw = false);
+    void CheckFaultsOnComplete(bool draw = false, std::vector<std::pair<std::uint64_t, std::uint64_t>> tableRanges = {});
 
     // Draws (MetalDraw.mm, D6): the device's draw objects (made at the first draw), a sync when
     // recorded GPU work writes guest memory the CPU is about to read, the GPU buffer holding a
@@ -284,7 +299,8 @@ struct VulkanDevice::State {
     void RecordDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, const Graphics::CompiledShader& vertex, const Graphics::CompiledShader* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots, const Graphics::Metal::TessellationStages* tessellation = nullptr);
     // Waits for every recorded batch and runs their completions (VulkanDevice::WaitIdle).
     void Sync();
-    void CheckFaults();
+    // `serial`: the batch whose completion checks (0: no image table ranges are consumed).
+    void CheckFaults(std::uint64_t serial = 0);
 };
 
 }

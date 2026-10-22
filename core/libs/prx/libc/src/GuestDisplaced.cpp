@@ -1088,6 +1088,19 @@ void GuestDisplacedNativeStats_nid_no_patch(std::uint64_t* unpatched, std::uint6
     if (trapReturns != nullptr) *trapReturns = g_farReturns.load(std::memory_order_relaxed);
 }
 
+}
+
+// For the guest sampler (aps5-fex, through dlsym): is a host PC inside a displaced-access stub chunk? Reads the chunk
+// table without the lock: chunks are only appended, and a sample that races an append is only misfiled.
+extern "C" bool GuestDisplacedIsStubPc_nid_no_patch(std::uintptr_t pc) {
+    const std::size_t count = std::atomic_ref(GuestArena::g_chunkCount).load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < count && i < GuestArena::kMaxChunks; ++i)
+        if (pc >= GuestArena::g_chunks[i].rx && pc - GuestArena::g_chunks[i].rx < GuestArena::g_chunks[i].bytes) return true;
+    return false;
+}
+
+namespace GuestArena {
+
 void GuestDisplacedRanges_nid_no_patch(const DisplacedRange** ranges, std::size_t* count) {
     const bool active = g_enabled.load(std::memory_order_acquire);
     if (ranges != nullptr) *ranges = g_ranges;

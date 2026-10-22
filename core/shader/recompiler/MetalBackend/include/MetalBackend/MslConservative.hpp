@@ -141,7 +141,7 @@ inline std::string FragmentText() {
             if (dot(n, aps5_c - a) + radius > 0.0f) aps5_keep = false;
         }
 #endif
-        if (!aps5_keep) discard_fragment();
+        if (!aps5_keep) { discard_fragment(); aps5_demoted = true; }
     }
 )";
 }

@@ -12,6 +12,9 @@
 
 extern "C" int APS5_VABI vswprintf_nid_postfix(char16_t*, std::size_t, const char16_t*, VaList*);
 extern "C" int APS5_VABI snwprintf_s_nid_postfix(char16_t*, std::size_t, const char16_t*, ...);
+extern "C" int APS5_VABI vswprintf_s_nid_postfix(char16_t*, std::size_t, const char16_t*, VaList*);
+extern "C" int APS5_VABI swprintf_s_nid_postfix(char16_t*, std::size_t, const char16_t*, ...);
+extern "C" int APS5_VABI vsnwprintf_s_nid_postfix(char16_t*, std::size_t, const char16_t*, VaList*);
 extern "C" int APS5_VABI swprintf_nid_postfix(char16_t*, std::size_t, const char16_t*, ...);
 extern "C" std::size_t APS5_VABI strftime_nid_postfix(char*, std::size_t, const char*, const GuestTm*);
 extern "C" std::size_t APS5_VABI wcsftime_nid_postfix(char16_t*, std::size_t, const char16_t*, const GuestTm*);
@@ -103,10 +106,13 @@ static void CheckPositional() {
 static void CheckPointer() {
     char16_t buffer[64];
     const auto address = [](std::uintptr_t value) { return reinterpret_cast<void*>(value); };
-    Require(Format(buffer, 64, u"%p|%p|%p", address(0), address(0x1234), address(0xdeadbeef12)) == 23 &&
-        buffer == std::u16string(u"0x0|0x1234|0xdeadbeef12"), "vswprintf %p uses the 0x form");
-    Require(Format(buffer, 64, u"[%8p][%-8p][%08p][%.6p]", address(0x1a), address(0x1a), address(0x1a), address(0x1a)) == 40 &&
-        buffer == std::u16string(u"[    0x1a][0x1a    ][0x00001a][0x00001a]"), "vswprintf %p width and precision");
+    Require(Format(buffer, 64, u"%p|%p|%p", address(0), address(0x1234), address(0xdeadbeef12)) == 17 &&
+        buffer == std::u16string(u"0|1234|deadbeef12"), "vswprintf %p uses the console form");
+    Require(Format(buffer, 64, u"[%10p][%-10p][%.8p][%08p]", address(0x1234), address(0x1234), address(0x1234), address(0x1a)) == 44 &&
+        buffer == std::u16string(u"[      1234][1234      ][00001234][0000001a]"), "vswprintf %p width and precision");
+    Require(Format(buffer, 64, u"[%.0p][%p]", address(0), address(0)) == 5 &&
+        buffer == std::u16string(u"[][0]"), "vswprintf %p with a zero precision prints nothing");
+    Require(Format(buffer, 64, u"[%lp]", address(0x1234)) == -1, "vswprintf %lp is refused");
 }
 
 static void CheckCount() {
@@ -138,6 +144,38 @@ static void CheckGroupingFlag() {
         buffer == std::u16string(u"1234567|42    |1234.50|+0012|1e+06"), "swprintf ' flag");
     Require(snwprintf_s_nid_postfix(buffer, 48, u"%'lld %ls", 9876543210ll, u"x") == 12 && buffer == std::u16string(u"9876543210 x"),
         "snwprintf_s ' flag");
+}
+
+static void CheckSecureWideBoundary() {
+    constexpr std::size_t wideRsizeMax = (SIZE_MAX >> 1) / sizeof(char16_t);
+    char16_t buffer[4];
+    for (auto& unit : buffer) unit = u'x';
+
+    buffer[0] = u'x';
+    buffer[1] = u'y';
+    Require(swprintf_s_nid_postfix(buffer, wideRsizeMax, u"%n") < 0 && buffer[0] == 0, "swprintf_s accepted-boundary failure clears");
+    Require(buffer[1] == u'y', "swprintf_s does not clear beyond the first unit");
+
+    buffer[0] = u'x';
+    buffer[1] = u'y';
+    Require(swprintf_s_nid_postfix(buffer, wideRsizeMax + 1, u"%n") < 0 && buffer[0] == u'x' && buffer[1] == u'y',
+        "swprintf_s oversized size leaves the buffer untouched");
+
+    buffer[0] = u'x';
+    buffer[1] = u'y';
+    Require(vswprintf_s_nid_postfix(buffer, wideRsizeMax, u"%n", nullptr) < 0 && buffer[0] == 0, "vswprintf_s accepted-boundary failure clears");
+    buffer[0] = u'x';
+    buffer[1] = u'y';
+    Require(vswprintf_s_nid_postfix(buffer, wideRsizeMax + 1, u"%n", nullptr) < 0 && buffer[0] == u'x' && buffer[1] == u'y',
+        "vswprintf_s oversized size leaves the buffer untouched");
+
+    buffer[0] = u'x';
+    buffer[1] = u'y';
+    Require(vsnwprintf_s_nid_postfix(buffer, wideRsizeMax, u"%n", nullptr) < 0 && buffer[0] == 0, "vsnwprintf_s accepted-boundary failure clears");
+    buffer[0] = u'x';
+    buffer[1] = u'y';
+    Require(vsnwprintf_s_nid_postfix(buffer, wideRsizeMax + 1, u"%n", nullptr) < 0 && buffer[0] == u'x' && buffer[1] == u'y',
+        "vsnwprintf_s oversized size leaves the buffer untouched");
 }
 
 static void CheckSwprintf() {
@@ -236,6 +274,7 @@ int main() {
     CheckPointer();
     CheckCount();
     CheckSwprintf();
+    CheckSecureWideBoundary();
     CheckWcsftime();
     Check(u"%.2s", "\xc3\xa9\xc3\xa8", u"\u00e9\u00e8");
     Check(u"%.1s", "\xc3\xa9\xc3\xa8", u"\u00e9");

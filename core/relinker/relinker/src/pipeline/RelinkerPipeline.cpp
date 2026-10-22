@@ -1,20 +1,29 @@
 #include <relinker/pipeline/RelinkerPipeline.hpp>
 #include <elfpatcher/general/ElfConstants.hpp>
-#include <relinker/analysis/ValidationPolicy.hpp>
 #include <relinker/analysis/UnusedNidFilter/PltCompactor.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
+#include <relinker/analysis/SceCodeExtent.hpp>
+#include <relinker/analysis/RelativeJumpTables.hpp>
 #include <algorithm>
-#include <optional>
 #include <sstream>
 
 #include <cstring>
 #include <limits>
 #include <tuple>
+#include <utility>
 #include <domain/ImportModule.hpp>
 
 namespace Relinker {
 
 using namespace Elfpatcher;
+
+namespace {
+
+constexpr std::uint16_t kEtNone = 0;
+constexpr std::uint16_t kEtRel = 1;
+constexpr std::uint16_t kEtCore = 4;
+
+}
 
 RelinkerPipeline::RelinkerPipeline(std::shared_ptr<IElfReader> elfReader, std::shared_ptr<ISyscallScanner> syscallScanner, std::shared_ptr<ICallSiteResolver> callSiteResolver, std::shared_ptr<IValidationPolicy> validationPolicy, std::shared_ptr<ISysVDynamicSectionBuilder> dynamicSectionBuilder, std::shared_ptr<IUnusedNidFilter> unusedNidFilter, std::uint32_t unusedFilterLevel, Domain::IProgress& progress)
     : elfReader(std::move(elfReader))
@@ -47,7 +56,15 @@ std::string RelinkerPipeline::relocationTypeName(std::uint32_t type) {
     }
 }
 
-RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf) {
+RelinkResult RelinkerPipeline::Relink() {
+    const auto inputType = elfReader->ReadHeader().Type;
+    if (inputType == kEtRel)
+        throw RelinkerException("ET_REL relocatable inputs are not supported");
+    if (inputType == kEtNone)
+        throw RelinkerException("ET_NONE inputs do not specify an ELF object type");
+    if (inputType == kEtCore)
+        throw RelinkerException("ET_CORE core dumps are not executable images");
+
     auto programHeaders = elfReader->ReadProgramHeaders();
 
     std::vector<std::uint8_t> textSection;
@@ -60,8 +77,8 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         if (ph.Type == PT_LOAD && (ph.Flags & PF_X) != 0) {
             auto segment = elfReader->ReadSegment(ph);
             if (!segment.empty()) {
-                if (textSection.empty()) {
-                    textSection = segment;
+                if (executableSegments.empty()) {
+                    if (unusedFilterLevel != 0) textSection = segment;
                     textVAddr = ph.MappedAddress;
                 }
                 executableSegments.emplace_back(std::move(segment), ph.MappedAddress, ph.Offset);
@@ -106,7 +123,35 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         for (const auto& t : dynTags)
             if (t.Tag == tag)
                 return t.Value;
-        throw RelinkerException("DT tag not found");
+        const char* name = "unknown";
+        switch (tag) {
+        case DT_OS_STRTAB: name = "DT_OS_STRTAB"; break;
+        case DT_STRTAB: name = "DT_STRTAB"; break;
+        case DT_OS_STRSZ: name = "DT_OS_STRSZ"; break;
+        case DT_STRSZ: name = "DT_STRSZ"; break;
+        case DT_OS_SYMTAB: name = "DT_OS_SYMTAB"; break;
+        case DT_SYMTAB: name = "DT_SYMTAB"; break;
+        case DT_OS_SYMENT: name = "DT_OS_SYMENT"; break;
+        case DT_SYMENT: name = "DT_SYMENT"; break;
+        case DT_OS_PLTGOT: name = "DT_OS_PLTGOT"; break;
+        case DT_PLTGOT: name = "DT_PLTGOT"; break;
+        case DT_OS_PLTREL: name = "DT_OS_PLTREL"; break;
+        case DT_PLTREL: name = "DT_PLTREL"; break;
+        case DT_OS_PLTRELSZ: name = "DT_OS_PLTRELSZ"; break;
+        case DT_PLTRELSZ: name = "DT_PLTRELSZ"; break;
+        case DT_OS_JMPREL: name = "DT_OS_JMPREL"; break;
+        case DT_JMPREL: name = "DT_JMPREL"; break;
+        case DT_OS_RELA: name = "DT_OS_RELA"; break;
+        case DT_RELA: name = "DT_RELA"; break;
+        case DT_OS_RELASZ: name = "DT_OS_RELASZ"; break;
+        case DT_RELASZ: name = "DT_RELASZ"; break;
+        case DT_OS_RELAENT: name = "DT_OS_RELAENT"; break;
+        case DT_RELAENT: name = "DT_RELAENT"; break;
+        case DT_OS_SYMTABSZ: name = "DT_OS_SYMTABSZ"; break;
+        }
+        std::ostringstream message;
+        message << "Required dynamic tag " << name << " (0x" << std::hex << tag << ") not found";
+        throw RelinkerException(message.str());
     };
 
     auto requireExactlyOneOf = [&](const std::int64_t osTag, const std::int64_t sysvTag, const char* name) {
@@ -114,8 +159,11 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         const bool hasSysv = hasTag(sysvTag);
         if (hasOs && hasSysv)
             throw RelinkerException(std::string("Both DT_OS_ and DT_ variants present for ") + name);
-        if (!hasOs && !hasSysv)
-            throw RelinkerException(std::string("Neither DT_OS_ nor DT_ variant present for ") + name);
+        if (!hasOs && !hasSysv) {
+            std::ostringstream message;
+            message << "Neither DT_OS_ nor DT_ variant present for " << name << " (tags 0x" << std::hex << osTag << " and 0x" << sysvTag << ")";
+            throw RelinkerException(message.str());
+        }
         return hasOs;
     };
 
@@ -148,8 +196,9 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
 
     const FileByteOffset dynSymTabOffset = readAsOffset(DT_OS_SYMTAB, DT_SYMTAB, "DT_SYMTAB");
     constexpr std::size_t symEntSize = 24;
-    if (readAsSize(DT_OS_SYMENT, DT_SYMENT, "DT_SYMENT") != symEntSize)
-        throw RelinkerException("Unsupported DT_SYMENT value");
+    const auto symbolEntrySize = readAsSize(DT_OS_SYMENT, DT_SYMENT, "DT_SYMENT");
+    if (symbolEntrySize != symEntSize)
+        throw RelinkerException("Unsupported DT_SYMENT value: " + std::to_string(symbolEntrySize) + "; expected 24 bytes");
 
     FileByteOffset dynJmpRelOffset = 0;
     if (hasPltRelocations) {
@@ -158,20 +207,34 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
             ? getTagValue(DT_OS_PLTREL)
             : getTagValue(DT_PLTREL);
         if (jmprelType != DT_RELA)
-            throw RelinkerException("Unsupported DT_PLTREL type");
+            throw RelinkerException("Unsupported DT_PLTREL type: " + std::to_string(jmprelType) + "; expected DT_RELA (7)");
         dynJmpRelOffset = readAsOffset(DT_OS_JMPREL, DT_JMPREL, "DT_JMPREL");
         if (gotSize % 24 != 0)
-            throw RelinkerException("Invalid DT_PLTRELSZ value");
+            throw RelinkerException("Invalid DT_PLTRELSZ value: " + std::to_string(gotSize) + " bytes; expected a multiple of 24 bytes");
     }
     const ByteCount dynJmpRelSize = gotSize;
 
-    const FileByteOffset dynRelaOffset = readAsOffset(DT_OS_RELA, DT_RELA, "DT_RELA");
-    const ByteCount dynRelaSize = readAsSize(DT_OS_RELASZ, DT_RELASZ, "DT_RELASZ");
+    if (hasTag(DT_REL) || hasTag(DT_RELSZ) || hasTag(DT_RELENT))
+        throw RelinkerException("DT_REL relocations are not supported");
+    if (hasTag(DT_RELR) || hasTag(DT_RELRSZ) || hasTag(DT_RELRENT))
+        throw RelinkerException("DT_RELR relocations are not supported");
+
+    const bool hasRelaTable = hasTag(DT_OS_RELA) || hasTag(DT_RELA)
+        || hasTag(DT_OS_RELASZ) || hasTag(DT_RELASZ);
+    FileByteOffset dynRelaOffset = 0;
+    ByteCount dynRelaSize = 0;
+    if (hasRelaTable) {
+        dynRelaOffset = readAsOffset(DT_OS_RELA, DT_RELA, "DT_RELA");
+        dynRelaSize = readAsSize(DT_OS_RELASZ, DT_RELASZ, "DT_RELASZ");
+    }
     constexpr std::size_t relaEntSize = 24;
-    if (readAsSize(DT_OS_RELAENT, DT_RELAENT, "DT_RELAENT") != relaEntSize)
-        throw RelinkerException("Unsupported DT_RELAENT value");
+    if (hasRelaTable || hasTag(DT_OS_RELAENT) || hasTag(DT_RELAENT)) {
+        const auto relocationEntrySize = readAsSize(DT_OS_RELAENT, DT_RELAENT, "DT_RELAENT");
+        if (relocationEntrySize != relaEntSize)
+            throw RelinkerException("Unsupported DT_RELAENT value: " + std::to_string(relocationEntrySize) + "; expected 24 bytes");
+    }
     if (dynRelaSize % relaEntSize != 0)
-        throw RelinkerException("Invalid DT_RELASZ value");
+        throw RelinkerException("Invalid DT_RELASZ value: " + std::to_string(dynRelaSize) + " bytes; expected a multiple of 24 bytes");
 
     std::vector<std::pair<std::uint64_t, std::string>> neededLibraryNamesByStrOffset;
     for (const auto& tag : dynTags)
@@ -180,9 +243,10 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
 
     std::vector<NidReference> nidRefs;
     std::vector<std::string> neededLibraries;
-    auto policy = std::dynamic_pointer_cast<ValidationPolicy>(validationPolicy);
 
     const std::vector<std::uint8_t>& raw = elfReader->GetRawBytes();
+    const std::optional<ByteCount> dynSymTabSize = hasTag(DT_OS_SYMTABSZ)
+        ? std::optional<ByteCount>(getTagValue(DT_OS_SYMTABSZ)) : std::nullopt;
 
     if (dynStrTabOffset > raw.size() || dynStrTabSize > raw.size() - dynStrTabOffset)
         throw RelinkerException("Dynamic string table is out of bounds", dynStrTabOffset);
@@ -209,7 +273,6 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     for (auto& [fst, snd] : neededLibraryNamesByStrOffset) {
         snd = readCStr(fst);
         neededLibraries.push_back(snd);
-        if (policy) policy->RegisterLibraryImport(snd);
     }
 
     std::map<std::uint64_t, std::string> importModules;
@@ -224,6 +287,22 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         return relaOff + off;
     };
 
+    auto symbolEntryPos = [&](const std::uint32_t symIdx) -> FileByteOffset {
+        const ByteCount off = static_cast<ByteCount>(symIdx) * symEntSize;
+        const FileByteOffset symOff = dynSymTabOffset + off;
+        if (symOff < dynSymTabOffset || symOff > raw.size() || raw.size() - symOff < symEntSize
+            || (dynSymTabSize && (off > *dynSymTabSize || symEntSize > *dynSymTabSize - off)))
+            throw RelinkerException("Symbol table entry out of bounds", symOff);
+        return symOff;
+    };
+
+    auto isZeroSectionSymbol = [&](const std::uint32_t symIdx) {
+        const FileByteOffset symOff = symbolEntryPos(symIdx);
+        std::uint64_t value = 0;
+        std::memcpy(&value, raw.data() + symOff + 8, sizeof(value));
+        return (raw[symOff + 4] & 0xf) == 3 && value == 0;
+    };
+
     const auto isTlsRelocation = [](const std::uint32_t type) {
         return type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64;
     };
@@ -231,12 +310,8 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     const bool hasTlsSegment = std::any_of(programHeaders.begin(), programHeaders.end(),
                                            [](const ProgramHeader& ph) { return ph.Type == PT_TLS; });
 
-    // The value of a symbol the executable defines in its own TLS block, or nothing for an import;
-    // a defined symbol that is not STT_TLS cannot be the target of a TLS relocation.
     const auto definedTlsSymbolValue = [&](const std::uint32_t symIdx, const FileByteOffset pos) -> std::optional<std::uint64_t> {
-        const FileByteOffset symOff = dynSymTabOffset + static_cast<FileByteOffset>(symIdx) * symEntSize;
-        if (symOff < dynSymTabOffset || symOff > raw.size() || raw.size() - symOff < symEntSize)
-            throw RelinkerException("Symbol table entry out of bounds", symOff);
+        const FileByteOffset symOff = symbolEntryPos(symIdx);
         std::uint16_t section = 0;
         std::memcpy(&section, raw.data() + symOff + 6, sizeof(section));
         if (section == SHN_UNDEF)
@@ -249,16 +324,6 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     };
     const auto definedTlsSymbol = [&](const std::uint32_t symIdx, const FileByteOffset pos) {
         return definedTlsSymbolValue(symIdx, pos).has_value();
-    };
-
-    // OpenOrbis create-fself names symbol 1 (a local STT_SECTION, value 0) in its RELATIVE entries.
-    auto isZeroSectionSymbol = [&](const std::uint32_t symIdx) {
-        const FileByteOffset symOff = dynSymTabOffset + static_cast<FileByteOffset>(symIdx) * symEntSize;
-        if (symOff < dynSymTabOffset || symOff > raw.size() || raw.size() - symOff < symEntSize)
-            throw RelinkerException("Symbol table entry out of bounds", symOff);
-        std::uint64_t value = 0;
-        std::memcpy(&value, raw.data() + symOff + 8, sizeof(value));
-        return (raw[symOff + 4] & 0xf) == 3 && value == 0;
     };
 
     auto extractRela = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
@@ -283,14 +348,10 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
                 continue;
             }
 
-            // A TLS relocation against the executable's own block (no symbol, or a defined STT_TLS
-            // symbol) is position independent data for the loader, copied by extractLocal below.
             if (isTlsRelocation(relType) && (symIdx == 0 || definedTlsSymbol(symIdx, pos)))
                 continue;
 
-            const FileByteOffset symOff = dynSymTabOffset + static_cast<FileByteOffset>(symIdx) * symEntSize;
-            if (symOff < dynSymTabOffset || symOff > raw.size() || raw.size() - symOff < 5)
-                throw RelinkerException("Symbol table entry out of bounds", symOff);
+            const FileByteOffset symOff = symbolEntryPos(symIdx);
 
             std::uint32_t nameOff = 0;
             std::memcpy(&nameOff, raw.data() + symOff, 4);
@@ -312,56 +373,64 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     for (const auto& ref : nidRefs)
         validationPolicy->ValidateRelocationTypeSupported(ref.RelocationTypeValue, ref.RelocationTableOffset);
 
+    std::vector<std::pair<VirtualAddress, VirtualAddress>> unwindRanges;
     if (std::any_of(programHeaders.begin(), programHeaders.end(), [](const ProgramHeader& ph) { return ph.Type == PT_SCE_DYNLIBDATA; })) {
         const auto functions = UnusedNidFilter::ReadExceptionFunctions(raw, programHeaders, {}, {});
+        for (const auto& function : functions) unwindRanges.emplace_back(function.Begin, function.End);
+        std::sort(unwindRanges.begin(), unwindRanges.end());
         for (auto& [segment, segmentVAddr, segmentFileOffset] : executableSegments) {
             static_cast<void>(segmentFileOffset);
-            VirtualAddress codeEnd = 0;
-            for (const auto& function : functions)
-                if (function.Begin >= segmentVAddr && function.Begin - segmentVAddr < segment.size())
-                    codeEnd = std::max(codeEnd, function.End);
-            if (codeEnd == 0)
-                continue;
-            if (codeEnd - segmentVAddr > segment.size())
-                throw RelinkerException("Unwind function exceeds executable segment", codeEnd);
-            if (hasPltRelocations && dynJmpRelSize != 0) {
-                const auto target = [&](const std::size_t at) {
-                    std::int32_t displacement = 0;
-                    std::memcpy(&displacement, segment.data() + at + 2, sizeof(displacement));
-                    return segmentVAddr + at + 6 + static_cast<VirtualAddress>(static_cast<std::int64_t>(displacement));
-                };
-                const std::size_t lastFunctionEnd = codeEnd - segmentVAddr;
-                std::optional<std::size_t> plt;
-                for (std::size_t at = lastFunctionEnd; segment.size() >= 16 && at <= segment.size() - 16; ++at) {
-                    if (segment[at] == 0xff && segment[at + 1] == 0x35 && segment[at + 6] == 0xff && segment[at + 7] == 0x25
-                        && target(at) == gotVAddr + 8 && target(at + 6) == gotVAddr + 16) {
-                        plt = at;
-                        break;
-                    }
-                }
-                if (!plt)
-                    throw RelinkerException("PLT not found after the last unwind function", codeEnd);
-                const ByteCount pltSize = 16 * (1 + dynJmpRelSize / relaEntSize);
-                if (pltSize > segment.size() - *plt)
-                    throw RelinkerException("PLT exceeds executable segment", segmentVAddr + *plt);
-                codeEnd = segmentVAddr + *plt + pltSize;
-            }
-            segment.resize(codeEnd - segmentVAddr);
+            if (const auto codeEnd = FindSceCodeEnd(segment, segmentVAddr, functions, gotVAddr, dynJmpRelSize))
+                segment.resize(*codeEnd - segmentVAddr);
         }
     }
 
+    std::vector<std::vector<std::uint8_t>> scanSegments;
+    for (const auto& [segment, segmentVAddr, segmentFileOffset] : executableSegments) {
+        static_cast<void>(segmentFileOffset);
+        auto& scanSegment = scanSegments.emplace_back(segment);
+        for (const auto& table : FindRelativeJumpTables(segment, segmentVAddr, unwindRanges))
+            std::fill(scanSegment.begin() + static_cast<std::ptrdiff_t>(table.Begin - segmentVAddr), scanSegment.begin() + static_cast<std::ptrdiff_t>(table.End - segmentVAddr), std::uint8_t{0x90});
+    }
+
     std::vector<RelinkPatch> syscallPatches;
-    for (auto& [segment, segmentVAddr, segmentFileOffset] : executableSegments) {
-        for (const auto offset : syscallScanner->ScanCodeSectionForSyscalls(segment, segmentVAddr, segment.size())) {
+    for (std::size_t index = 0; index < executableSegments.size(); ++index) {
+        auto& [segment, segmentVAddr, segmentFileOffset] = executableSegments[index];
+        auto& scanSegment = scanSegments[index];
+        for (const auto offset : syscallScanner->ScanCodeSectionForSyscalls(scanSegment, segmentVAddr, scanSegment.size())) {
             if (offset > segment.size() || segment.size() - offset < 2u)
                 throw RelinkerException("Syscall trap patch exceeds executable segment", segmentVAddr + offset);
-            segment[offset] = 0x0F;
-            segment[offset + 1] = 0x0B;
+            segment[offset] = scanSegment[offset] = 0x0F;
+            segment[offset + 1] = scanSegment[offset + 1] = 0x0B;
             syscallPatches.push_back({segmentFileOffset + offset, {0x0F, 0x0B}});
         }
     }
 
-    validationPolicy->ValidateSyscallAbsence();
+
+    std::vector<std::pair<ByteCount, std::string>> exportedSymbols;
+    std::vector<VirtualAddress> exportedFunctions;
+    if (hasTag(DT_OS_SYMTABSZ)) {
+        const auto symbolBytes = getTagValue(DT_OS_SYMTABSZ);
+        if (symbolBytes % symEntSize != 0 || dynSymTabOffset > raw.size() || symbolBytes > raw.size() - dynSymTabOffset)
+            throw RelinkerException("Invalid executable dynamic symbol table size");
+        for (ByteCount off = symEntSize; off < symbolBytes; off += symEntSize) {
+            const auto* symbol = raw.data() + dynSymTabOffset + off;
+            std::uint16_t section = 0;
+            std::memcpy(&section, symbol + 6, sizeof(section));
+            if (section == 0 || (symbol[4] >> 4) == 0 || (symbol[5] & 3) == 1 || (symbol[5] & 3) == 2) continue;
+            std::uint32_t sourceName = 0;
+            std::memcpy(&sourceName, symbol, sizeof(sourceName));
+            auto name = readCStr(sourceName);
+            name.resize(name.find('#') == std::string::npos ? name.size() : name.find('#'));
+            exportedSymbols.emplace_back(off, std::move(name));
+            const auto binding = symbol[4] >> 4;
+            if ((binding == STB_GLOBAL || binding == STB_WEAK) && (symbol[4] & 15) == STT_FUNC) {
+                VirtualAddress address = 0;
+                std::memcpy(&address, symbol + 8, sizeof(address));
+                exportedFunctions.push_back(address);
+            }
+        }
+    }
 
     progress.Report({Domain::ProgressStage::Imports, {}, 0, 1});
     const std::size_t originalNidCount = nidRefs.size();
@@ -390,7 +459,7 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
             { std::ostringstream message; message << "CFG/GOT filtering skipped: multiple executable segments are not modeled; "
                       << nonPltCount << " -> " << nonPltCount << "; filtered=0\n"; progress.Message(message.str()); }
         } else {
-            nonPltRefs = unusedNidFilter->Filter(nonPltRefs, raw, textSection, textVAddr);
+            nonPltRefs = unusedNidFilter->Filter(nonPltRefs, raw, textSection, textVAddr, exportedFunctions);
             if (nonPltRefs.size() > nonPltCount) throw RelinkerException("Unused NID filter increased the reference count");
             { std::ostringstream message; message << "CFG/GOT filtering: " << nonPltCount << " -> " << nonPltRefs.size() << "; filtered=" << nonPltCount - nonPltRefs.size() << "\n"; progress.Message(message.str()); }
         }
@@ -421,26 +490,14 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         if (auto declared = Domain::DeclaredImportModule(ref.Nid, importModules); !declared.empty()) dynSection.UnmatchedImportModules.insert(std::move(declared));
     }
 
-    if (hasTag(DT_OS_SYMTABSZ)) {
-        const auto symbolBytes = getTagValue(DT_OS_SYMTABSZ);
-        if (symbolBytes % symEntSize != 0 || dynSymTabOffset > raw.size() || symbolBytes > raw.size() - dynSymTabOffset)
-            throw RelinkerException("Invalid executable dynamic symbol table size");
-        for (ByteCount off = symEntSize; off < symbolBytes; off += symEntSize) {
-            const auto* symbol = raw.data() + dynSymTabOffset + off;
-            std::uint16_t section = 0;
-            std::memcpy(&section, symbol + 6, sizeof(section));
-            if (section == 0 || (symbol[4] >> 4) == 0 || (symbol[5] & 3) == 1 || (symbol[5] & 3) == 2) continue;
-            std::uint32_t sourceName = 0;
-            std::memcpy(&sourceName, symbol, sizeof(sourceName));
-            auto name = readCStr(sourceName);
-            name.resize(name.find('#') == std::string::npos ? name.size() : name.find('#'));
-            const auto nameOffset = static_cast<std::uint32_t>(dynSection.DynStrData.size());
-            dynSection.DynStrData.insert(dynSection.DynStrData.end(), name.begin(), name.end());
-            dynSection.DynStrData.push_back(0);
-            const auto position = dynSection.DynSymData.size();
-            dynSection.DynSymData.insert(dynSection.DynSymData.end(), symbol, symbol + symEntSize);
-            std::memcpy(dynSection.DynSymData.data() + position, &nameOffset, sizeof(nameOffset));
-        }
+    for (const auto& [off, name] : exportedSymbols) {
+        const auto* symbol = raw.data() + dynSymTabOffset + off;
+        const auto nameOffset = static_cast<std::uint32_t>(dynSection.DynStrData.size());
+        dynSection.DynStrData.insert(dynSection.DynStrData.end(), name.begin(), name.end());
+        dynSection.DynStrData.push_back(0);
+        const auto position = dynSection.DynSymData.size();
+        dynSection.DynSymData.insert(dynSection.DynSymData.end(), symbol, symbol + symEntSize);
+        std::memcpy(dynSection.DynSymData.data() + position, &nameOffset, sizeof(nameOffset));
     }
 
     auto appendRela = [&](std::vector<std::uint8_t>& buf, std::uint64_t offset, std::uint64_t info, std::int64_t addend) {
@@ -463,9 +520,8 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
             std::memcpy(&rOffset, raw.data() + pos, 8);
             std::memcpy(&rInfo, raw.data() + pos + 8, 8);
             std::memcpy(&rAddend, raw.data() + pos + 16, 8);
-            const std::uint32_t relType = static_cast<std::uint32_t>(rInfo & 0xffffffff);
             const std::uint32_t symIdx = static_cast<std::uint32_t>(rInfo >> 32);
-            // extractRela already rejected a RELATIVE entry whose symbol is not 0 or a zero section symbol.
+            const std::uint32_t relType = static_cast<std::uint32_t>(rInfo & 0xffffffff);
             if (relType == R_X86_64_RELATIVE) {
                 appendRela(dynSection.RelaData, rOffset, static_cast<std::uint64_t>(R_X86_64_RELATIVE), rAddend);
                 continue;
@@ -503,13 +559,14 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         entry.TargetSection = ".got";
         entry.TargetOffset = ref.RelocationAddress;
         entry.CallSitesResolved = false;
+        entry.Weak = ref.Weak;
         entries.push_back(std::move(entry));
     }
 
-    for (const auto& [segment, segmentVAddr, segmentFileOffset] : executableSegments) {
-        static_cast<void>(segmentFileOffset);
+    for (std::size_t index = 0; index < executableSegments.size(); ++index) {
+        const auto& segmentVAddr = std::get<1>(executableSegments[index]);
         for (auto& entry : entries) {
-            auto segmentSites = callSiteResolver->ResolveCallSites(segment, segmentVAddr, entry.TargetOffset, 8);
+            auto segmentSites = callSiteResolver->ResolveCallSites(scanSegments[index], segmentVAddr, entry.TargetOffset, 8);
             entry.CallSites.insert(entry.CallSites.end(), segmentSites.begin(), segmentSites.end());
             entry.CallSitesResolved = !entry.CallSites.empty();
         }

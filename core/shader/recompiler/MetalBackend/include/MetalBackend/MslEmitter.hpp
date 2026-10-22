@@ -30,6 +30,8 @@ struct MslTargetOptions {
     bool float16DenormPreserve = false;
     // SpirvTarget::mslWave64LaneLocal (DECISIONS D62).
     bool wave64LaneLocal = false;
+    // SpirvTarget::depthRangeRemap (upstream 53212b18a): not implemented on Metal; Emit throws when set.
+    bool depthRangeRemap = false;
 };
 
 // IR -> Metal Shading Language, the MetalBackend counterpart of SpirvEmitter (same inputs, same

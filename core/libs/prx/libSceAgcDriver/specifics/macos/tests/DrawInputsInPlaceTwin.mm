@@ -1,9 +1,11 @@
-// Metal twin of tests/Recorder.cpp's --draw-inputs-in-place-only mode (agc_draw_inputs_in_place). The test
+// Metal twin of tests/Recorder.cpp's --draw-inputs-in-place-only and --draw-inputs-copied-only modes
+// (agc_draw_inputs_in_place, agc_draw_inputs_copied). The test
 // function (drawInputInPlaceTests, Recorder.cpp:2037-2131) is copied unchanged. It checks the draw-input
 // primitives of Graphics/src/Draw.cpp (InPlaceDrawInput, InPlaceIndexRange, compiled unchanged on macOS) over
 // Metal host imports (GuestBufferMemory.mm: no-copy buffers over 16 KiB pages of write-watched memory) and the
 // Metal recorder (Recorder.mm): an input is bound in place only when imported, aligned, recorded and clear of
-// pending GPU writes and queued label stores; its read is noted on the open batch and retired with it; the highest
+// pending GPU writes (a vertex input asking for it is bound behind them instead, upstream 13a82bdccf) and queued
+// label stores; its read is noted on the open batch and retired with it; the highest
 // index of a kept index range is reused until a guest write changes it. Expected values are upstream's.
 // Upstream's "not tested" exits (no host imports, no write watching) are requirements here: the Metal device
 // has both. Its imports are compared, not watched (DECISIONS D19), so instead of upstream's kept-highest-index
@@ -22,7 +24,7 @@
 
 namespace {
 
-void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
+void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied = false) {
     auto context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
@@ -51,6 +53,12 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     context.recorder = &recorder;
     recorder.Sync();
     const auto vertices = address + 4096;
+    context.drawInputsInPlace = !copied;
+    if (copied) {
+        Require(InPlaceDrawInput(context, vertices, 256, 4) == nullptr, "an imported draw input was bound in place where draw inputs are copied");
+        Require(!recorder.PendingReadOverlaps(vertices, 256), "a copied draw input's read was noted as an in-place read");
+        return;
+    }
     const auto* import = InPlaceDrawInput(context, vertices, 256, 4);
     Require(import != nullptr && import->base <= vertices && vertices + 256 <= import->base + import->bytes, "an imported draw input was not bound in place");
     const auto read = recorder.DescribePendingRead(vertices, 256);
@@ -59,10 +67,16 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(context, vertices + 2, 256, 2) != nullptr, "an aligned 16-bit draw input was not bound in place");
     recorder.NotePendingWrite(address + 8192, 16);
     Require(InPlaceDrawInput(context, address + 8192, 256, 4) != nullptr && !recorder.PendingWriteOverlaps(address + 8192, 256), "a draw input under a pending GPU write was bound before the write completed");
+    bool behind = false;
+    Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && !behind, "a vertex input free of pending GPU writes was marked as ordered behind one");
+    recorder.NotePendingWrite(address + 20480, 16);
+    Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && behind && recorder.PendingWriteOverlaps(address + 20480, 256), "a vertex input under a pending GPU write was not bound in place behind it");
     const std::array<std::byte, 4> label{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
     recorder.RecordStore(import->buffer, address + 12288 - import->base, label, address + 12288);
     Require(recorder.QueuedStoreOverlaps(address + 12288, 4), "the label store was not queued");
     Require(InPlaceDrawInput(context, address + 12288, 256, 4) == nullptr, "a draw input under a queued label store was bound in place");
+    behind = false;
+    Require(InPlaceDrawInput(context, address + 12288, 256, 4, &behind) == nullptr, "a vertex input under a queued label store was bound in place");
     Require(InPlaceDrawInput(context, address + 16384, 256, 4) != nullptr, "a queued label store refused a disjoint draw input");
     alignas(64) static std::array<std::byte, 256> unregistered{};
     Require(InPlaceDrawInput(context, reinterpret_cast<std::uint64_t>(unregistered.data()), unregistered.size(), 4) == nullptr, "memory without a host import was bound in place");
@@ -137,6 +151,15 @@ const bool registered = AgcDriver::MetalTwins::RegisterRecorderMode("--draw-inpu
     return RunMode([](const Device& device, Recorder& recorder) {
         drawInputInPlaceTests(device, recorder);
         std::cout << "In-place draw input tests passed\n";
+    });
+});
+
+// --draw-inputs-copied-only (agc_draw_inputs_copied): upstream's same function with copied = true; draw
+// inputs are copied, so an imported input is never bound in place nor noted as an in-place read.
+const bool registeredCopied = AgcDriver::MetalTwins::RegisterRecorderMode("--draw-inputs-copied-only", [] {
+    return RunMode([](const Device& device, Recorder& recorder) {
+        drawInputInPlaceTests(device, recorder, true);
+        std::cout << "Copied draw input tests passed\n";
     });
 });
 

@@ -3,9 +3,11 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "prx/libc/include/General.hpp"
 #include "H264Fixture.hpp"
@@ -78,6 +80,29 @@ struct AvcPictureInfo {
     std::uint32_t picHeightInLumaSamples;
 };
 
+struct Vp9PictureInfo {
+    std::uint64_t thisSize;
+    bool isValid;
+    std::uint64_t ptsData;
+    std::uint64_t dtsData;
+    std::uint64_t attachedData;
+    std::uint32_t profile;
+    std::uint32_t level;
+    std::uint32_t keyFrameFlag;
+    std::uint32_t intraOnly;
+    std::uint8_t bitDepth;
+    std::uint8_t colorRange;
+    std::uint32_t colorSpace;
+    std::uint32_t numFrames;
+    std::uint32_t frameWidth;
+    std::uint32_t frameHeight;
+    std::uint32_t renderWidth;
+    std::uint32_t renderHeight;
+};
+
+static_assert(sizeof(Vp9PictureInfo) == 88);
+static_assert(offsetof(Vp9PictureInfo, colorSpace) == 60);
+
 extern "C" {
 int APS5_VABI sceVideodec2QueryDecoderMemoryInfo_nid_postfix(const DecoderConfigInfo*, DecoderMemoryInfo*);
 int APS5_VABI sceVideodec2CreateDecoder_nid_postfix(const DecoderConfigInfo*, const DecoderMemoryInfo*, std::uint64_t*);
@@ -86,6 +111,7 @@ int APS5_VABI sceVideodec2Decode_nid_postfix(std::uint64_t, const InputData*, Fr
 int APS5_VABI sceVideodec2Flush_nid_postfix(std::uint64_t, FrameBuffer*, OutputInfo*);
 int APS5_VABI sceVideodec2Reset_nid_postfix(std::uint64_t);
 int APS5_VABI sceVideodec2GetPictureInfo_nid_postfix(const OutputInfo*, AvcPictureInfo*, void*);
+int APS5_VABI sceVideodec2GetVp9PictureInfo_nid_postfix(const OutputInfo*, Vp9PictureInfo*);
 int APS5_VABI sceVideodec2GetAvcPictureInfo_nid_postfix(const OutputInfo*, AvcPictureInfo*, AvcPictureInfo*);
 }
 
@@ -357,7 +383,15 @@ void testClip(std::uint32_t codec, std::uint32_t profile, const std::vector<std:
         check(output.codecType == codec && !output.isErrorFrame && output.frameWidth == Width && output.frameHeight == Height && output.framePitch == 256 && output.frameBuffer == buffer.data(), "unexpected picture geometry");
         AvcPictureInfo info{sizeof(AvcPictureInfo)};
         checkThrows([&] { sceVideodec2GetPictureInfo_nid_postfix(&output, &info, nullptr); });
-        check(hashNv12(buffer.data(), output.framePitch) == hashes[pictures], "picture " + std::to_string(pictures) + " differs from the reference");
+        Vp9PictureInfo vp9{sizeof(Vp9PictureInfo)};
+        if (codec == CodecVp9) {
+            check(sceVideodec2GetVp9PictureInfo_nid_postfix(&output, &vp9) == 0 && vp9.isValid, "VP9 picture metadata missing");
+            check(vp9.ptsData == 1000 + pictures && vp9.dtsData == pictures && vp9.attachedData == 0, "VP9 picture timestamps differ");
+            check(vp9.profile == 0 && vp9.bitDepth == 8 && vp9.colorSpace == 0 && vp9.colorRange == 0 && vp9.numFrames == 1 && vp9.intraOnly == 0, "VP9 coded header metadata differs");
+            check(vp9.frameWidth == Width && vp9.frameHeight == Height && vp9.renderWidth == Width && vp9.renderHeight == Height, "VP9 picture dimensions differ");
+            check(vp9.keyFrameFlag == (pictures == 0 ? 1u : 0u), "VP9 key frame flag differs");
+        } else checkThrows([&] { sceVideodec2GetVp9PictureInfo_nid_postfix(&output, &vp9); });
+        check(hashNv12(buffer.data(), output.framePitch, output.frameHeight) == hashes[pictures], "picture " + std::to_string(pictures) + " differs from the reference");
         ++pictures;
         return true;
     };
@@ -379,8 +413,90 @@ void testClip(std::uint32_t codec, std::uint32_t profile, const std::vector<std:
     check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
 }
 
+void testVp9PictureMetadata() {
+    const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 1, CodecVp9, 0, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
+    DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
+    check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "VP9 memory query failed");
+    std::uint64_t handle = 0;
+    check(sceVideodec2CreateDecoder_nid_postfix(&config, &memory, &handle) == 0, "VP9 create failed");
+    const auto units = ivfFrames();
+    std::vector<std::uint8_t> firstBuffer(memory.maxFrameBufferSize), secondBuffer(memory.maxFrameBufferSize);
+    OutputInfo firstOutput{sizeof(OutputInfo)}, secondOutput{sizeof(OutputInfo)};
+    const auto decode = [&](const std::vector<std::uint8_t>& bytes, std::vector<std::uint8_t>& buffer, OutputInfo& output, std::uint64_t tag) {
+        const InputData input{sizeof(InputData), bytes.data(), bytes.size(), tag, tag + 1, tag + 2};
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "VP9 metadata decode failed");
+    };
+    const auto query = [&](const OutputInfo& output) {
+        struct Guarded { Vp9PictureInfo info{sizeof(Vp9PictureInfo)}; std::uint64_t guard = 0x123456789abcdef0ull; } guarded;
+        check(sceVideodec2GetVp9PictureInfo_nid_postfix(&output, &guarded.info) == 0, "VP9 metadata query failed");
+        check(guarded.guard == 0x123456789abcdef0ull && guarded.info.thisSize == sizeof(Vp9PictureInfo), "VP9 info overwrote caller storage");
+        return guarded.info;
+    };
+    Vp9PictureInfo info{sizeof(Vp9PictureInfo)};
+    checkThrows([&] { sceVideodec2GetVp9PictureInfo_nid_postfix(nullptr, &info); });
+    checkThrows([&] { sceVideodec2GetVp9PictureInfo_nid_postfix(&firstOutput, nullptr); });
+    info.thisSize = sizeof(Vp9PictureInfo) - 1;
+    checkThrows([&] { sceVideodec2GetVp9PictureInfo_nid_postfix(&firstOutput, &info); });
+    check(!query(firstOutput).isValid, "VP9 unknown buffer reported a picture");
+    std::vector<std::uint8_t> superframe;
+    for (std::size_t index = 0; index < 2; ++index) superframe.insert(superframe.end(), units[index].begin(), units[index].end());
+    superframe.push_back(0xc9);
+    for (std::size_t index = 0; index < 2; ++index) {
+        superframe.push_back(static_cast<std::uint8_t>(units[index].size()));
+        superframe.push_back(static_cast<std::uint8_t>(units[index].size() >> 8u));
+    }
+    superframe.push_back(0xc9);
+    decode(superframe, firstBuffer, firstOutput, 9000);
+    check(firstOutput.isValid && hashNv12(firstBuffer.data(), firstOutput.framePitch, firstOutput.frameHeight) == Vp9Hashes[0], "VP9 first superframe picture differs");
+    const auto firstInfo = query(firstOutput);
+    check(firstInfo.isValid && firstInfo.numFrames == 2 && firstInfo.keyFrameFlag == 1 && firstInfo.ptsData == 9000 && firstInfo.dtsData == 9001 && firstInfo.attachedData == 9002, "VP9 first superframe metadata differs");
+    FrameBuffer frame{sizeof(FrameBuffer), secondBuffer.data(), secondBuffer.size(), false};
+    check(sceVideodec2Flush_nid_postfix(handle, &frame, &secondOutput) == 0 && secondOutput.isValid, "VP9 second superframe picture missing");
+    check(hashNv12(secondBuffer.data(), secondOutput.framePitch, secondOutput.frameHeight) == Vp9Hashes[1], "VP9 second superframe picture differs");
+    const auto secondInfo = query(secondOutput);
+    check(secondInfo.numFrames == 2 && secondInfo.keyFrameFlag == 0 && secondInfo.ptsData == 9000, "VP9 second superframe metadata differs");
+    firstOutput.frameWidth = 1;
+    check(query(firstOutput).frameWidth == Width && query(firstOutput).keyFrameFlag == 1, "VP9 retained picture metadata changed");
+    check(sceVideodec2Reset_nid_postfix(handle) == 0 && !query(firstOutput).isValid, "VP9 reset retained old picture ownership");
+    auto hidden = units[0];
+    hidden[0] &= static_cast<std::uint8_t>(~2u);
+    decode(hidden, firstBuffer, firstOutput, 9100);
+    check(!firstOutput.isValid, "VP9 hidden keyframe was presented");
+    decode(std::vector<std::uint8_t>{0x88}, secondBuffer, secondOutput, 9200);
+    info = query(secondOutput);
+    check(info.isValid && info.ptsData == 9200 && info.keyFrameFlag == 0 && info.frameWidth == Width, "VP9 existing reference metadata differs");
+    check(hashNv12(secondBuffer.data(), secondOutput.framePitch, secondOutput.frameHeight) == Vp9Hashes[0], "VP9 existing reference pixels differ");
+    check(sceVideodec2Reset_nid_postfix(handle) == 0, "VP9 reset failed");
+    checkThrows([&] { decode(std::vector<std::uint8_t>{0x88}, firstBuffer, firstOutput, 9300); });
+    checkThrows([&] { decode(std::vector<std::uint8_t>{0}, firstBuffer, firstOutput, 9400); });
+    checkThrows([&] { decode(std::vector<std::uint8_t>{0x82}, firstBuffer, firstOutput, 9500); });
+    checkThrows([&] { decode(std::vector<std::uint8_t>{0xc1, 0, 0, 0xc1}, firstBuffer, firstOutput, 9550); });
+    std::vector<bool> bits;
+    for (const auto byte : units[0]) for (int shift = 7; shift >= 0; --shift) bits.push_back(((byte >> shift) & 1u) != 0);
+    check(bits.size() > 69, "VP9 test keyframe header is truncated");
+    bits[35] = true;
+    bits[68] = true;
+    std::vector<bool> render;
+    for (const auto value : {static_cast<unsigned>(Width * 2 - 1), static_cast<unsigned>(Height * 2 - 1)})
+        for (int shift = 15; shift >= 0; --shift) render.push_back(((value >> shift) & 1u) != 0);
+    bits.insert(bits.begin() + 69, render.begin(), render.end());
+    std::vector<std::uint8_t> resized(bits.size() / 8);
+    for (std::size_t index = 0; index < bits.size(); ++index) if (bits[index]) resized[index / 8] |= static_cast<std::uint8_t>(1u << (7u - index % 8));
+    decode(resized, firstBuffer, firstOutput, 9600);
+    info = query(firstOutput);
+    check(info.isValid && info.bitDepth == 8 && info.colorRange == 1 && info.frameWidth == Width && info.frameHeight == Height && info.renderWidth == Width * 2 && info.renderHeight == Height * 2, "VP9 render size or color range metadata differs");
+    check(hashNv12(firstBuffer.data(), firstOutput.framePitch, firstOutput.frameHeight) == Vp9Hashes[0], "VP9 render metadata changed coded pixels");
+    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0 && !query(firstOutput).isValid, "VP9 delete retained picture ownership");
+}
+
 void testTenBit() {
     for (const auto codec : {CodecHevc, CodecVp9}) {
+        for (const auto [profile, expected] : {std::pair<std::uint32_t, std::uint64_t>{1, 2048ull * 1088 * 3 / 2}, {2, 3840ull * 1088 * 3 / 2}}) {
+            const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 1, codec, profile, 0, 1920, 1088, 4, 1};
+            DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
+            check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0 && memory.maxFrameBufferSize == expected, "1920x1088 frame size differs for profile " + std::to_string(profile));
+        }
         const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 1, codec, 2, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
         DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
         check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
@@ -391,16 +507,29 @@ void testTenBit() {
             const InputData input{sizeof(InputData), HevcMain10Stream.data(), HevcMain10Stream.size(), 0, 0, 0};
             FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
             OutputInfo output{sizeof(OutputInfo)};
-            checkThrows([&] {
-                sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output);
-                sceVideodec2Flush_nid_postfix(handle, &frame, &output);
-            });
+            check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "ten-bit decode failed");
+            if (!output.isValid) check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0, "ten-bit flush failed");
+            check(output.isValid && frame.isAccepted && output.frameWidth == Width && output.frameHeight == Height && output.framePitch == 128 && output.framePitchInBytes == 256 && output.frameFormat == 0, "ten-bit picture geometry differs");
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            std::uint16_t largest = 0;
+            const auto mix = [&](const std::uint8_t* row) {
+                for (std::uint32_t column = 0; column < Width; ++column) {
+                    std::uint16_t word = 0;
+                    std::memcpy(&word, row + column * 2, 2);
+                    largest = std::max(largest, word);
+                    hash = (hash ^ word) * 0x100000001b3ull;
+                }
+            };
+            for (std::uint32_t row = 0; row < Height; ++row) mix(buffer.data() + static_cast<std::size_t>(row) * output.framePitchInBytes);
+            for (std::uint32_t row = 0; row < Height / 2; ++row) mix(buffer.data() + static_cast<std::size_t>(output.framePitchInBytes) * Height + static_cast<std::size_t>(row) * output.framePitchInBytes);
+            check(largest == 1023, "ten-bit samples are not in the low bits of their words");
+            check(hash == 0x453fd1cd69e47611ull, "ten-bit picture differs from the reference");
         }
         check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
     }
 }
 
-void testDecode(bool lengthPrefixed) {
+void testDecode(bool lengthPrefixed, bool separateParameters = false) {
     const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 0, 1, 100, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
     DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
     check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
@@ -412,7 +541,7 @@ void testDecode(bool lengthPrefixed) {
         check(output.isValid == frame.isAccepted, "frame buffer acceptance disagrees with the output");
         if (!output.isValid) return false;
         check(pictures < PictureHashes.size(), "more pictures than access units");
-        check(!output.isErrorFrame && output.frameWidth == Width && output.frameHeight == Height && output.framePitch == 256 && output.frameBuffer == buffer.data(), "unexpected picture geometry");
+        check(!output.isErrorFrame && output.frameWidth == Width && output.frameHeight == CodedHeight && output.framePitch == 256 && output.frameBuffer == buffer.data(), "unexpected picture geometry");
         AvcPictureInfo info{sizeof(AvcPictureInfo)};
         check(sceVideodec2GetPictureInfo_nid_postfix(&output, &info, nullptr) == 0 && info.isValid, "picture info missing");
         const auto unit = DisplayOrderUnits[pictures];
@@ -420,13 +549,34 @@ void testDecode(bool lengthPrefixed) {
         check(info.idrPictureFlag == (pictures == 0 ? 1 : 0) && info.profileIdc == 100, "picture flags mismatch");
         AvcPictureInfo avc{sizeof(AvcPictureInfo)};
         check(sceVideodec2GetAvcPictureInfo_nid_postfix(&output, &avc, nullptr) == 0 && avc.isValid, "avc picture info missing");
-        check(avc.ptsData == 1000 + unit && avc.dtsData == unit && avc.attachedData == 0xa0 + unit && avc.idrPictureFlag == (pictures == 0 ? 1 : 0) && avc.profileIdc == 100 && avc.picWidthInLumaSamples == Width && avc.picHeightInLumaSamples == Height, "avc picture info mismatch");
-        check(hashNv12(buffer.data(), output.framePitch) == PictureHashes[pictures], "picture " + std::to_string(pictures) + " differs from the reference");
+        check(avc.ptsData == 1000 + unit && avc.dtsData == unit && avc.attachedData == 0xa0 + unit && avc.idrPictureFlag == (pictures == 0 ? 1 : 0) && avc.profileIdc == 100 && avc.picWidthInLumaSamples == Width && avc.picHeightInLumaSamples == CodedHeight, "avc picture info mismatch");
+        check(hashNv12(buffer.data(), output.framePitch, output.frameHeight) == PictureHashes[pictures], "picture " + std::to_string(pictures) + " differs from the reference");
         ++pictures;
         return true;
     };
-    const auto units = accessUnits(lengthPrefixed);
+    auto units = accessUnits(lengthPrefixed);
     check(units.size() == PictureHashes.size(), "unexpected access unit count");
+    if (separateParameters) {
+        auto& first = units.front();
+        std::size_t slice = 0;
+        for (std::size_t index = 0; index + 3 < first.size(); ++index) {
+            if (first[index] != 0 || first[index + 1] != 0 || first[index + 2] != 1) continue;
+            const auto type = first[index + 3] & 0x1fu;
+            if (type >= 1 && type <= 5) {
+                slice = index > 0 && first[index - 1] == 0 ? index - 1 : index;
+                break;
+            }
+            index += 2;
+        }
+        check(slice != 0, "the first access unit has no slice after its parameter sets");
+        const std::vector<std::uint8_t> parameters(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(slice));
+        first.erase(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(slice));
+        const InputData input{sizeof(InputData), parameters.data(), parameters.size(), 999, 0, 0x9f};
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "a unit of parameter sets alone was not accepted");
+        check(!output.isValid && !frame.isAccepted, "a unit of parameter sets alone produced a picture");
+    }
     for (std::size_t unit = 0; unit < units.size(); ++unit) {
         const InputData input{sizeof(InputData), units[unit].data(), units[unit].size(), 1000 + unit, unit, 0xa0 + unit};
         FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
@@ -444,6 +594,103 @@ void testDecode(bool lengthPrefixed) {
     check(sceVideodec2Reset_nid_postfix(handle) == 0, "reset failed");
     check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
     checkThrows([&] { sceVideodec2DeleteDecoder_nid_postfix(handle); });
+}
+
+void decodeInOrder(const std::vector<std::vector<std::uint8_t>>& units) {
+    const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 0, 1, 100, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
+    DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
+    check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
+    std::uint64_t handle = 0;
+    check(sceVideodec2CreateDecoder_nid_postfix(&config, &memory, &handle) == 0, "decoder creation failed");
+    std::vector<std::uint8_t> buffer(memory.maxFrameBufferSize);
+    std::size_t pictures = 0;
+    const auto take = [&](const OutputInfo& output) {
+        if (!output.isValid) return false;
+        check(pictures < PictureHashes.size(), "more pictures than access units");
+        check(!output.isErrorFrame && output.frameWidth == Width && output.frameHeight == CodedHeight, "unexpected picture geometry");
+        check(hashNv12(buffer.data(), output.framePitch, output.frameHeight) == PictureHashes[pictures], "picture " + std::to_string(pictures) + " differs from the reference");
+        ++pictures;
+        return true;
+    };
+    for (std::size_t unit = 0; unit < units.size(); ++unit) {
+        const InputData input{sizeof(InputData), units[unit].data(), units[unit].size(), 1000 + unit, unit, 0xa0 + unit};
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "decode failed");
+        take(output);
+    }
+    for (;;) {
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0, "flush failed");
+        if (!take(output)) break;
+    }
+    check(pictures == PictureHashes.size(), "missing pictures after flush");
+    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
+}
+
+bool readsAsOneLengthPrefix(const std::vector<std::uint8_t>& unit) {
+    const std::size_t length = (static_cast<std::size_t>(unit[0]) << 24u) | (static_cast<std::size_t>(unit[1]) << 16u) | (static_cast<std::size_t>(unit[2]) << 8u) | unit[3];
+    return length + 4 == unit.size();
+}
+
+std::vector<std::uint8_t> lengthPrefixedFiller(std::size_t length) {
+    std::vector<std::uint8_t> filler;
+    for (int shift = 24; shift >= 0; shift -= 8) filler.push_back(static_cast<std::uint8_t>(length >> shift));
+    filler.push_back(0x0c);
+    filler.insert(filler.end(), length - 1, 0xff);
+    return filler;
+}
+
+void testLengthPrefixLooksLikeStartCode() {
+    auto units = accessUnits(true);
+    const auto filler = lengthPrefixedFiller(0x101);
+    check(!(units[0][0] == 0 && units[0][1] == 0 && (units[0][2] == 1 || units[0][3] == 1)), "the first length-prefixed unit already begins with start-code bytes");
+    units[1].insert(units[1].begin(), filler.begin(), filler.end());
+    check(units[1][0] == 0 && units[1][1] == 0 && units[1][2] == 1, "the crafted unit does not begin with start-code bytes");
+    decodeInOrder(units);
+
+    auto mixed = accessUnits(false);
+    const auto mixedFiller = lengthPrefixedFiller(0x123);
+    mixed[1] = accessUnits(true)[1];
+    mixed[1].insert(mixed[1].begin(), mixedFiller.begin(), mixedFiller.end());
+    check(mixed[0][2] == 0 && mixed[0][3] == 1 && mixed[1][0] == 0 && mixed[1][1] == 0 && mixed[1][2] == 1, "the length-prefixed unit does not follow an Annex-B unit with a four-byte start code");
+    decodeInOrder(mixed);
+}
+
+void testStartCodeLooksLikeLengthPrefix() {
+    auto units = accessUnits(false);
+    for (auto& unit : units) {
+        check(unit[0] == 0 && unit[1] == 0 && unit[2] == 0 && unit[3] == 1, "an access unit does not open with a four-byte start code");
+        unit.erase(unit.begin());
+    }
+    auto& first = units.front();
+    std::size_t sequence = 0;
+    std::size_t afterPicture = 0;
+    bool picture = false;
+    for (std::size_t index = 0; index + 3 < first.size(); ++index) {
+        if (first[index] != 0 || first[index + 1] != 0 || first[index + 2] != 1) continue;
+        const auto type = first[index + 3] & 0x1fu;
+        if (picture) {
+            afterPicture = first[index - 1] == 0 ? index - 1 : index;
+            break;
+        }
+        if (type == 7 && sequence == 0) sequence = index;
+        if (type == 8 && sequence != 0) picture = true;
+        index += 2;
+    }
+    check(sequence != 0 && afterPicture > sequence, "the first access unit has no SPS and PPS before another NAL");
+    const std::vector<std::uint8_t> delimiter(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(first[sequence - 1] == 0 ? sequence - 1 : sequence));
+    check(delimiter.size() >= 4 && delimiter[2] == 1 && !readsAsOneLengthPrefix(delimiter), "the access unit delimiter is not an unambiguous unit with a three-byte start code");
+    std::vector<std::uint8_t> parameters(first.begin() + static_cast<std::ptrdiff_t>(sequence), first.begin() + static_cast<std::ptrdiff_t>(afterPicture));
+    first.erase(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(afterPicture));
+    if (first[2] == 0) first.erase(first.begin());
+    const std::size_t padded = 4 + ((std::size_t{1} << 8u) | parameters[3]);
+    check(parameters.size() < padded, "the parameter sets are too long to pad");
+    parameters.resize(padded, 0);
+    check(readsAsOneLengthPrefix(parameters), "the padded parameter sets do not read as one length-prefixed NAL");
+    units.insert(units.begin(), {delimiter, parameters});
+    decodeInOrder(units);
 }
 
 std::uint64_t createDecoder(std::uint32_t codec, std::uint32_t profile) {
@@ -514,6 +761,42 @@ std::uint64_t frameBufferBytes() {
     DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
     check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
     return memory.maxFrameBufferSize;
+}
+
+void testDecodeAfterFlush() {
+    std::vector<std::uint8_t> buffer(frameBufferBytes());
+    const auto handle = createDecoder(1, 100);
+    {
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0 && !output.isValid && !frame.isAccepted, "flushing a decoder that decoded nothing gave a picture");
+    }
+    const auto units = accessUnits(false);
+    for (const std::uint64_t base : {1000u, 5000u}) {
+        std::size_t pictures = 0;
+        const auto take = [&](const OutputInfo& output) {
+            if (!output.isValid) return false;
+            check(pictures < PictureHashes.size() && owned(buffer, base + DisplayOrderUnits[pictures]), "a picture decoded after a flush is out of display order");
+            check(hashNv12(buffer.data(), output.framePitch, output.frameHeight) == PictureHashes[pictures], "picture " + std::to_string(pictures) + " decoded after a flush differs from the reference");
+            ++pictures;
+            return true;
+        };
+        for (std::size_t unit = 0; unit < units.size(); ++unit) {
+            const InputData input{sizeof(InputData), units[unit].data(), units[unit].size(), base + unit, unit, base + unit};
+            FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+            OutputInfo output{sizeof(OutputInfo)};
+            check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "decode after a flush failed");
+            take(output);
+        }
+        for (;;) {
+            FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+            OutputInfo output{sizeof(OutputInfo)};
+            check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0, "flush failed");
+            if (!take(output)) break;
+        }
+        check(pictures == PictureHashes.size(), "missing pictures of a stream decoded after a flush");
+    }
+    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
 }
 
 void testPictureOwnership() {
@@ -618,6 +901,9 @@ int main() {
         testFailures();
         testDecode(false);
         testDecode(true);
+        testLengthPrefixLooksLikeStartCode();
+        testStartCodeLooksLikeLengthPrefix();
+        testDecode(false, true);
         const auto hevc = hevcUnits(HevcStream.data(), HevcStream.size());
         testClip(CodecHevc, 1, hevc, HevcHashes);
         std::vector<std::vector<std::uint8_t>> hevcLengthPrefixed;
@@ -641,7 +927,9 @@ int main() {
         }
         testClip(CodecHevc, 1, hevcLengthPrefixed, HevcHashes);
         testClip(CodecVp9, 0, ivfFrames(), Vp9Hashes);
+        testVp9PictureMetadata();
         testTenBit();
+        testDecodeAfterFlush();
         testPictureOwnership();
         testConcurrentOwnership();
         std::puts("Videodec2 tests passed");

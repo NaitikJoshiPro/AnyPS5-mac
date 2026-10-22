@@ -5,7 +5,7 @@
 
 namespace Elfpatcher::Windows {
 
-std::vector<std::uint8_t> WindowsPeWriter::Write(const std::vector<PeSection>& sections, const std::uint32_t entryRva, const std::array<PeDirectory, 16>& directories, const bool windowsGui, const std::optional<std::uint64_t> fixedImageBase) const {
+std::vector<std::uint8_t> WindowsPeWriter::Write(const std::vector<PeSection>& sections, const std::uint32_t entryRva, const std::array<PeDirectory, 16>& directories, const bool windowsGui, const std::optional<std::uint64_t> fixedImageBase, const bool dynamicBase) const {
     constexpr std::size_t peOffset = 0x80;
     constexpr std::size_t optionalOffset = peOffset + 24;
     constexpr std::size_t sectionTable = optionalOffset + 240;
@@ -32,7 +32,7 @@ std::vector<std::uint8_t> WindowsPeWriter::Write(const std::vector<PeSection>& s
     Io::WriteU16(result, optionalOffset + 50, 2);
     Io::WriteU32(result, optionalOffset + 60, LoadRva);
     Io::WriteU16(result, optionalOffset + 68, windowsGui ? 2 : 3);
-    Io::WriteU16(result, optionalOffset + 70, directories[5].Size == 0 ? 0x100 : 0x140);
+    Io::WriteU16(result, optionalOffset + 70, dynamicBase && directories[5].Size != 0 ? 0x140 : 0x100);
     Io::WriteU64(result, optionalOffset + 72, 0x210000);
     Io::WriteU64(result, optionalOffset + 80, 0x200000);
     Io::WriteU64(result, optionalOffset + 88, 0x100000);
@@ -44,14 +44,14 @@ std::vector<std::uint8_t> WindowsPeWriter::Write(const std::vector<PeSection>& s
     bool foundEntry = false;
     for (std::size_t index = 0; index < sections.size(); ++index) {
         const auto& section = sections[index];
-        if (section.Name.empty() || section.Name.size() > 8 || section.Data.empty() || section.Rva != endRva)
+        if (section.Name.empty() || section.Name.size() > 8 || section.MemorySize() == 0 || section.Rva != endRva)
             throw Domain::RelinkerException("Invalid PE section layout: " + section.Name, section.Rva);
         const auto initialized = static_cast<std::size_t>(std::find_if(section.Data.rbegin(), section.Data.rend(), [](const std::uint8_t value) { return value != 0; }).base() - section.Data.begin());
         const auto rawSize = Io::AlignUp(CheckedRva(initialized), FileAlignment);
         const auto rawOffset = rawSize == 0 ? 0u : CheckedRva(result.size());
         const auto header = sectionTable + index * 40;
         std::copy(section.Name.begin(), section.Name.end(), result.begin() + static_cast<std::ptrdiff_t>(header));
-        Io::WriteU32(result, header + 8, CheckedRva(section.Data.size()));
+        Io::WriteU32(result, header + 8, CheckedRva(section.MemorySize()));
         Io::WriteU32(result, header + 12, section.Rva);
         Io::WriteU32(result, header + 16, rawSize);
         Io::WriteU32(result, header + 20, rawOffset);
@@ -68,7 +68,7 @@ std::vector<std::uint8_t> WindowsPeWriter::Write(const std::vector<PeSection>& s
             result.insert(result.end(), section.Data.begin(), section.Data.begin() + static_cast<std::ptrdiff_t>(initialized));
             result.resize(static_cast<std::size_t>(rawOffset) + rawSize);
         }
-        endRva = AlignRva(section.Rva + static_cast<std::uint64_t>(section.Data.size()));
+        endRva = AlignRva(section.Rva + section.MemorySize());
     }
     if (!foundEntry)
         throw Domain::RelinkerException("PE entry point is not inside executable section data", entryRva);

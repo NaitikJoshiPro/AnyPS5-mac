@@ -8,6 +8,7 @@
 #include <bitset>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -120,9 +121,23 @@ public:
     // reads that stay in the reading lane's 32-lane half at one lane per invocation.
     [[nodiscard]] std::string HalfBallot(const IrValue* predicate);
     std::uint32_t half = 0u;
+    // Relative-addressing window slots kept in the window array (the rest are locals of their own,
+    // MslAluMath.cpp VectorWindow): unset until the first window access computes it, 0 for the whole
+    // window in the array.
+    std::optional<std::uint32_t> vectorWindowIndexed;
     std::uint32_t hostSubgroupSize = 32u;
     const ShaderWorkgroupInputInfo* workgroup = nullptr;
     std::unordered_set<const IrValue*> waveUniform;
+    // Upstream d422c760c/3265cb6d7 (SpirvBdaRead.cpp BdaAnchor): the user-data register pairs whose
+    // BDA range the program searches once at entry (MslAddress.cpp), collected at the first address
+    // read; `name` is the prologue's ulong3 (usable size, device address, offset of the base in the
+    // range), empty until a read uses the anchor.
+    struct BdaAnchor {
+        std::uint32_t lowRegister = 0;
+        std::uint32_t highRegister = 0;
+        std::string name;
+    };
+    std::optional<std::vector<BdaAnchor>> bdaAnchors;
     // True when `instruction` is computed once for both halves (always true when laneCount is 1).
     [[nodiscard]] bool SharedAcrossHalves(const IrValue& instruction) const;
 
@@ -180,6 +195,16 @@ public:
     // Images (MslImage.cpp): the direct runtime-mode switch case being emitted, {selector function
     // constant id, mode index}, for Reflection::samplerModeUses; {0, ~0u} outside one.
     std::pair<std::uint32_t, std::uint32_t> imageModeCase {0u, ~0u};
+    // Images (MslImage.cpp): the image/sampler table access being emitted (MslAbi Version 15), as
+    // SpirvEmitterState::tableAccess: MSL expressions of the texture array element, the record's T#
+    // dword 3 (swizzle) and the sampler array element.
+    struct TableAccess {
+        bool active = false;
+        std::string element;
+        std::string dword3;
+        std::string samplerElement;
+    };
+    TableAccess tableAccess;
     // Descriptor kinds the emitted code references (TableResource): the table holds only these ranges,
     // as the SPIR-V path drops unused descriptor variables (so the binding plan drops them too).
     std::set<DescriptorBindingKind> usedKinds;
@@ -317,8 +342,17 @@ struct MslGraphicsInterface {
 // The guest cull distances a vertex program writes (highest index + 1; MslAbi Version 10).
 [[nodiscard]] std::uint32_t MslCullDistanceCount(const MslEmitterState& state);
 // The clip distance that carries the emulated cull verdict: after the guest clip distances and the
-// all-zero position distance.
+// all-zero position distance (when there is room for it, MslZeroPositionDistance).
 [[nodiscard]] std::uint32_t MslCullClipSlot(const MslEmitterState& state);
+[[nodiscard]] std::uint32_t MslGuestClipDistanceCount(const MslEmitterState& state);
+[[nodiscard]] bool MslZeroPositionDistance(const MslEmitterState& state);
+// Upstream 72518f64f/1ffc5f672: a pixel function's PA_SC_AA_MASK coverage of its quad pixel, for
+// quad-masked programs (ShaderPixelInputInfo::QuadMasked): the guest samples the pixel covers
+// (MslQuadCoverage, 16 bits; all ones without a partial sample mask) and whether the pixel is
+// uncovered (MslQuadUncovered, a bool expression over aps5_in and, for a partial sample mask, the
+// `uint aps5_sample_mask_in [[sample_mask]]` parameter EmitMslEntryPoint adds).
+[[nodiscard]] std::string MslQuadCoverage(const MslEmitterState& state);
+[[nodiscard]] std::string MslQuadUncovered(const MslEmitterState& state);
 [[nodiscard]] std::string PerVertexField(std::uint32_t location, std::uint32_t vertex);
 // The host threadgroup size a workgroup maps to (MslEntryPoint.cpp): the guest workgroup for
 // laneCount 1; for laneCount 2 one-dimensional, 32 host invocations per guest wave64.

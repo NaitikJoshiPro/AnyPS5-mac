@@ -12,6 +12,8 @@ list(APPEND agcMetalTwins
         "tests/Recorder.cpp=specifics/macos/tests/CopiedDirectOrderingTwin.mm"
         # Recorder.cpp modes upstream added by fdefd7660.
         "tests/Recorder.cpp=specifics/macos/tests/VertexTargetRangeTwin.mm"
+        # Recorder.cpp mode upstream added by ea3a2152d (UPSYNC3): a storage write-back split across two imports.
+        "tests/Recorder.cpp=specifics/macos/tests/SplitWriteBackTwin.mm"
         "tests/execution/PooledBufferRange.cpp=specifics/macos/tests/PooledBufferRangeTwin.mm"
         "Graphics/src/MultisampleTarget.cpp=specifics/macos/src/MultisampleTarget.mm"
 )

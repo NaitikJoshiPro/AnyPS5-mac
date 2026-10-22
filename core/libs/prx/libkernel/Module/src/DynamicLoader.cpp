@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libkernel/Module/ModuleArgs.hpp"
 #include <nid/NidCompute.hpp>
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <filesystem>
@@ -28,6 +29,10 @@
 #include <link.h>
 #endif
 
+#ifdef _WIN32
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch();
+#endif
+
 namespace {
 thread_local std::array<char, 512> loaderError{};
 thread_local bool pendingError = false;
@@ -44,10 +49,14 @@ struct Module {
     bool owned = true;
     bool global = false;
     bool guest = false;
+#ifdef _WIN32
+    std::uintptr_t globalOrder = 0;
+#endif
     ~Module() {
         if (owned && native) {
 #ifdef _WIN32
             FreeLibrary(static_cast<HMODULE>(native));
+            ForgetUnloadedUnwindImages_nid_no_patch();
 #else
             ::dlclose(native);
 #endif
@@ -71,26 +80,10 @@ void* Symbol(Module& module, const char* name) {
 #endif
 }
 #ifndef _WIN32
-std::uintptr_t MainProgramBase() {
 #ifdef __APPLE__
+// dyld has no link maps (dladdr1, dlinfo): the main program is the first image dyld loaded.
+std::uintptr_t MainProgramBase() {
     return reinterpret_cast<std::uintptr_t>(_dyld_get_image_header(0));
-#else
-    static const std::uintptr_t base = [] {
-        struct Scan {
-            std::uintptr_t value = 0;
-        };
-        Scan scan;
-        ::dl_iterate_phdr(
-            [](dl_phdr_info* info, size_t, void* data) {
-                auto* found = static_cast<Scan*>(data);
-                if (found->value == 0 && info->dlpi_name != nullptr && info->dlpi_name[0] == '\0') found->value = info->dlpi_addr;
-                return found->value == 0 ? 0 : 1;
-            },
-            &scan);
-        return scan.value;
-    }();
-    return base;
-#endif
 }
 
 bool FromGuestModule(void* address) {
@@ -100,6 +93,28 @@ bool FromGuestModule(void* address) {
     const std::string path(info.dli_fname);
     return path.ends_with(".prx");
 }
+#else
+const link_map* MainProgramMap() {
+    static const link_map* const map = [] {
+        void* handle = ::dlopen(nullptr, RTLD_LAZY);
+        link_map* found = nullptr;
+        const bool resolved = handle != nullptr && ::dlinfo(handle, RTLD_DI_LINKMAP, &found) == 0 && found != nullptr;
+        if (handle != nullptr) ::dlclose(handle);
+        if (!resolved) throw std::runtime_error("dlsym: cannot find the link map of the main program");
+        return found;
+    }();
+    return map;
+}
+
+bool FromGuestModule(void* address) {
+    Dl_info info{};
+    link_map* image = nullptr;
+    if (address == nullptr || !::dladdr1(address, &info, reinterpret_cast<void**>(&image), RTLD_DL_LINKMAP) || info.dli_fname == nullptr || image == nullptr) return false;
+    if (image == MainProgramMap()) return true;
+    const std::string path(info.dli_fname);
+    return path.ends_with(".prx");
+}
+#endif
 
 void* DefaultScopeSymbol(const char* symbolName) {
     auto* result = ::dlsym(RTLD_DEFAULT, symbolName);
@@ -232,7 +247,21 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
 #endif
         std::lock_guard lock(modulesMutex);
         const auto handle = nextHandle++;
-        modules.emplace(handle, std::move(module));
+#ifdef _WIN32
+        module->globalOrder = module->global ? handle : 0;
+        for (const auto& [key, entry] : modules) {
+            if (entry->native == module->native && entry->globalOrder != 0 &&
+                (module->globalOrder == 0 || entry->globalOrder < module->globalOrder)) module->globalOrder = entry->globalOrder;
+        }
+#endif
+        modules.emplace(handle, module);
+#ifdef _WIN32
+        for (const auto& [key, entry] : modules) {
+            if (entry->native != module->native) continue;
+            entry->global = module->globalOrder != 0;
+            entry->globalOrder = module->globalOrder;
+        }
+#endif
         return reinterpret_cast<void*>(handle);
     } catch (const std::exception& error) { Error(error.what()); return nullptr; }
 }
@@ -244,6 +273,10 @@ void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
             std::lock_guard lock(modulesMutex);
             if (handle == nullptr || handle == reinterpret_cast<void*>(static_cast<std::intptr_t>(-2))) {
                 for (const auto& [key, module] : modules) if (module->global) search.push_back(module);
+#ifdef _WIN32
+                std::sort(search.begin(), search.end(), [](const auto& left, const auto& right) { return left->globalOrder < right->globalOrder; });
+                search.erase(std::unique(search.begin(), search.end(), [](const auto& left, const auto& right) { return left->native == right->native; }), search.end());
+#endif
             } else {
                 auto found = modules.find(reinterpret_cast<std::uintptr_t>(handle));
                 if (found == modules.end()) { Error("dlsym: invalid or unsupported module handle"); return nullptr; }
@@ -256,6 +289,8 @@ void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
             if (auto* result = DefaultScopeSymbol(name)) return result;
             const auto nid = Nid::ComputeNid(name, "");
             if (auto* result = DefaultScopeSymbol(nid.c_str())) return result;
+            if (auto* result = DefaultScopeSymbol((std::string(name) + "#guest").c_str())) return result;
+            if (auto* result = DefaultScopeSymbol((nid + "#guest").c_str())) return result;
         }
 #endif
         Error("dlsym: symbol not found in supported module scope");
@@ -265,26 +300,28 @@ void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
 int APS5_VABI dlclose_nid_postfix(void* handle) {
     const auto key = reinterpret_cast<std::uintptr_t>(handle);
     std::shared_ptr<Module> module;
-#ifdef _WIN32
     bool lastReference = true;
-#endif
     {
         std::lock_guard lock(modulesMutex);
         auto found = modules.find(key);
         if (found == modules.end()) { Error("dlclose: invalid module handle"); return -1; }
         module = found->second;
-#ifdef _WIN32
         for (const auto& [other, entry] : modules) {
             if (other != key && entry->native == module->native) lastReference = false;
         }
-#endif
     }
-#ifdef _WIN32
     if (module->owned && module->native && lastReference) {
         GuestAllocations::Mutation mutation;
+#ifdef _WIN32
         mutation.UnregisterImage(module->native);
-    }
+#elif defined(__APPLE__)
+        // macOS: the runner registers (and forgets) guest module images itself when it maps them, and dyld
+        // handles carry no load address; nothing to unregister here.
+        static_cast<void>(mutation);
+#else
+        mutation.UnregisterImage(reinterpret_cast<const void*>(static_cast<link_map*>(module->native)->l_addr));
 #endif
+    }
     {
         std::lock_guard lock(modulesMutex);
         auto found = modules.find(key);

@@ -13,7 +13,9 @@ add_test(NAME agc_metal_pipeline_cache COMMAND agc_metal_pipeline_cache_tests)
 add_test(NAME agc_metal_pipeline_cache_background COMMAND agc_metal_pipeline_cache_tests --background)
 # agc_metal_pipeline_cache_save_race: archive saves while other threads compile (the archive is off under validation).
 add_test(NAME agc_metal_pipeline_cache_save_race COMMAND agc_metal_pipeline_cache_tests --save-race)
-set_tests_properties(agc_metal_pipeline_cache agc_metal_pipeline_cache_background agc_metal_pipeline_cache_save_race PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+# agc_metal_pipeline_cache_mesh: mesh render pipelines bypass the archive (GATE5-STK3).
+add_test(NAME agc_metal_pipeline_cache_mesh COMMAND agc_metal_pipeline_cache_tests --mesh)
+set_tests_properties(agc_metal_pipeline_cache agc_metal_pipeline_cache_background agc_metal_pipeline_cache_save_race agc_metal_pipeline_cache_mesh PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 set_tests_properties(agc_metal_pipeline_cache_background PROPERTIES ENVIRONMENT "APS5_NO_PIPELINE_CACHE=1")
 
 # agc_metal_library_store (DECISIONS D55): the persistent MSL library store and the startup prewarm.

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,7 @@ int APS5_VABI sceAudioOut2ContextResetParam(AudioOut2ContextParam*);
 int APS5_VABI sceAudioOut2ContextCreate(const AudioOut2ContextParam*, void*, std::size_t, AudioOut2ContextHandle*);
 int APS5_VABI sceAudioOut2ContextDestroy(AudioOut2ContextHandle);
 int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle, std::uint32_t);
+void AudioOut2ContextWaitStats_nid_no_patch(AudioOut2ContextHandle, std::uint64_t*, std::uint64_t*);
 int APS5_VABI sceAudioOut2ContextGetQueueLevel(AudioOut2ContextHandle, std::uint32_t*, std::uint32_t*);
 int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle, const AudioOut2PortParam*, AudioOut2PortHandle*);
 int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle);
@@ -188,6 +190,33 @@ void TestPrimingAfterRunningDry() {
     Require(Constant(played, second, burst, -0.5f * masterGain));
 }
 
+// D79: a blocking push on a full queue sleeps until the device consumes a grain (the callback signals), not in
+// 1 ms polls, and the pushes run at the output's real-time rate.
+void TestBlockingPushWakesOnConsumption() {
+    Session session("wake.raw");
+    session.Fill(0.25f);
+    session.Point(session.buffer.data());
+    for (std::uint32_t push = 0; push < cushionGrains + queueDepth + 4; push++) Require(sceAudioOut2ContextPush(session.context, 1) == 0);
+    std::uint64_t waitsBefore = 0, wakeupsBefore = 0;
+    AudioOut2ContextWaitStats_nid_no_patch(session.context, &waitsBefore, &wakeupsBefore);
+    constexpr std::uint32_t pushes = 60;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t push = 0; push < pushes; push++) Require(sceAudioOut2ContextPush(session.context, 1) == 0);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::uint64_t waits = 0, wakeups = 0;
+    AudioOut2ContextWaitStats_nid_no_patch(session.context, &waits, &wakeups);
+    session.Point(nullptr);
+    session.Close();
+    const double expected = static_cast<double>(pushes) * grain / frequency;
+    std::fprintf(stderr, "blocking pushes: %u in %.3f s (real time %.3f s); %llu full waits, %llu extra wake-ups\n", pushes, seconds, expected,
+                 static_cast<unsigned long long>(waits - waitsBefore), static_cast<unsigned long long>(wakeups - wakeupsBefore));
+    // The disk driver writes in real time: the pushes are paced to it (generous bounds for a loaded machine).
+    Require(seconds > 0.5 * expected && seconds < 2.5 * expected);
+    // Most pushes wait; each wakes about once per grain the device takes. 1 ms polling took about 5 per wait.
+    Require(waits - waitsBefore >= pushes / 2);
+    Require(wakeups - wakeupsBefore <= 2 * (waits - waitsBefore));
+}
+
 }
 
 int main() {
@@ -196,5 +225,6 @@ int main() {
     TestRecreatedPort();
     TestLevelExcludesCushion();
     TestPrimingAfterRunningDry();
+    TestBlockingPushWakesOnConsumption();
     return 0;
 }

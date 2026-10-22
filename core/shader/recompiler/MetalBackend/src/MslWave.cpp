@@ -251,8 +251,26 @@ bool AllOnesWord(const IrValue* word) {
 }
 
 bool AllLanesBit(const IrValue* bit) {
-    const auto words = LaneBitWords(Resolved(bit));
+    // Upstream 859dcae2a: a saved EXEC set to every lane (`!x || x`) is every lane too.
+    bit = Resolved(bit);
+    if (Is(bit, IrOpcode::LogicalOr) && EitherOrder(bit, [](const IrValue* inverted, const IrValue* other) { return Is(inverted, IrOpcode::LogicalNot) && Resolved(inverted->Argument(0)) == other; })) return true;
+    const auto words = LaneBitWords(bit);
     return words && AllOnesWord((*words)[0]) && AllOnesWord((*words)[1]);
+}
+
+// Upstream 34e7c309a (SpirvAluEmitterMath): the not-helper test (IEqual32 of HelperInvocation and
+// 0) counts as a lane bit, and a conjunction with a false or helper conjunct is zero before any
+// operand is walked (the walk budget is spent on loop phis otherwise).
+bool HelperTest(const IrValue* predicate) {
+    return Is(predicate, IrOpcode::IEqual32) && EitherOrder(predicate, [](const IrValue* builtin, const IrValue* zero) { return IsU32(zero, 0u) && Is(builtin, IrOpcode::GetBuiltin) && IsU32(builtin->Argument(0), static_cast<std::uint32_t>(StageInputKind::HelperInvocation)) && IsU32(builtin->Argument(1), 0u); });
+}
+
+bool HelperOrFalseConjunct(const IrValue* bit) {
+    bit = Resolved(bit);
+    if (bit == nullptr) return false;
+    if (bit->HasImmediate()) return bit->Type() == IrType::Bool && !bit->ImmediateBool();
+    if (Is(bit, IrOpcode::LogicalAnd)) return HelperOrFalseConjunct(bit->Argument(0)) || HelperOrFalseConjunct(bit->Argument(1));
+    return HelperTest(bit);
 }
 
 bool EveryInvocationEnters(IrShaderStage stage) {
@@ -267,9 +285,10 @@ public:
         bit = Resolved(bit);
         if (bit == nullptr || !Spend()) return false;
         if (bit->HasImmediate()) return bit->Type() == IrType::Bool && !bit->ImmediateBool();
-        if (Is(bit, IrOpcode::LogicalAnd)) return ZeroBit(bit->Argument(0)) || ZeroBit(bit->Argument(1));
+        if (Is(bit, IrOpcode::LogicalAnd)) return HelperOrFalseConjunct(bit) || ZeroBit(bit->Argument(0)) || ZeroBit(bit->Argument(1));
         if (Is(bit, IrOpcode::SelectU1)) return ZeroBit(bit->Argument(1)) && ZeroBit(bit->Argument(2));
         if (Is(bit, IrOpcode::Phi)) return Incoming(bit, [this](const IrValue* incoming) { return ZeroBit(incoming); });
+        if (Is(bit, IrOpcode::IEqual32)) return HelperTest(bit);
         const auto words = LaneBitWords(bit);
         return words && Word((*words)[0], 0u) && Word((*words)[1], 1u);
     }
@@ -287,7 +306,7 @@ private:
         if (predicate->HasImmediate()) return everyInvocationEnters && predicate->Type() == IrType::Bool && predicate->ImmediateBool();
         switch (predicate->Opcode()) {
             case IrOpcode::LogicalAnd: return NotHelper(predicate->Argument(0)) || NotHelper(predicate->Argument(1));
-            case IrOpcode::IEqual32: return EitherOrder(predicate, [](const IrValue* builtin, const IrValue* zero) { return IsU32(zero, 0u) && Is(builtin, IrOpcode::GetBuiltin) && IsU32(builtin->Argument(0), static_cast<std::uint32_t>(StageInputKind::HelperInvocation)) && IsU32(builtin->Argument(1), 0u); });
+            case IrOpcode::IEqual32: return HelperTest(predicate);
             default: return ZeroBit(predicate);
         }
     }
@@ -331,7 +350,8 @@ private:
 
     bool everyInvocationEnters;
     std::unordered_set<const IrValue*> phis;
-    std::uint32_t budget = 512u;
+    // Upstream 99500f9d4: 2048 steps (was 512).
+    std::uint32_t budget = 2048u;
 };
 
 bool EveryLaneBit(const IrValue* bit, bool constantTrue) {
@@ -506,6 +526,56 @@ std::optional<HalfWaveScan> MatchHalfWaveScan(const IrValue* value, IrShaderStag
     return HalfWaveScan{&*reduction, source};
 }
 
+// Upstream 859dcae2a (SpirvAluEmitterMath MatchRowScan / EmitRowReduction): a row scan (DPP row_shr
+// 1, 2, 4 and 8 over keys holding the identity on lanes the wave did not enter with, or on lanes an
+// all-active ballot masks off) read at a row's last lane would shuffle from lanes that already left
+// the surrounding loop, inactive on the host with undefined values; the read becomes a SIMD
+// reduction over the active invocations of that row.
+bool ActiveMaskedWord(const IrValue* word, std::uint32_t depth = 0u) {
+    word = Resolved(word);
+    if (word == nullptr || depth > 8u) return false;
+    if (Is(word, IrOpcode::CompositeExtractU32x4)) {
+        const auto* ballot = Resolved(word->Argument(0));
+        const auto* active = ballot != nullptr && Is(ballot, IrOpcode::Ballot) ? Resolved(ballot->Argument(0)) : nullptr;
+        return active != nullptr && active->HasImmediate() && active->Type() == IrType::Bool && active->ImmediateBool() && IsU32(word->Argument(1), 0u);
+    }
+    return Is(word, IrOpcode::BitwiseAnd32) && (ActiveMaskedWord(word->Argument(0), depth + 1u) || ActiveMaskedWord(word->Argument(1), depth + 1u));
+}
+
+bool ActiveMaskedBit(const IrValue* bit) {
+    const auto words = LaneBitWords(Resolved(bit));
+    return words && ActiveMaskedWord((*words)[0]) && ActiveMaskedWord((*words)[1]);
+}
+
+std::optional<HalfWaveScan> MatchRowScan(const IrValue* value, IrShaderStage stage, bool narrow) {
+    const auto* top = Unmasked(Resolved(value), narrow);
+    for (const auto& reduction : WaveReductions) {
+        if (reduction.floating) continue;
+        const IrValue* scan = top;
+        for (const auto control : {0x118u, 0x114u, 0x112u, 0x111u}) {
+            scan = RowScanStepInput(scan, reduction, control, narrow);
+            if (scan == nullptr) break;
+        }
+        if (scan == nullptr) continue;
+        const auto* source = Unmasked(scan, narrow);
+        if (Is(source, IrOpcode::SelectU32) && IsU32(source->Argument(2), reduction.identity) && (ActiveMaskedBit(source->Argument(0)) || EntryLaneWalk{stage}.ZeroBit(source->Argument(0)))) return HalfWaveScan{&reduction, source};
+    }
+    return std::nullopt;
+}
+
+// The row reduction of a v_readlane_b32 at immediate lane `lane` of a graphics program whose wave
+// one host SIMD group holds at one lane per invocation, or nullopt.
+std::optional<std::string> RowReduction(MslEmitterState& state, const IrValue& instruction, std::uint32_t lane) {
+    if ((lane & 15u) != 15u || state.laneCount != 1u || state.laneLocal || state.hostSubgroupSize == 1u || state.hostSubgroupSize != state.program.WaveSize()) return std::nullopt;
+    const auto stage = state.program.Resources().stage;
+    auto scan = MatchRowScan(instruction.Argument(0u), stage, false);
+    if (!scan) scan = MatchRowScan(instruction.Argument(0u), stage, true);
+    if (!scan) return std::nullopt;
+    const auto keys = "((" + state.GuestLane() + " >> 4u) == " + U32(lane >> 4u) + " ? " + state.Value(scan->source) + " : " + MslHex(scan->reduction->identity) + "u)";
+    std::string reduce = scan->reduction->reduce;
+    const bool signedReduce = reduce.find("as_type<int>") != std::string::npos;
+    return reduce + keys + (signedReduce ? ")))" : "))");
+}
 
 void Ballot(MslEmitterState& state, const IrValue& instruction) {
     // Both guest lane halves for wave64 on 32-wide SIMD groups (core helper).
@@ -559,11 +629,36 @@ void ReadLane(MslEmitterState& state, const IrValue& instruction) {
                 }
             }
         }
+        if ((lane & 15u) == 15u && state.hostSubgroupSize != 1u && !state.laneLocal) {
+            // Upstream 859dcae2a's row reduction (RowReduction) in the half-wave view: the matched scan's keys
+            // hold the identity on lanes the wave did not enter with or that are inactive, and the guest lanes
+            // 32-63 of this view are never active (its EXEC masks and ballots hold this SIMD group's lanes
+            // only), so rows 2 and 3 reduce to the identity, as upstream's subgroup reduction of an empty row on
+            // a 32-lane host; rows 0 and 1 reduce over this SIMD group's active lanes of the row.
+            auto scan = MatchRowScan(instruction.Argument(0u), stage, false);
+            if (!scan) scan = MatchRowScan(instruction.Argument(0u), stage, true);
+            if (scan) {
+                if (lane >= 32u) {
+                    state.Define(instruction, MslHex(scan->reduction->identity) + "u");
+                    return;
+                }
+                const auto keys = "((" + state.GuestLane() + " >> 4u) == " + U32(lane >> 4u) + " ? " + state.Value(scan->source) + " : " + MslHex(scan->reduction->identity) + "u)";
+                std::string reduce = scan->reduction->reduce;
+                const bool signedReduce = reduce.find("as_type<int>") != std::string::npos;
+                state.Define(instruction, reduce + keys + (signedReduce ? ")))" : "))"));
+                return;
+            }
+        }
         if (lane >= 32u && UpperLaneWalk{stage}.ZeroValue(instruction.Argument(0u))) {
             state.Define(instruction, "0u");
             return;
         }
         if (lane >= 32u && state.hostSubgroupSize != 1u) state.Fail(instruction, "v_readlane_b32 of lane " + std::to_string(lane) + " is outside the 32-lane host SIMD group that runs this wave64 graphics program at one lane per invocation (work package B6)");
+    } else if (const IrValue* selector = instruction.Argument(1u)->Resolve(); selector->HasImmediate() && state.program.Resources().stage != IrShaderStage::Compute) {
+        if (const auto reduced = RowReduction(state, instruction, selector->ImmediateU32() & (state.program.WaveSize() - 1u))) {
+            state.Define(instruction, *reduced);
+            return;
+        }
     }
     const auto lane = Constant(state, "uint", "(" + state.Arg(instruction, 1u) + ") & " + U32(state.program.WaveSize() - 1u), "aps5_rl");
     state.Define(instruction, WaveRead(state, instruction, 0u, lane));

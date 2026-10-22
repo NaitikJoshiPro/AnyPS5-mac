@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
+#include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
@@ -93,6 +94,19 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
     }
     EmitKillIfPixelValidMaskInactive(state);
+    if (state.quadPixelUncovered != 0u) EmitKillIfBoolFalse(state, Unary(state, spv::OpLogicalNot, TypeBool(state), state.quadPixelUncovered));
+    if (state.stencilReplay) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeI32(state), value, state.stencilRefVariable);
+        const auto reference = Unary(state, spv::OpBitcast, TypeU32(state), value);
+        const auto masked = Binary(state, spv::OpBitwiseAnd, TypeU32(state), reference, ConstantU32(state, 0xffu));
+        const auto offset = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::StencilReferenceOffset, state.program.Metadata().bindings.stencilReferenceDword);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), offset);
+        const auto expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), expected, pointer);
+        EmitKillIfBoolFalse(state, Binary(state, spv::OpIEqual, TypeBool(state), masked, expected));
+    }
     state.module.AddFunction(spv::OpReturn);
 }
 
@@ -291,6 +305,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Void: return Invoke(EmitVoid, ctx, inst);
         case IrOpcode::Reference: return Invoke(EmitReference, ctx, inst);
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
+        case IrOpcode::UnlinkedCall: return Invoke(EmitUnlinkedCall, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
         case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
@@ -649,6 +664,8 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SharedAtomicMskor64: return Invoke(EmitSharedAtomicMskor64, ctx, inst);
         case IrOpcode::DataAppend: return Invoke(EmitDataAppend, ctx, inst);
         case IrOpcode::DataConsume: return Invoke(EmitDataConsume, ctx, inst);
+        case IrOpcode::DataOrderedCount: return Invoke(EmitDataOrderedCount, ctx, inst);
+        case IrOpcode::DataOrderedSwap: return Invoke(EmitDataOrderedSwap, ctx, inst);
         case IrOpcode::SwizzleU32: return Invoke(EmitSwizzleU32, ctx, inst);
         case IrOpcode::ImageQueryDimensions: return Invoke(EmitImageQueryDimensions, ctx, inst);
         case IrOpcode::ImageQueryLod: return Invoke(EmitImageQueryLod, ctx, inst);
@@ -791,6 +808,25 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
     return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
 }
 
+bool AccessesMemory(IrOpcode opcode) {
+    return opcode == IrOpcode::ReadConst || opcode == IrOpcode::ReadConstBuffer || SharedAccessOf(opcode) != SharedAccess::None || BufferAccessOf(opcode) != BufferAccess::None || AddressOpcodeInfoOf(opcode).access != AddressAccess::None || ImageOpcodeInfoOf(opcode).access != ImageAccess::None;
+}
+
+bool PrecedesEveryMemoryAccess(const IrProgram& program, const IrValue& barrier) {
+    const auto& blocks = program.BlockOrder();
+    const IrBlock* block = blocks.empty() ? nullptr : blocks.front();
+    for (std::size_t steps = 0; block != nullptr && steps < blocks.size(); ++steps) {
+        for (const auto* instruction : block->Instructions()) {
+            if (instruction == &barrier) return true;
+            if (AccessesMemory(instruction->Opcode())) return false;
+        }
+        if (block->Successors().size() != 1u) return false;
+        block = block->Successors().front();
+        if (block->Predecessors().size() != 1u) return false;
+    }
+    return false;
+}
+
 }
 
 void EmitControlFlow(SpirvModule& module, const IrProgram& program) {
@@ -847,6 +883,7 @@ void EmitVoid(SpirvValueEmitContext&) {
 void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     if (state.program.Resources().stage == IrShaderStage::Vertex) {
+        if (PrecedesEveryMemoryAccess(state.program, inst)) return;
         for (const auto* block : state.program.BlockOrder()) {
             for (const auto* instruction : block->Instructions()) {
                 if (CommunicatesThroughMemory(instruction->Opcode())) ctx.Fail(inst, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");
@@ -870,6 +907,13 @@ void EmitReference(SpirvValueEmitContext& context) {
 
 void EmitReferenceU32(SpirvValueEmitContext& context) {
     EmitVoid(context);
+}
+
+void EmitUnlinkedCall(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "calls an unlinked target without a fault buffer");
+    RecordBdaFaultWords(state, low, high, ConstantU32(state, 0u), programCounter, BdaAbi::FaultReason::UnlinkedCall);
+    StopBdaInvocationIf(state, ConstantBool(state, true));
 }
 
 void EmitControlNop(SpirvValueEmitContext& context) {

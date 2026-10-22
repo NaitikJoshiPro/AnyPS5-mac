@@ -10,6 +10,8 @@ list(APPEND agcMetalTwins
         "Graphics/src/TextureDetiler.cpp=specifics/macos/src/TextureDetiler.mm"
         "Graphics/src/TextureDetilerDescriptors.cpp=specifics/macos/src/TextureDetiler.mm"
         "Graphics/src/Texture.cpp=specifics/macos/src/Texture.mm"
+        # UPSYNC4: the Vulkan multisample compute readback (ab52b02381) refuses on Metal.
+        "Graphics/src/MultisampleReadback.cpp=specifics/macos/src/MultisampleReadbackMetal.mm"
         "Graphics/src/UnitShadow.cpp=specifics/macos/src/UnitShadow.mm"
         "Graphics/src/GpuColorTransfer.cpp=specifics/macos/src/GpuColorTransfer.mm"
         "tests/Recorder.cpp=specifics/macos/tests/D3RecorderModes.mm"

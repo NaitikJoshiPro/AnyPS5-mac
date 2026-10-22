@@ -2,11 +2,12 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_SPECIFICS_MACOS_SRC_RECORDERKERNELS_H
 
 // MSL twins of the driver's helper compute shaders (work package D2): the GLSL originals live in
-// Graphics/shaders (MeshArguments.comp, SampleCounter.comp, SampleDumps.comp) and the parameter
+// Graphics/shaders (MeshArguments.comp, DispatchArguments.comp, SampleCounter.comp, SampleDumps.comp) and the parameter
 // blocks keep their push-constant layouts, now uploaded and bound at buffer index 0 (Metal 4 has
 // no push constants). FillPattern is new: Metal fills bytes only, so dword and 16-byte pattern
-// fills (vkCmdFillBuffer, the device's pattern fills) run it. Every kernel runs as one threadgroup
-// of one thread except FillPattern (one thread per dword). Compiled at first use per device
+// fills (vkCmdFillBuffer, the device's pattern fills) run it; IndexGather is new too (D81). Every
+// kernel runs as one threadgroup of one thread except FillPattern and IndexGather (one thread per
+// dword or index). Compiled at first use per device
 // (Metal::HelperPipeline).
 
 namespace AgcDriver::Graphics::Metal {
@@ -20,15 +21,6 @@ static inline void AddSamples(thread uint& low, thread uint& high, device const 
     const uint sum = low + value[0];
     high = high + value[1] + (sum < low ? 1u : 0u);
     low = sum;
-}
-
-// The 16 render-backend entries of a ZPASS_DONE dump: entry 0 holds the total, the others 0, each
-// with bit 63 (valid) set.
-static inline void StoreDump(device uint* target, uint low, uint high) {
-    for (uint db = 0u; db < 16u; ++db) {
-        target[db * 4u] = db == 0u ? low : 0u;
-        target[db * 4u + 1u] = (db == 0u ? high : 0u) | 0x80000000u;
-    }
 }
 
 struct FillParameters {
@@ -72,6 +64,28 @@ kernel void MeshArguments(constant MeshArgumentParameters& p [[buffer(0)]]) {
     p.arguments[4] = first;
 }
 
+// e54d2f35fe: the MSL twin of DispatchArguments.comp. An indirect dispatch's group counts copied
+// into a 12-byte argument buffer, all three 0 when one exceeds the device limit (a count a skipped
+// producer never wrote, 0xffffffff, would otherwise launch up to 2^32 groups and hang the GPU).
+struct DispatchArgumentParameters {
+    device const uint* source;
+    device uint* arguments;
+    uint maxX;
+    uint maxY;
+    uint maxZ;
+    uint unused;
+};
+
+kernel void DispatchArguments(constant DispatchArgumentParameters& p [[buffer(0)]]) {
+    const uint x = p.source[0];
+    const uint y = p.source[1];
+    const uint z = p.source[2];
+    const bool valid = x <= p.maxX && y <= p.maxY && z <= p.maxZ;
+    p.arguments[0] = valid ? x : 0u;
+    p.arguments[1] = valid ? y : 0u;
+    p.arguments[2] = valid ? z : 0u;
+}
+
 struct SampleCounterParameters {
     device uint* counter;
     device uint* target;
@@ -80,12 +94,26 @@ struct SampleCounterParameters {
 };
 
 kernel void SampleCounter(constant SampleCounterParameters& p [[buffer(0)]]) {
+    // A ZPASS_DONE dump is 16 render-backend entries: entry 0 holds the total, the others 0, each
+    // with bit 63 (valid) set. store 1, 3, 2 publish a dump in three dispatches (barriers between): the high word without
+    // the ready bit, then the low word (and the counter), then the ready bit, so the CPU never
+    // sees the ready marker before the counts (upstream 6b164f21af).
+    if (p.store == 2u) {
+        for (uint db = 0u; db < 16u; ++db) p.target[db * 4u + 1u] |= 0x80000000u;
+        return;
+    }
     uint low = p.counter[0];
     uint high = p.counter[1];
     for (uint i = 0u; i < p.count; ++i) AddSamples(low, high, p.counter + 4u + 2u * i);
+    if (p.store == 1u) {
+        for (uint db = 0u; db < 16u; ++db) p.target[db * 4u + 1u] = db == 0u ? (high & 0x7fffffffu) : 0u;
+        return;
+    }
+    if (p.store == 3u) {
+        for (uint db = 0u; db < 16u; ++db) p.target[db * 4u] = db == 0u ? low : 0u;
+    }
     p.counter[0] = low;
     p.counter[1] = high;
-    if (p.store != 0u) StoreDump(p.target, low, high);
 }
 
 struct SampleDumpParameters {
@@ -95,7 +123,25 @@ struct SampleDumpParameters {
     uint dumpCount;
     uint firstSegment;
     uint lastSegment;
+    uint phase;
 };
+
+// Index expansion of indices recorded GPU work writes (W1, D81): target[i] is the guest index at
+// position positions[i] of the source (16- or 32-bit), so the expansion's order (fans, provoking
+// vertex rotation) is planned on the CPU from positions alone and the values never cross to it.
+struct IndexGatherParameters {
+    device const uchar* source;
+    device const uint* positions;
+    device uint* target;
+    uint count;
+    uint indexSize;
+};
+
+kernel void IndexGather(constant IndexGatherParameters& p [[buffer(0)]], uint index [[thread_position_in_grid]]) {
+    if (index >= p.count) return;
+    const uint position = p.positions[index];
+    p.target[index] = p.indexSize == 2u ? uint(reinterpret_cast<device const ushort*>(p.source)[position]) : reinterpret_cast<device const uint*>(p.source)[position];
+}
 
 kernel void SampleDumps(constant SampleDumpParameters& p [[buffer(0)]]) {
     uint low = p.counter[0];
@@ -105,8 +151,15 @@ kernel void SampleDumps(constant SampleDumpParameters& p [[buffer(0)]]) {
         const uint end = p.dumps[dump * 4u + 2u];
         for (; segment < end; ++segment) AddSamples(low, high, p.counter + 4u + 2u * segment);
         const ulong address = ulong(p.dumps[dump * 4u]) | (ulong(p.dumps[dump * 4u + 1u]) << 32u);
-        StoreDump(reinterpret_cast<device uint*>(address), low, high);
+        device uint* target = reinterpret_cast<device uint*>(address);
+        // Phases 0, 1, 2 (separate dispatches): high word without the ready bit, low word, ready bit.
+        for (uint db = 0u; db < 16u; ++db) {
+            if (p.phase == 0u) target[db * 4u + 1u] = db == 0u ? (high & 0x7fffffffu) : 0u;
+            else if (p.phase == 1u) target[db * 4u] = db == 0u ? low : 0u;
+            else target[db * 4u + 1u] = (db == 0u ? high : 0u) | 0x80000000u;
+        }
     }
+    if (p.phase != 2u && p.dumpCount != 0u) return;
     for (; segment < p.lastSegment; ++segment) AddSamples(low, high, p.counter + 4u + 2u * segment);
     p.counter[0] = low;
     p.counter[1] = high;

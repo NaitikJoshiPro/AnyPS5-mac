@@ -9,6 +9,7 @@
 #include "GuestGuards.hpp"
 #include "GuestProgram.hpp"
 #include "GuestSampler.hpp"
+#include "GuestStats.hpp"
 #include "Options.hpp"
 
 #include <FEXCore/Config/Config.h>
@@ -237,6 +238,7 @@ public:
             thread = guestCode.context->CreateThread();
         }
         GuestSampler::Register(thread);
+        GuestStats::Register(thread);
         thread->CurrentFrame->State.rip = rip;
         thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = rsp;
         callRet = mmap(nullptr, ThreadState::CALLRET_STACK_SIZE + 2 * Page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -265,6 +267,7 @@ public:
 
     ~GuestThread() {
         GuestSampler::Unregister(thread);
+        GuestStats::Unregister(thread);
         {
             std::lock_guard lock(threadsMutex);
             guestCode.context->DestroyThread(thread);
@@ -535,6 +538,12 @@ void PrepareFex(const std::vector<std::pair<FEXCore::Config::ConfigOption, std::
     // A locked access that crosses 16 bytes is emulated in the SIGBUS handler with two CASes, which tear under
     // contention unless such accesses share a lock (x86 makes them atomic). Only that slow path takes the lock.
     FEXCore::Config::Set(FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1");
+    // FEX's memory-saving lookup defaults (no L2 table, an L1 that shrinks) sent ASTRO BOT's indirect branches through
+    // CompileCode's map lookup 700-900 times a second per process (lookup-cache misses, APS5_FEX_STATS). The L2 table is
+    // a lazily touched virtual reservation; with it and a full-size L1 the misses drop to a few per 30 s (D71).
+    // APS5_FEX_CONFIG=DisableL2Cache=1,DynamicL1Cache=1 restores FEX's defaults.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLEL2CACHE, "0");
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DYNAMICL1CACHE, "0");
     for (const auto& [option, value] : config)
         FEXCore::Config::Set(option, value);
     LoadOptions();
@@ -593,6 +602,7 @@ GuestCpu::GuestCpu(Bridge& bridge, const GuestProgram& program) {
     RedirectGuestGuards(bridge, program, *state->context);
     guestCode = {program.CodeRanges(), &bridge, &program.Tls(), state->context.get()};
     InstallFaultHandler();
+    GuestStats::Start();
     GuestSampler::Start(state->context.get(), state->modules.get(), state->returns.GetConfig().SRAGPRMapping,
                         [&bridge](std::uint64_t rip) { return bridge.StubName(rip); });
     if (!atExitRegistered) atExitRegistered = std::atexit(FlushAtExit) == 0;

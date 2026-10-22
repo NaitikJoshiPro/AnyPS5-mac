@@ -53,6 +53,8 @@ struct PipelineCacheStatistics {
     // Pipelines the compiler built (archive misses) and pipelines served by the persisted archive.
     std::uint64_t pipelinesCompiled = 0;
     std::uint64_t archiveHits = 0;
+    // Of pipelinesCompiled, those the archive never stores (mesh render pipelines).
+    std::uint64_t pipelinesUnarchived = 0;
     // Requests served by a pipeline already in memory (or by a finished background task).
     std::uint64_t memoryHits = 0;
     // Background tasks started by Prepare*, and requests that waited for an unfinished task.
@@ -150,6 +152,15 @@ struct DepthStencilRequest {
     bool operator==(const DepthStencilRequest&) const = default;
 };
 
+// Guest compute pipelines the caches built (compiled or an archive hit; process-wide), and those
+// built by a thread holding the GPU mutex (upstream 7fae4549e's VulkanDevice::ComputePipelineCounts:
+// PrepareDispatch starts the build on the cache's workers, outside the mutex).
+struct ComputePipelineCreation {
+    std::uint64_t created = 0;
+    std::uint64_t underGpuMutex = 0;
+};
+ComputePipelineCreation ComputePipelineCreationCounts();
+
 class PipelineCache {
 public:
     // `directory`: where the archive lives (empty: the default from the environment, see above).
@@ -188,7 +199,11 @@ public:
     // archives as lookup archives (no compile), keeping each written archive a superset of the
     // last. Requested after every new pipeline and run by the saver thread, coalesced and spaced
     // (SaveSpacing); also at destruction. Never throws.
-    void Save();
+    // `waitForPipelines` false (the saver thread; upstream 1d8acd1eda SaveUnlessBusy): when a
+    // pipeline creation holds serializerGate, the save is skipped instead of queueing an exclusive
+    // lock that would hold every later creation behind that compile; returns false and the saver
+    // asks again after the spacing. True (destruction, tests) waits for the gate.
+    bool Save(bool waitForPipelines = true);
     // Waits until no background task runs.
     void Drain();
 
@@ -214,6 +229,8 @@ private:
     id<MTLLibrary> library(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool prewarm);
     void prewarm(std::vector<StoredLibrary> stored);
     id<MTLComputePipelineState> buildCompute(const PipelineFunction& function);
+    // Compute(): `guest` counts a pipeline built for a guest kernel (ComputePipelineCreationCounts).
+    id<MTLComputePipelineState> compute(const PipelineFunction& function, bool guest);
     id<MTLRenderPipelineState> buildRender(const RenderPipelineRequest& request);
     id<MTLRenderPipelineState> buildMeshRender(const RenderPipelineRequest& request);
     MTL4FunctionDescriptor* functionDescriptor(const PipelineFunction& function);
@@ -226,13 +243,24 @@ private:
     void noteArchived(std::function<void(NSArray<id<MTL4Archive>>*)> replay, bool captured);
     id<MTLComputePipelineState> obtainCompute(const std::function<MTL4ComputePipelineDescriptor*()>& describe, const char* what);
     id<MTLRenderPipelineState> obtainRender(const std::function<MTL4PipelineDescriptor*()>& describe, const char* what);
+    // Mesh render pipelines (MetalMesh.mm): compiled by `plainCompiler`, never looked up in nor
+    // captured into the archive. A captured mesh pipeline crashed the serializer's flush on macOS
+    // 27.0.1 (dispatch_retain(NULL) in -[_MTLBinaryArchive materializeAirNTFromOnlineForSlice:
+    // entryList:] on the saver thread; SuperTuxKart at ~40 s, GATE5-STK3).
+    id<MTLRenderPipelineState> obtainUnarchivedRender(MTL4PipelineDescriptor* descriptor, const char* what);
     MTL4PipelineDescriptor* renderDescriptor(const RenderPipelineRequest& request);
     MTL4PipelineDescriptor* meshDescriptor(const RenderPipelineRequest& request);
 
     id<MTLDevice> device = nil;
     id<MTL4Compiler> compiler = nil;
+    // A compiler without the serializer (obtainUnarchivedRender); `compiler` when there is no archive.
+    id<MTL4Compiler> plainCompiler = nil;
     id<MTL4PipelineDataSetSerializer> serializer = nil;
-    id<MTL4Archive> archive = nil;
+    // The archive generations this cache looks pipelines up in, newest first (empty: none). Every
+    // cache of a process loads the same set: the newest generation of the last run together with
+    // the generations its other devices wrote (upstream 8c8cd86cf: a process holds the windowless
+    // device next to its windowed replacement, and neither device's pipelines may be dropped).
+    NSArray<id<MTL4Archive>>* archives = nil;
     std::filesystem::path archivePath;
 
     mutable std::mutex mutex;

@@ -49,7 +49,7 @@ ExternalProject_Add(fexcore
     BUILD_ALWAYS TRUE
     BUILD_BYPRODUCTS ${APS5_FEX_LIBRARIES})
 
-add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/BridgeSignatures.cpp src/ConsoleSyscalls.cpp src/GuestCall.cpp src/GuestGuards.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/GuestSampler.cpp src/Options.cpp src/Trampolines.S)
+add_library(aps5-fex-runtime STATIC src/Bridge.cpp src/BridgeSignatures.cpp src/ConsoleSyscalls.cpp src/GuestCall.cpp src/GuestGuards.cpp src/GuestCpu.cpp src/GuestImage.cpp src/GuestProgram.cpp src/GuestSampler.cpp src/GuestStats.cpp src/Options.cpp src/Trampolines.S)
 target_sources(aps5-fex-runtime PRIVATE src/AotSeeds.cpp src/CodeCache.cpp src/CodePool.cpp)
 add_dependencies(aps5-fex-runtime fexcore)
 # Header-only: the displaced guest window (GuestDisplaced.hpp) the fault handler must leave to libc.

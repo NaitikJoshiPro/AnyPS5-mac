@@ -13,12 +13,16 @@
 //                                   APS5_METALFX=0: the bilinear scaler, exact pixels)
 //   agc_metal_draw_tests metalfx    (agc_metal_metalfx_present: D61's MetalFX spatial upscale in the
 //                                   present: upscales through MetalFX, downscales and clears do not)
+//   agc_metal_draw_tests gather     (agc_metal_draw_index_gather: D81's index expansion of indices a
+//                                   recorded GPU fill writes: 16- and 32-bit fans gathered on the
+//                                   GPU with no CPU read, a restarted list still read on the CPU)
 //   agc_metal_draw_tests decode     (agc_metal_present_gpu_decode: D66's display decode on the GPU:
 //                                   linear/pitched and 64 KiB R_X tiled, BGRA/RGBA 8-bit, 10-bit, both
 //                                   16-bit float orders against DecodeDisplayBuffer; a recorded GPU
 //                                   fill is decoded without a CPU wait; unimported memory decodes on
 //                                   the CPU)
 #include "../src/MetalDeviceState.h"
+#include "../src/MetalVulkanImages.h"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -612,6 +616,74 @@ void NoDrawableSize(void*, std::uint32_t* width, std::uint32_t* height) {
 
 }
 
+// D81: an index expansion whose indices recorded GPU work writes (here a recorded fill over stale
+// CPU bytes) gathers them on the GPU in queue order instead of syncing and reading them; a
+// primitive restart still needs the values on the CPU (a sync, then the fill's bytes).
+static void CheckIndexGather(AgcDriver::VulkanDevice& device) {
+    GuestBlock vertices(16384);
+    GuestBlock target(Extent * Extent * 4u);
+    constexpr std::array<std::array<float, 4>, 4> quad {{{0.0f, -1.0f, 0.5f, 0.0f}, {1.0f, -1.0f, 0.5f, 0.0f}, {1.0f, 1.0f, 0.5f, 0.0f}, {0.0f, 1.0f, 0.5f, 0.0f}}};
+    WriteVertices(vertices, quad);
+    const auto quadShaders = MakeShaders(vertices.Address(), 4u, 0xff0000ffu);
+    const auto rightHalfOnly = [&](const std::string& what) {
+        for (const auto y : {2u, Extent / 2u, Extent - 3u}) {
+            for (const auto x : {Extent / 2u + 1u, Extent - 2u}) Require(PixelRgba8(target, x, y) == 0xff0000ffu, what + ": right-half pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") uncovered");
+            for (const auto x : {1u, Extent / 4u}) Require(PixelRgba8(target, x, y) == 0u, what + ": left-half pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") drawn");
+        }
+    };
+    GuestBlock indices(16384);
+    struct Case {
+        const char* name;
+        std::uint32_t indexSize;
+        std::array<std::uint32_t, 4> pattern;
+        std::uint32_t count;
+        VkPrimitiveTopology topology;
+        bool restart;
+    };
+    // 16-bit fan {0 1 2 3}, 32-bit fan {0 1 2 3}, 16-bit restarted list {0 1 2 R 0 2 3 R}.
+    const std::array<Case, 3> cases {{
+        {"16-bit fan", 2u, {0x00010000u, 0x00030002u, 0u, 0u}, 4u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, false},
+        {"32-bit fan", 4u, {0u, 1u, 2u, 3u}, 4u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, false},
+        {"restarted 16-bit list", 2u, {0x00010000u, 0xffff0002u, 0x00020000u, 0xffff0003u}, 8u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true},
+    }};
+    for (const auto& item : cases) {
+        std::memset(target.Data(), 0, target.Size());
+        // Stale CPU bytes: every index 3 (degenerate triangles) until the recorded fill lands.
+        std::memset(indices.Data(), 0, 64u);
+        for (std::size_t i = 0; i < 64u / item.indexSize; ++i) {
+            const std::uint32_t three = 3u;
+            std::memcpy(indices.Data() + i * item.indexSize, &three, item.indexSize);
+        }
+        Require(device.FillBuffer(indices.Address(), 16u, item.pattern), std::string(item.name) + ": the index fill was not recorded on the GPU (no host import)");
+        auto state = BaseState();
+        SetTarget(state, target.Address(), VK_FORMAT_R8G8B8A8_UNORM, ColorTileMode::Linear, 4u);
+        state.topology = item.topology;
+        state.primitiveRestart = item.restart;
+        const auto before = AgcDriver::Graphics::Metal::IndexExpansionCounts();
+        Draw(device, state, quadShaders, {indices.Address(), item.count, item.indexSize, 1u, 0u, true});
+        const auto after = AgcDriver::Graphics::Metal::IndexExpansionCounts();
+        if (item.restart) Require(after.gathered == before.gathered && after.settled == before.settled + 1u, std::string(item.name) + ": a restarted list was not read on the CPU after a sync");
+        else Require(after.gathered == before.gathered + 1u && after.settled == before.settled, std::string(item.name) + ": the indices were read on the CPU, not gathered on the GPU");
+        device.WaitIdle();
+        rightHalfOnly(item.name);
+        std::printf("gather: %s passed\n", item.name);
+    }
+    // Indices nothing recorded writes are read on the CPU without a sync, as before.
+    std::memset(target.Data(), 0, target.Size());
+    const std::array<std::uint16_t, 4> fanIndices {0u, 1u, 2u, 3u};
+    std::memcpy(indices.Data(), fanIndices.data(), sizeof(fanIndices));
+    auto fan = BaseState();
+    SetTarget(fan, target.Address(), VK_FORMAT_R8G8B8A8_UNORM, ColorTileMode::Linear, 4u);
+    fan.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    const auto before = AgcDriver::Graphics::Metal::IndexExpansionCounts();
+    Draw(device, fan, quadShaders, {indices.Address(), 4u, 2u, 1u, 0u, true});
+    const auto after = AgcDriver::Graphics::Metal::IndexExpansionCounts();
+    Require(after.gathered == before.gathered && after.settled == before.settled, "CPU-written fan indices were gathered or synced");
+    device.WaitIdle();
+    rightHalfOnly("CPU-written fan");
+    std::puts("gather: CPU-written indices are read on the CPU");
+}
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "targets";
     std::unique_ptr<AgcDriver::VulkanDevice> device;
@@ -634,6 +706,8 @@ int main(int argc, char** argv) {
             CheckMetalFx(*device);
         } else if (mode == "decode") {
             CheckGpuDecode(*device);
+        } else if (mode == "gather") {
+            CheckIndexGather(*device);
         } else {
             std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
             return 2;

@@ -2,6 +2,8 @@
 #include "prx/libc/include/Shutdown.hpp"
 #include "tests/VideoOutTestEnvironment.hpp"
 #include "prx/libSceVideoOut/include/DisplayMode.hpp"
+#include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +15,7 @@ extern "C" {
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param);
 int APS5_VABI sceVideoOutClose(int handle);
 int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
+int APS5_VABI sceVideoOutGetOutputStatusWithVrr(int handle, void* status);
 int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatus* status);
 }
 
@@ -91,6 +94,18 @@ int main(int argc, char** argv) {
     Require(output.dynamicRange == (hdr ? 2u : 1u) && output.flags == (hdr ? 1u : 0u));
     Require(output.refreshRate == 3u);
 
+    std::array<std::byte, 96> vrr;
+    vrr.fill(std::byte{0xff});
+    Require(sceVideoOutGetOutputStatusWithVrr(handle, vrr.data()) == 0);
+    Require(std::memcmp(vrr.data(), &output, sizeof(output)) == 0);
+    for (std::size_t offset = sizeof(output); offset < 80; ++offset) Require(vrr[offset] == std::byte{0});
+    for (std::size_t offset = 80; offset < vrr.size(); ++offset) Require(vrr[offset] == std::byte{0xff});
+    vrr.fill(std::byte{0xff});
+    Require(sceVideoOutGetOutputStatusWithVrr(handle, nullptr) == static_cast<int>(0x80290002u));
+    Require(sceVideoOutGetOutputStatusWithVrr(NEVER_OPENED_HANDLE, vrr.data()) == static_cast<int>(0x8029000Bu));
+    Require(sceVideoOutGetOutputStatusWithVrr(-1, vrr.data()) == static_cast<int>(0x8029000Bu));
+    for (const auto byte : vrr) Require(byte == std::byte{0xff});
+
     Require(Rejects(handle, nullptr));
     Require(Rejects(0, &status));
     Require(Rejects(-1, &status));
@@ -98,5 +113,6 @@ int main(int argc, char** argv) {
 
     Require(sceVideoOutClose(handle) == 0);
     Require(Rejects(handle, &status));
+    Require(sceVideoOutGetOutputStatusWithVrr(handle, vrr.data()) == static_cast<int>(0x8029000Bu));
     LibcRunShutdown_nid_postfix();
 }

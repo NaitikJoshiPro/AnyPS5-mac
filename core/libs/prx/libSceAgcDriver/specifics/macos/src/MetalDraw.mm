@@ -27,6 +27,7 @@
 #include "MetalMesh.h"
 #include "MetalTessellation.h"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -43,6 +44,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "MetalResidency.h"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -250,6 +252,9 @@ struct DrawCache {
         id<MTLTexture> texture;
         bool clearDepth = false;
         bool clearStencil = false;
+        // The clear values (AcquireDepthSurface: a plane fill's, else DB_DEPTH_CLEAR/DB_STENCIL_CLEAR).
+        float depthValue = 0.0f;
+        std::uint8_t stencilValue = 0;
     };
 
     // Private textures of tiled color targets. `gpuNewer`: passes whose write-back has not landed
@@ -316,6 +321,15 @@ Metal::DrawCache& VulkanDevice::State::Draws() {
 namespace {
 
 std::atomic<std::uint64_t> emulatedDraws{0};
+// D81: index expansions gathered on the GPU, and those that read indices recorded work still
+// wrote on the CPU (each a recorder sync).
+std::atomic<std::uint64_t> indexGathers{0};
+std::atomic<std::uint64_t> indexSettles{0};
+
+bool GpuIndexGather() {
+    static const bool enabled = std::getenv("APS5_CPU_INDEX_EXPANSION") == nullptr;
+    return enabled;
+}
 std::atomic<std::uint64_t> emulatedSlicePasses{0};
 std::atomic<std::uint64_t> emulatedBegun{0};
 
@@ -437,6 +451,45 @@ static void CheckInputsClearOfTarget(Settle settle, const Graphics::State& graph
             firstByte = Graphics::VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance);
         }
         if (overlaps(address + firstByte, address + bytes)) throw std::runtime_error("AGC graphics: vertex buffer aliases the render target");
+    }
+}
+
+// Upstream Draw.cpp prepareDrawInputs: the index buffer and the vertex records a draw reads must not
+// overlap a multisampled color target, whose samples are only on the host (RequireNoMultisampleTarget).
+// A vertex descriptor is checked whole first (nothing is guarded, or it is clear of every target);
+// only one that reaches a target is narrowed to the records the draw fetches, as upstream's copy plan.
+template <typename Settle>
+static void CheckInputsClearOfMultisampleTargets(Settle settle, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const ShaderRecompiler::VertexAttribute> attributes, std::uint64_t indexBegin, std::uint64_t indexBytes) {
+    if (draw.indexed) Graphics::RequireNoMultisampleTarget(indexBegin, static_cast<std::size_t>(indexBytes), "an index buffer read");
+    std::optional<std::uint32_t> maxIndex;
+    bool scanned = false;
+    for (const auto& attribute : attributes) {
+        if (Graphics::NullVertexDescriptor(attribute)) continue;
+        const auto& fields = attribute.resource.fields;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        const auto stride = (fields[1] >> 16u) & 0x3fffu;
+        const std::uint64_t extent = stride == 0u ? Graphics::ZeroStrideAvailableBytes(attribute) : static_cast<std::uint64_t>(fields[2]) * stride;
+        if (extent == 0u) continue;
+        try {
+            Graphics::RequireNoMultisampleTarget(address, static_cast<std::size_t>(extent), "a vertex buffer read");
+            continue;
+        } catch (const std::runtime_error&) {
+            if (draw.indirect) throw;
+        }
+        if (attribute.fetchIndex == 0u && !scanned) {
+            scanned = true;
+            if (!draw.indexed) {
+                maxIndex = draw.firstVertex + draw.indexCount - 1u;
+            } else {
+                settle(indexBegin, indexBytes);
+                const auto highest = Graphics::HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(GuestArena::HostRange(indexBegin, static_cast<std::size_t>(indexBytes))), static_cast<std::size_t>(indexBytes)), draw.indexSize, graphics.primitiveRestart);
+                if (highest) maxIndex = *highest + draw.firstVertex;
+            }
+        }
+        if (attribute.fetchIndex == 0u && !maxIndex) continue;
+        const auto end = Graphics::VertexBufferReadSize(attribute, maxIndex.value_or(0u), draw.instanceCount, draw.firstInstance);
+        const auto first = Graphics::VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance);
+        if (end > first) Graphics::RequireNoMultisampleTarget(address + first, static_cast<std::size_t>(end - first), "a vertex buffer read");
     }
 }
 
@@ -572,9 +625,40 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const auto& vertexResult = *vertex.program;
     // Before the indirect records are read, as upstream validates its inputs first.
     CheckInputsClearOfTarget([&](std::uint64_t begin, std::uint64_t bytes) { state.SettleRange(begin, bytes); }, graphics, draw, (tessellation != nullptr ? *tessellation->local->program : vertexResult).vertexAttributes, draw.indexed ? draw.indexAddress : 0u, draw.indexed ? static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize : 0u);
+    CheckInputsClearOfMultisampleTargets([&](std::uint64_t begin, std::uint64_t bytes) { state.SettleRange(begin, bytes); }, graphics, draw, (tessellation != nullptr ? *tessellation->local->program : vertexResult).vertexAttributes, draw.indexed ? draw.indexAddress : 0u, draw.indexed ? static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize : 0u);
     const auto& vertexReflection = vertexResult.msl.Reflection();
     const auto* fragmentResult = fragment != nullptr ? fragment->program : nullptr;
     const Abi::Reflection* fragmentReflection = fragmentResult != nullptr ? &fragmentResult->msl.Reflection() : nullptr;
+    // Upstream 1ffc5f672 / 72518f64f (PA_SC_AA_MASK). A mask that differs between the four quad
+    // pixels is compiled into the fragment function (pixel.quadSampleMask / quadPixelMask from
+    // DrawDecode, part of the shader key): it writes its coverage or discards uncovered pixels and
+    // tests late (MslQuadCoverage). A mask that is the same for the whole quad is the Vulkan
+    // pipeline's pSampleMask; MTLRenderPipelineDescriptor has none, so the fragment function ANDs
+    // its [[sample_mask]] with APS5_SAMPLE_MASK (guest sample bits; the function shifts them by
+    // APS5_SAMPLE_BASE itself), a library macro and so part of the library and pipeline keys. Under
+    // the macro the function discards pixels whose covered samples the mask removes before its body
+    // (a mask of 0 runs no body, as Vulkan runs no invocation) and tests late (MslAbi Version 15).
+    // The remaining refusals are TechnicalDebt metal-pipeline-sample-mask.
+    const bool partialSampleMask = Graphics::PartialSampleMask(graphics);
+    const bool hostSampleMask = partialSampleMask && Graphics::UniformSampleMask(graphics);
+    if (partialSampleMask) {
+        if (fragmentReflection == nullptr) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a draw without a pixel program: Metal has no pipeline sample mask, the fragment function applies it (TechnicalDebt metal-pipeline-sample-mask)");
+        const bool tested = graphics.depth.has_value() && (graphics.depthTest || graphics.stencilTest || graphics.depthBoundsTest);
+        const bool earlyWithMemoryWrites = tested && Graphics::ShadersWriteMemory(std::span(fragment, 1u));
+        if (hostSampleMask) {
+            // Every fragment function carries [[sample_mask]] under the macro, an output-less one in an
+            // otherwise empty output struct (MslStageIo.cpp hostMaskMember), so the mask also keeps the
+            // masked samples of a covered pixel off the depth and stencil writes.
+            // The function drops [[early_fragment_tests]] under APS5_SAMPLE_MASK (Metal applies its
+            // [[sample_mask]] after early tests); a memory-writing program would then also run for
+            // pixels the tests reject.
+            if (fragmentReflection->earlyFragmentTests && earlyWithMemoryWrites) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a pixel program with early depth or stencil tests that writes memory: Metal applies the fragment function's [[sample_mask]] after early tests, so the program tests late (TechnicalDebt metal-pipeline-sample-mask)");
+        } else {
+            // Upstream ValidateSampleMask: the masked pixels are removed in the function, after the
+            // tests, which an early-tested program that writes memory cannot tolerate.
+            if (graphics.pixelEarlyZ && earlyWithMemoryWrites) Fail("a sample mask that differs between the pixels of a quad, from a pixel program with early depth or stencil tests that writes memory: the masked pixels are removed in the shader, after the tests (TechnicalDebt metal-pipeline-sample-mask)");
+        }
+    }
     // Mesh draws (B6 stage 5, MetalMesh.h): the "vertex" stage is the NGG primitive shader's mesh function.
     const bool mesh = vertexReflection.stage == Abi::Stage::Mesh && graphics.stages.mesh.has_value();
     // Tessellated draws (MetalTessellation.h): the "vertex" stage is the domain program; the local
@@ -648,6 +732,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     if (calls.empty()) return;
     Graphics::Metal::MeshDrawPlan meshPlan;
     std::uint32_t meshSplits = 1u;
+    std::uint32_t pointSplitVertices = 0u;
     if (mesh) {
         std::span<const std::byte> indices;
         if (draw.indexed) {
@@ -657,7 +742,13 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         }
         meshPlan = Graphics::Metal::PlanMeshDraw(graphics, draw, indices);
         if (meshPlan.groups == 0u || meshPlan.instances == 0u) return;
-        if (triangleVertices) {
+        if (triangleVertices && primitive.topologyClass == MTLPrimitiveTopologyClassPoint) {
+            // Points need no staging; their vertices are split by Metal's mesh output size (D78).
+            const auto outputs = vertexReflection.outputLocations;
+            pointSplitVertices = Abi::MeshPointSplitVertices(graphics.stages.mesh->maxVertices, graphics.stages.mesh->maxPrimitives, static_cast<std::uint32_t>(std::popcount(outputs)), static_cast<std::uint32_t>(std::popcount(fragmentReflection != nullptr ? fragmentReflection->perVertexLocations & outputs : 0u)));
+            meshSplits = Abi::MeshPointSplits(graphics.stages.mesh->maxVertices, pointSplitVertices);
+            if (static_cast<std::uint64_t>(meshPlan.groups) * meshPlan.instances * meshSplits > Graphics::Metal::MaxMeshThreadgroupsPerGrid) Fail("a point mesh draw of " + std::to_string(meshPlan.groups) + " groups x " + std::to_string(meshPlan.instances) + " instances x " + std::to_string(meshSplits) + " splits exceeds the mesh grid");
+        } else if (triangleVertices) {
             meshSplits = Abi::MeshTriangleVerticesSplits(graphics.stages.mesh->maxPrimitives);
             if (static_cast<std::uint64_t>(meshPlan.groups) * meshPlan.instances * meshSplits > Graphics::Metal::MaxMeshThreadgroupsPerGrid) Fail("a triangle-vertices mesh draw of " + std::to_string(meshPlan.groups) + " groups x " + std::to_string(meshPlan.instances) + " instances x " + std::to_string(meshSplits) + " splits exceeds the mesh grid");
         }
@@ -726,6 +817,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         indexBegin = draw.indexAddress;
         indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
         if (indexBegin == 0u || indexBytes == 0u) Fail("an indexed draw without an index buffer");
+        // Upstream Draw.cpp: an index range the guest cannot read (unmapped, or a sparse range
+        // without backing) is refused before it is wrapped.
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(indexBegin), static_cast<std::size_t>(indexBytes), draw.indexSize);
         fetchPlan.reads.push_back({indexBegin, indexBegin + indexBytes});
     }
 
@@ -752,7 +846,12 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // Tiled targets are the image cache's resident images (upstream image path): their writes
         // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
         std::shared_ptr<Graphics::StorageTexture> resident;
-        if (target.tileMode != Graphics::ColorTileMode::Linear && state.images->ImageContext() != nullptr && ResidentTargets()) {
+        // Upstream Draw.cpp (linearResident): a linear target over memory that already has a host
+        // import is a resident image too, so the draw is recorded instead of synced (debug aid
+        // APS5_NO_RESIDENT_LINEAR=1 keeps it in place).
+        static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+        const bool linearResident = residentLinear && target.tileMode == Graphics::ColorTileMode::Linear && target.depth <= 1u && target.arrayAddress == 0u && !target.mipTail && state.images->ImageContext() != nullptr && Graphics::ExistingHostImportFor(*state.images->ImageContext(), target.address, Graphics::ColorTargetLayout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor).Bytes()) != nullptr;
+        if ((target.tileMode != Graphics::ColorTileMode::Linear || linearResident) && state.images->ImageContext() != nullptr && ResidentTargets()) {
             const auto& imageContext = *state.images->ImageContext();
             if (Graphics::AttachmentProxyFormat(imageContext, target.format) != VK_FORMAT_UNDEFINED) Fail("color target format " + std::to_string(target.format) + " needs an attachment proxy");
             if (target.arrayLastSlice != 0u) {
@@ -875,19 +974,32 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             const std::array<id<MTLTexture>, 1> resident {use.texture};
             state.images->MakeResident(resident);
         }
-        depthSurface = DrawCache::DepthSurface{target, format, use.texture, use.clearDepth, use.clearStencil};
+        depthSurface = DrawCache::DepthSurface{target, format, use.texture, use.clearDepth, use.clearStencil, use.depth, use.stencil};
         depth = &*depthSurface;
         passKey = Mix(Mix(passKey, target.address), static_cast<std::uint64_t>(format));
     }
     // The sample count and positions are pass state.
     std::array<MTLSamplePosition, 8> samplePositions {};
     if (graphics.samples > 1u) {
+        // Upstream b6cde5698 passes patterns that differ between the pixels of the guest's 2x2 grid
+        // as a VK_EXT_sample_locations 2x2 grid; Metal's setSamplePositions takes one pattern for
+        // every pixel (docs/dev/TechnicalDebt.md). Pixel 0's pattern leads the array either way.
+        if (graphics.sampleLocationGrid) Fail("sample locations that vary between the pixels of the 2x2 grid (PA_SC_AA_SAMPLE_LOCS_PIXEL_*): Metal sets one sample pattern for every pixel");
         const auto locations = Graphics::SampleLocations(graphics);
         passKey = Mix(passKey, graphics.samples);
         for (std::uint32_t sample = 0; sample < graphics.samples; ++sample) {
             samplePositions[sample] = MTLSamplePositionMake(locations[sample].x, locations[sample].y);
             passKey = Mix(passKey, static_cast<std::uint64_t>(locations[sample].x * 16.0f) | (static_cast<std::uint64_t>(locations[sample].y * 16.0f) << 8u));
         }
+    }
+    // Upstream 9bf98992ff: a multisampled rasterizer over one-sample targets draws one sample at sample
+    // 0's location (Graphics::State keeps it as a custom one-sample location). Without programmable
+    // positions the draw samples the pixel centre, as upstream's device without sample locations does.
+    const bool oneSamplePosition = graphics.samples == 1u && graphics.customSampleLocations && !graphics.sampleLocationGrid && state.device.programmableSamplePositionsSupported;
+    if (oneSamplePosition) {
+        const auto locations = Graphics::SampleLocations(graphics);
+        samplePositions[0] = MTLSamplePositionMake(locations[0].x, locations[0].y);
+        passKey = Mix(Mix(passKey, 1u), static_cast<std::uint64_t>(locations[0].x * 16.0f) | (static_cast<std::uint64_t>(locations[0].y * 16.0f) << 8u));
     }
 
     // Pipelines: a second channel pass for alternate-alpha 8_8 targets, a back-face pass for
@@ -920,6 +1032,7 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         request.vertex.macros.push_back({Abi::TriangleVerticesMacro, "1"});
 
         if (primitiveVertices != 3u && !mesh) request.vertex.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
+        if (pointSplitVertices != 0u) request.vertex.macros.push_back({Abi::PointSplitVerticesMacro, std::to_string(pointSplitVertices) + "u"});
         if (conservativeMode != 0u) request.vertex.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
         if (perVertex) {
             request.vertex.macros.push_back({Abi::PerVertexLocationsMacro, std::to_string(static_cast<std::uint32_t>(fragmentReflection->perVertexLocations)) + "u"});
@@ -950,7 +1063,20 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // Dual-source blending: the fragment function writes color(0) index(1) too.
         const bool dualSource = graphics.dualSourceBlend || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::DualSourceBlend && constant.value == 1u; });
         if (dualSource) function.macros.push_back({Abi::DualSourceMacro, "1"});
+        // Blending into a target with a reversed component order (upstream 16ea32c97d/c434467f6d,
+        // State::reversedBlend): MRT0's SRC1 blend factors read the second source aps5_rb, which the
+        // function writes at color(0) index(1) under ReversedBlendMacro (MslAbi Version 15). The
+        // library refuses it beside APS5_DUAL_SOURCE.
+        const bool reversedBlend = graphics.reversedBlend != 0u || std::any_of(fragmentResult->specialization.begin(), fragmentResult->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::ReversedBlend && constant.value != 0u; });
+        if (reversedBlend) {
+            if (dualSource) throw std::runtime_error("Metal draw: a reversed component order blend beside dual-source blending is not supported (one color(0) index(1) output)");
+            function.macros.push_back({Abi::ReversedBlendMacro, "1"});
+        }
         if (conservativeMode != 0u) function.macros.push_back({Abi::ConservativeMacro, std::to_string(conservativeMode)});
+        // The uniform PA_SC_AA_MASK (upstream HostSampleMask, guest sample bits; none when full).
+        if (hostSampleMask) function.macros.push_back({Abi::SampleMaskMacro, std::to_string(static_cast<std::uint32_t>(Graphics::HostSampleMask(graphics))) + "u"});
+        // Point and line draws output only their own corners' per-vertex values (DECISIONS D78).
+        if (triangleVertices && primitiveVertices != 3u) function.macros.push_back({Abi::PrimitiveVerticesMacro, std::to_string(primitiveVertices) + "u"});
         request.fragment = std::move(function);
     }
     for (const auto& attachment : colors) {
@@ -1045,7 +1171,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     std::vector<std::vector<PipelinePass>> slicePipelines;
     if (slices > 1u && request.fragment.has_value()) request.fragment->macros.push_back({Abi::SampleCountMacro, std::to_string(graphics.samples)});
     slicePipelines.push_back(buildPipelinePasses(request));
-    const bool sliceSpecific = fragmentReflection != nullptr && (fragmentReflection->exportsSampleMask || fragmentReflection->perSample);
+    // APS5_SAMPLE_MASK makes the function write [[sample_mask]] (shifted by APS5_SAMPLE_BASE).
+    const bool sliceSpecific = fragmentReflection != nullptr && (fragmentReflection->exportsSampleMask || fragmentReflection->perSample || hostSampleMask);
     for (std::uint32_t slice = 1; slice < slices; ++slice) {
         if (!sliceSpecific) {
             slicePipelines.push_back(slicePipelines.front());
@@ -1075,6 +1202,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // order, rotated (winding kept) so its provoking vertex comes first. Indexed draws read the guest
     // indices (settled); non-indexed ones count from the call's first vertex (baseVertex adds it).
     const bool lastVertex = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && !graphics.rectList;
+    // Upstream f2a4236ab draws rect lists with the last vertex provoking by taking the flat inputs from
+    // the rectangle's third vertex. The MSL rect-list paths cannot tell which parameters are flat and
+    // would hand every corner the first vertex's: refused while the pixel shader has a flat input
+    // (TechnicalDebt metal-rect-list-last-vertex).
+    if (graphics.rectList && graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT && fragment != nullptr && fragment->program != nullptr) {
+        const auto& parameters = fragment->program->fragmentParameters;
+        if (std::any_of(parameters.begin(), parameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flat; })) Fail("rect lists with the last vertex provoking and flat pixel inputs (TechnicalDebt metal-rect-list-last-vertex)");
+    }
     // Upstream 99edf9435 (Pipeline.cpp ValidateProvokingVertex): P10 of a flat input reads the
     // provoking vertex, measured only with the last vertex provoking.
     if (graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT && fragment != nullptr && fragment->program != nullptr) {
@@ -1089,14 +1224,31 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     const bool expand = !mesh && !tess && (primitive.fan || triangleVertices || listRestart || (lastVertex && primitive.topologyClass != MTLPrimitiveTopologyClassPoint));
     std::vector<std::uint32_t> fanIndices;
     std::vector<DrawCall> fanCalls;
+    // D81: indices that recorded GPU work still writes are not read on the CPU (that waited for the
+    // whole recorder, Recorder.Sync inside the draw). Without a primitive restart that matters, the
+    // expansion depends on positions alone: it is planned over positions, and a helper kernel
+    // gathers the guest indices at those positions into the draw's index list on the GPU, ordered
+    // after the writers in queue order. Restarts (values decide the segments), the triangle-vertices
+    // table (its ids add each call's base vertex on the CPU), unwrappable or misaligned memory and
+    // a pending CPU write-back over the indices (FlushForGpuRead waited then) read them on the CPU
+    // as before. APS5_CPU_INDEX_EXPANSION=1 always reads them on the CPU.
+    const bool restartMatters = graphics.primitiveRestart && (listTopology || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || graphics.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP);
+    std::uint64_t gatherSource = 0;
+    if (expand && draw.indexed && !triangleVertices && !restartMatters && GpuIndexGather() && (draw.indexSize == 2u ? indexBegin % 2u == 0u : indexBegin % 4u == 0u) && (state.recorder->PendingWriteOverlaps(indexBegin, indexBytes) || state.recorder->PendingLabelIn(indexBegin, indexBytes))) {
+        gatherSource = state.TryWrap(indexBegin, indexBytes);
+        if (gatherSource != 0u && !Graphics::Metal::FlushForGpuRead(indexBegin, indexBytes)) gatherSource = 0u;
+    }
+    const bool gather = gatherSource != 0u;
     if (expand) {
         std::vector<std::byte> guest;
-        if (draw.indexed) {
+        if (draw.indexed && !gather) {
+            if (state.recorder->PendingWriteOverlaps(indexBegin, indexBytes) || state.recorder->PendingLabelIn(indexBegin, indexBytes)) indexSettles.fetch_add(1u, std::memory_order_relaxed);
             state.SettleRange(indexBegin, indexBytes);
             guest.resize(indexBytes);
             std::memcpy(guest.data(), reinterpret_cast<const void*>(GuestArena::HostRange(indexBegin, indexBytes)), indexBytes);
         }
         const auto indexAt = [&](std::uint32_t position) -> std::uint32_t {
+            if (gather) return position;
             if (draw.indexSize == 2u) {
                 std::uint16_t value;
                 std::memcpy(&value, guest.data() + position * 2u, 2u);
@@ -1175,6 +1327,31 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             const auto vertexOffset = draw.indexed ? call.vertexOffset : static_cast<std::int32_t>(call.first);
             fanCalls.push_back({static_cast<std::uint32_t>(fanIndices.size()) - first, call.instances, first, vertexOffset, call.firstInstance});
         }
+    }
+    // D81: the positions become guest indices on the GPU, before the pass (a compute encoder ends an
+    // open one; the render encoder's queue barrier orders the index fetch after the kernel).
+    std::uint64_t gatheredAddress = 0;
+    if (gather && !fanIndices.empty()) {
+        auto& stream = Graphics::Metal::Stream(recorder.Commands());
+        const auto positions = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
+        const auto gathered = stream.Allocate(fanIndices.size() * 4u, 16u);
+        struct {
+            std::uint64_t source;
+            std::uint64_t positions;
+            std::uint64_t target;
+            std::uint32_t count;
+            std::uint32_t indexSize;
+        } parameters{gatherSource, positions.address, gathered.address, static_cast<std::uint32_t>(fanIndices.size()), draw.indexSize};
+        static_assert(sizeof(parameters) == 32);
+        // Earlier recorded writers of the indices (this encoder's dispatches and blits) first.
+        stream.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        id<MTLComputePipelineState> pipeline = Graphics::Metal::HelperPipeline(state.device, Graphics::Metal::HelperKernel::IndexGather);
+        const NSUInteger width = std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 256u);
+        stream.DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake((fanIndices.size() + width - 1u) / width, 1u, 1u), MTLSizeMake(width, 1u, 1u));
+        state.KeepWrapped(indexBegin, indexBytes);
+        recorder.NotePendingRead(indexBegin, static_cast<std::size_t>(indexBytes), Recorder::ReadKind::DrawInput);
+        gatheredAddress = gathered.address;
+        indexGathers.fetch_add(1u, std::memory_order_relaxed);
     }
 
     state.WrapUnions(plans);
@@ -1278,14 +1455,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     pass.depthAttachment.texture = depth->texture;
                     if (graphics.samples > 1u) pass.depthAttachment.slice = slice;
                     pass.depthAttachment.loadAction = depth->clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
-                    pass.depthAttachment.clearDepth = depth->target.clearDepth;
+                    pass.depthAttachment.clearDepth = depth->depthValue;
                     pass.depthAttachment.storeAction = MTLStoreActionStore;
                 }
                 if (HasStencil(depth->format)) {
                     pass.stencilAttachment.texture = depth->texture;
                     if (graphics.samples > 1u) pass.stencilAttachment.slice = slice;
                     pass.stencilAttachment.loadAction = depth->clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
-                    pass.stencilAttachment.clearStencil = depth->target.clearStencil;
+                    pass.stencilAttachment.clearStencil = depth->stencilValue;
                     pass.stencilAttachment.storeAction = MTLStoreActionStore;
                 }
             }
@@ -1302,6 +1479,8 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             if (graphics.samples > 1u) {
                 if (!state.device.programmableSamplePositionsSupported) Fail("the device has no programmable sample positions");
                 [pass setSamplePositions:samplePositions.data() + slice * hostSamples.samples count:hostSamples.samples];
+            } else if (oneSamplePosition) {
+                [pass setSamplePositions:samplePositions.data() count:1];
             }
             if (void* visibility = recorder.SampleVisibilityBuffer()) {
                 pass.visibilityResultBuffer = (__bridge id<MTLBuffer>)visibility;
@@ -1461,7 +1640,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             [cache.vertexArguments setAddress:upload.address atIndex:Abi::Index(Abi::BufferIndex::TriangleVertices)];
         } else if (expanded) {
             indexType = MTLIndexTypeUInt32;
-            if (!fanIndices.empty()) {
+            if (gatheredAddress != 0u) {
+                indexAddress = gatheredAddress;
+                indexLength = fanIndices.size() * 4u;
+            } else if (!fanIndices.empty()) {
                 const auto upload = stream.Write(std::as_bytes(std::span(fanIndices)), 16u);
                 indexAddress = upload.address;
                 indexLength = fanIndices.size() * 4u;
@@ -1609,7 +1791,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         state.NoteBindings(localPlan);
         state.NoteBindings(hullPlan);
     }
-    state.CheckFaultsOnComplete(true);
+    state.CheckFaultsOnComplete(true, imageBindings.TableRanges());
+    // Upstream 88ee39183 (keepRecordedDraw): a resident linear target's results go back to guest
+    // memory right after the draw with a recorded GPU store, so CPU readers of the import see them
+    // without a wait.
+    for (const auto& attachment : colors) {
+        if (attachment.resident == nullptr || attachment.resident->Descriptor().tileMode != Graphics::TextureTileMode::kLinear) continue;
+        Graphics::StorageTexture::FlushPending(attachment.resident->Descriptor().baseAddress, static_cast<std::size_t>(attachment.resident->GuestBytes()), nullptr, "linear target");
+    }
     // As upstream (Draw.cpp, SyncNotResident): a draw over a colour target that is not a resident
     // image writes guest memory in place, which the CPU may read without a flush hook (a queue
     // reported idle does not wait for the GPU), so it is submitted and waited for here.
@@ -1630,6 +1819,10 @@ namespace Graphics::Metal {
 
 EmulatedSampleStatistics EmulatedSampleCounts() {
     return {emulatedDraws.load(std::memory_order_relaxed), emulatedSlicePasses.load(std::memory_order_relaxed), emulatedBegun.load(std::memory_order_relaxed)};
+}
+
+IndexExpansionStatistics IndexExpansionCounts() {
+    return {indexGathers.load(std::memory_order_relaxed), indexSettles.load(std::memory_order_relaxed)};
 }
 
 }
@@ -1677,6 +1870,12 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck) {
 }
 
+// Upstream Pipeline.cpp: an overrasterized draw (a multisampled rasterizer into one-sample color
+// targets) needs merged coverage reduction, which Metal has no counterpart of (render pass sample
+// counts must match): refused as on a Vulkan device without the extension
+// (TechnicalDebt metal-mixed-samples).
+constexpr const char* MergedCoverageRefusal = "Metal draw: an overrasterized draw (a multisampled rasterizer into one-sample color targets) requires VK_NV_framebuffer_mixed_samples with merged coverage reduction, which Metal render passes have no counterpart of";
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
     for (const auto& shader : shaders) {
@@ -1684,6 +1883,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
     }
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot draw");
+    if (graphics.mergedCoverage) throw std::runtime_error(MergedCoverageRefusal);
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
     Graphics::Metal::TessellationStages tessellation;
@@ -1708,6 +1908,9 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // Mesh draws: the geometry path's NGG primitive shader as a mesh function (MetalMesh.h).
     const bool meshDraw = vertex->stage == ShaderRecompiler::ShaderStage::Mesh;
     if (!tessellated && (meshDraw ? (graphics.stages.path != Graphics::ShaderPath::Geometry || !graphics.stages.mesh) : (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh))) Fail("the geometry shader path without a mesh configuration, or a mesh configuration on the vertex path");
+    // Upstream Draw.cpp prepareDrawInputs: fast-launch subgroups (VGT_SHADER_STAGES_EN bits 19-20) generate
+    // their vertex ids from the draw's vertex range, so an index buffer has no place in them.
+    if (meshDraw && ((graphics.stages.registerValue >> 19u) & 3u) != 0u && draw.indexed) Fail("indexed fast-launch draws are unsupported");
     for (const auto* shader : {vertex, fragment, tessellation.local, tessellation.hull}) {
         if (shader == nullptr) continue;
         if (shader->program->msl.empty()) throw std::runtime_error("Metal device: the shader has no MSL form (recompile it for the device's Target(), whose backend is Msl)");
@@ -1721,6 +1924,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    if (graphics.mergedCoverage) return std::string(MergedCoverageRefusal);
     const bool meshPath = graphics.stages.path == Graphics::ShaderPath::Geometry && graphics.stages.mesh;
     const bool tessellationPath = graphics.stages.path == Graphics::ShaderPath::Tessellation && graphics.stages.tessellation;
     if (graphics.stages.path != Graphics::ShaderPath::Vertex && !meshPath && !tessellationPath) return std::string("Metal draw (work package D6): the geometry path without a mesh configuration and tessellation plus geometry are not implemented");
@@ -1757,11 +1961,26 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
         Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, 1u, destination.arraySlice));
         return;
     }
+    if (pass.mode == Graphics::ColorMetadataPass::Mode::FmaskDecompress) {
+        // Upstream Draw.cpp RunColorMetadataPass: an FMASK decompress expands a pending CMASK fast
+        // clear into the target's multisample host image.
+        const auto* imageContext = state->images->ImageContext();
+        if (imageContext == nullptr) Fail("a CB FMASK decompress without the device's image context");
+        for (const auto& color : pass.targets) Graphics::MaterializeMultisampleTargetClear(*imageContext, color);
+        return;
+    }
     // DCC targets (upstream Draw.cpp RunColorMetadataPass): fast-clear keys store the clear texel and comp-to-single
     // keys each block's first texel in guest memory, and the keys are left uncompressed, exactly as before a draw
     // (MaterializeDcc). The image cache's resident image of the target, if any, reloads from guest memory.
     const auto* imageContext = state->images->ImageContext();
     for (const auto& color : pass.targets) {
+        // A multisampled target is its host image (as in a draw above): its guest memory holds no
+        // samples, so the pass expands the pending CMASK clear into the host image instead.
+        if (color.samples > 1u) {
+            if (imageContext == nullptr) Fail("a CB metadata pass over a multisampled target without the device's image context");
+            Graphics::MaterializeMultisampleTargetClear(*imageContext, color);
+            continue;
+        }
         std::shared_ptr<Graphics::StorageTexture> resident;
         if (color.tileMode != Graphics::ColorTileMode::Linear && imageContext != nullptr) {
             resident = Graphics::CachedStorageSurface(*imageContext, Graphics::SurfaceForTarget(color));

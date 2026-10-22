@@ -16,7 +16,12 @@ int APS5_VABI sceNpWebApi2Initialize(int, std::size_t);
 int APS5_VABI sceNpWebApi2Terminate(int);
 int APS5_VABI sceNpWebApi2GetMemoryPoolStats(int, NpWebApi2MemoryPoolStats*);
 int APS5_VABI sceNpWebApi2PushEventCreateHandle(int);
+int APS5_VABI sceNpWebApi2PushEventAbortHandle(int, int);
 int APS5_VABI sceNpWebApi2PushEventSetHandleTimeout(int, int, std::uint32_t);
+int APS5_VABI sceNpWebApi2CreateUserContext(int, int);
+int APS5_VABI sceNpWebApi2CreateRequest(int, const char*, const char*, const char*, const void*, std::int64_t*);
+int APS5_VABI sceNpWebApi2SetRequestTimeout(std::int64_t, std::uint32_t);
+int APS5_VABI sceNpWebApi2DeleteRequest(std::int64_t);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -42,9 +47,17 @@ int main() {
     Require(Throws([&] { sceNpWebApi2GetMemoryPoolStats(context, nullptr); }));
     const int handle = sceNpWebApi2PushEventCreateHandle(context);
     Require(handle > 0);
+    Require(sceNpWebApi2PushEventAbortHandle(context, handle) == 0);
+    Require(sceNpWebApi2PushEventAbortHandle(context, handle + 1000) == 0);
     Require(sceNpWebApi2PushEventSetHandleTimeout(context, handle, 30000) == 0);
+    const int user = sceNpWebApi2CreateUserContext(context, 1);
+    std::int64_t request = 0;
+    Require(user > 0 && sceNpWebApi2CreateRequest(user, "sessionManager", "/v1/sessions", "GET", nullptr, &request) == 0);
+    Require(sceNpWebApi2SetRequestTimeout(request, 30000000) == 0);
+    Require(sceNpWebApi2DeleteRequest(request) == 0);
     Require(sceNpWebApi2Terminate(context) == 0);
     Require(Throws([&] { sceNpWebApi2GetMemoryPoolStats(context, &stats); }));
+    Require(Throws([&] { sceNpWebApi2PushEventAbortHandle(context, handle); }));
     Require(Throws([&] { sceNpWebApi2PushEventSetHandleTimeout(context, handle, 30000); }));
     Require(sceNpWebApi2Terminate(other) == 0);
     return 0;

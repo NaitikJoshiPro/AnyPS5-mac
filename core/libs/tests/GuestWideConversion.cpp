@@ -12,6 +12,7 @@
 extern "C" {
 std::uint64_t APS5_VABI _WStoul_nid_postfix(const char16_t*, char16_t**, int);
 int APS5_VABI _Iswctype_nid_postfix(std::uint32_t, std::uint64_t);
+int APS5_VABI swscanf_nid_postfix(const char16_t*, const char16_t*, ...);
 int APS5_VABI swscanf_s_nid_postfix(const char16_t*, const char16_t*, ...);
 int APS5_VABI iswalnum_nid_postfix(std::uint32_t);
 int APS5_VABI iswalpha_nid_postfix(std::uint32_t);
@@ -118,6 +119,8 @@ static void CheckScan() {
     Require(swscanf_s_nid_postfix(u"-2", u"%hd", &half) == 1 && half == -2, "%hd");
     unsigned value = 0;
     Require(swscanf_s_nid_postfix(u"0xg", u"%x", &value) == 0, "%x prefix without digits is a matching failure");
+    void* pointer = nullptr;
+    Require(swscanf_s_nid_postfix(u"0x7ffe12345678 5", u"%p%d", &pointer, &first) == 2 && reinterpret_cast<std::uintptr_t>(pointer) == 0x7ffe12345678u && first == 5, "%p takes no size");
 
     char16_t text[6] = {u'?'};
     Require(swscanf_s_nid_postfix(u"hello world", u"%ls", text, std::size_t{6}) == 1 && std::u16string(text) == u"hello", "%ls fits");
@@ -156,9 +159,75 @@ static void CheckScan() {
     Require(Throws([&] { swscanf_s_nid_postfix(u"Ā", u"%s", narrow, std::size_t{4}); }), "unconvertible narrow %s throws");
 }
 
+static void CheckUnsizedScan() {
+    int first = 0;
+    int second = 0;
+    Require(swscanf_nid_postfix(u"  42 -7", u"%d%d", &first, &second) == 2 && first == 42 && second == -7, "swscanf %d");
+    Require(swscanf_nid_postfix(u"x=0x1f", u"x=%i", &first) == 1 && first == 31, "swscanf %i with a hex prefix");
+    Require(swscanf_nid_postfix(u"1 2", u"%*d%d", &first) == 1 && first == 2, "swscanf suppressed %d");
+    Require(swscanf_nid_postfix(u"12345", u"%3d%d", &first, &second) == 2 && first == 123 && second == 45, "swscanf %d width");
+    std::int64_t wide = 0;
+    Require(swscanf_nid_postfix(u"5000000000", u"%ld", &wide) == 1 && wide == 5000000000LL, "swscanf %ld is 64-bit");
+    short half = 0;
+    Require(swscanf_nid_postfix(u"-2", u"%hd", &half) == 1 && half == -2, "swscanf %hd");
+    unsigned value = 0;
+    Require(swscanf_nid_postfix(u"0xg", u"%x", &value) == 0, "swscanf %x prefix without digits is a matching failure");
+    void* pointer = nullptr;
+    Require(swscanf_nid_postfix(u"0x7ffe12345678", u"%p", &pointer) == 1 && reinterpret_cast<std::uintptr_t>(pointer) == 0x7ffe12345678u, "swscanf %p stores a whole pointer");
+    Require(swscanf_nid_postfix(u"DeadBeef", u"%p", &pointer) == 1 && reinterpret_cast<std::uintptr_t>(pointer) == 0xdeadbeefu, "swscanf %p without a prefix");
+    void* next = nullptr;
+    Require(swscanf_nid_postfix(u"0x1234", u"%4p%p", &pointer, &next) == 2 && reinterpret_cast<std::uintptr_t>(pointer) == 0x12u && reinterpret_cast<std::uintptr_t>(next) == 0x34u, "swscanf %p width");
+    Require(swscanf_nid_postfix(u"0xff 7", u"%*p%d", &first) == 1 && first == 7, "swscanf suppressed %p");
+    Require(swscanf_nid_postfix(u"-1", u"%p", &pointer) == 1 && reinterpret_cast<std::uintptr_t>(pointer) == std::numeric_limits<std::uintptr_t>::max(), "swscanf %p converts as unsigned");
+    Require(swscanf_nid_postfix(u"0xg", u"%p", &pointer) == 0, "swscanf %p prefix without digits is a matching failure");
+
+    char16_t text[16] = {u'?'};
+    Require(swscanf_nid_postfix(u"hello world", u"%ls", text) == 1 && std::u16string(text) == u"hello", "swscanf %ls");
+    Require(swscanf_nid_postfix(u"7 a-long-word", u"%d%ls", &first, text) == 2 && first == 7 && std::u16string(text) == u"a-long-word", "swscanf %ls takes no size");
+    Require(swscanf_nid_postfix(u"hello world", u"%3ls", text) == 1 && std::u16string(text) == u"hel", "swscanf %ls width");
+    char narrow[8] = {};
+    Require(swscanf_nid_postfix(u"abc def", u"%s%d", narrow, &first) == 1 && std::strcmp(narrow, "abc") == 0, "swscanf %s");
+    char16_t pair[3] = {u'?', u'?', u'?'};
+    Require(swscanf_nid_postfix(u"xyz", u"%2lc", pair) == 1 && pair[0] == u'x' && pair[1] == u'y' && pair[2] == u'?', "swscanf %2lc");
+    Require(swscanf_nid_postfix(u"x", u"%2lc", pair) == 0, "swscanf %2lc short input");
+    char letter = 0;
+    Require(swscanf_nid_postfix(u" q7", u"%c%d", &letter, &first) == 1 && letter == ' ', "swscanf %c does not skip white space");
+    Require(swscanf_nid_postfix(u"cab12", u"%l[abc]%d", text, &first) == 2 && std::u16string(text) == u"cab" && first == 12, "swscanf %l[");
+    Require(swscanf_nid_postfix(u"été!", u"%l[^!]", text) == 1 && std::u16string(text) == u"été", "swscanf %l[^");
+    Require(swscanf_nid_postfix(u"key=val", u"%[^=]=%s", narrow, narrow + 4) == 2 && std::strcmp(narrow, "key") == 0 && std::strcmp(narrow + 4, "val") == 0, "swscanf %[^");
+    std::int64_t count = -1;
+    Require(swscanf_nid_postfix(u" 12 ab", u"%d %ln", &first, &count) == 1 && count == 4, "swscanf %ln");
+    int shortCount = -1;
+    Require(swscanf_nid_postfix(u"abc", u"%*ls%n", &shortCount) == 0 && shortCount == 3, "swscanf %n after a suppressed conversion");
+    Require(swscanf_nid_postfix(u"50% off", u"%d%% off", &first) == 1 && first == 50, "swscanf %%");
+    Require(swscanf_nid_postfix(u"50 off", u"%d%%", &first) == 1, "swscanf %% mismatch is a matching failure");
+
+    double real = 0;
+    Require(swscanf_nid_postfix(u"1.5e3", u"%lf", &real) == 1 && real == 1500.0, "swscanf %lf");
+    Require(swscanf_nid_postfix(u"1e+x", u"%lf", &real) == 0, "swscanf %lf incomplete exponent is a matching failure");
+    GuestLongDouble extended{};
+    Require(swscanf_nid_postfix(u"2.25", u"%Lf", &extended) == 1 && extended == GuestLongDoubleFromDouble(2.25), "swscanf %Lf");
+    float single = 0;
+    Require(swscanf_nid_postfix(u"-inf", u"%f", &single) == 1 && single == -std::numeric_limits<float>::infinity(), "swscanf %f infinity");
+
+    Require(swscanf_nid_postfix(u"a", u"b%d", &first) == 0, "swscanf literal mismatch is a matching failure");
+    Require(swscanf_nid_postfix(u"3 x", u"%d%d", &first, &second) == 1 && first == 3, "swscanf partial match");
+    Require(swscanf_nid_postfix(u"", u"%d", &first) == -1, "swscanf empty input is an input failure");
+    Require(swscanf_nid_postfix(u"", u"%ls", text) == -1, "swscanf empty input before %ls");
+    Require(swscanf_nid_postfix(u"   ", u"%ls", text) == -1, "swscanf white space only is an input failure");
+    Require(swscanf_nid_postfix(u"5", u"%d%d", &first, &second) == 1, "swscanf input failure after a conversion");
+    Require(swscanf_nid_postfix(nullptr, u"%d", &first) == -1, "swscanf null buffer");
+    Require(swscanf_nid_postfix(u"5", nullptr) == -1, "swscanf null format");
+    Require(Throws([&] { swscanf_nid_postfix(u"abc", u"%l[a-c]", text); }), "swscanf scanset range throws");
+    Require(Throws([&] { swscanf_nid_postfix(u"5", u"%Ld", &wide); }), "swscanf %Ld throws");
+    Require(Throws([&] { swscanf_nid_postfix(u"1", u"%lp", &pointer); }), "swscanf %lp throws");
+    Require(Throws([&] { swscanf_nid_postfix(u"Ā", u"%s", narrow); }), "swscanf unconvertible narrow %s throws");
+}
+
 int main() {
     CheckStoul();
     CheckClassification();
     CheckScan();
+    CheckUnsizedScan();
     return failures == 0 ? 0 : 1;
 }

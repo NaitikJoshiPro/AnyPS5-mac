@@ -1,11 +1,14 @@
 import argparse
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 TEST_OUTPUT = r"tests[\\/]"
 COMMAND = re.compile(r"^\s*(add_test|set_tests_properties|subdirs)\s*\(", re.M | re.I)
 ARGUMENT = re.compile(r'"(?:\\.|[^"\\])*"|\[(?P<equals>=*)\[.*?\](?P=equals)\]|[^\s()]+', re.S)
+LEXICAL = re.compile(r'\\.|"(?:\\.|[^"\\])*"|\[(?P<literal_equals>=*)\[.*?\](?P=literal_equals)\]'
+                     r'|(?P<comment>\#\[(?P<comment_equals>=*)\[.*?\](?P=comment_equals)\]|\#[^\n]*)', re.S)
 
 KNOWN_UNRUN = set()
 
@@ -21,8 +24,16 @@ def built(build):
         raise ValueError(f"test registration audit requires a Ninja generator, got {generator!r}")
     if not program or program.endswith("-NOTFOUND"):
         raise FileNotFoundError(f"CMAKE_MAKE_PROGRAM is not set in {Path(build) / 'CMakeCache.txt'}")
+    encoding = "utf-8"
+    if sys.platform == "win32":
+        codepage = subprocess.run([program, "-t", "wincodepage"], capture_output=True, text=True,
+                                  encoding="ascii", check=True).stdout.strip()
+        encodings = {"Build file encoding: UTF-8": "utf-8", "Build file encoding: ANSI": "mbcs"}
+        if codepage not in encodings:
+            raise ValueError(f"unsupported Ninja build-file encoding: {codepage!r}")
+        encoding = encodings[codepage]
     listed = subprocess.run([program, "-C", str(build), "-t", "targets", "all"],
-                            capture_output=True, text=True, check=True).stdout
+                            capture_output=True, text=True, encoding=encoding, check=True).stdout
     names = set()
     for line in listed.splitlines():
         path, _, rule = line.partition(": ")
@@ -40,8 +51,11 @@ def built(build):
 
 
 def commands(content):
+    content = LEXICAL.sub(lambda match: re.sub(r"[^\n]", " ", match.group())
+                          if match.group("comment") is not None else match.group(), content)
+    code = LEXICAL.sub(lambda match: re.sub(r"[^\n]", "_", match.group()), content)
     parsed_until = 0
-    for command in COMMAND.finditer(content):
+    for command in COMMAND.finditer(code):
         if command.start() < parsed_until:
             continue
         position, arguments = command.end(), []
@@ -81,21 +95,24 @@ def registered(build):
         if directory in visited or not file.is_file():
             continue
         visited.add(directory)
-        tests, disabled = {}, {}
+        tests, latest = [], {}
         for command, arguments in commands(file.read_text(encoding="utf-8", errors="replace")):
             if command == "subdirs":
                 pending.extend(directory / argument for argument in arguments)
             elif command == "add_test" and arguments:
-                tests[arguments[0]] = arguments[1:]
+                test = [arguments[1:], False]
+                tests.append(test)
+                latest[arguments[0]] = test
             elif command == "set_tests_properties" and "PROPERTIES" in arguments:
                 properties = arguments.index("PROPERTIES")
                 values = arguments[properties + 1:]
                 for key, value in zip(values[::2], values[1::2]):
                     if key == "DISABLED":
                         for name in arguments[:properties]:
-                            disabled[name] = value.upper() in ("1", "ON", "YES", "TRUE", "Y")
-        for test, arguments in tests.items():
-            if disabled.get(test, False):
+                            if name in latest:
+                                latest[name][1] = value.upper() in ("1", "ON", "YES", "TRUE", "Y")
+        for arguments, disabled in tests:
+            if disabled:
                 continue
             for index, argument in enumerate(arguments):
                 if index and (argument.startswith("-") or re.match(r"^[A-Za-z_]\w*=", argument)):
@@ -113,8 +130,11 @@ if __name__ == "__main__":
     parser.add_argument("build", type=Path, nargs="?", default=Path("build"), help="configured build directory")
     parser.add_argument("--list", action="store_true", help="print every test executable and whether ctest runs it")
     args = parser.parse_args()
-    every = sorted(built(args.build))
-    run = registered(args.build)
+    try:
+        every = sorted(built(args.build))
+        run = registered(args.build)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.error(str(error))
     if args.list:
         for name in every:
             print(f"{'run' if name in run else 'NOT RUN'}  {name}")

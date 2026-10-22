@@ -110,7 +110,9 @@ TextureFormatInfo GuestTextureFormat(std::uint32_t guestFormat) {
         guestFormat = static_cast<std::uint32_t>(ShaderRecompiler::SrgbUnormFormat(static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat)));
     }
     // Formats 30, 34 and 43 (11_11_10 and 10_11_11 variants) are read as R32 uint and unpacked in the
-    // shader (ImageResource::conversionFormat), as on the Vulkan path.
+    // shader (ImageResource::conversionFormat), as on the Vulkan path. A sampled 43 is instead a
+    // B10G11R11 (RG11B10Float) copy repacked by TextureDetiler::DispatchRepack (Texture.mm, upstream
+    // 571fecadd); storage and packed 43 still take this R32 path.
     const auto remapped = guestFormat == 30u || guestFormat == 34u || guestFormat == 43u ? 20u : guestFormat;
     for (const auto& entry : Formats) {
         if (entry.guest == remapped) return {entry.format, entry.bytes, entry.textureBytes, entry.blockCompressed, entry.swapRedBlue};

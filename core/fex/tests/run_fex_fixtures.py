@@ -77,8 +77,22 @@ def sites_forgotten(directory):
     return None
 
 
-CHECKS = {"opening": created_with_mode, "pc-sample": sampled_spin, "displaced-churn": sites_forgotten}
+def translation_stats(directory):
+    """APS5_FEX_STATS: the exit report counts the blocks FEXCore compiled and the time it took (GuestStats.cpp)."""
+    text = (directory / "stderr.txt").read_text(errors="replace")
+    totals = re.findall(r"\[fex-stats\] window \d+: .*total JIT (\d+) blocks in ([\d.]+) ms", text)
+    if not totals:
+        return "no '[fex-stats] ... total JIT N blocks in T ms' line"
+    blocks, ms = int(totals[-1][0]), float(totals[-1][1])
+    if blocks < 1 or ms <= 0.0:
+        return f"the stats counted {blocks} blocks in {ms} ms; expected the program's blocks and their compile time"
+    return None
+
+
+CHECKS = {"opening": created_with_mode, "pc-sample": sampled_spin, "displaced-churn": sites_forgotten,
+          "fex-stats": translation_stats}
 ENVIRONMENT = {"pc-sample": {"APS5_FEX_SAMPLE": "1", "APS5_FEX_SAMPLE_REPORT": "60"},
+               "fex-stats": {"APS5_FEX_STATS": "60", "APS5_FEX_CACHE": "0"},
                "displaced-churn": {"APS5_DISPLACED_TRACE": "1"}}
 
 
@@ -230,6 +244,7 @@ COMPILED = {
     "kernel-sys": (lambda d: compiled_executable(d, [str(HERE / "kernel_sys.cpp")], {"libc.prx": ["exit"],
                    "libkernel.prx": ["pathconf"]}), 43),
     "pc-sample": (lambda d: compiled_executable(d, [str(HERE / "pc_sample.cpp")], {"libc.prx": ["exit"]}, ["-O2"]), 43),
+    "fex-stats": (lambda d: compiled_executable(d, [str(HERE / "pc_sample.cpp")], {"libc.prx": ["exit"]}, ["-O2"]), 43),
     "dlsym-host": (lambda d: compiled_executable(d, [str(HERE / "dlsym_host.cpp")], {"libc.prx": ["exit", "strlen",
                    "_ZSt13set_terminatePFvvE", "_ZSt13get_terminatev"], "libkernel.prx": ["sceKernelDlsym"]}), 43),
 }

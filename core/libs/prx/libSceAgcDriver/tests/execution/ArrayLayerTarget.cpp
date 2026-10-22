@@ -42,6 +42,7 @@ constexpr std::size_t LayerBytes = 65536;
 constexpr std::size_t SurfaceBytes = LayerBytes * Layers;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t TileR64KBX = 0x1b;
+constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::uint32_t Color32FloatInfo = (4u << 2u) | (7u << 8u);
 constexpr std::uint32_t TiledAttrib3 = 0x4dc6c000u;
@@ -59,8 +60,14 @@ constexpr std::array<std::array<float, 4>, 3> Triangle{{
 }};
 
 alignas(256) std::array<std::array<std::uint32_t, 9>, Layers> LoadCodes{};
+alignas(256) constexpr std::array<std::uint32_t, 13> Sample2DCode{
+    0x7e020d00, 0x060202f0, 0x100202ff, 0x3c000000, 0x7e0402ff, 0x3b800000, 0xf09c0108, 0x00610301,
+    0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000,
+};
 alignas(256) std::array<std::uint32_t, 16> PixelCode{};
 alignas(256) std::array<std::uint32_t, Threads> Output{};
+
+void SampleSliceZero(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode);
 
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
@@ -74,7 +81,7 @@ std::string Hex(std::uint32_t value) {
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t registeredBytes = SurfaceBytes, std::size_t registeredOffset = 0) : registeredOffset(registeredOffset) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(SurfaceBytes, LayerBytes));
         if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, SurfaceBytes, PAGE_READWRITE, SurfaceBytes);
@@ -90,11 +97,11 @@ public:
         }
 #endif
         Require(block != nullptr, "array layer target: cannot allocate the guest block");
-        GuestAllocations::Mutation().Add(block, SurfaceBytes, true, true, true);
+        GuestAllocations::Mutation().Add(block + registeredOffset, registeredBytes, true, true, true);
     }
 
     ~GuestBlock() {
-        GuestAllocations::Mutation().Remove(block);
+        if (registered) GuestAllocations::Mutation().Remove(block + registeredOffset);
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(block, SurfaceBytes);
         GuestArena::GuestArenaRelease_nid_postfix(block, SurfaceBytes);
@@ -108,18 +115,24 @@ public:
     GuestBlock& operator=(const GuestBlock&) = delete;
 
     std::uint8_t* Data() { return block; }
+    void Unregister() {
+        GuestAllocations::Mutation().Remove(block + registeredOffset);
+        registered = false;
+    }
 
 private:
     std::uint8_t* block = nullptr;
+    std::size_t registeredOffset = 0;
+    bool registered = true;
 };
 
-std::array<std::uint32_t, 8> ArrayDescriptor(std::uint64_t address, std::uint32_t swizzleMode) {
+std::array<std::uint32_t, 8> SurfaceDescriptor(std::uint64_t address, std::uint32_t swizzleMode, std::uint32_t type, std::uint32_t lastLayer) {
     return {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((Side - 1u) & 3u) << 30u),
         ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
-        0xfacu | (swizzleMode << 20u) | (Type2DArray << 28u),
-        Layers - 1u,
+        0xfacu | (swizzleMode << 20u) | (type << 28u),
+        lastLayer,
         0u,
         0u,
         0u,
@@ -146,16 +159,25 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     device.WaitIdle();
 }
 
-void LoadLayer(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t layer, std::uint32_t swizzleMode) {
+void Load(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::array<std::uint32_t, 8>& texture) {
     Output.fill(0xdeadbeefu);
-    auto& code = LoadCodes[layer];
-    code = {0x7e020280, 0x7e040280u | layer, 0xf0001128, 0x00010300, 0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000};
     std::vector<std::uint32_t> userData(16, 0u);
     const auto buffer = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
-    const auto texture = ArrayDescriptor(surface, swizzleMode);
+    const std::array<std::uint32_t, 4> pointSampler{0u, 0xfffu << 12u, 1u << 26u, 0u};
+    std::copy(pointSampler.begin(), pointSampler.end(), userData.begin() + 12);
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     Dispatch(device, code, userData);
+}
+
+void LoadLayer(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t layer, std::uint32_t swizzleMode) {
+    auto& code = LoadCodes[layer];
+    code = {0x7e020280, 0x7e040280u | layer, 0xf0001128, 0x00010300, 0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000};
+    Load(device, code, SurfaceDescriptor(surface, swizzleMode, Type2DArray, Layers - 1u));
+}
+
+void Sample2D(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t swizzleMode) {
+    Load(device, Sample2DCode, SurfaceDescriptor(surface, swizzleMode, Type2D, 0u));
 }
 
 void RequireOutput(std::uint32_t inside, std::uint32_t outside, const std::string& what) {
@@ -273,6 +295,63 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t sw
     LoadLayer(device, surface, slice, swizzleMode);
     RequireOutput(drawn, Initial, "slice " + std::to_string(slice) + " uploaded again from guest memory");
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    SampleSliceZero(device, texels, swizzleMode);
+}
+
+void SampleSliceZero(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode) {
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    DrawSlice(device, surface, 0, swizzleMode, false);
+    const auto pending = StorageTexture::FindPending(surface, LayerBytes);
+    Require(pending != nullptr && pending->Descriptor().dimension == TextureDimension::k2DArray, "the draw into slice 0 did not render into the image of its array");
+    const auto plain = SurfaceDescriptor(surface, swizzleMode, Type2D, 0u);
+    Require(AgcDriver::Graphics::Texture::CanCopyFrom(*pending, AgcDriver::Graphics::DecodeTextureResource(plain)), "a 2D texture over slice 0 cannot view the array image's first layer");
+    Sample2D(device, surface, swizzleMode);
+    RequireOutput(std::bit_cast<std::uint32_t>(Drawn), Initial, "slice 0 sampled as a 2D texture after the draw");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
+    device.WaitIdle();
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
+void UnregisteredUnusedLayer(AgcDriver::VulkanDevice& device, std::uint32_t slice) {
+    GuestBlock block(LayerBytes, slice * LayerBytes);
+    auto* texels = block.Data();
+    const auto surface = AddressOf(texels);
+    const auto active = surface + slice * LayerBytes;
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    DrawSlice(device, surface, slice, TileR64KBX, false);
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the registered slice was not pending before its CPU write-back");
+    StorageTexture::FlushPending(active, LayerBytes, nullptr, "test");
+    device.WaitIdle();
+    const auto* first = reinterpret_cast<std::uint32_t*>(active);
+    const auto* last = reinterpret_cast<std::uint32_t*>(active + LayerBytes);
+    const auto unchanged = [](std::uint32_t value) { return value == Initial; };
+    const auto drawn = std::count(first, last, std::bit_cast<std::uint32_t>(Drawn));
+    const bool untouched = std::all_of(reinterpret_cast<const std::uint32_t*>(texels), first, unchanged) && std::all_of(last, reinterpret_cast<const std::uint32_t*>(texels + SurfaceBytes), unchanged);
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(drawn == ScissorWidth * Side, "CPU write-back discarded the registered slice because an unused array slice was unregistered");
+    Require(untouched, "CPU write-back modified an unregistered unused slice");
+}
+
+void RetiredArrayLayer(AgcDriver::VulkanDevice& device) {
+    GuestBlock block(LayerBytes);
+    auto* texels = block.Data();
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    DrawSlice(device, surface, 0u, TileR64KBX, false);
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the retired slice was not pending before it was unregistered");
+    block.Unregister();
+    StorageTexture::FlushPending(surface, LayerBytes, nullptr, "test");
+    device.WaitIdle();
+    const bool untouched = std::all_of(reinterpret_cast<const std::uint32_t*>(texels), reinterpret_cast<const std::uint32_t*>(texels + SurfaceBytes), [](std::uint32_t value) { return value == Initial; });
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(untouched, "CPU write-back stored results over a retired allocation");
 }
 
 }
@@ -285,6 +364,9 @@ int main() {
         Run(*device, block.Data(), TileR64KBX);
         Run(*device, block.Data(), static_cast<std::uint32_t>(AgcDriver::Graphics::ColorTileMode::D64KBX));
         for (std::uint32_t slice = 1; slice < Layers; ++slice) Run(*device, block.Data(), TileR64KBX, true, slice);
+        UnregisteredUnusedLayer(*device, 0u);
+        UnregisteredUnusedLayer(*device, Layers - 1u);
+        RetiredArrayLayer(*device);
         std::puts("array layer target tests passed");
         return 0;
     } catch (const std::exception& error) {

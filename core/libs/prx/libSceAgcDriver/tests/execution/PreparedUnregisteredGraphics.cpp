@@ -51,8 +51,6 @@ void Check(AgcDriver::VulkanDevice& device) {
     Require(draw.programs.size() == 2 && draw.roles.back() == ProgramRole::Fragment, "unregistered graphics programs did not decode as a vertex and a fragment stage");
     for (const auto& program : draw.programs) Require(program.snapshot != nullptr && program.snapshot->header.empty() && program.snapshot->prepared->entries.empty(), "an unregistered graphics program was not read as raw code");
     Require(RawGraphicsDrawn(), "a draw of unregistered graphics programs was not noted");
-    // A later registration may not cover code that was drawn raw (it would give the program two
-    // identities); registrations elsewhere stay allowed.
     for (const auto& program : draw.programs) {
         const auto begin = program.snapshot->codeAddress;
         Require(RawGraphicsDrawnIn(begin, begin + 4u) && RawGraphicsDrawnIn(begin - 4u, begin + 1u), "a raw-drawn program's code is not recorded");

@@ -32,6 +32,16 @@ static inline uint aps5_fbits_flush(uint value, bool flush) {
     return flush && (value & 0x7fffffffu) < 0x00800000u ? (value & 0x80000000u) : value;
 }
 
+// ds_add_f32 as measured on gfx1010/gfx1031 (upstream 731575c80): operands flushed to a signed zero
+// when FLOAT_MODE denormal bit 0 is clear, the result when bit 1 is clear; a NaN data operand stores
+// quieted, else a NaN old value stores quieted, and +inf + -inf stores 0xffc00000.
+static inline uint aps5_lds_fadd32(uint old, uint data, bool flushInputs, bool flushResult) {
+    if ((data & 0x7fffffffu) > 0x7f800000u) return data | 0x00400000u;
+    if ((old & 0x7fffffffu) > 0x7f800000u) return old | 0x00400000u;
+    const uint sum = aps5_fbits_flush(as_type<uint>(as_type<float>(aps5_fbits_flush(old, flushInputs)) + as_type<float>(aps5_fbits_flush(data, flushInputs))), flushResult);
+    return (sum & 0x7fffffffu) > 0x7f800000u ? 0xffc00000u : sum;
+}
+
 static inline ulong aps5_fbits_flush(ulong value, bool flush) {
     return flush && (value & 0x7ffffffffffffffful) < 0x0010000000000000ul ? (value & 0x8000000000000000ul) : value;
 }
@@ -226,10 +236,12 @@ void Load(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits
 }
 
 void Store(MslEmitterState& state, const IrValue& instruction, std::uint32_t bits, std::uint32_t components) {
-    const auto lane = MslUniformStoreLane(state, instruction, 0u, 0u);
+    const auto shared = SharedOf(state, instruction);
+    // Per-invocation LDS (upstream 6337c8afb, pixel programs) has a copy per lane: every active lane writes its own, so
+    // a wave-uniform store is not narrowed to the highest active lane there.
+    const auto lane = shared.space == "thread" ? std::string() : MslUniformStoreLane(state, instruction, 0u, 0u);
     state.Line("if (" + Active(state, instruction) + (lane.empty() ? std::string() : " && " + lane) + ") {");
     state.Indent();
-    const auto shared = SharedOf(state, instruction);
     const auto address = ByteAddress(state, instruction);
     if (bits < 32u && shared.space == "thread") {
         const auto index = state.Temporary("aps5_di");
@@ -337,7 +349,8 @@ Atomic32Op Atomic32Of(MslEmitterState& state, const IrValue& instruction) {
     }
     case IrOpcode::SharedAtomicFAdd32: {
         const auto data = state.Arg(instruction, 1u);
-        return custom([=](const std::string& old) { return "as_type<uint>(as_type<float>(" + old + ") + as_type<float>(uint(" + data + ")))"; });
+        const std::string r = state.Memory(instruction).flushDenormalResults ? "true" : "false";
+        return custom([=](const std::string& old) { return "aps5_lds_fadd32(" + old + ", uint(" + data + "), " + f + ", " + r + ")"; });
     }
     case IrOpcode::SharedAtomicMskor32: {
         const auto mask = state.Arg(instruction, 1u);
@@ -470,19 +483,24 @@ void SharedAtomic64(MslEmitterState& state, const IrValue& instruction) {
 }
 
 // AppendConsume: one atomic per wave adds (subtracts) the number of active lanes; every lane gets
-// the old counter value. Emitted in half 0; half 1 copies it.
-void AppendConsume(MslEmitterState& state, const IrValue& instruction, bool append) {
+// the old counter value. Emitted in half 0; half 1 copies it. ds_ordered_count (`ordered`, upstream
+// 46a1cc0fc/3a7e82a17) adds the first active lane's data operand to the GDS counter at offset0 alone
+// (no M0 base or size); its swap form (`swap`, upstream b0558ce95) exchanges that operand into the
+// counter instead. The operand is read in the guest lane that is first active (upstream fcc426b6a):
+// half 1's value when every active lane of a wave64 program at two lanes per invocation is in
+// lanes 32 to 63.
+void AppendConsume(MslEmitterState& state, const IrValue& instruction, bool append, bool ordered = false, bool swap = false) {
     if (state.half == 1u) {
         state.Define(instruction, state.HalfName(instruction, 0u));
         return;
     }
     const auto& memory = state.Memory(instruction);
     const auto shared = SharedOf(state, instruction);
-    if (shared.space == "thread") state.Fail(instruction, "ds_append/ds_consume on function LDS is not implemented in the MSL backend (work package B6)");
     const bool gds = memory.kind == ResourceKind::Gds;
+    const bool m0Address = gds && !ordered;
     const auto index = state.Temporary("aps5_di");
     std::string bounds;
-    if (gds) {
+    if (m0Address) {
         const auto m0 = state.Arg(instruction, 0u);
         state.Line("const uint " + index + " = ((" + m0 + " >> 16u) + " + U32(memory.offset) + ") >> 2u;");
         bounds = "(" + index + " < " + shared.length + " && (" + m0 + " & 0xffffu) != 0u)";
@@ -496,11 +514,29 @@ void AppendConsume(MslEmitterState& state, const IrValue& instruction, bool appe
     const auto value = state.Temporary("aps5_ac");
     state.Line("const uint2 " + ballot + " = " + state.WaveBallot(instruction.Argument(1u)) + ";");
     state.Line("const uint " + count + " = popcount(" + ballot + ".x) + popcount(" + ballot + ".y);");
-    state.Line("const uint " + first + " = (" + ballot + ".x != 0u ? ctz(" + ballot + ".x) : 32u + ctz(" + ballot + ".y)) & 31u;");
+    const auto guestFirst = state.Temporary("aps5_gfl");
+    state.Line("const uint " + guestFirst + " = " + ballot + ".x != 0u ? ctz(" + ballot + ".x) : 32u + ctz(" + ballot + ".y);");
+    state.Line("const uint " + first + " = " + guestFirst + " & 31u;");
     const auto lanesActive = state.laneCount == 2u ? "(" + count + " != 0u)" : std::string(state.Arg(instruction, 1u));
+    std::string amount = count;
+    if (ordered) {
+        amount = state.Temporary("aps5_amt");
+        if (state.laneCount == 2u) {
+            state.Line("const uint " + amount + " = (" + guestFirst + " & 32u) != 0u ? simd_shuffle(" + state.HalfArg(instruction, 4u, 1u) + ", ushort(" + first + ")) : simd_shuffle(" + state.HalfArg(instruction, 4u, 0u) + ", ushort(" + first + "));");
+        } else {
+            state.Line("const uint " + amount + " = simd_shuffle(" + state.Arg(instruction, 4u) + ", ushort(" + first + "));");
+        }
+    }
     state.Line("uint " + value + " = 0u;");
-    const auto pointer = AtomicPointer(shared, index);
-    state.Line("if (" + state.Builtin(MslBuiltin::ThreadIndexInSimdgroup) + " == " + first + " && " + lanesActive + " && " + bounds + ") " + value + " = " + (append ? "atomic_fetch_add_explicit(" : "atomic_fetch_sub_explicit(") + pointer + ", " + count + ", memory_order_relaxed);");
+    const auto condition = state.Builtin(MslBuiltin::ThreadIndexInSimdgroup) + " == " + first + " && " + lanesActive + " && " + bounds;
+    if (shared.space == "thread") {
+        // Per-invocation LDS (upstream 6337c8afb): the first active lane updates its own copy.
+        state.Line("if (" + condition + ") { " + value + " = " + shared.words + "[" + index + "]; " + shared.words + "[" + index + "] = " + (swap ? amount : value + (append ? " + " : " - ") + count) + "; }");
+    } else {
+        const auto pointer = AtomicPointer(shared, index);
+        const char* atomic = swap ? "atomic_exchange_explicit(" : append ? "atomic_fetch_add_explicit(" : "atomic_fetch_sub_explicit(";
+        state.Line("if (" + condition + ") " + value + " = " + atomic + pointer + ", " + amount + ", memory_order_relaxed);");
+    }
     state.Define(instruction, "simd_shuffle(" + value + ", ushort(" + first + "))");
 }
 
@@ -523,8 +559,9 @@ MslB5Storage MslLdsStorage(MslEmitterState& state) {
         state.AddPrologue("threadgroup uint aps5_lds[" + std::to_string(dwords + (state.requirements.ldsLock ? 1u : 0u)) + "];");
     }
     if (state.requirements.ldsLock) {
-        // The lock dword starts free; nobody takes it before every invocation passed the barrier.
-        state.AddPrologue("aps5_lds[" + std::to_string(dwords) + "] = 0u;");
+        // The lock dword starts free, written by one invocation (upstream 4864a7480); nobody takes it
+        // before every invocation passed the barrier.
+        state.AddPrologue("if (" + state.Builtin(MslBuiltin::ThreadIndexInThreadgroup) + " == 0u) aps5_lds[" + std::to_string(dwords) + "] = 0u;");
         state.AddPrologue("threadgroup_barrier(" + state.LdsMemoryFlags() + ");");
     }
     return {"aps5_lds", dwords};
@@ -547,7 +584,9 @@ void MslLockLoop(MslEmitterState& state, const IrValue& instruction, const MslLo
     state.Line(lock.acquire);
     critical();
     state.Line(lock.release);
-    state.Line("atomic_store_explicit(" + lock.pointer + ", 0u, memory_order_relaxed);");
+    // Upstream 317a323ee: the lock is released with an exchange (a read-modify-write, ordered with the
+    // compare-exchanges that take it); the critical section holds no fences of its own.
+    state.Line("(void)atomic_exchange_explicit(" + lock.pointer + ", 0u, memory_order_relaxed);");
     state.Line(flag + " = true;");
     state.Outdent();
     state.Line("}");
@@ -683,6 +722,12 @@ bool EmitMslMemoryInstruction(MslEmitterState& state, const IrValue& instruction
         return true;
     case IrOpcode::DataConsume:
         AppendConsume(state, instruction, false);
+        return true;
+    case IrOpcode::DataOrderedCount:
+        AppendConsume(state, instruction, true, true);
+        return true;
+    case IrOpcode::DataOrderedSwap:
+        AppendConsume(state, instruction, true, true, true);
         return true;
     default:
         return false;

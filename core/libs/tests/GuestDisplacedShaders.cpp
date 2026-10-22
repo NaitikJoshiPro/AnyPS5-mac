@@ -271,27 +271,45 @@ Results Exercise(const Arena& arena, Graph& graph, std::uintptr_t guestBase) {
     results.Add(size.m_size);
     Shader fused{};
     Require(sceAgcFuseShaderHalves_0200(&fused, graph.front, graph.back, graph.scratch) == 0, "sceAgcFuseShaderHalves failed");
-    Require(g_seen.registered.size() == 2 && arena.Contains(g_seen.registered[1]), "the driver did not get the guest fused header");
-    for (const volatile void* pointer : {static_cast<const volatile void*>(fused.code), static_cast<const volatile void*>(fused.sh_registers), static_cast<const volatile void*>(fused.cx_registers),
-             static_cast<const volatile void*>(fused.specials), static_cast<const volatile void*>(fused.input_semantics), static_cast<const volatile void*>(fused.output_semantics),
+    // A geometry fusion keeps its program in memory libSceAgc owns (upstream d6f67d1be), host memory outside the
+    // displaced window whose host addresses are its guest addresses; only the fused register list goes to the
+    // caller's memory, written through its host view.
+    Require(g_seen.registered.size() == 2, "the driver did not get the fused header");
+    const auto owned = g_seen.registered[1];
+    Require(!arena.Contains(owned) && !GuestArena::IsDisplaced(owned), "the fused program is not in libSceAgc-owned host memory");
+    Require(fused.sh_registers == graph.scratch, "the fused register list is not in the caller's memory");
+    const auto fusedBase = reinterpret_cast<std::uintptr_t>(fused.code);
+    const auto inProgram = [&](const volatile void* pointer) {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        Require(pointer == nullptr || (!arena.Contains(address) && address >= fusedBase && address < owned + fused.header_size),
+            "a fused table is outside the libSceAgc-owned program");
+        return pointer == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(address - fusedBase);
+    };
+    for (const volatile void* pointer : {static_cast<const volatile void*>(fused.cx_registers), static_cast<const volatile void*>(fused.specials),
+             static_cast<const volatile void*>(fused.input_semantics), static_cast<const volatile void*>(fused.output_semantics),
              static_cast<const volatile void*>(fused.user_data)})
-        results.Add(offset(pointer));
-    const Shader stored = *arena.Host(reinterpret_cast<Shader*>(g_seen.registered[1]));
-    Require(std::memcmp(&stored, &fused, sizeof(Shader)) == 0, "the fused header in memory differs from the result");
-    const auto* fusedUserData = arena.Host(fused.user_data);
-    results.Add(offset(fusedUserData->direct_resource_offset));
-    results.Add(offset(fusedUserData->sharp_resource_offset[1]));
-    results.Add(arena.Host(fusedUserData->direct_resource_offset)[1]);
-    const auto* fusedCode = arena.Host(static_cast<const std::uint32_t*>(const_cast<const void*>(fused.code)));
-    for (std::size_t i = 0; i < fused.shader_size / 4; ++i) results.Add(fusedCode[i]);
+        results.Add(inProgram(pointer));
+    results.Add(inProgram(reinterpret_cast<const Shader*>(owned)));
+    results.Add(offset(fused.sh_registers));
+    const Shader stored = *reinterpret_cast<const Shader*>(owned);
+    Shader expectedHeader = fused;
+    expectedHeader.sh_registers = stored.sh_registers;
+    Require(std::memcmp(&stored, &expectedHeader, sizeof(Shader)) == 0, "the registered fused header differs from the result");
     const auto* fusedSh = arena.Host(fused.sh_registers);
+    Require(std::memcmp(stored.sh_registers, fusedSh, fused.num_sh_registers * sizeof(ShaderRegister)) == 0, "the caller's register list differs from the program's");
+    const auto* fusedUserData = fused.user_data;
+    results.Add(inProgram(fusedUserData->direct_resource_offset));
+    results.Add(inProgram(fusedUserData->sharp_resource_offset[1]));
+    results.Add(fusedUserData->direct_resource_offset[1]);
+    const auto* fusedCode = static_cast<const std::uint32_t*>(const_cast<const void*>(fused.code));
+    for (std::size_t i = 0; i < fused.shader_size / 4; ++i) results.Add(fusedCode[i]);
     for (std::size_t i = 0; i < fused.num_sh_registers; ++i) {
-        // the program address registers hold the fused code's guest address
-        // (bits 8-15 of the address in the hi register differ between the two memories: left out)
+        // the program address registers hold the owned program's address
+        // (bits 8-15 of the address in the hi register differ between programs: left out)
         const bool address = fusedSh[i].offset == SPI_SHADER_PGM_LO_ES || fusedSh[i].offset == SPI_SHADER_PGM_LO_GS;
         const bool high = fusedSh[i].offset == SPI_SHADER_PGM_LO_ES + 1u || fusedSh[i].offset == SPI_SHADER_PGM_LO_GS + 1u;
         results.Add(fusedSh[i].offset);
-        results.Add(address ? fusedSh[i].value - static_cast<std::uint32_t>(guestBase >> 8u) : high ? fusedSh[i].value & 0xffffff00u : fusedSh[i].value);
+        results.Add(address ? fusedSh[i].value - static_cast<std::uint32_t>(fusedBase >> 8u) : high ? fusedSh[i].value & 0xffffff00u : fusedSh[i].value);
     }
     results.Add(fused.shader_size);
     results.Add(fused.header_size);

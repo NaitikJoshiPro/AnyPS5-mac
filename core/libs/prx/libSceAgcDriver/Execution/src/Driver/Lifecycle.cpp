@@ -1,15 +1,27 @@
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/Progress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "ShaderDiskCache.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestDisplaced.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
+#include <exception>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 #ifdef _WIN32
@@ -19,6 +31,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sys/mman.h>
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -28,6 +41,68 @@ namespace {
 constexpr std::uintptr_t InlineImportStackBytes = 256 * 1024;
 
 std::atomic<std::uint64_t> gpuMapImportThreads{0};
+
+void PrintFailure(std::exception_ptr error) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& cause) {
+        std::fprintf(stderr, "[gpu] driver failure: %s\n", cause.what());
+    } catch (...) {
+        std::fprintf(stderr, "[gpu] driver failure with a non-standard exception\n");
+    }
+    FlushAsyncLog_nid_no_patch();
+    std::fflush(stderr);
+}
+
+constexpr std::uint64_t DriverMemoryAddress = 0xfe0000000ull + GuestArena::GuestAddressOffset;
+constexpr std::size_t DriverMemoryBytes = 2u << 20u;
+constexpr std::uint64_t FsTableAddress = DriverMemoryAddress + 0x40000ull;
+constexpr std::uint64_t FsTableSlotBytes = 16u;
+constexpr std::uint64_t FsTableSlots = 6u;
+constexpr std::uint64_t FsRoutineRecords = 8u;
+constexpr std::uint64_t FsRoutineRecordBytes = 16u;
+constexpr std::uint64_t FsRoutineTableBytes = FsRoutineRecords * FsRoutineRecordBytes;
+constexpr std::uint64_t FsRoutineTableAddress = FsTableAddress + FsTableSlots * FsTableSlotBytes;
+constexpr std::uint64_t FsRoutineAddress = FsRoutineTableAddress + FsRoutineTableBytes;
+constexpr std::uint32_t ScalarSetpcB64LinkS14 = 0xbe80200eu;
+constexpr std::uint32_t ScalarEndProgram = 0xbf810000u;
+constexpr std::uint64_t FsTableDword3 = 0x5204u;
+
+void MapDriverMemory() {
+    void* mapped;
+#ifdef _WIN32
+    mapped = reinterpret_cast<void*>(DriverMemoryAddress);
+    GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PAGE_READWRITE, DriverMemoryBytes);
+#elif defined(__APPLE__)
+    // The range lies in the PS5 system-reserved range, which the guest arena keeps as one used range (no guest
+    // mapping, fixed or not, lands there; GuestArenaCommit refuses it), so the driver maps it itself. On arm64 it is
+    // also inside the displaced window (the commpage guard, D33): the host backs it at its alias, which the
+    // displaced window reserves PROT_NONE, and guest accesses and GPU imports reach it through HostAddress().
+    mapped = reinterpret_cast<void*>(DriverMemoryAddress);
+    // MAP_FIXED would replace whatever the host has there: only the displaced alias may be replaced.
+    if (!GuestArena::IsDisplaced(DriverMemoryAddress)) throw std::runtime_error("the AGC driver memory range is not in the displaced window on this host");
+    if (mmap(GuestArena::HostPointer(mapped), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
+        throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
+#else
+    mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
+#endif
+    if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
+    // Written through the host view: on arm64 macOS the guest addresses are displaced (identity elsewhere).
+    auto* routineTable = GuestArena::HostPointer(reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress));
+    for (std::uint64_t record = 0; record < FsRoutineRecords; ++record) {
+        routineTable[record * 2u] = FsRoutineAddress;
+        routineTable[record * 2u + 1u] = 0u;
+    }
+    auto* routine = GuestArena::HostPointer(reinterpret_cast<std::uint32_t*>(FsRoutineAddress));
+    routine[0] = ScalarSetpcB64LinkS14;
+    routine[1] = ScalarEndProgram;
+    auto* slot = GuestArena::HostPointer(reinterpret_cast<std::uint64_t*>(FsTableAddress));
+    slot[0] = (FsRoutineTableAddress & 0xffffffffffffull) | 16ull << 48u;
+    slot[1] = FsTableDword3 << 32u | FsRoutineRecords;
+    GuestAllocations::Mutation mutation;
+    mutation.Add(mapped, DriverMemoryBytes, true, true, true);
+}
 
 bool StackHoldsImport() {
 #ifdef _WIN32
@@ -64,8 +139,7 @@ bool StackHoldsImport() {
     const auto low = bounds.low;
     const auto high = bounds.high;
 #endif
-    const volatile unsigned char marker = 0;
-    const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
+    const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     return frame >= low && frame < high && frame - low >= InlineImportStackBytes;
 }
 
@@ -81,6 +155,7 @@ Driver& Driver::Get() {
 }
 
 Driver::~Driver() {
+    Progress::SetHook(nullptr, nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }
@@ -99,6 +174,7 @@ void Driver::stop() {
     {
         std::lock_guard lock(mutex);
         stopping = true;
+        eopFlips.clear();
         for (auto& [queue, worker] : workers) {
             worker.pending.clear();
             worker.unfinishedWrites.clear();
@@ -109,19 +185,31 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    DrawPipeline::Queue0().Stop();
     StopWorkerSampler();
     CloseRegistrationPreparation();
+    Graphics::StopPipelineLibraryWorker();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::ReportHostImports();
     device.Reset();
     replacedDevices.clear();
+    Graphics::FlushPipelineJournal();
     Graphics::ShutdownGuestBufferWorkers();
+    Graphics::StopCompareHelpers();
+    ShaderRecompiler::ShaderDiskCache::Shutdown();
     PerformanceTrace::StopOutput();
+    FlushAsyncLogAtEnd_nid_no_patch();
     StopProfileOutput_nid_no_patch();
     stopped = true;
 }
 
 Driver::Driver() {
+    InstallAsyncLog_nid_no_patch();
+    static const bool driverMemory = (MapDriverMemory(), true);
+    static_cast<void>(driverMemory);
     static_cast<void>(GuestMemory::TrackerGeneration());
+    // D80: GPU completions and landed labels wake the queue workers that wait for them.
+    Progress::SetHook([](void* driver) { static_cast<Driver*>(driver)->changed.notify_all(); }, this);
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });
@@ -177,9 +265,11 @@ void Driver::CheckFailure() {
 
 void Driver::ReportFailure(std::exception_ptr error) {
     require(error != nullptr, "null asynchronous failure");
+    bool first = false;
     {
         std::lock_guard lock(mutex);
-        if (!failure) failure = error;
+        first = !failure;
+        if (first) failure = error;
         failed.store(true, std::memory_order_release);
         for (const auto& [handle, output] : outputs) output->Fail(failure);
         for (auto& [queue, worker] : workers) {
@@ -190,6 +280,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
             worker.unfinishedWrites.clear();
             worker.queued.store(0, std::memory_order_release);
         }
+        if (first) PrintFailure(error);
     }
     changed.notify_all();
 }
@@ -207,6 +298,18 @@ void Driver::checkStopping() const {
 bool& Driver::onWorkerThread() {
     static thread_local bool worker = false;
     return worker;
+}
+
+}
+
+namespace AgcDriver {
+
+void FlushAsyncLog_nid_no_patch() {
+    AsyncLog::Get().Flush();
+}
+
+std::unique_lock<std::mutex> HoldAsyncLog() {
+    return AsyncLog::Get().Hold();
 }
 
 }

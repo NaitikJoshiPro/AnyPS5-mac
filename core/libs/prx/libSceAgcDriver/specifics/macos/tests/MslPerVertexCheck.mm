@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <iostream>
@@ -125,6 +126,11 @@ struct PixelCase {
     // DECISIONS D38: the input (host) or the weights (emulated) are read at several locations,
     // through interpolant<> (pull-model interpolation) instead of a qualifier.
     bool pullModel = false;
+    // Upstream c8b3a3753: DB_ALPHA_TO_MASK 0x18701 (eight samples, 64 per-pixel bins).
+    bool ditheredAlphaToCoverage = false;
+    // Upstream 72518f64f/1ffc5f672: PA_SC_AA_MASK's quad pixels and per-pixel samples.
+    std::uint8_t quadPixelMask = 0xf;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
 };
 
 ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTarget& target, const PixelCase& test, std::uint32_t vertexPush) {
@@ -151,6 +157,9 @@ ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTa
     pixel.linearCentroid = (test.inputs & PixelInputBit(PixelInput::LinearCentroid)) != 0u;
     pixel.targetOutputMode[0] = test.outputMode;
     pixel.alphaToCoverage = test.alphaToCoverage;
+    pixel.ditheredAlphaToCoverage = test.ditheredAlphaToCoverage;
+    pixel.quadPixelMask = test.quadPixelMask;
+    pixel.quadSampleMask = test.quadSampleMask;
     pixel.targetExportMapping.fill(0xe4u);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(test.code.data()), std::as_bytes(test.code)}}};
     ShaderRecompiler::RecompileRequest request{
@@ -190,10 +199,10 @@ NSString* Decimal(std::uint64_t value) {
     return [NSString stringWithFormat:@"%llu", static_cast<unsigned long long>(value)];
 }
 
-void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, std::uint32_t conservative, MTLPixelFormat format, std::uint32_t primitiveVertices = 3u) {
+void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, std::uint32_t conservative, MTLPixelFormat format, std::uint32_t primitiveVertices = 3u, NSString* sampleMask = nil) {
     const auto& fragment = pixel.msl.Reflection();
     const auto& vertexReflection = vertex.msl.Reflection();
-    const auto what = name + (conservative != 0u ? " (conservative)" : "") + (primitiveVertices == 1u ? " (points)" : primitiveVertices == 2u ? " (lines)" : "");
+    const auto what = name + (conservative != 0u ? " (conservative)" : "") + (primitiveVertices == 1u ? " (points)" : primitiveVertices == 2u ? " (lines)" : "") + (sampleMask != nil ? " (APS5_SAMPLE_MASK)" : "");
     NSMutableDictionary<NSString*, NSObject*>* vertexMacros = [@{
         @(Abi::TriangleVerticesMacro): @"1",
         @(Abi::PerVertexLocationsMacro): Decimal(fragment.perVertexLocations & 0xffffffffu),
@@ -204,11 +213,16 @@ void Link(id<MTLDevice> device, const std::string& name, const ShaderRecompiler:
     // MslAbi Version 14 (DECISIONS D69): points and lines take one or two guest vertices per primitive.
     if (primitiveVertices != 3u) vertexMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
     id<MTLFunction> vertexFunction = Compile(device, what + " vertex", vertex, vertexMacros);
-    id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, @{
+    NSMutableDictionary<NSString*, NSObject*>* fragmentMacros = [@{
         @(Abi::VertexOutputsMacro): Decimal(vertexReflection.outputLocations & 0xffffffffu),
         @(Abi::VertexOutputsHighMacro): Decimal(vertexReflection.outputLocations >> 32u),
         @(Abi::ConservativeMacro): Decimal(conservative),
-    });
+    } mutableCopy];
+    // MslAbi Version 18: the uniform PA_SC_AA_MASK as MetalDraw passes it (guest sample bits).
+    if (sampleMask != nil) fragmentMacros[@(Abi::SampleMaskMacro)] = sampleMask;
+    // DECISIONS D78: points and lines output and read only their own corners.
+    if (primitiveVertices != 3u) fragmentMacros[@(Abi::PrimitiveVerticesMacro)] = [NSString stringWithFormat:@"%uu", primitiveVertices];
+    id<MTLFunction> fragmentFunction = Compile(device, what + " fragment", pixel, fragmentMacros);
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = vertexFunction;
     descriptor.fragmentFunction = fragmentFunction;
@@ -252,14 +266,34 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
         // export lowers it, so a uint export must keep every sample.
         Require(Has(source, "aps5_out.aps5_sample_mask = 0xffffffffu;") && Has(source, "[[sample_mask]]"), name + ": alpha to coverage does not start from full coverage");
         // MslAbi Version 9: the measured proportional mask (DECISIONS D28), over the guest sample count.
-        Require(Has(source, "aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(") == (test.outputMode != 7u), name + ": the alpha-to-coverage mask does not match the export type");
-        Require(Has(source, "#define APS5_SAMPLE_COUNT get_num_samples()") == (test.outputMode != 7u), name + ": the alpha-to-coverage mask has no guest sample count default");
+        Require(Has(source, "aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(") == (test.outputMode != 7u && !test.ditheredAlphaToCoverage), name + ": the alpha-to-coverage mask does not match the export type");
+        Require(Has(source, "#define APS5_SAMPLE_COUNT get_num_samples()") == (test.outputMode != 7u && !test.ditheredAlphaToCoverage), name + ": the alpha-to-coverage mask has no guest sample count default");
+        // Upstream c8b3a3753: the dithered setting's per-quad-pixel table at the window position.
+        Require(Has(source, "aps5_out.aps5_sample_mask = aps5_dithered_alpha_to_mask(as_type<float>(") == (test.outputMode != 7u && test.ditheredAlphaToCoverage), name + ": the dithered alpha-to-coverage mask does not match the setting");
         Require(Has(source, "#if APS5_SAMPLE_BASE"), name + ": the exported mask is not shifted to the pass's samples");
+    }
+    const bool quadSamples = std::ranges::any_of(test.quadSampleMask, [](std::uint16_t mask) { return mask != 0xffffu; });
+    if (test.quadPixelMask != 0xfu || quadSamples) {
+        // Uncovered quad pixels are discarded (demoted to helpers) before the guest body and keep
+        // the program off early fragment tests.
+        auto withoutHostMask = source;
+        if (const auto at = withoutHostMask.find(Abi::SampleMaskDiscardText); at != std::string::npos) withoutHostMask.erase(at, std::string(Abi::SampleMaskDiscardText).size());
+        Require(Has(withoutHostMask, "discard_fragment();") && !Has(source, "[[early_fragment_tests]]"), name + ": uncovered quad pixels are not demoted");
+        Require(Has(source, "aps5_out.aps5_sample_mask &= aps5_quad_coverage;") == quadSamples, name + ": the per-pixel sample coverage does not match the mask");
     }
     if (*test.qualifier != '\0') Require(Has(source, std::string(" [[user(locn0), ") + test.qualifier + "]]"), name + ": input 0 is not interpolated with " + test.qualifier);
     const auto format = test.outputMode == 7u ? MTLPixelFormatRGBA32Uint : MTLPixelFormatRGBA32Float;
     Link(device, name, vertex, pixel, 0u, format);
     Link(device, name, vertex, pixel, 1u, format);
+    // MslAbi Version 18 (upstream 1ffc5f672): a function with outputs takes the uniform sample mask
+    // (APS5_SAMPLE_MASK): its mask export is ANDed with it, or it gains a [[sample_mask]] member.
+    if (reflection.colorOutputs != 0u || reflection.exportsSampleMask) {
+        Require(Has(source, "#if defined(APS5_SAMPLE_MASK)"), name + ": the fragment function does not take the uniform sample mask");
+        // Pixels whose covered samples the mask removes run no guest body (Vulkan runs no invocation).
+        Require(Has(source, "uint aps5_sample_mask_in [[sample_mask]]") && Has(source, Abi::SampleMaskDiscardText), name + ": pixels the uniform sample mask removes are not discarded before the body");
+        Require(Has(source, "aps5_out.aps5_sample_mask &= APS5_SAMPLE_MASK;") == reflection.exportsSampleMask && Has(source, "aps5_out.aps5_sample_mask = APS5_SAMPLE_MASK;") == !reflection.exportsSampleMask, name + ": the uniform sample mask is not applied to the function's coverage");
+        Link(device, name, vertex, pixel, 0u, format, 3u, @"5u");
+    }
     Link(device, name, vertex, pixel, 0u, format, 1u);
     Link(device, name, vertex, pixel, 0u, format, 2u);
     std::printf("%s: per-vertex locations 0x%llx, barycentrics %u, linked in the triangle-vertices mode\n", test.name, static_cast<unsigned long long>(reflection.perVertexLocations), reflection.emulatedBarycentrics);
@@ -286,6 +320,13 @@ int main() {
             const auto linear = PixelInputBit(PixelInput::LinearCenter);
             const auto position = PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY);
             const auto threeLocations = PixelInputBit(PixelInput::PerspectiveSample) | perspective | PixelInputBit(PixelInput::PerspectiveCentroid);
+            PixelCase dithered{"dithered alpha to coverage", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u, true, 9u};
+            dithered.ditheredAlphaToCoverage = true;
+            PixelCase quadPixels{"quad pixel mask 0x9", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u};
+            quadPixels.quadPixelMask = 0x9u;
+            PixelCase quadSamples{"per-pixel sample mask", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u};
+            quadSamples.quadSampleMask = {0x3u, 0xffffu, 0xcu, 0xffffu};
+            for (const auto& test : {dithered, quadPixels, quadSamples}) Check(metal, target, vertex, test);
             const std::array<PixelCase, 15> cases{{
                 {"perspective I/J", BarycentricPixelCode, perspective, false, 64u, 0u, 1u},
                 {"linear I/J", BarycentricPixelCode, linear, false, 64u, 0u, 2u},

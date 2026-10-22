@@ -8,6 +8,9 @@
 #include "prx/libSceUserService/UserService.hpp"
 #include "prx/libc/include/ConsoleSettings.hpp"
 
+static std::atomic<bool> initialized{false};
+static std::atomic<bool> loginReported{false};
+
 static int ReportAccessibilitySetting(int user_id, int32_t* setting, int32_t value) {
  if (user_id != USER_SERVICE_INITIAL_USER_ID) {
   return USER_SERVICE_ERROR_NOT_LOGGED_IN;
@@ -25,6 +28,11 @@ int APS5_VABI sceUserServiceGetAccessibilityChatTranscription(int user_id, int32
  return ReportAccessibilitySetting(user_id, chat_transcription, 0);
 }
 
+int APS5_VABI sceUserServiceGetAccessibilityKeyremapEnable() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI sceUserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hold_delay) {
  return ReportAccessibilitySetting(user_id, press_and_hold_delay, 0);
 }
@@ -35,6 +43,11 @@ int APS5_VABI sceUserServiceGetAccessibilityTriggerEffect(int user_id, int32_t* 
 
 int APS5_VABI sceUserServiceGetAccessibilityVibration(int user_id, int32_t* vibration) {
  return ReportAccessibilitySetting(user_id, vibration, 1);
+}
+
+int APS5_VABI sceUserServiceGetAccessibilityZoom() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
 }
 
 int APS5_VABI sceUserServiceGetAccessibilityZoomEnabled(int user_id, int32_t* zoom_enabled) {
@@ -57,12 +70,14 @@ int APS5_VABI sceUserServiceGetAgeLevel(int user_id, uint32_t* age_level) {
  return USER_SERVICE_OK;
 }
 
-// The initial user is reported as logging in once; afterwards there are no user events.
+// The initial user is reported as logging in once per initialization; afterwards there are no user events.
 int APS5_VABI sceUserServiceGetEvent(SceUserServiceEvent* event) {
+ if (!initialized.load()) {
+  return USER_SERVICE_ERROR_NOT_INITIALIZED;
+ }
  if (event == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
- static std::atomic<bool> loginReported{false};
  if (loginReported.exchange(true)) {
   return USER_SERVICE_ERROR_NO_EVENT;
  }
@@ -115,6 +130,9 @@ int APS5_VABI sceUserServiceGetInitialUser(int* user_id) {
 }
 
 int APS5_VABI sceUserServiceGetLoginUserIdList(UserServiceLoginUserIdList* user_id_list) {
+ if (!initialized.load()) {
+  return USER_SERVICE_ERROR_NOT_INITIALIZED;
+ }
  if (user_id_list == nullptr) {
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
@@ -148,16 +166,40 @@ int APS5_VABI sceUserServiceGetUserNumber(int user_id, int32_t* number) {
  return USER_SERVICE_OK;
 }
 
-int APS5_VABI sceUserServiceInitialize(const void* params) {
- (void)params;
+static bool ValidThreadPriority(int priority) {
+ return priority >= USER_SERVICE_THREAD_PRIORITY_MIN && priority <= USER_SERVICE_THREAD_PRIORITY_MAX;
+}
+
+static int MarkInitialized() {
+ if (initialized.exchange(true)) {
+  return USER_SERVICE_ERROR_ALREADY_INITIALIZED;
+ }
+ loginReported.store(false);
  return USER_SERVICE_OK;
 }
 
-int APS5_VABI sceUserServiceInitialize2(void) {
- return USER_SERVICE_OK;
+int APS5_VABI sceUserServiceInitialize(const void* params) {
+ if (params != nullptr) {
+  int priority = 0;
+  std::memcpy(&priority, params, sizeof(priority));
+  if (!ValidThreadPriority(priority)) {
+   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+  }
+ }
+ return MarkInitialized();
+}
+
+int APS5_VABI sceUserServiceInitialize2(int priority) {
+ if (!ValidThreadPriority(priority)) {
+  return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+ }
+ return MarkInitialized();
 }
 
 int APS5_VABI sceUserServiceTerminate(void) {
+ if (!initialized.exchange(false)) {
+  return USER_SERVICE_ERROR_NOT_INITIALIZED;
+ }
  return USER_SERVICE_OK;
 }
 

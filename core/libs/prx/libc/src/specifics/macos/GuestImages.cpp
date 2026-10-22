@@ -18,8 +18,18 @@ constexpr std::size_t HeadersOffset = 0x60;
 
 std::atomic<unsigned long long> imagesAdded {0};
 std::atomic<unsigned long long> imagesRemoved {0};
-std::mutex registeredMutex;
-std::vector<dl_phdr_info> registered;
+// Process-owned: guest code still walks the images from atexit handlers and late static destructors
+// (guest_memory_lifetime), after a namespace-scope mutex would have been destroyed (macOS then fails
+// the lock with EINVAL), so the registry is never destroyed.
+struct RegisteredImages {
+    std::mutex mutex;
+    std::vector<dl_phdr_info> images;
+};
+
+RegisteredImages& Registered() {
+    static auto* registered = new RegisteredImages;
+    return *registered;
+}
 
 void OnImageAdded(const mach_header*, intptr_t) {
     imagesAdded.fetch_add(1, std::memory_order_relaxed);
@@ -41,8 +51,9 @@ __attribute__((constructor)) void TrackImages() {
 // query and protect their pages.
 extern "C" void Aps5RegisterGuestImage_nid_no_patch(const dl_phdr_info* image) {
     GuestAllocations::RegisterRunnerImage(*image);
-    std::lock_guard lock(registeredMutex);
-    registered.push_back({image->dlpi_addr, image->dlpi_name, image->dlpi_phdr, image->dlpi_phnum});
+    auto& registered = Registered();
+    std::lock_guard lock(registered.mutex);
+    registered.images.push_back({image->dlpi_addr, image->dlpi_name, image->dlpi_phdr, image->dlpi_phnum});
     imagesAdded.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -64,8 +75,9 @@ extern "C" void* LibcGuestCallable_nid_no_patch(const void* address, const char*
 extern "C" int dl_iterate_phdr(int (*callback)(dl_phdr_info*, std::size_t, void*), void* data) {
     std::vector<dl_phdr_info> images;
     {
-        std::lock_guard lock(registeredMutex);
-        images = registered;
+        auto& registered = Registered();
+        std::lock_guard lock(registered.mutex);
+        images = registered.images;
     }
     for (auto& image : images) {
         image.dlpi_adds = imagesAdded.load(std::memory_order_relaxed);

@@ -28,7 +28,15 @@ namespace ShaderRecompiler {
 std::string TriangleVertexMacroDefaults() {
     return "#ifndef APS5_PER_VERTEX_LOCATIONS\n#define APS5_PER_VERTEX_LOCATIONS 0\n#endif\n"
            "#ifndef APS5_PER_VERTEX_LOCATIONS_HI\n#define APS5_PER_VERTEX_LOCATIONS_HI 0\n#endif\n"
-           "#ifndef APS5_BARYCENTRICS\n#define APS5_BARYCENTRICS 0\n#endif\n";
+           "#ifndef APS5_BARYCENTRICS\n#define APS5_BARYCENTRICS 0\n#endif\n"
+           "#ifndef APS5_PRIMITIVE_VERTICES\n#define APS5_PRIMITIVE_VERTICES 3u\n#endif\n";
+}
+
+// Per-vertex corner fields of a point or line draw (MslAbi Version 16, DECISIONS D78): corners past
+// the primitive's vertices repeat its last one, so they are not output; `corner` 0 always is.
+std::string CornerField(std::uint32_t location, std::uint32_t corner, const std::string& declaration) {
+    if (corner == 0u) return declaration;
+    return "#if APS5_PRIMITIVE_VERTICES > " + std::to_string(corner) + "u\n" + declaration + "#endif\n";
 }
 
 std::string TriangleVerticesCondition() {
@@ -57,12 +65,50 @@ std::string PerVertexField(std::uint32_t location, std::uint32_t vertex) {
     return "pv" + std::to_string(location) + "_" + std::to_string(vertex);
 }
 
-std::uint32_t MslCullClipSlot(const MslEmitterState& state) {
+std::uint32_t MslGuestClipDistanceCount(const MslEmitterState& state) {
     std::uint32_t count = 0u;
     for (const auto& output : state.program.Info().outputs) {
         if (output.kind == StageOutputKind::ClipDistance) count = std::max(count, output.index + 1u);
     }
-    return count + 1u;
+    return count;
+}
+
+// Upstream 5c29d125e: the all-zero position distance only while the guest clip distances and the
+// emulated cull distance leave one of the eight free; otherwise a primitive with a vertex at clip
+// position (0,0,0,0) is not removed (TechnicalDebt, as upstream's EmitSetAttribute entry).
+bool MslZeroPositionDistance(const MslEmitterState& state) {
+    return MslGuestClipDistanceCount(state) + (MslCullDistanceCount(state) != 0u ? 1u : 0u) < 8u;
+}
+
+std::uint32_t MslCullClipSlot(const MslEmitterState& state) {
+    return MslGuestClipDistanceCount(state) + (MslZeroPositionDistance(state) ? 1u : 0u);
+}
+
+namespace {
+
+std::string QuadPixel() {
+    return "((uint(aps5_in.aps5_position.x) & 1u) | ((uint(aps5_in.aps5_position.y) & 1u) << 1u))";
+}
+
+}
+
+std::string MslQuadCoverage(const MslEmitterState& state) {
+    const auto& pixel = *state.inputInfo.pixel;
+    if (!pixel.QuadSampleMaskPartial()) return "0xffffffffu";
+    // 16 guest samples per quad pixel, the top row's two pixels in one word, the bottom row's in
+    // the other (x selects the half word).
+    const auto& masks = pixel.quadSampleMask;
+    const auto top = static_cast<std::uint32_t>(masks[0]) | (static_cast<std::uint32_t>(masks[1]) << 16u);
+    const auto bottom = static_cast<std::uint32_t>(masks[2]) | (static_cast<std::uint32_t>(masks[3]) << 16u);
+    return "((((" + QuadPixel() + " & 2u) != 0u ? " + std::to_string(bottom) + "u : " + std::to_string(top) + "u) >> ((" + QuadPixel() + " & 1u) << 4u)) & 0xffffu)";
+}
+
+std::string MslQuadUncovered(const MslEmitterState& state) {
+    const auto& pixel = *state.inputInfo.pixel;
+    // The host mask's bits are guest samples APS5_SAMPLE_BASE and up (DECISIONS D28).
+    // aps5_sample_coverage: the stage function's coverage, a per-sample invocation's own sample (MslAbi::SampleMaskDiscardText).
+    if (pixel.QuadSampleMaskPartial()) return "(((aps5_sample_coverage << APS5_SAMPLE_BASE) & " + MslQuadCoverage(state) + ") == 0u)";
+    return "(((" + std::to_string(static_cast<std::uint32_t>(pixel.quadPixelMask)) + "u >> " + QuadPixel() + ") & 1u) == 0u)";
 }
 
 std::uint32_t MslCullDistanceCount(const MslEmitterState& state) {
@@ -212,6 +258,41 @@ static uint aps5_alpha_to_mask(float alpha, uint samples) {
 }
 )";
 
+// Dithered alpha to coverage (upstream c8b3a3753, StoreDitheredAlphaCoverage): DB_ALPHA_TO_MASK
+// 0x18701 at eight samples (the driver accepts it only there), 64 alpha bins whose packed word
+// holds one 8-sample mask per pixel of the 2x2 quad, selected by ((x & 1) << 1) | (y & 1) of the
+// window position; NaN and negative alphas take bin 0, alphas above 63/64 bin 63.
+constexpr std::string_view DitheredAlphaToMaskText = R"(static uint aps5_dithered_alpha_to_mask(float alpha, float4 position) {
+    const uint masks[64] = {
+        0x00000000u, 0x00000010u, 0x00000004u, 0x10000004u, 0x10000002u, 0x10100002u, 0x04100002u, 0x04101002u,
+        0x04101001u, 0x04101011u, 0x04041011u, 0x14041011u, 0x12041011u, 0x12141011u, 0x12140411u, 0x12141411u,
+        0x12141411u, 0x12141431u, 0x12141415u, 0x32141415u, 0x32121415u, 0x32321415u, 0x16321415u, 0x16323415u,
+        0x15323415u, 0x15323435u, 0x15163435u, 0x35163435u, 0x35163235u, 0x35363235u, 0x35361635u, 0x35363635u,
+        0x35363635u, 0x35363675u, 0x3536363du, 0x7536363du, 0x75363637u, 0x75763637u, 0x3d763637u, 0x3d767637u,
+        0x3d757637u, 0x3d757677u, 0x3d3d7677u, 0x7d3d7677u, 0x773d7677u, 0x777d7677u, 0x777d3e77u, 0x777d7e77u,
+        0x777d7e77u, 0x777d7ef7u, 0x777d7e7fu, 0xf77d7e7fu, 0xf7777e7fu, 0xf7f77e7fu, 0x7ff77e7fu, 0x7ff7fe7fu,
+        0x7ff7fd7fu, 0x7ff7fdffu, 0x7f7ffdffu, 0xff7ffdffu, 0xff7ff7ffu, 0xfffff7ffu, 0xffff7fffu, 0xffffffffu,
+    };
+    const float positive = alpha > 0.0f ? alpha : 0.0f;
+    const float bounded = positive > 0.984375f ? 0.984375f : positive;
+    const uint pixel = ((uint(position.x) & 1u) << 1u) | (uint(position.y) & 1u);
+    return (masks[uint(bounded * 64.0f)] >> (pixel << 3u)) & 0xffu;
+}
+)";
+
+// Reversed-order blending (upstream 16ea32c97 / c434467f6, FragmentOutputSpecialization.hpp): each
+// component of a ReversedBlendCode route field (RouteBits per component) picks the export's own
+// component, component 0, 0 or 1.
+constexpr std::string_view ReversedBlendRouteText = R"(static float4 aps5_reversed_route(float4 color, uint routes) {
+    float4 result;
+    for (uint c = 0u; c < 4u; ++c) {
+        const uint route = (routes >> (2u * c)) & 3u;
+        result[c] = route == 0u ? color[c] : route == 1u ? color[0] : route == 2u ? 0.0f : 1.0f;
+    }
+    return result;
+}
+)";
+
 // EmitBuiltinU32 for vertex and pixel programs: the value's bits as a uint.
 std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
     const auto stage = StageOf(state);
@@ -246,7 +327,10 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             state.AddParameter("uint aps5_layer_in [[render_target_array_index]]");
             return "aps5_layer_in";
         case StageInputKind::HelperInvocation:
-            return "(simd_is_helper_thread() ? 1u : 0u)";
+            // Upstream 90b20afac: a pixel the quad mask demoted reads as a helper. Metal's discard_fragment
+            // demotes, but simd_is_helper_thread() stays false after it, so the stage function's demotions
+            // (quad and sample masks, conservative coverage) reach the body as aps5_demoted.
+            return "((simd_is_helper_thread() || aps5_demoted) ? 1u : 0u)";
         case StageInputKind::LayerExported:
             // Upstream #5097 (EmitBuiltinU32): 1 when the draw's last geometry stage exports a render
             // target index (PipelineSpecialization::LayerExported, default 0); the ancillary word's
@@ -257,6 +341,21 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             // (Recompiler.hpp RasterPrimitive), PipelineSpecialization::RasterPrimitive, default
             // Triangle; the ancillary word's bits 0-1 (ConstantFolder::ComposePackedAncillary).
             return state.FunctionConstant(PipelineSpecialization::RasterPrimitive, static_cast<std::uint32_t>(RasterPrimitive::Triangle));
+        case StageInputKind::SampleMask:
+            // Upstream 03b0db052: SAMPLE_COVERAGE (SPI_PS_INPUT_ENA bit 14) from the coverage input
+            // every fragment function declares (EmitMslEntryPoint); host sample 0 is guest sample
+            // APS5_SAMPLE_BASE (DECISIONS D28). The driver refuses the per-sample case, as upstream.
+            state.AddParameter("uint aps5_sample_mask_in [[sample_mask]]");
+            return "(aps5_sample_mask_in << APS5_SAMPLE_BASE)";
+        case StageInputKind::BaryCoordSmoothCenter:
+        case StageInputKind::BaryCoordSmoothSample:
+        case StageInputKind::BaryCoordNoPerspectiveCenter:
+        case StageInputKind::BaryCoordNoPerspectiveSample:
+            // Upstream's offset barycentrics (InterpolateAtOffset at the pixel center or the guest
+            // sample location) come only from targets with InterpolationFunction, which the Metal
+            // device does not advertise; the read's location flag (center or sample, DECISIONS D38)
+            // selects the same host interpolation as the plain kinds. Custom guest sample locations
+            // are the host's only when the driver programs them.
         case StageInputKind::BaryCoordSmooth:
         case StageInputKind::BaryCoordNoPerspective:
             // Exact barycentrics only exist in programs the recompiler translated for the emulated
@@ -264,7 +363,7 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
             // function emits one-hot corner weights, interpolated as the hardware interpolates the
             // guest's I/J (EmulatedBarycentric).
             if (component > 1u) state.Fail(instruction, "barycentric component is out of range");
-            return "as_type<uint>(" + EmulatedBarycentric(state, kind == StageInputKind::BaryCoordNoPerspective, ReadLocation(state, instruction, std::nullopt)) + "[" + std::to_string(component + 1u) + "])";
+            return "as_type<uint>(" + EmulatedBarycentric(state, BarycentricInputOf(kind) == StageInputKind::BaryCoordNoPerspective, ReadLocation(state, instruction, std::nullopt)) + "[" + std::to_string(component + 1u) + "])";
         default:
             break;
         }
@@ -438,7 +537,8 @@ std::string ExportVector(MslEmitterState& state, const std::string& data, const 
         return name;
     }
     state.Line("uint4 " + name + " = uint4(0u, 0u, 0u, " + std::string(uintOutput ? "1u" : "0x3f800000u") + ");");
-    const auto exported = exp.en & (mode == 1u ? 0x1u : mode == 2u ? 0x3u : mode == 3u ? 0x9u : 0xfu);
+    // Upstream 26a746a43: 32_AR (mode 3) exports channels 0 and 1, and channel 1 is the alpha (GFX10).
+    const auto exported = exp.en & (mode == 1u ? 0x1u : mode == 2u || mode == 3u ? 0x3u : 0xfu);
     if (exp.compr) {
         for (std::uint32_t pair = 0; pair < 2u; ++pair) {
             if ((exp.en & (3u << (pair * 2u))) == 0u) continue;
@@ -450,7 +550,7 @@ std::string ExportVector(MslEmitterState& state, const std::string& data, const 
         }
     } else {
         for (std::uint32_t component = 0; component < 4u; ++component) {
-            if (((exported >> component) & 1u) != 0u) state.Line(name + "[" + std::to_string(component) + "] = " + data + "[" + std::to_string(component) + "];");
+            if (((exported >> component) & 1u) != 0u) state.Line(name + "[" + std::to_string(mode == 3u && component == 1u ? 3u : component) + "] = " + data + "[" + std::to_string(component) + "];");
         }
     }
     return name;
@@ -470,8 +570,10 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
         if ((exp.en & (1u << component)) == 0u) continue;
         const auto output = DecodePositionExportComponent(vertex.paClVsOutCntl, exp.index, component);
         const auto raw = data + "[" + std::to_string(component) + "]";
-        // DefineMeshOutputs: mesh functions output the position, parameters and the layer only.
-        if (mesh && (output.viewport || output.pointSize || output.clipDistance != std::numeric_limits<std::uint32_t>::max() || output.cullDistance != std::numeric_limits<std::uint32_t>::max())) state.Fail("unsupported mesh output kind (viewport index, point size, clip or cull distance)");
+        // DefineMeshOutputs: mesh functions output the position, parameters, the layer and (upstream
+        // f7a2903ed) clip distances; cull distances are staged per vertex in threadgroup memory
+        // (aps5_mcull) and turned into the primitive's cull flag by the mesh epilogue.
+        if (mesh && (output.viewport || output.pointSize)) state.Fail("unsupported mesh output kind (viewport index or point size)");
         if (output.layer && mesh) {
             // Per vertex in threadgroup memory; each primitive takes its provoking vertex's layer.
             const auto index = state.GuestInvocationIndex();
@@ -485,11 +587,18 @@ void AuxPositionExport(MslEmitterState& state, const std::string& data, const Ex
             state.Line("aps5_out.aps5_point_size = as_type<float>(" + raw + ");");
             continue;
         }
-        if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_out.aps5_clip[" + std::to_string(output.clipDistance) + "] = as_type<float>(" + raw + ");");
+        if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) state.Line(OutputRecord(state) + ".aps5_clip[" + std::to_string(output.clipDistance) + "] = as_type<float>(" + raw + ");");
         // Upstream #423: Metal has no cull distance output. The guest program's distances go to the
         // vertex function's per-vertex record (aps5_cull, EmitMslEntryPoint), which turns them into
         // one clip distance per primitive (MslAbi Version 10).
-        if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) state.Line("aps5_cull[" + std::to_string(output.cullDistance) + "] = as_type<float>(" + raw + ");");
+        // Mesh functions: no per-vertex record survives to the primitive, so the distance goes to
+        // threadgroup memory, read by the epilogue's per-primitive verdict (MeshCullTest).
+        if (output.cullDistance != std::numeric_limits<std::uint32_t>::max() && mesh) {
+            const auto index = state.GuestInvocationIndex();
+            state.Line("if (" + index + " < " + U32(vertex.mesh.maxVertices) + ") aps5_mcull[" + index + " * " + U32(MslCullDistanceCount(state)) + " + " + U32(output.cullDistance) + "] = as_type<float>(" + raw + ");");
+        } else if (output.cullDistance != std::numeric_limits<std::uint32_t>::max()) {
+            state.Line("aps5_cull[" + std::to_string(output.cullDistance) + "] = as_type<float>(" + raw + ");");
+        }
     }
 }
 
@@ -539,13 +648,30 @@ void MeshRestartStart(MslEmitterState& state, const IrValue& instruction) {
     state.Define(instruction, "(" + state.Arg(instruction, 1u) + ") ? " + table + "[min(uint(" + state.Arg(instruction, 0u) + "), " + table + "[" + U32(MeshRestartLengthDword) + "] - 1u) + " + U32(MeshRestartTableDword) + "] : 0u");
 }
 
-// SelectExportPacking: 10_11_11 targets take the colour packed into the red channel.
+// SelectExportPacking: 10_11_11 UNORM and (upstream 49b0e805f) 11_11_10 float targets take the
+// colour packed into the red channel of a 32-bit uint attachment.
 std::string ExportPacking(MslEmitterState& state, std::uint32_t target, const std::string& color) {
     state.RequirePrelude(MslPreludeChunk::StageIo);
     const auto packing = state.FunctionConstant(PipelineSpecialization::ExportPackingBase + target, static_cast<std::uint32_t>(ColorExportPacking::None));
     const auto name = state.Temporary("aps5_pk");
-    state.Line("const uint4 " + name + " = " + packing + " == " + U32(static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11)) + " ? uint4(aps5_pack_unorm_10_11_11(" + color + "), 0u, 0u, 0u) : " + color + ";");
+    const auto floating = packing + " == " + U32(static_cast<std::uint32_t>(ColorExportPacking::Float11_11_10));
+    state.Line("const uint4 " + name + " = " + packing + " != " + U32(static_cast<std::uint32_t>(ColorExportPacking::None)) + " ? uint4(aps5_pack_export(" + color + ", " + floating + " ? APS5_FORMAT_10_11_11_FLOAT : APS5_FORMAT_11_11_10_UNORM), 0u, 0u, 0u) : " + color + ";");
     return name;
+}
+
+// Upstream 16ea32c97 / c434467f6 (SpecializeFragmentOutputs): with APS5_REVERSED_BLEND (the driver
+// sets it when PipelineSpecialization::ReversedBlend is not 0) the MRT0 store also writes the second
+// blend source color(0) index(1) from the SecondShift routes and, when the ColorShift routes are not
+// all Own, stores the ColorShift routing of the export instead; both come from copies of the export.
+void EmitReversedBlend(MslEmitterState& state) {
+    if (state.declarations.find("aps5_reversed_route") == std::string::npos) state.AddDeclaration(ReversedBlendRouteText);
+    const auto code = state.FunctionConstant(PipelineSpecialization::ReversedBlend, 0u);
+    const auto source = state.Temporary("aps5_rs");
+    state.Line(std::string("#if defined(") + MslAbi::ReversedBlendMacro + ") && " + MslAbi::ReversedBlendMacro);
+    state.Line("const float4 " + source + " = float4(aps5_out.c0);");
+    state.Line("aps5_out.aps5_rb = aps5_reversed_route(" + source + ", (" + code + " >> " + U32(ReversedBlendCode::SecondShift) + ") & " + U32(ReversedBlendCode::Routes) + ");");
+    state.Line("if (((" + code + " >> " + U32(ReversedBlendCode::ColorShift) + ") & " + U32(ReversedBlendCode::Routes) + ") != 0u) aps5_out.c0 = APS5_COLOR0_TYPE(aps5_reversed_route(" + source + ", (" + code + " >> " + U32(ReversedBlendCode::ColorShift) + ") & " + U32(ReversedBlendCode::Routes) + "));");
+    state.Line("#endif");
 }
 
 void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
@@ -580,7 +706,13 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
         AuxPositionExport(state, data, exp);
     } else if (exp.kind == ExportTargetKind::MrtZ) {
         if ((exp.en & 1u) != 0u && HasOutput(state, StageOutputKind::Depth)) state.Line("aps5_out.aps5_depth = as_type<float>(" + data + ".x);");
-        if ((exp.en & 2u) != 0u && HasOutput(state, StageOutputKind::StencilRef)) state.Line("aps5_out.aps5_stencil = " + data + ".y;");
+        if ((exp.en & 2u) != 0u && HasOutput(state, StageOutputKind::StencilRef)) {
+            // Upstream 7563b4a48: with STENCIL_OP_VAL_EXPORT_ENABLE the exported operation value is
+            // bits 8-15 of the second MRTZ channel (the driver turns the reachable REPLACE_OP into
+            // REPLACE with it).
+            const bool operationValue = PixelInfo(state).psStencilOperationValueExport;
+            state.Line("aps5_out.aps5_stencil = " + (operationValue ? "((" + data + ".y >> 8u) & 0xffu)" : data + ".y") + ";");
+        }
         if ((exp.en & 4u) != 0u && HasOutput(state, StageOutputKind::SampleMask)) state.Line("aps5_out.aps5_sample_mask = " + data + ".z;");
     } else if (exp.kind == ExportTargetKind::Position) {
         auto position = "as_type<float4>(" + ExportVector(state, data, exp, false) + ")";
@@ -597,7 +729,7 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
         }
         state.Line(record + ".aps5_position = " + position + ";");
         // The all-zero position cull distance (StoreZeroPositionClipDistance; not on mesh outputs).
-        if (stage != IrShaderStage::Mesh) state.Line("aps5_out.aps5_clip[" + std::to_string(ClipDistanceCount(state)) + "] = ((as_type<uint4>(aps5_out.aps5_position).x | as_type<uint4>(aps5_out.aps5_position).y | as_type<uint4>(aps5_out.aps5_position).z | as_type<uint4>(aps5_out.aps5_position).w) & 0x7fffffffu) == 0u ? -1.0f : 0.0f;");
+        if (stage != IrShaderStage::Mesh && MslZeroPositionDistance(state)) state.Line("aps5_out.aps5_clip[" + std::to_string(ClipDistanceCount(state)) + "] = ((as_type<uint4>(aps5_out.aps5_position).x | as_type<uint4>(aps5_out.aps5_position).y | as_type<uint4>(aps5_out.aps5_position).z | as_type<uint4>(aps5_out.aps5_position).w) & 0x7fffffffu) == 0u ? -1.0f : 0.0f;");
     } else {
         const auto kind = exp.kind == ExportTargetKind::Mrt ? StageOutputKind::Mrt : StageOutputKind::Parameter;
         const auto* output = FindOutput(state, kind, exp.index);
@@ -616,11 +748,17 @@ void SetAttribute(MslEmitterState& state, const IrValue& instruction) {
                 state.Line("const uint4 " + name + " = " + mapped + ");");
                 value = name;
                 if (exp.index == 0u && !uintOutput && PixelInfo(state).psAlphaToCoverage) {
-                    if (state.declarations.find("aps5_alpha_to_mask") == std::string::npos) state.AddDeclaration(AlphaToMaskText);
-                    state.Line("aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(" + value + ".w), APS5_SAMPLE_COUNT);");
+                    if (PixelInfo(state).psDitheredAlphaToCoverage) {
+                        if (state.declarations.find("aps5_dithered_alpha_to_mask") == std::string::npos) state.AddDeclaration(DitheredAlphaToMaskText);
+                        state.Line("aps5_out.aps5_sample_mask = aps5_dithered_alpha_to_mask(as_type<float>(" + value + ".w), aps5_in.aps5_position);");
+                    } else {
+                        if (state.declarations.find("aps5_alpha_to_mask") == std::string::npos) state.AddDeclaration(AlphaToMaskText);
+                        state.Line("aps5_out.aps5_sample_mask = aps5_alpha_to_mask(as_type<float>(" + value + ".w), APS5_SAMPLE_COUNT);");
+                    }
                 }
                 if (!uintOutput && mode != 5u && mode != 6u) value = ExportPacking(state, exp.index, value);
                 state.Line("aps5_out.c" + std::to_string(output->location) + " = as_type<APS5_COLOR" + std::to_string(output->location) + "_TYPE>(" + value + ");");
+                if (output->location == 0u && !uintOutput) EmitReversedBlend(state);
             } else {
                 state.Line(record + ".p" + std::to_string(output->location) + " = as_type<float4>(" + value + ");");
             }
@@ -661,9 +799,10 @@ static uint4 aps5_vertex_fetch(device const Aps5VertexFetch* records, uint locat
     return aps5_format_load(memory, info, record.stride << 16u, records_, word3, true, index, 0u, 0u, dstSel, 4u, false, stop);
 }
 
-// SelectExportPacking's 10_11_11 UNORM packing of an RGB colour (float bits).
-static uint aps5_pack_unorm_10_11_11(uint4 color) {
-    const Aps5Format info = aps5_format(APS5_FORMAT_11_11_10_UNORM);
+// SelectExportPacking's PackExport: the 10_11_11 UNORM or 11_11_10 float packing of an RGB colour
+// (float bits).
+static uint aps5_pack_export(uint4 color, uint format) {
+    const Aps5Format info = aps5_format(format);
     uint packed = 0u;
     for (uint component = 0u; component < info.count; ++component) packed |= aps5_format_store(info.type, info.bits[component], color[component]) << info.offsets[component];
     return packed;
@@ -734,8 +873,8 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         const auto culls = MslCullDistanceCount(state);
         if (culls != 0u && stage == IrShaderStage::TessellationEvaluation) state.Fail("domain programs that write cull distances (the tessellation mesh function has no cull distance emulation; TechnicalDebt metal-tessellation)");
         if (culls > MaxClipDistances) state.Fail("more than 8 guest cull distances");
-        const auto clips = ClipDistanceCount(state) + 1u + (culls != 0u ? 1u : 0u);
-        if (clips > MaxClipDistances) state.Fail(culls != 0u ? "guest clip distances plus the all-zero clip position distance and the emulated cull distance exceed 8 clip distances" : "guest clip distances plus the all-zero clip position distance exceed 8 clip distances");
+        const auto clips = ClipDistanceCount(state) + (MslZeroPositionDistance(state) ? 1u : 0u) + (culls != 0u ? 1u : 0u);
+        if (clips > MaxClipDistances) state.Fail("guest clip distances plus the emulated cull distance exceed 8 clip distances");
         state.reflection.cullDistances = culls;
         text += "struct Aps5VertexOut {\n    float4 aps5_position [[position]];\n";
         std::uint32_t scalars = 4u;
@@ -775,7 +914,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         for (const auto& output : state.program.Info().outputs) {
             if (output.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(output.location) + "\n";
-            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += CornerField(output.location, vertex, "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n");
             text += "#endif\n";
         }
         text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
@@ -816,8 +955,22 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
                 scalars += 4u;
                 break;
             case StageOutputKind::Layer: layer = true; break;
-            default: state.Fail("mesh functions output the position, parameters and layer only: clip and cull distances, point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
+            case StageOutputKind::ClipDistance: break;
+            case StageOutputKind::CullDistance:
+                // Upstream f7a2903ed writes gl_CullDistance per mesh vertex; Metal has no cull
+                // distance output: the mesh epilogue culls a primitive whose vertices all have a
+                // negative distance in one slot (as D30 does for vertex functions; MeshCullTest).
+                if (MslCullDistanceCount(state) > MaxClipDistances) state.Fail("more than 8 guest cull distances");
+                break;
+            default: state.Fail("mesh functions output the position, parameters, layer and clip distances only: point size and viewport index of NGG programs are not implemented (TechnicalDebt metal-mesh-functions)");
             }
+        }
+        // Upstream f7a2903ed: guest clip distances per mesh vertex (no all-zero-position distance on
+        // mesh outputs, as the SPIR-V path).
+        if (const auto clips = MslGuestClipDistanceCount(state); clips != 0u) {
+            if (clips > MaxClipDistances) state.Fail("more than 8 guest clip distances");
+            text += "    float aps5_clip [[clip_distance]] [" + std::to_string(clips) + "];\n";
+            scalars += clips;
         }
         if (scalars > 124u) state.Fail("the mesh function exceeds 124 scalar varyings");
         // Point lists (MslAbi Version 16, DECISIONS D75): NGG programs export no point size here.
@@ -831,14 +984,21 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         text += "#if " + TriangleVerticesCondition() + "\n";
         text += "#if (APS5_BARYCENTRICS & 1)\n    float3 aps5_bw [[user(aps5_bw)]];\n#endif\n";
         text += "#if (APS5_BARYCENTRICS & 2)\n    float3 aps5_bwl [[user(aps5_bwl)]];\n#endif\n";
+        // Point draws (MslAbi Version 20, DECISIONS D78): each vertex carries its own per-vertex values.
+        text += "#if APS5_PRIMITIVE_VERTICES == 1u\n";
+        for (const auto& output : state.program.Info().outputs) {
+            if (output.kind != StageOutputKind::Parameter) continue;
+            text += "#if " + PerVertexLocationCondition(output.location) + "\n    float4 " + PerVertexField(output.location, 0u) + " [[user(aps5_" + PerVertexField(output.location, 0u) + ")]];\n#endif\n";
+        }
+        text += "#endif\n";
         text += "#endif\n";
         text += "};\n\nstruct Aps5MeshPrimitive {\n    bool aps5_culled [[primitive_culled]];\n";
         if (layer) text += "    uint aps5_layer [[render_target_array_index]];\n";
-        text += "#if " + TriangleVerticesCondition() + "\n";
+        text += "#if (" + TriangleVerticesCondition() + ") && APS5_PRIMITIVE_VERTICES > 1u\n";
         for (const auto& output : state.program.Info().outputs) {
             if (output.kind != StageOutputKind::Parameter) continue;
             text += "#if " + PerVertexLocationCondition(output.location) + "\n";
-            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n";
+            for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += CornerField(output.location, vertex, "    float4 " + PerVertexField(output.location, vertex) + " [[user(aps5_" + PerVertexField(output.location, vertex) + ")]];\n");
             text += "#endif\n";
         }
         text += "#endif\n";
@@ -850,10 +1010,17 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             // MslAbi Version 16 (DECISIONS D75): point and line draws output points and lines, one or
             // two of the primitive export's indices per primitive (PrimitiveVerticesMacro).
             const std::string primitiveVertices = MslAbi::PrimitiveVerticesMacro;
+            // Upstream a0347cfed: an NGG geometry program with line-strip output
+            // (ShaderMeshInputInfo::outputPrimitiveSize 2) exports lines whatever the draw's topology.
+            const auto outputVertices = VertexInfo(state).mesh.outputPrimitiveSize;
+            if (outputVertices != 2u && outputVertices != 3u) state.Fail("mesh functions output lines or triangles, the program outputs primitives of " + std::to_string(outputVertices) + " vertices");
+            if (outputVertices == 2u) text += "#undef " + primitiveVertices + "\n#define " + primitiveVertices + " 2u\n";
             text += "#ifndef " + primitiveVertices + "\n#define " + primitiveVertices + " 3u\n#endif\n";
             text += "#if " + primitiveVertices + " == 1u\n#define APS5_MESH_TOPOLOGY metal::topology::point\n#elif " + primitiveVertices + " == 2u\n#define APS5_MESH_TOPOLOGY metal::topology::line\n#else\n#define APS5_MESH_TOPOLOGY metal::topology::triangle\n#endif\n";
             text += "#if " + TriangleVerticesCondition() + "\n";
-            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(3u * split) + ", " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n";
+            text += "#if " + primitiveVertices + " == 1u\n#ifndef " + std::string(MslAbi::PointSplitVerticesMacro) + "\n#define " + std::string(MslAbi::PointSplitVerticesMacro) + " " + std::to_string(meshOutput.vertices) + "u\n#endif\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::string(MslAbi::PointSplitVerticesMacro) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n#else\n";
+            text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, APS5_PRIMITIVE_VERTICES * " + std::to_string(split) + "u, " + std::to_string(split) + ", APS5_MESH_TOPOLOGY>;\n#endif\n";
             text += "#else\n";
             text += "using Aps5Mesh = metal::mesh<Aps5MeshVertex, Aps5MeshPrimitive, " + std::to_string(meshOutput.vertices) + ", " + std::to_string(meshOutput.primitives) + ", APS5_MESH_TOPOLOGY>;\n";
             text += "#endif\n\n";
@@ -864,6 +1031,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     if (stage != IrShaderStage::Pixel) state.Fail("only vertex, mesh and pixel graphics stages are implemented in the MSL backend so far (work package B6)");
     const auto& pixel = PixelInfo(state);
     text += "#ifndef APS5_VERTEX_OUTPUTS\n#define APS5_VERTEX_OUTPUTS 0xffffffff\n#endif\n#ifndef APS5_VERTEX_OUTPUTS_HI\n#define APS5_VERTEX_OUTPUTS_HI 0xffffffff\n#endif\n";
+    text += "#ifndef APS5_PRIMITIVE_VERTICES\n#define APS5_PRIMITIVE_VERTICES 3u\n#endif\n";
     text += "#ifndef APS5_SAMPLE_BASE\n#define APS5_SAMPLE_BASE 0\n#endif\n";
     text += "struct Aps5FragmentIn {\n    float4 aps5_position [[position]];\n";
     std::string accessors;
@@ -902,9 +1070,15 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         const auto macro = location < 32u ? std::string("APS5_VERTEX_OUTPUTS") : std::string("APS5_VERTEX_OUTPUTS_HI");
         const auto guard = "#if ((" + macro + " >> " + std::to_string(location % 32u) + ") & 1)\n";
         text += guard;
-        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += "    float4 " + PerVertexField(location, vertex) + " [[user(aps5_" + PerVertexField(location, vertex) + "), flat]];\n";
+        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) text += CornerField(location, vertex, "    float4 " + PerVertexField(location, vertex) + " [[user(aps5_" + PerVertexField(location, vertex) + "), flat]];\n");
         text += "#endif\n";
-        accessors += guard + "#define aps5_pv_" + std::to_string(location) + "(v, c) aps5_in.pv" + std::to_string(location) + "_##v[c]\n#else\n#define aps5_pv_" + std::to_string(location) + "(v, c) 0.0f\n#endif\n";
+        // Point and line draws (D78) read their missing corners from the last one they have.
+        const auto name = "aps5_pv_" + std::to_string(location);
+        const auto field = "aps5_in.pv" + std::to_string(location) + "_";
+        accessors += guard + "#define " + name + "(v, c) " + name + "_##v(c)\n#define " + name + "_0(c) " + field + "0[c]\n";
+        accessors += "#if APS5_PRIMITIVE_VERTICES > 1u\n#define " + name + "_1(c) " + field + "1[c]\n#else\n#define " + name + "_1(c) " + field + "0[c]\n#endif\n";
+        accessors += "#if APS5_PRIMITIVE_VERTICES > 2u\n#define " + name + "_2(c) " + field + "2[c]\n#else\n#define " + name + "_2(c) " + name + "_1(c)\n#endif\n";
+        accessors += "#else\n#define " + name + "(v, c) 0.0f\n#endif\n";
     }
     // The corner weights at each location read (DECISIONS D38): one location takes its qualifier,
     // several make the weights an interpolant<>.
@@ -962,20 +1136,43 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             break;
         }
     }
-    if (pixel.psAlphaToCoverage && !state.reflection.exportsSampleMask) {
+    // Reversed-order blending (EmitReversedBlend): the second blend source of MRT0. Upstream refuses
+    // it with dual-source blending, for a non-float MRT0 and next to other colour outputs.
+    if ((state.reflection.colorOutputs & 1u) != 0u) {
+        const std::string guard = std::string("#if defined(") + MslAbi::ReversedBlendMacro + ") && " + MslAbi::ReversedBlendMacro + "\n";
+        const bool uintOutput0 = std::ranges::any_of(state.program.Info().outputs, [&](const StageOutput& output) { return output.kind == StageOutputKind::Mrt && output.location == 0u && output.index < std::size(pixel.targetOutputMode) && pixel.targetOutputMode[output.index] == 7u; });
+        members += guard;
+        if (uintOutput0) members += "#error \"reversed-order blending needs a float4 MRT0 output\"\n";
+        if ((state.reflection.colorOutputs & ~1u) != 0u) members += "#error \"reversed-order blending needs MRT0 to be the only color output\"\n";
+        members += "#if defined(APS5_DUAL_SOURCE) && APS5_DUAL_SOURCE\n#error \"reversed-order blending cannot be combined with dual-source blending\"\n#endif\n";
+        members += "    float4 aps5_rb [[color(0), index(1)]];\n#endif\n";
+    }
+    // Upstream 1ffc5f672: a partial per-pixel PA_SC_AA_MASK writes its coverage (EmitMslEntryPoint).
+    if ((pixel.psAlphaToCoverage || pixel.QuadSampleMaskPartial()) && !state.reflection.exportsSampleMask) {
         members += "    uint aps5_sample_mask [[sample_mask]];\n";
         state.reflection.exportsSampleMask = true;
     }
+    // Upstream 1ffc5f672: a PA_SC_AA_MASK that is the same for the four quad pixels but leaves
+    // samples out is the Vulkan pipeline's sample mask; MTLRenderPipelineDescriptor has none, so the
+    // driver compiles the function with APS5_SAMPLE_MASK (the guest samples kept) and the function
+    // ANDs its coverage with it (MTLCompileOptions.preprocessorMacros, as APS5_SAMPLE_BASE). A function without other
+    // outputs returns a struct whose only member is that mask under the macro (empty without it, which Metal takes as
+    // no outputs), so a depth- or stencil-writing draw of an output-less program keeps the mask off those writes.
+    const bool hostMaskMember = !state.reflection.exportsSampleMask;
+    if (hostMaskMember) members += "#if defined(APS5_SAMPLE_MASK)\n    uint aps5_sample_mask [[sample_mask]];\n#endif\n";
     if (!members.empty()) {
         text += "struct Aps5FragmentOut {\n" + members + "};\n\n";
         result.outputType = "Aps5FragmentOut";
     }
     // PS_ITER_SAMPLE: the stage function takes [[sample_id]] (EmitMslEntryPoint).
     if (pixel.psSampleShading) state.reflection.perSample = true;
+    // MslAbi Version 9: the guest mask's bits of this pass's host samples (APS5_SAMPLE_BASE,
+    // DECISIONS D28).
+    const std::string toHost = "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";
     if (state.reflection.exportsSampleMask) {
-        // MslAbi Version 9: the guest mask's bits of this pass's host samples (APS5_SAMPLE_BASE,
-        // DECISIONS D28).
-        result.epilogue += "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";
+        result.epilogue += "#if defined(APS5_SAMPLE_MASK)\n    aps5_out.aps5_sample_mask &= APS5_SAMPLE_MASK;\n#endif\n" + toHost;
+    } else if (hostMaskMember) {
+        result.epilogue += "#if defined(APS5_SAMPLE_MASK)\n    aps5_out.aps5_sample_mask = APS5_SAMPLE_MASK;\n" + toHost + "#endif\n";
     }
     // Primitive-ordered pixel shaders (the SPIR-V path's PixelInterlockOrderedEXT around the whole
     // program): the stage function brackets the guest body with raster-order-group accesses
@@ -987,10 +1184,14 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
     // refuses [[early_fragment_tests]] on a function that returns [[depth]] or [[stencil]] (MSL
     // specification 5.1.2), so depth and stencil exports keep late tests here (Vulkan ignores those
     // writes under EarlyFragmentTests; TechnicalDebt metal-early-depth-export).
-    if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.psDepthExportEnable && !pixel.psStencilRefExportEnable) {
+    // Upstream 72518f64f: quad-masked pixel functions (they discard uncovered pixels) test late.
+    if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.QuadMasked() && !pixel.psDepthExportEnable && !pixel.psStencilRefExportEnable) {
         // Conservative rasterization discards in the stage function (MslConservative), which
         // early fragment tests would not wait for.
-        result.attributes = "#if !(defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE)\n[[early_fragment_tests]]\n#endif\n";
+        // MslAbi Version 15: a uniform PA_SC_AA_MASK (APS5_SAMPLE_MASK) is applied by the function's
+        // [[sample_mask]], which Metal applies after early tests; Vulkan's pipeline mask removes the
+        // samples before them, so those draws test late (MetalDraw refuses the memory-writing case).
+        result.attributes = "#if !(defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE) && !defined(APS5_SAMPLE_MASK)\n[[early_fragment_tests]]\n#endif\n";
         state.reflection.earlyFragmentTests = true;
     }
     if (state.usesValidMask) {
@@ -1002,7 +1203,7 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
 
 MslPreludeEntry MslStagePrelude(MslPreludeChunk chunk) {
     if (chunk != MslPreludeChunk::StageIo) throw std::runtime_error("MSL emission failed: prelude chunk " + std::to_string(static_cast<std::uint32_t>(chunk)) + " is not a stage chunk (work package B6)");
-    static const std::string text = "#define APS5_FORMAT_11_11_10_UNORM " + std::to_string(static_cast<std::uint32_t>(IrBufferFormat::Format11_11_10UNorm)) + "u\n" + std::string(StageIoText);
+    static const std::string text = "#define APS5_FORMAT_11_11_10_UNORM " + std::to_string(static_cast<std::uint32_t>(IrBufferFormat::Format11_11_10UNorm)) + "u\n#define APS5_FORMAT_10_11_11_FLOAT " + std::to_string(static_cast<std::uint32_t>(IrBufferFormat::Format10_11_11Float)) + "u\n" + std::string(StageIoText);
     return {text, OnBufferFormat};
 }
 

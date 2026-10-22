@@ -104,12 +104,105 @@ namespace ShaderRecompiler::MslAbi {
 // Version 16: mesh functions take PrimitiveVerticesMacro too (DECISIONS D75): point and line draws
 //   output metal::topology::point / line with the primitive export's first one or two indices, in
 //   the plain and the triangle-vertices mode (N unshared vertices per primitive).
-inline constexpr std::uint32_t Version = 16u;
+// Version 17: not used (DRV-D's D78 had it before its rebase onto sync4; D78 is Version 20).
+// Version 18 (upstream sync UPSYNC3, DECISIONS D72; was 15 on branch sync3):
+// - fragment: APS5_SAMPLE_MASK (SampleMaskMacro), the uniform PA_SC_AA_MASK in guest sample bits
+//   (upstream 1ffc5f672 HostSampleMask, the Vulkan pipeline's pSampleMask): the function ANDs its
+//   [[sample_mask]] with it before the APS5_SAMPLE_BASE shift, and a function with other outputs
+//   but no mask export gains a [[sample_mask]] member that writes it; unset when the mask is full.
+//   Every fragment function reads [[sample_mask]] (aps5_sample_mask_in) and, under the macro,
+//   discards a pixel whose covered samples the mask removes before the guest body
+//   (SampleMaskDiscardText: Vulkan runs no invocation for it, so its memory writes do not happen),
+//   and drops [[early_fragment_tests]] (Metal applies the function's mask after early tests).
+// - image and sampler tables (upstream d9e47d1e9/34525fdf7/c794273ab/55eefe9c5, ImageTableAbi) replace
+//   the bindless image search. ImageTableMap is an Aps5Buffer entry holding the driver's finalized
+//   table map words. SamplerTable is one Aps5TableArray<sampler> entry (16 bytes: the GPU address of
+//   an array of 8-byte sampler MTLResourceIDs, its size in bytes, flags 0) indexed by the map's
+//   sampler element (+2 depth compare, +1 point twin). ImageTable is ImageTableSlots such entries
+//   (struct Aps5ImageTable, member k<b> typed as heap binding b = FirstImageBinding + slot; the
+//   multisampled slots are Aps5Buffer placeholders): the driver writes the same array of texture
+//   MTLResourceIDs (one per table element of the stage) to every slot, and an access reads element
+//   HeaderElementBase + element (the Metal driver's per-shader builds keep the base 0). A missed key,
+//   poisoned word, out-of-range element or driver rejection records BdaAbi fault reason ImageTable
+//   (bytes = poison index) as the SPIR-V path does, and the access yields zero.
+// - fragment: APS5_REVERSED_BLEND (ReversedBlendMacro, upstream 16ea32c97/c434467f6): a function with
+//   an MRT0 output gains a float4 aps5_rb [[color(0), index(1)]] member under the macro, and each MRT0
+//   store routes copies of the export through the ReversedBlendCode in function constant
+//   PipelineSpecialization::ReversedBlend: SecondShift routes into aps5_rb, ColorShift routes (when
+//   not all Own) into c0. The library does not compile (#error) for a uint MRT0, other colour
+//   outputs or APS5_DUAL_SOURCE alongside it.
+// - images: a cube T# read through DIM 2D image_sample / image_load (upstream 3b96840e6, the
+//   front end's cubeFaceCompatible runtime mode Dim2DArray + cube) reads face 0: the missing face
+//   coordinate is 0 instead of a "too few coordinate components" failure. Direct 2D images whose
+//   accesses allow it gain that mode in their ImageBase selector switch.
+// - image tables carry stores (upstream 603dc01db, RuntimeAbi 14 ImageStorageTable): a written,
+//   non-atomic table image reads and writes through the ImageStorageTable range, ImageStorageTableSlots
+//   Aps5TableArray entries (struct Aps5ImageStorageTable, member k<b> typed as storage heap binding
+//   b = FirstStorageImageBinding + slot, texture<T, access::read_write>; the multisampled and atomic
+//   slots are Aps5Buffer placeholders). The driver writes the array of storage-view MTLResourceIDs
+//   of the table's elements (same element indices as the ImageTable array) to every slot and marks
+//   every bound element written. Atomic, packed, BY2/BY4, multisampled and dynamic-mip table stores
+//   are not emitted (the front end poisons them, or emission fails).
+// - fragment: ColorExportPacking::Float11_11_10 (upstream 49b0e805f): an 11_11_10 float target is
+//   a 32-bit uint attachment, the export packed into its red channel as the 10_11_11 UNORM one.
+// - mesh: a program whose ShaderMeshInputInfo::outputPrimitiveSize is 2 (upstream a0347cfed, NGG
+//   line-strip output) sets PrimitiveVerticesMacro to 2 in its own source, whatever the driver passes.
+// - images: D16 stores to SINT storage images (upstream a18d6e9a6) convert each half as the D16 format
+//   buffer stores do (sign-extended, then saturated); an unnormalized base-level sample folds its texel
+//   offset into the coordinate (upstream 7c19c66de).
+// - wave: a v_readlane_b32 at a row's last lane (15, 31) of a DPP row scan in a wave32 graphics
+//   program becomes a SIMD reduction over the active invocations of that row (upstream 859dcae2a).
+// - images: a sampled (not storage, not packed) format-43 T# (10_11_11 float, upstream 571fecadd)
+//   has no conversionFormat and the Float numeric class: the function samples the driver's repacked
+//   RG11B10Float view (channel order fixed by the view's BGRA swizzle) as a plain float texture,
+//   then applies the T# dst_sel as for any texture. Storage and packed accesses keep the conversion.
+// Version 19 (upstream sync UPSYNC4, 0d078f75d..661f8b717; the SpirvBackend changes mirrored):
+// - compute: WorkgroupId (and through it GlobalInvocationId) adds function constants
+//   PipelineSpecialization::WorkgroupOffsetBase + axis (8241-8243, default 0; upstream 11a7b61d7),
+//   which RecompileResult::specialization lists for every compute program.
+// - vertex: the all-zero position clip distance is present only while the guest clip distances and
+//   the emulated cull distance leave one of the eight free (upstream 5c29d125e); the cull verdict's
+//   clip slot (MslCullClipSlot) follows.
+// - fragment: SAMPLE_COVERAGE reads [[sample_mask]] (aps5_sample_mask_in << APS5_SAMPLE_BASE,
+//   upstream 03b0db052); with DB_SHADER_CONTROL.STENCIL_OP_VAL_EXPORT_ENABLE the [[stencil]] output
+//   is bits 8-15 of the second MRTZ channel (upstream 7563b4a48). The stage function's sample-mask
+//   discard sets aps5_demoted (branch commit 55d7d4298).
+// - BdaAbi::Fault word 7 (otherFaults) is or-ed with 1 for every recorded fault that is not
+//   Unaligned (upstream fcb48b774).
+// - address reads through a user-data base with two or more read sites search the page-table range
+//   once in the prologue (aps5_bda_anchor, upstream d422c760c/3265cb6d7) and load directly inside it.
+// - 32-bit buffer atomics off a dword boundary act on the containing dword (upstream 7e4ce1ab3); the
+//   LDS lock is set free by one invocation and released with an exchange (upstream 4864a7480,
+//   317a323ee); ds_ordered_count swap (upstream b0558ce95) and the ordered count's operand from the
+//   first active lane's half (upstream fcc426b6a).
+// Version 20 (DECISIONS D78; Version 17 on branch drvd-land2 before the rebase onto sync4): point
+//   and line draws in the triangle-vertices mode output and read only their own corners' per-vertex
+//   fields (PrimitiveVerticesMacro in the fragment function too); mesh point draws need no staging
+//   (MeshPointSplitVertices, PointSplitVerticesMacro).
+inline constexpr std::uint32_t Version = 20u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
 // a subgroup's primitives are split over the grid's z dimension in equal parts.
 inline constexpr std::uint32_t MeshMaxVertices = 256u;
+// Version 20 (DECISIONS D78): point draws in the mesh function's triangle-vertices mode need no
+// staging: every vertex record carries its own per-vertex values (user(aps5_pv<L>_0)) and corner
+// weight, and each point takes its vertex's. Metal's mesh output holds at most MeshMaxOutputBytes,
+// so the subgroup's vertices are split over the grid's z in runs of MeshPointSplitVertices
+// (PointSplitVerticesMacro); a point belongs to the run holding its vertex. The record estimate:
+// position, parameters, per-vertex values, weights and point size at 16 bytes each, 16 bytes a
+// primitive.
+inline constexpr std::uint32_t MeshMaxOutputBytes = 32768u;
+inline constexpr std::uint32_t MeshPointSplitVertices(std::uint32_t maxVertices, std::uint32_t maxPrimitives, std::uint32_t parameters, std::uint32_t perVertexLocations) {
+    const std::uint32_t record = 16u * (1u + parameters + perVertexLocations) + 32u;
+    const std::uint32_t primitives = maxPrimitives * 16u;
+    const std::uint32_t available = primitives < MeshMaxOutputBytes ? MeshMaxOutputBytes - primitives : 0u;
+    const std::uint32_t vertices = available / record;
+    return vertices == 0u ? 1u : vertices < maxVertices ? vertices : (maxVertices == 0u ? 1u : maxVertices);
+}
+inline constexpr std::uint32_t MeshPointSplits(std::uint32_t maxVertices, std::uint32_t splitVertices) {
+    return maxVertices == 0u ? 1u : (maxVertices + splitVertices - 1u) / splitVertices;
+}
 inline constexpr std::uint32_t MeshTriangleVerticesSplits(std::uint32_t maxPrimitives) {
     constexpr std::uint32_t limit = MeshMaxVertices / 3u;
     return maxPrimitives == 0u ? 1u : (maxPrimitives + limit - 1u) / limit;
@@ -180,10 +273,22 @@ enum class EntryKind : std::uint32_t {
     Sampler
 };
 
+// Version 18: the ImageTable range holds one Aps5TableArray entry per sampled heap binding
+// (FirstImageBinding .. FirstStorageImageBinding - 1), all pointing at the same texture array.
+inline constexpr std::uint32_t ImageTableSlots = RuntimeAbi::FirstStorageImageBinding - RuntimeAbi::FirstImageBinding;
+// Version 18: the ImageStorageTable range holds one Aps5TableArray entry per storage heap binding
+// (FirstStorageImageBinding .. Samplers - 1), all pointing at the same storage texture array.
+inline constexpr std::uint32_t ImageStorageTableSlots = static_cast<std::uint32_t>(RuntimeAbi::Binding::Samplers) - RuntimeAbi::FirstStorageImageBinding;
+
 // The entry kind of a RuntimeAbi binding (its number within a stage group).
+// RuntimeAbi 12 (upstream d9e47d1e9) adds the runtime-indexed tables: SamplerTable, ImageTableMap and
+// ImageTable (the one binding numbered past Count, shared by every stage on the SPIR-V path). On Metal
+// all three are buffer entries (Version 15): the map's words, and arrays of MTLResourceIDs.
 inline EntryKind KindOf(RuntimeAbi::Binding binding) {
     const auto value = static_cast<std::uint32_t>(binding);
+    if (binding == RuntimeAbi::Binding::ImageTable || binding == RuntimeAbi::Binding::ImageStorageTable) return EntryKind::Buffer;
     if (value >= static_cast<std::uint32_t>(RuntimeAbi::Binding::Count)) throw std::runtime_error("MslAbi: invalid RuntimeAbi binding " + std::to_string(value));
+    if (binding == RuntimeAbi::Binding::SamplerTable || binding == RuntimeAbi::Binding::ImageTableMap) return EntryKind::Buffer;
     if (binding == RuntimeAbi::Binding::Samplers) return EntryKind::Sampler;
     if (value >= RuntimeAbi::FirstImageBinding && value < static_cast<std::uint32_t>(RuntimeAbi::Binding::Samplers)) return EntryKind::Texture;
     return EntryKind::Buffer;
@@ -289,6 +394,9 @@ inline constexpr const char* WindowSpaceHeightMacro = "APS5_WINDOW_SPACE_HEIGHT"
 // - fragment: 1 when the pipeline blends with two sources (PipelineSpecialization::DualSourceBlend):
 //   colour location 1 becomes color(0) index(1) (Reflection::dualSource: the function writes it);
 inline constexpr const char* DualSourceMacro = "APS5_DUAL_SOURCE";
+// - fragment: 1 when PipelineSpecialization::ReversedBlend is not 0 (Version 15, upstream 16ea32c97):
+//   the function writes MRT0's second blend source aps5_rb at color(0) index(1);
+inline constexpr const char* ReversedBlendMacro = "APS5_REVERSED_BLEND";
 // - fragment: the MSL type of colour output n (float4, uint4 or int4; default from pixelInfo),
 //   APS5_COLOR<n>_TYPE.
 inline constexpr const char* ColorTypeMacroPrefix = "APS5_COLOR";
@@ -300,6 +408,19 @@ inline constexpr const char* SampleBaseMacro = "APS5_SAMPLE_BASE";
 // (an emulated count, DECISIONS D28; default: the pass's get_num_samples()), for the alpha-to-
 // coverage mask.
 inline constexpr const char* SampleCountMacro = "APS5_SAMPLE_COUNT";
+// Version 18: fragment: the guest samples a uniform PA_SC_AA_MASK keeps (decimal with a u suffix,
+// guest sample bits; unset when every sample is kept): the function ANDs its [[sample_mask]] with
+// it (MTLRenderPipelineDescriptor has no sample mask). The driver refuses it for a function without
+// outputs when the draw writes depth or stencil.
+inline constexpr const char* SampleMaskMacro = "APS5_SAMPLE_MASK";
+// Version 18: the stage function's discard of pixels without samples left by APS5_SAMPLE_MASK
+// (before the guest body; the host coverage bits are guest samples APS5_SAMPLE_BASE and up).
+// aps5_sample_coverage is the stage function's [[sample_mask]] input, or for a function that runs
+// per sample its own sample's bit of it (Metal's input holds the pixel's whole coverage there).
+// Metal's discard_fragment demotes the thread, but the thread keeps writing device memory and
+// simd_is_helper_thread() stays false, so the function records the demotion in aps5_demoted, which
+// the guest body's helper-invocation test reads (MslStageIo.cpp HelperInvocation).
+inline constexpr const char* SampleMaskDiscardText = "#if defined(APS5_SAMPLE_MASK)\n    if (((aps5_sample_coverage << APS5_SAMPLE_BASE) & (APS5_SAMPLE_MASK)) == 0u) { discard_fragment(); aps5_demoted = true; }\n#endif\n";
 // Version 5: the triangle-vertices expansion, shared by conservative rasterization and the per-vertex
 // fragment value emulation (no Metal geometry stage; per-vertex fragment inputs are Apple10-only):
 // - vertex: 1 when the draw is non-indexed with 3 host vertices per guest triangle and binds
@@ -314,11 +435,17 @@ inline constexpr const char* TriangleVerticesMacro = "APS5_TRIANGLE_VERTICES";
 // 0..N-1] and emits corner v % N; corners N..2 repeat the primitive's last vertex. Unset: 3.
 // Version 16: mesh (any mode): the draw's topology class, 1 for points, 2 for lines (the output
 // topology and the indices read from each primitive export).
+// Version 20 (DECISIONS D78): vertex, mesh and fragment in the triangle-vertices mode: the per-vertex
+// corner fields user(aps5_pv<L>_<j>) exist for j < N only; the fragment function reads corners past
+// N from corner N - 1. The triangle-vertices mesh<> holds N x MeshTriangleVerticesPrimitives vertices.
 inline constexpr const char* PrimitiveVerticesMacro = "APS5_PRIMITIVE_VERTICES";
 // Version 16: vertex and mesh: 1 when the draw is a point list (DECISIONS D75). A function whose guest
 // program exports no point size then writes [[point_size]] 1.0 (Metal leaves an unwritten size
 // undefined; Vulkan's maintenance5 default is 1.0; PA_SU_POINT_SIZE is not applied).
 inline constexpr const char* PointsMacro = "APS5_POINTS";
+// Version 20 (DECISIONS D78): mesh, triangle-vertices mode of a point draw: MeshPointSplitVertices,
+// the vertices each threadgroup outputs (threadgroup z outputs [z x it, (z + 1) x it)).
+inline constexpr const char* PointSplitVerticesMacro = "APS5_POINT_SPLIT_VERTICES";
 // - vertex and fragment: 1 for overestimating conservative rasterization (needs triangle vertices);
 inline constexpr const char* ConservativeMacro = "APS5_CONSERVATIVE";
 // - vertex and mesh (with TriangleVerticesMacro): the fragment function's

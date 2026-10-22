@@ -50,11 +50,21 @@ bool exactSizes() {
     return exact;
 }
 
+bool systemMemoryHeap(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t heap) {
+    bool typed = false;
+    for (std::uint32_t type = 0; type < std::min<std::uint32_t>(memory.memoryTypeCount, VK_MAX_MEMORY_TYPES); ++type) {
+        if (memory.memoryTypes[type].heapIndex != heap) continue;
+        if ((memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) return false;
+        typed = true;
+    }
+    return typed;
+}
+
 constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
 }
 
-BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, MaxSlots())), metal(new Metal::PoolObjects) {
+BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, MaxSlots())), cacheReclaim(context.cacheReclaim), metal(new Metal::PoolObjects) {
     metal->device = Metal::DeviceOf(context);
     if (metal->device == nil) Metal::Fail("the buffer pool needs a Context carrying a Metal device (a Vulkan context reached the Metal buffer pool)");
     metal->queue = Metal::QueueOf(context);
@@ -68,10 +78,13 @@ BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(
     if (metal->queue != nil) ::AgcDriver::Metal::Residency::Attach(metal->queue, metal->residency);
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
-    // The device-local heap of a unified-memory Mac is its recommended working set.
+    // The device-local heap of a unified-memory Mac is its recommended working set, and its memory
+    // is host-visible system memory (upstream 878c30378: a smaller device tier on such heaps).
     VkPhysicalDeviceMemoryProperties memory{};
     memory.memoryHeapCount = 1;
     memory.memoryHeaps[0] = {static_cast<VkDeviceSize>(metal->device.recommendedMaxWorkingSetSize), VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryTypeCount = 1;
+    memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0};
     deviceTier.budget = DeviceTierEnabled() ? DeviceBudget(memory) : 0;
 }
 
@@ -87,14 +100,38 @@ BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags u
     const bool host = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     const MTLResourceOptions options = MTLResourceHazardTrackingModeUntracked | (host ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate);
     const auto length = std::max<std::size_t>(capacity, 1);
-    id<MTLBuffer> buffer = [metal->device newBufferWithLength:length options:options];
+    // A length beyond maxBufferLength cannot be allocated: the release runtime returns nil, the API validation
+    // layer asserts (MTL_DEBUG_LAYER), so it is refused here as nil, and the retries and the failure report below
+    // run as they would for any refused allocation.
+    const bool fits = length <= static_cast<std::size_t>(metal->device.maxBufferLength);
+    const auto make = [&]() -> id<MTLBuffer> { return fits ? [metal->device newBufferWithLength:length options:options] : nil; };
+    id<MTLBuffer> buffer = make();
     VkDeviceSize reclaimed = 0;
+    VkDeviceSize released = 0;
+    unsigned attempts = 1;
     if (buffer == nil) {
         reclaimed = trim();
-        if (reclaimed != 0) buffer = [metal->device newBufferWithLength:length options:options];
-        if (buffer != nil) std::fprintf(stderr, "[bufferpool] buffer allocation recovered: allocation=%zu reclaimed=%llu\n", length, static_cast<unsigned long long>(reclaimed));
+        if (reclaimed != 0) {
+            buffer = make();
+            ++attempts;
+        }
     }
-    if (buffer == nil) Metal::Fail("cannot allocate a " + std::to_string(length) + "-byte " + (host ? "shared" : "private") + " buffer (reclaimed " + std::to_string(reclaimed) + " bytes first)");
+    // Upstream 8cda58273: release the texture caches when trimming the pool was not enough.
+    if (buffer == nil) {
+        if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(length));
+        if (released != 0) {
+            buffer = make();
+            ++attempts;
+        }
+    }
+    if (buffer != nil && attempts > 1) std::fprintf(stderr, "[bufferpool] buffer allocation recovered: allocation=%zu reclaimed=%llu released=%llu attempts=%u\n", length, static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), attempts);
+    if (buffer == nil) {
+        // Upstream e6a78f41bf: the failure reports the heap budgets. Metal has one heap (unified memory):
+        // the device's allocated bytes against its recommended working set, the budget DeviceBudget uses.
+        const auto used = static_cast<unsigned long long>(metal->device.currentAllocatedSize) >> 20u;
+        const auto heapBudget = static_cast<unsigned long long>(metal->device.recommendedMaxWorkingSetSize) >> 20u;
+        Metal::Fail("cannot allocate a " + std::to_string(length) + "-byte " + (host ? "shared" : "private") + " buffer (reclaimed " + std::to_string(reclaimed) + " bytes and released " + std::to_string(released) + " cache bytes first, attempts " + std::to_string(attempts) + "); heap 0 " + std::to_string(used) + "/" + std::to_string(heapBudget) + " MiB");
+    }
     {
         std::lock_guard lock(metal->residencyMutex);
         ::AgcDriver::Metal::Residency::Add(metal->residency, buffer);
@@ -112,14 +149,21 @@ BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags u
     return allocation;
 }
 
-VkDeviceSize BufferPool::DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory) {
+VkDeviceSize BufferPool::DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported) {
     static const char* value = std::getenv("APS5_STAGING_POOL_MIB");
     if (value != nullptr) return static_cast<VkDeviceSize>(std::strtoull(value, nullptr, 10)) << 20u;
-    VkDeviceSize largest = 0;
+    std::optional<std::uint32_t> largest;
     for (std::uint32_t heap = 0; heap < memory.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS; ++heap) {
-        if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) largest = std::max(largest, memory.memoryHeaps[heap].size);
+        if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && (!largest || memory.memoryHeaps[heap].size > memory.memoryHeaps[*largest].size)) largest = heap;
     }
-    return std::max<VkDeviceSize>(VkDeviceSize{512} << 20u, largest / 8u);
+    VkDeviceSize size = largest ? memory.memoryHeaps[*largest].size : 0;
+    if (largest && reported != nullptr && reported->heapBudget[*largest] != 0) size = std::min(size, reported->heapBudget[*largest]);
+    if (largest && systemMemoryHeap(memory, *largest)) return std::max<VkDeviceSize>(VkDeviceSize{128} << 20u, size / 64u);
+    return std::max<VkDeviceSize>(VkDeviceSize{512} << 20u, size / 8u);
+}
+
+VkDeviceSize BufferPool::ReclaimTarget(VkDeviceSize bytes) {
+    return bytes + std::max<VkDeviceSize>(bytes, VkDeviceSize{256} << 20u);
 }
 
 bool BufferPool::DeviceTierEnabled() {
@@ -146,6 +190,10 @@ bool BufferPool::DeviceTiered(VkMemoryPropertyFlags properties) {
     return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && DeviceTierEnabled();
 }
 
+VkDeviceSize BufferPool::SlabBlockBytes(std::size_t capacity) {
+    return std::max<VkDeviceSize>(VkDeviceSize{2} << 20u, static_cast<VkDeviceSize>(capacity) * 8u);
+}
+
 std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags properties) {
     constexpr std::size_t smallest = 256;
     if (exactSizes()) return bytes;
@@ -164,7 +212,8 @@ VkBufferUsageFlags BufferPool::Usage(VkBufferUsageFlags usage, VkMemoryPropertyF
 }
 
 BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlags properties) {
-    if (DeviceTiered(properties)) return deviceTier;
+    // Upstream 27ded2c4d: small device buffers stay in the small tier (unless the tiers are shared).
+    if (DeviceTiered(properties) && (sharedTiers() || capacity >= classLimit)) return deviceTier;
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 

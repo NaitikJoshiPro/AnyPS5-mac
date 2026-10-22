@@ -1,8 +1,10 @@
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/MallocManagedSize.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +40,28 @@ std::size_t alignUp(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+struct Usage {
+    std::atomic<std::size_t> system{0};
+    std::atomic<std::size_t> maxSystem{0};
+    std::atomic<std::size_t> inUse{0};
+    std::atomic<std::size_t> maxInUse{0};
+};
+
+Usage& usage() {
+    static Usage value;
+    return value;
+}
+
+void grow(std::atomic<std::size_t>& current, std::atomic<std::size_t>& peak, std::size_t bytes) {
+    const auto now = current.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    auto seen = peak.load(std::memory_order_relaxed);
+    while (now > seen && !peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {}
+}
+
+void shrink(std::atomic<std::size_t>& current, std::size_t bytes) {
+    current.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
 class ArenaHeap {
 public:
     static ArenaHeap& Get() {
@@ -52,8 +76,9 @@ public:
         if (total > MaximumSmallBytes) {
             blockBytes = alignUp(total, LargeGranuleBytes);
             if (void* cached = _large.Take(blockBytes)) return cached;
-            void* raw = GuestArena::GuestArenaAllocate_nid_postfix(blockBytes, PageBytes);
+            void* raw = arenaAllocate(blockBytes, PageBytes);
             commit(raw, blockBytes);
+            grow(usage().system, usage().maxSystem, blockBytes);
             return raw;
         }
         auto& sizeClass = _classes[classIndex(total)];
@@ -65,8 +90,9 @@ public:
             return block;
         }
         if (sizeClass.bump == nullptr || sizeClass.bytes > static_cast<std::size_t>(sizeClass.bumpEnd - sizeClass.bump)) {
-            auto* span = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(SpanBytes, PageBytes));
+            auto* span = static_cast<std::uint8_t*>(arenaAllocate(SpanBytes, PageBytes));
             commit(span, SpanBytes);
+            grow(usage().system, usage().maxSystem, SpanBytes);
             sizeClass.bump = span;
             sizeClass.bumpEnd = span + SpanBytes;
         }
@@ -111,8 +137,42 @@ private:
         return static_cast<std::size_t>(found - _classes.begin());
     }
 
+    static void* arenaAllocate(std::size_t bytes, std::size_t alignment) {
+        try {
+            return GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment);
+        } catch (const std::runtime_error&) {
+            throw std::bad_alloc();
+        }
+    }
+
     static void commit(void* pointer, std::size_t bytes) {
-        GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ReadWriteProtection, bytes);
+        try {
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ReadWriteProtection, bytes);
+        } catch (const std::system_error& error) {
+            abandon(pointer, bytes);
+            if (outOfMemory(error)) throw std::bad_alloc();
+            throw;
+        } catch (...) {
+            abandon(pointer, bytes);
+            throw;
+        }
+    }
+
+    static void abandon(void* pointer, std::size_t bytes) {
+        GuestArena::GuestArenaReset_nid_postfix(pointer, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(pointer, bytes);
+    }
+
+    static bool outOfMemory(const std::system_error& error) {
+#ifdef _WIN32
+        constexpr int NotEnoughMemory = 8;
+        constexpr int OutOfMemory = 14;
+        constexpr int CommitmentLimit = 1455;
+        return error.code().category() == std::system_category() &&
+            (error.code().value() == NotEnoughMemory || error.code().value() == OutOfMemory || error.code().value() == CommitmentLimit);
+#else
+        return error.code() == std::errc::not_enough_memory;
+#endif
     }
 
     // Freed large blocks stay committed and are handed out again for the same block size: the game
@@ -168,6 +228,7 @@ private:
             GuestArena::GuestArenaReset_nid_postfix(raw, bytes);
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(raw), bytes);
             GuestArena::GuestArenaRelease_nid_postfix(raw, bytes);
+            shrink(usage().system, bytes);
         }
 
         std::mutex _lock;
@@ -185,12 +246,17 @@ void* rawAllocate(std::size_t total, std::size_t& blockBytes) {
     blockBytes = total;
     void* raw = std::malloc(total);
     if (raw == nullptr) throw std::bad_alloc();
+    grow(usage().system, usage().maxSystem, total);
     return raw;
 }
 
 void rawFree(void* raw, std::size_t blockBytes) {
-    if (GuestArena::GuestArenaAvailable_nid_postfix()) ArenaHeap::Get().Free(raw, blockBytes);
-    else std::free(raw);
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+        ArenaHeap::Get().Free(raw, blockBytes);
+    } else {
+        std::free(raw);
+        shrink(usage().system, blockBytes);
+    }
 }
 
 void* allocate(GuestAllocations::Mutation& mutation, std::size_t alignment, std::size_t bytes, bool gpu) {
@@ -210,12 +276,15 @@ void* allocate(GuestAllocations::Mutation& mutation, std::size_t alignment, std:
         rawFree(raw, blockBytes);
         throw;
     }
+    grow(usage().inUse, usage().maxInUse, blockBytes);
     return pointer;
 }
 
 void free(GuestAllocations::Mutation& mutation, void* pointer) {
     mutation.Remove(pointer);
-    rawFree(reinterpret_cast<void**>(pointer)[-2], reinterpret_cast<std::size_t*>(pointer)[-1]);
+    const auto blockBytes = reinterpret_cast<std::size_t*>(pointer)[-1];
+    shrink(usage().inUse, blockBytes);
+    rawFree(reinterpret_cast<void**>(pointer)[-2], blockBytes);
 }
 
 }
@@ -277,6 +346,17 @@ void* GuestHeapAlign_nid_postfix(std::size_t alignment, std::size_t bytes) {
 void* GuestHeapAlignForGpu_nid_postfix(std::size_t alignment, std::size_t bytes) {
     GuestAllocations::Mutation mutation;
     return allocate(mutation, alignment, bytes, true);
+}
+
+int GuestHeapStatsFast_nid_postfix(void* stats) {
+    auto* managed = static_cast<MallocManagedSize*>(stats);
+    if (managed == nullptr || managed->size < sizeof(MallocManagedSize)) return 22;
+    auto& value = usage();
+    managed->maxSystemSize = value.maxSystem.load(std::memory_order_relaxed);
+    managed->currentSystemSize = value.system.load(std::memory_order_relaxed);
+    managed->maxInuseSize = value.maxInUse.load(std::memory_order_relaxed);
+    managed->currentInuseSize = value.inUse.load(std::memory_order_relaxed);
+    return 0;
 }
 
 }

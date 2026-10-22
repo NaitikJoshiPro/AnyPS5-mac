@@ -226,8 +226,8 @@ void SetActiveRecorderCalls(const ActiveRecorderCalls& calls);
 ActiveRecorderCalls ActiveRecorder();
 
 // The driver's helper kernels (MSL in RecorderKernels.h), compiled once per device and kept for
-// the process: FillPattern, MeshArguments, SampleCounter, SampleDumps.
-enum class HelperKernel { FillPattern, MeshArguments, SampleCounter, SampleDumps, Count };
+// the process: FillPattern, MeshArguments, SampleCounter, SampleDumps, DispatchArguments, IndexGather.
+enum class HelperKernel { FillPattern, MeshArguments, SampleCounter, SampleDumps, DispatchArguments, IndexGather, Count };
 id<MTLComputePipelineState> HelperPipeline(id<MTLDevice> device, HelperKernel kernel);
 
 // A VkCommandBuffer handle carries the address of a CommandStream.
@@ -239,6 +239,11 @@ inline CommandStream& Stream(VkCommandBuffer handle) {
 inline VkCommandBuffer Handle(CommandStream& stream) {
     return reinterpret_cast<VkCommandBuffer>(&stream);
 }
+
+// Test hook (RecorderKeptBytesMetal.mm, the twin of upstream's mocked vkEndCommandBuffer and
+// vkQueueSubmit failures): the next Recorder::Submit on this thread throws `what` after ending its
+// command buffer (`beforeCommit`) or instead of committing it, before the batch counts as submitted.
+void FailNextRecorderSubmit(const char* what, bool beforeCommit);
 
 }
 

@@ -6,16 +6,33 @@
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Queue.hpp"
 #include <array>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <future>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#define APS5_DUP _dup
+#define APS5_DUP2 _dup2
+#define APS5_CLOSE _close
+#define APS5_FILENO _fileno
+#else
+#include <unistd.h>
+#define APS5_DUP dup
+#define APS5_DUP2 dup2
+#define APS5_CLOSE close
+#define APS5_FILENO fileno
+#endif
 
 namespace {
 
@@ -121,7 +138,6 @@ void testFlipAndBoundary() {
     expectFailure([&] { AgcDriverRegisterVideoOutput_nid_postfix(7, output); });
     std::array<std::uint32_t, 6> words{0xc004105c, 7, 0xfffffffeu, 1, 0, 0};
     Packet packet{words.data(), 6, 0, {}};
-    expectFailure([&] { sceAgcDriverSubmitAcb(0x20, &packet); });
     words[0] = 0xc004105d;
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
     words[0] = 0xc004105c;
@@ -307,6 +323,18 @@ void testComputeRenderingWait() {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+void testComputeFlip() {
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    std::array<std::uint32_t, 6> words{0xc004105c, 7, 0xfffffffeu, 1, 0x76543211u, 0xfedcba98u};
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitAcb(0x20, &packet) == 0, "compute flip submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(output->state->ready == 1 && output->state->failed == 0, "a flip submitted on a compute queue was not handed to its output");
+    check(output->state->last.argument == -0x123456789abcdefLL && output->state->last.index == -2 && output->state->last.mode == 1, "decoded compute flip arguments changed");
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
 void testFailure() {
     auto output = std::make_shared<Output>();
     output->state->fail = true;
@@ -322,6 +350,40 @@ void testFailure() {
     check(expectFailure([] { submitFlip(); }) == messages[0], "submit lost flip failure");
     check(output->state->ready == 0 && output->state->failed == 1, "failed flip was completed successfully");
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
+void testFailureLog() {
+    const auto path = std::filesystem::temp_directory_path() / ("aps5_worker_failure_log_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+    std::fflush(stderr);
+    const int saved = APS5_DUP(APS5_FILENO(stderr));
+    check(saved >= 0, "stderr could not be saved");
+    check(std::freopen(path.string().c_str(), "wb", stderr) != nullptr, "stderr could not be redirected");
+    std::string message;
+    std::string error;
+    try {
+        auto output = std::make_shared<Output>();
+        output->state->fail = true;
+        AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+        submitFlip();
+        message = expectFailure([] { AgcDriverWaitIdle_nid_postfix(); });
+        check(expectFailure([] { submitFlip(); }) == message, "the stored failure was not rethrown on the next driver call");
+        AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    } catch (const std::exception& caught) {
+        error = caught.what();
+    }
+    std::fflush(stderr);
+    APS5_DUP2(saved, APS5_FILENO(stderr));
+    APS5_CLOSE(saved);
+    std::string captured;
+    {
+        std::ifstream file(path, std::ios::binary);
+        captured.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    std::filesystem::remove(path);
+    if (!error.empty()) throw std::runtime_error(error);
+    check(message == "intentional flip failure", "the worker failure was not rethrown");
+    check(captured.find("[gpu] driver failure: intentional flip failure\n") != std::string::npos, "the worker failure was not printed");
+    check(captured.find("driver failure") == captured.rfind("driver failure"), "the worker failure was printed more than once");
 }
 
 void testReset(bool compute) {
@@ -381,9 +443,10 @@ void testQueues() {
         std::lock_guard lock(output->state->mutex);
         check(output->state->last.handle == 9 && output->state->last.argument == 0x2468ace013572468LL, "command buffer flip did not reach the video output");
     }
-    int bogus = 0;
-    check(expectFailure([&] { sceAgcDriverSubmitCommandBuffer(&bogus, &packet); }).find("not created by sceAgcDriverCreateQueue") != std::string::npos, "unknown queue handle accepted");
-    expectFailure([&] { sceAgcDriverSubmitCommandBuffer(nullptr, &packet); });
+    // Anything else is upstream's guest queue context (queue id at offset 4); a null context is EINVAL.
+    std::array<std::uint32_t, 2> bogus{0, 7};
+    check(expectFailure([&] { sceAgcDriverSubmitCommandBuffer(bogus.data(), &packet); }).find("unsupported queue") != std::string::npos, "unknown queue context accepted");
+    check(sceAgcDriverSubmitCommandBuffer(nullptr, &packet) == EINVAL, "null queue context was not EINVAL");
     check(sceAgcDriverDestroyQueue(direct) == 0, "queue destruction failed");
     expectFailure([&] { sceAgcDriverDestroyQueue(direct); });
     expectFailure([&] { sceAgcDriverSubmitCommandBuffer(direct, &packet); });
@@ -398,8 +461,15 @@ int main(int argc, char** argv) {
             std::puts("present mode selection tests passed");
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "failure-log") {
+            testFailureLog();
+            const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
+            check(shutdown == "intentional flip failure", "shutdown lost worker failure");
+            std::puts("AGC worker failure log test passed");
+            return 0;
+        }
         if (argc == 2) testReset(std::string(argv[1]) == "compute");
-        else { testQueues(); testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testFailure(); }
+        else { testQueues(); testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testComputeFlip(); testFailure(); }
         const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
         check(shutdown.find(argc == 2 ? (std::string(argv[1]) == "compute" ? "not readable" : "required shader register") : "intentional flip failure") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC flip and suspend tests passed");

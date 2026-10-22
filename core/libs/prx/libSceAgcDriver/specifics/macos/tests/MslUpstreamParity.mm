@@ -16,6 +16,14 @@
 // - #5097: the ancillary word's render target index is [[render_target_array_index]] times the
 //   LayerExported function constant, and a pipeline whose vertex function writes no layer links;
 // - #4279: GDS plain reads and writes are relaxed atomics (the coherent gds buffer).
+// Upstream sync to 721db55dc:
+// - #5492 (731575c80): ds_add_f32 flushes operands and result per FLOAT_MODE and stores NaNs as the
+//   hardware does (aps5_lds_fadd32);
+// - #5176 (46a1cc0fc, 3a7e82a17): ds_ordered_count adds the first active lane's operand to the GDS
+//   counter at offset0 (no M0 base).
+// Upstream sync UPSYNC4 (MslAbi Version 19):
+// - b0558ce95: ds_ordered_count with offset1 bit 4 exchanges the first active lane's operand into
+//   the counter.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -96,6 +104,13 @@ alignas(256) constexpr std::array<std::uint32_t, 22> F16CompareCode{
 
 // tests/ShaderMemory.cpp verifyCoherentGds: ds_read_b32 and ds_write_b32 on GDS.
 alignas(256) constexpr std::array<std::uint32_t, 9> GdsCode{0x34000082u, 0xbefc03ffu, 0x0000ffffu, 0xd8da0000u, 0x01000000u, 0xbf8cc07fu, 0xd8360080u, 0x00000100u, 0xbf810000u};
+
+// ds_add_f32 v0, v1 gds (v1 = 1.0) after M0 = 0xffff.
+alignas(256) constexpr std::array<std::uint32_t, 8> GdsAddF32Code{0x34000082u, 0xbefc03ffu, 0x0000ffffu, 0x7e0202f2u, 0xd8560000u, 0x00000100u, 0xbf8cc07fu, 0xbf810000u};
+// tests/execution/GdsAppendConsume.cpp OrderedCode: ds_ordered_count v5, v1 offset0:16 offset1:3 gds.
+alignas(256) constexpr std::array<std::uint32_t, 10> OrderedCountCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe0310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
+// The same with offset1 bit 4 set: ds_ordered_count swap (upstream b0558ce95, offset1:0x13).
+alignas(256) constexpr std::array<std::uint32_t, 10> OrderedSwapCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe1310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
 
 alignas(256) std::array<std::uint32_t, 64> Backing{};
 
@@ -299,6 +314,25 @@ void EarlyTests(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& targe
     std::puts("early fragment tests: earlyZ without alpha-to-coverage, depth or stencil export");
 }
 
+// Upstream 16ea32c97 / c434467f6: a reversed-order blend code routes copies of the MRT0 export into
+// the second blend source (color(0) index(1), under APS5_REVERSED_BLEND) and, for non-Own colour
+// routes, into MRT0 itself.
+void ReversedBlend(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    namespace Code = ShaderRecompiler::ReversedBlendCode;
+    const auto inputs = PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::LinearCenter);
+    // Second source: every component reads component 0; colour: component 3 reads 1.
+    const std::uint32_t code = Code::Enable | (0x55u << Code::SecondShift) | (Code::One << (Code::ColorShift + 3u * Code::RouteBits));
+    const auto result = RecompilePixel(target, F16PixelCode, 0u, inputs, [&](auto& pixel) { pixel.reversedBlend = code; });
+    const auto& source = result.msl.Source();
+    Require(Has(source, "aps5_rb [[color(0), index(1)]]") && Has(source, "aps5_reversed_route("), "reversed blend: no second blend source from the MRT0 export");
+    Require(Constant(result, ShaderRecompiler::PipelineSpecialization::ReversedBlend) == code, "reversed blend: ReversedBlend is not specialised from the request");
+    static_cast<void>(MustCompile(device, "reversed blend", result, @{@(Abi::ReversedBlendMacro): @"1"}));
+    static_cast<void>(MustCompile(device, "reversed blend, macro unset", result, @{}));
+    std::string failure;
+    Require(Compile(device, result, @{@(Abi::ReversedBlendMacro): @"1", @(Abi::DualSourceMacro): @"1"}, failure) == nil && Has(failure, "dual-source"), "reversed blend: the library compiles with dual-source blending");
+    std::puts("reversed blend: MRT0 routes into color(0) index(1) under APS5_REVERSED_BLEND");
+}
+
 void LayerField(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
     for (const bool exported : {false, true}) {
         const auto result = RecompilePixel(target, LayerFieldPixelCode, 0u, PixelInputBit(PixelInput::Ancillary), [&](auto& pixel) {
@@ -333,6 +367,31 @@ void CoherentGds(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& targ
     std::puts("GDS: coherent reads and writes");
 }
 
+void GdsAddF32(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto result = RecompileCompute(target, GdsAddF32Code);
+    const std::string source(result.msl.Source());
+    // FLOAT_MODE 0xc0 keeps no f32 denormals: operands and result flush.
+    Require(Has(source, "aps5_lds_fadd32(") && Has(source, ", true, true)"), "ds_add_f32: the add does not flush operands and result as FLOAT_MODE says");
+    static_cast<void>(MustCompile(device, "ds_add_f32", result, @{}));
+    std::puts("ds_add_f32: hardware flush and NaN rules");
+}
+
+void OrderedCount(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto result = RecompileCompute(target, OrderedCountCode);
+    const std::string source(result.msl.Source());
+    Require(Has(source, "aps5_amt") && Has(source, "atomic_fetch_add_explicit(") && Has(source, " = 4u;"), "ds_ordered_count: the first lane's operand is not added at offset0 / 4");
+    static_cast<void>(MustCompile(device, "ds_ordered_count", result, @{}));
+    std::puts("ds_ordered_count: first active lane's operand added to the GDS counter");
+}
+
+void OrderedSwap(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto result = RecompileCompute(target, OrderedSwapCode);
+    const std::string source(result.msl.Source());
+    Require(Has(source, "aps5_amt") && Has(source, "atomic_exchange_explicit(") && !Has(source, "atomic_fetch_add_explicit(") && Has(source, " = 4u;"), "ds_ordered_count swap: the first lane's operand is not exchanged into the counter at offset0 / 4");
+    static_cast<void>(MustCompile(device, "ds_ordered_count swap", result, @{}));
+    std::puts("ds_ordered_count swap: first active lane's operand exchanged into the GDS counter");
+}
+
 }
 
 int main() {
@@ -353,7 +412,11 @@ int main() {
             ComparedF16(metal, target);
             EarlyTests(metal, target);
             LayerField(metal, target);
+            ReversedBlend(metal, target);
             CoherentGds(metal, target);
+            GdsAddF32(metal, target);
+            OrderedCount(metal, target);
+            OrderedSwap(metal, target);
         }
         std::puts("msl upstream parity check passed");
         return 0;

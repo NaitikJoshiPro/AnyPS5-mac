@@ -54,7 +54,7 @@ void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
         default:
             return;
     }
-    MousePublishInput_nid_postfix(input);
+    MousePublishInput_nid_no_patch(input);
 }
 
 void MouseInput::SetPresentation(std::uint32_t sourceWidth, std::uint32_t sourceHeight, std::uint32_t presentedWidth, std::uint32_t presentedHeight) {
@@ -78,10 +78,14 @@ std::int32_t MouseInput::scaled(std::int32_t delta, double scale, double& remain
 }
 
 bool MouseInput::CaptureWanted(bool allowed) const {
-    return allowed && focused && MouseIsOpen_nid_postfix();
+    return allowed && focused && MouseIsOpen_nid_no_patch();
 }
 
 void MouseInput::UpdateCapture(bool allowed) {
+    if (!allowed) {
+        captured = false;
+        return;
+    }
     const bool wanted = CaptureWanted(allowed);
     if (wanted == captured && (SDL_GetRelativeMouseMode() == SDL_TRUE) == wanted) return;
     if (SDL_SetRelativeMouseMode(wanted ? SDL_TRUE : SDL_FALSE) != 0) {

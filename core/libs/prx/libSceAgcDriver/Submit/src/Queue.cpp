@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 // Queue objects as the oops-sdk uses them on retail firmware 12.40 (oops-sdk include/agc/driver.h,
 // src/gl/gl_context.c, docs/hardware/agc-gl-cube-oracle-fw1240.md): CreateQueue(type, &handle, 0)
@@ -23,7 +24,15 @@ struct Queue {
 
 std::mutex queueMutex;
 std::unordered_map<const void*, std::unique_ptr<Queue>> queues;
+// Handles sceAgcDriverDestroyQueue released: still ours, so a late submission throws instead of being read
+// as a guest queue context.
+std::unordered_set<const void*> destroyedQueues;
 
+}
+
+bool AgcDriver::IsQueueHandle(const void* handle) {
+    std::lock_guard lock(queueMutex);
+    return handle != nullptr && (queues.contains(handle) || destroyedQueues.contains(handle));
 }
 
 std::uint32_t AgcDriver::QueueFromHandle(const void* handle, const char* function) {
@@ -46,6 +55,7 @@ int APS5_VABI sceAgcDriverCreateQueue(std::uint32_t type, void** queue, std::uin
     void* handle = created.get();
     {
         std::lock_guard lock(queueMutex);
+        destroyedQueues.erase(handle);
         queues.emplace(handle, std::move(created));
     }
     *queue = handle;
@@ -56,6 +66,7 @@ int APS5_VABI sceAgcDriverDestroyQueue(void* queue) {
     std::lock_guard lock(queueMutex);
     if (!queue || queues.erase(queue) == 0)
         throw std::runtime_error("sceAgcDriverDestroyQueue: the queue handle was not created by sceAgcDriverCreateQueue or was already destroyed");
+    destroyedQueues.insert(queue);
     return 0;
 }
 

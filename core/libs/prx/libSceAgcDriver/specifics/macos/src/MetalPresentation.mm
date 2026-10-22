@@ -30,7 +30,9 @@
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HalfFloatScanout.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
@@ -51,6 +53,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -204,9 +207,13 @@ FrameDumps& Dumps() {
     return dumps;
 }
 
+// Optional BMP dumps turn themselves off after the first host I/O failure (upstream 6541db004b).
+FrameDumpOutput frameDumpOutput;
+
 // frame_<index>.bmp: every scale-th pixel of a BGRA8 image, 32-bit top-down (upstream's format).
 void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale) {
     if (scale == 0u || full.size() != static_cast<std::size_t>(fullWidth) * fullHeight * 4u) Fail("invalid frame dump pixels");
+    if (!frameDumpOutput.Enabled_nid_no_patch()) return;
     const std::uint32_t width = (fullWidth + scale - 1u) / scale;
     const std::uint32_t height = (fullHeight + scale - 1u) / scale;
     std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4u);
@@ -215,17 +222,7 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     }
     char name[32];
     std::snprintf(name, sizeof(name), "frame_%03d.bmp", index);
-    std::ofstream file;
-    file.exceptions(std::ios::failbit | std::ios::badbit);
-    file.open(name, std::ios::binary);
-    const std::uint32_t imageBytes = width * height * 4u;
-    const std::uint32_t header[13] = {0, 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<std::int32_t>(height)), 1u | (32u << 16u), 0, imageBytes, 2835, 2835, 0, 0};
-    const std::uint16_t magic = 0x4d42;
-    const std::uint32_t fileBytes = 54u + imageBytes;
-    file.write(reinterpret_cast<const char*>(&magic), 2);
-    file.write(reinterpret_cast<const char*>(&fileBytes), 4);
-    file.write(reinterpret_cast<const char*>(header + 1), 48);
-    file.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
+    frameDumpOutput.Write_nid_no_patch(name, width, height, pixels);
 }
 
 // Every scale-th pixel of a BGRA8 image (the dump's pixels, upstream's downscale).
@@ -258,6 +255,7 @@ public:
         std::lock_guard lock(mutex);
         if (stopping) Fail("frame dump writer has stopped");
         if (pixels.size() > MaxBytes - queuedBytes) Fail("frame dump queue exceeded 64 MiB");
+        if (!frameDumpOutput.Enabled_nid_no_patch()) return;
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp queued (%ux%u)\n", index, width, height);
         const auto bytes = pixels.size();
@@ -607,6 +605,12 @@ void VulkanDevice::State::AttachPresentation(const PresentationWindow& window) {
     presenter->arguments = [device newArgumentTableWithDescriptor:table error:&error];
     if (presenter->filter == nil || presenter->arguments == nil) Fail("cannot create the scaler's sampler or argument table: " + Metal::Describe(error));
     this->presenter = std::move(presenter);
+    // Upstream c9ba43bfb/76c0ba53e: the presenter reports whether its surface offers HDR10 and
+    // whether it presents HDR10. The CAMetalLayer stays BGRA8 sRGB (SDR): PQ display buffers are
+    // tone-mapped to SDR by the CPU decode (ReadDisplayBuffer, PqToSdr.hpp) at the host's reported
+    // white (PqToSdrWhiteNits). HDR10 passthrough to an EDR layer is a gap (docs/dev/TechnicalDebt.md).
+    AgcDriverSetSurfaceHdr10_nid_postfix(false);
+    SetPresentingHdr10(false);
 }
 
 void* VulkanDevice::Window() const {
@@ -632,6 +636,14 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     // SDL's Metal view owns the layer's drawableSize and contentsScale (it updates them on resizes
     // and backing-scale changes); the presenter only follows the size.
     presenter->MakeOffscreen();
+}
+
+// Upstream picks an HDR10 swapchain for PQ display buffers when the host reports HDR output (and
+// refreshes its HDR metadata). The Metal layer never offers HDR10 (AttachPresentation), so the
+// selection is always SDR: as upstream with an SDR-only surface, nothing changes here.
+void VulkanDevice::SelectDynamicRange(const DisplayBuffer*) {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::SelectDynamicRange");
+    if (state->presenter == nullptr) throw std::runtime_error("Metal device: cannot select the dynamic range of an unavailable presentation layer");
 }
 
 bool VulkanDevice::Presentable() const {
@@ -832,7 +844,7 @@ void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std:
     if (width == 0u || height == 0u || width > 16384u || height > 16384u) Fail("invalid display image extent");
     if (pixels.size() != static_cast<std::uint64_t>(width) * height * 4u) Fail("invalid display pixel buffer size");
     auto& dumps = Dumps();
-    if (dumps.dumped < dumps.limit) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit) {
         if (auto* presenter = state->presenter.get(); presenter != nullptr) presenter->dumpWriter.Enqueue(dumps.dumped++, width, height, {pixels.begin(), pixels.end()});
         else WriteFrameBmp(dumps.dumped++, width, height, pixels, 1u);
     }
@@ -849,9 +861,17 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    // Upstream 537bbcc96c: the presenter takes the newest collect epoch, so the flush of the display
+    // range below (GPU decode: FlushForGpuRead; CPU decode: ReadDisplayBuffer's FlushGpuWrites) keeps
+    // an untracked display image's comparison memo (StorageTexture::compareUntracked caches only at a
+    // nonzero epoch). The write-back path collects the range uncached before it compares, so CPU
+    // writes since the last present still change the memo's stamp. APS5_NO_PRESENT_EPOCH=1 compares
+    // the display surface at every present as before.
+    static const bool noAdopt = std::getenv("APS5_NO_PRESENT_EPOCH") != nullptr;
+    if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
     auto& dumps = Dumps();
     int dumpIndex = -1;
-    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0u) dumpIndex = dumps.dumped++;
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0u) dumpIndex = dumps.dumped++;
     // D66: decoded on the GPU from the host import; a dump frame needs the pixels on the CPU.
     if (dumpIndex < 0 && GpuDecodeRequested()) {
         const auto size = DisplayBufferSize(buffer);

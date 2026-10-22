@@ -5,6 +5,8 @@
 // textures one texel high (MslEntryPoint.cpp), 32-bit image atomics on R32Uint textures.
 #include "MetalBackend/MslEmitterState.hpp"
 #include "MslBufferShared.hpp"
+#include "BdaAbi.hpp"
+#include "ImageTableAbi.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "PipelineSpecialization.hpp"
 #include "RuntimeAbi.hpp"
@@ -217,24 +219,7 @@ struct Access {
     const MemoryInfo& mem;
     const ImageResource& image;
     const IrValue& address;
-    // Bindless image tables (ImageResource::indirectRoot): the RuntimeAbi::ResourceMetadata index
-    // of the image (a literal for direct images), the heap element the table slot selected (empty:
-    // the static element) and whether the key was mapped (empty: always).
-    std::string metadata = {};
-    std::string tableElement = {};
-    std::string mapped = {};
 };
-
-// Dword `member` of the image's RuntimeAbi::ResourceMetadata in the shader data.
-std::string MetadataDword(MslEmitterState& state, const std::string& index, std::uint32_t member) {
-    const IrBindingLayout& layout = state.program.Metadata().bindings;
-    const auto dword = "(" + std::to_string(layout.ImageMetadataDword() + member) + "u + (" + index + ") * " + std::to_string(sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t)) + "u)";
-    if (layout.UsesPushData()) {
-        state.usesPushData = true;
-        return "aps5_push[" + state.FunctionConstant(PipelineSpecialization::PushDataOffset, layout.pushDataStartDword) + " + " + dword + "]";
-    }
-    return "reinterpret_cast<device const uint*>(" + state.TableBuffer(DescriptorBindingKind::ShaderData, 0u) + ".address)[" + dword + "]";
-}
 
 bool HasFlag(const MemoryInfo& mem, std::uint32_t flag) {
     return (mem.imageSampleFlags & flag) != 0u;
@@ -352,27 +337,41 @@ std::string HeapElement(MslEmitterState& state, DescriptorBindingKind kind, std:
     return "aps5_table." + MslTableField(kind) + "[" + index + "]";
 }
 
-// The texture (heap element) a mode's access reads or writes.
+// The texture (heap element) a mode's access reads or writes. A table mode (MslAbi Version 15)
+// reads element tableAccess.element of the image table's array, typed as the mode's heap binding;
+// a storage table mode (Version 18, upstream 603dc01db) the same element of the storage table's.
 std::string Texture(MslEmitterState& state, const Access& access, std::uint32_t elementOffset = 0u) {
     const auto kind = DescriptorBindingForImage(access.image);
-    if (!access.tableElement.empty()) {
-        // TableImageIndex: the slot's heap element (ResourceMetadata.firstElement), bounded by the
-        // range the table declares.
-        state.TableResource(kind, 0u);
-        const auto& descriptors = state.program.Metadata().bindings.descriptors;
-        std::size_t count = 1u;
-        for (const auto& descriptor : descriptors) {
-            if (descriptor.kind == kind) count = std::max<std::size_t>(descriptor.resources.size(), 1u);
+    if (access.image.table != NoTable) {
+        if (!state.tableAccess.active) state.Fail(access.inst, "reads an image table texture outside a table access");
+        const auto binding = static_cast<std::uint32_t>(kind);
+        if (access.image.resourceClass == ImageResourceClass::Storage) {
+            // Float (29-35) and uint (36-42) storage views; atomic modes are never table modes.
+            constexpr auto storageEnd = RuntimeAbi::FirstStorageImageBinding + 14u;
+            if (elementOffset != 0u || access.image.mipMode == ImageMipMode::DynamicStorage || binding < RuntimeAbi::FirstStorageImageBinding || binding >= storageEnd || !TableModeEmitted(access.image)) state.Fail(access.inst, "selects an image table storage mode that is not a non-atomic, single-sampled, static-mip storage view (an image table store to a multisampled image or through dynamic mips is not implemented)");
+            static_cast<void>(state.TableResource(DescriptorBindingKind::ImageStorageTable, 0u));
+            return "aps5_table." + MslTableField(DescriptorBindingKind::ImageStorageTable) + ".k" + std::to_string(binding) + ".address[" + state.tableAccess.element + "].value";
         }
-        return "aps5_table." + MslTableField(kind) + "[min(" + access.tableElement + ", " + std::to_string(count - 1u) + "u)]";
+        if (elementOffset != 0u || access.image.resourceClass != ImageResourceClass::Sampled || binding < RuntimeAbi::FirstImageBinding || binding >= RuntimeAbi::FirstStorageImageBinding || !TableModeEmitted(access.image)) state.Fail(access.inst, "selects an image table mode that is not a sampled, single-sampled heap view");
+        static_cast<void>(state.TableResource(DescriptorBindingKind::ImageTable, 0u));
+        return "aps5_table." + MslTableField(DescriptorBindingKind::ImageTable) + ".k" + std::to_string(binding) + ".address[" + state.tableAccess.element + "].value";
     }
     return HeapElement(state, kind, state.DescriptorElement(kind, access.mem.resource) + elementOffset);
 }
 
 std::string Sampler(MslEmitterState& state, const Access& access) {
     // LoadSamplerDescriptor: element 2s+1 is the point-filtered twin for integer, converted and
-    // depth-bit reads.
-    const bool point = access.image.numericClass == IrTextureNumericClass::Sint || access.image.conversionFormat != IrBufferFormat::Invalid || access.image.depthBits;
+    // depth-bit reads (TablePointSampled, which adds uint, when the image or the sampler is a table).
+    const auto& samplerResource = state.program.Info().samplers.at(access.mem.sampler);
+    const bool table = samplerResource.table != NoTable || access.image.table != NoTable;
+    const bool point = table ? TablePointSampled(access.image) : access.image.numericClass == IrTextureNumericClass::Sint || access.image.conversionFormat != IrBufferFormat::Invalid || access.image.depthBits;
+    if (samplerResource.table != NoTable) {
+        // The sampler table entry's four elements: plain, point, compare, compare point.
+        if (!state.tableAccess.active) state.Fail(access.inst, "reads a sampler table entry outside a table access");
+        static_cast<void>(state.TableResource(DescriptorBindingKind::SamplerTable, 0u));
+        const auto variant = (access.image.depthCompare ? 2u : 0u) + (point ? 1u : 0u);
+        return "aps5_table." + MslTableField(DescriptorBindingKind::SamplerTable) + "[0].address[" + state.tableAccess.samplerElement + " + " + U(variant) + "].value";
+    }
     // Reflection::samplerModeUses: the mode case this reference sits in, or an unconditional use.
     if (state.imageModeCase.second != ~0u) {
         state.reflection.samplerModeUses.push_back(state.imageModeCase.first);
@@ -384,9 +383,10 @@ std::string Sampler(MslEmitterState& state, const Access& access) {
 }
 
 std::string SwizzleSelector(MslEmitterState& state, const Access& access, std::uint32_t component) {
-    if (access.image.indirectRoot != ImageResource::NoIndirectImage) {
-        const auto index = access.metadata.empty() ? std::to_string(access.mem.resource) + "u" : access.metadata;
-        return "((" + MetadataDword(state, index, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + 3u) + " >> " + U(component * 3u) + ") & 7u)";
+    // RuntimeImageSwizzle: a table mode's dst_sel comes from the selected record's T# dword 3.
+    if (access.image.table != NoTable) {
+        if (!state.tableAccess.active) state.Fail(access.inst, "reads an image table swizzle outside a table access");
+        return "((" + state.tableAccess.dword3 + " >> " + U(component * 3u) + ") & 7u)";
     }
     return state.FunctionConstant(PipelineSpecialization::ImageBase + access.mem.resource * PipelineSpecialization::ImageWords + 1u + component, component + 4u);
 }
@@ -455,10 +455,6 @@ bool EmulatedMultisample(const Access& access) {
 }
 
 std::string StorageSampleCount(MslEmitterState& state, const Access& access) {
-    if (access.image.indirectRoot != ImageResource::NoIndirectImage) {
-        const auto index = access.metadata.empty() ? std::to_string(access.mem.resource) + "u" : access.metadata;
-        return "(1u << ((" + MetadataDword(state, index, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + 3u) + " >> 16u) & 0xfu))";
-    }
     return state.FunctionConstant(PipelineSpecialization::SampleCountBase + access.mem.resource, 1u);
 }
 
@@ -753,7 +749,9 @@ void EmitRead(MslEmitterState& state, const Access& access) {
     }
     const auto numeric = access.image.numericClass;
     auto condition = state.Arg(access.inst, 2);
-    if (access.mem.imageDimension == RdnaImageDimension::Dim3D && access.image.dimension == RdnaImageDimension::Dim2D) {
+    // A 3D address on a 2D or (upstream bd09862e5) 1D mode reads slice 0 only; a 2D-array address
+    // on a 3D mode (upstream 945b97094) is bounded by the volume depth in BoundsCheck.
+    if (access.mem.imageDimension == RdnaImageDimension::Dim3D && (access.image.dimension == RdnaImageDimension::Dim2D || access.image.dimension == RdnaImageDimension::Dim1D)) {
         condition = "(" + condition + " && " + AddressU32(state, access, 2u) + " == 0u)";
     }
     const auto result = state.Name(access.inst);
@@ -894,7 +892,6 @@ std::string PackImageTexel(MslEmitterState& state, const Access& access, const s
 std::string StoreTexel(MslEmitterState& state, const Access& access, const std::string& data, bool integer) {
     const auto& mem = access.mem;
     const auto sint = SintStorageFormat(access.image);
-    if (sint.format != IrBufferFormat::Invalid && mem.dataBits == 16u) state.Fail(access.inst, "stores 16-bit data to an image of a SINT format");
     if (sint.format != IrBufferFormat::Invalid) state.RequirePrelude(MslPreludeChunk::BufferFormat);
     const auto dmask = EffectiveDmask(mem);
     std::array<std::string, 4> values;
@@ -915,7 +912,10 @@ std::string StoreTexel(MslEmitterState& state, const Access& access, const std::
         }
         values[component] = integer ? raw : mem.dataBits == 16u ? "aps5_f16_value(" + raw + ")" : "as_type<float>(" + raw + ")";
         if (component < sint.componentCount) {
-            values[component] = "aps5_format_store(" + U(FormatTypeCode(sint.type)) + ", " + U(sint.componentBits[component]) + ", " + values[component] + ")";
+            // Upstream a18d6e9a6: D16 data takes EmitD16StoreComponent (sign-extended, then
+            // saturated to the component width).
+            if (mem.dataBits == 16u) values[component] = "aps5_format_d16_store(" + U(FormatTypeCode(sint.type)) + ", " + U(sint.componentBits[component]) + ", " + raw + ")";
+            else values[component] = "aps5_format_store(" + U(FormatTypeCode(sint.type)) + ", " + U(sint.componentBits[component]) + ", " + values[component] + ")";
         }
     }
     const auto texel = state.Temporary("aps5_st");
@@ -1170,7 +1170,9 @@ SampleCoord CoordF32(MslEmitterState& state, const Access& access, std::uint32_t
     const auto encoded = AddressDimension(access).coordinateComponents;
     const bool cube = access.image.cube;
     const auto present = std::min(encoded, components);
-    if (first == NoImageComponent || (encoded < components && (cube || encoded == 0u)) || access.mem.imageAddressComponents < first + present) state.Fail(access.inst, "has an image address with too few coordinate components");
+    // A cube T# read through DIM 2D (upstream 3b96840e6): face 0, the missing face coordinate reads as 0.
+    const bool cubeFace = cube && access.mem.imageDimension == RdnaImageDimension::Dim2D;
+    if (first == NoImageComponent || (encoded < components && ((cube && !cubeFace) || encoded == 0u)) || access.mem.imageAddressComponents < first + present) state.Fail(access.inst, "has an image address with too few coordinate components");
     const auto component = [&](std::uint32_t index) { return index < present ? AddressF32(state, access, first + index) : std::string("0.0f"); };
     auto x = component(0);
     switch (access.image.dimension) {
@@ -1458,10 +1460,11 @@ void EmitSample(MslEmitterState& state, const Access& access, const ImageSampleL
     // Upstream #1418 (SpirvImageEmitter EmitSampleOp): a sampler that only samples with implicit LODs
     // or gradients (SamplesBaseLevelIfUnnormalized) and that the binding plan proves unnormalized
     // (function constant UnnormalizedBaseLevelBase + s, 1) samples the base level: an explicit LOD 0
-    // and no other operand, as the console's unnormalized samplers do.
+    // and no other operand, as the console's unnormalized samplers do. Upstream 7c19c66de: a texel
+    // offset is folded into the (unnormalized) coordinate there (FoldedOffsetCoord).
     if (!dref && SamplesBaseLevelIfUnnormalized(state.program.Info().samplers.at(mem.sampler))) {
         const auto selector = state.FunctionConstant(PipelineSpecialization::UnnormalizedBaseLevelBase + mem.sampler, 0u);
-        expression = selector + " != 0u ? " + texture + ".sample(" + sampler + ", " + coord.coord + slice + ", level(0.0f)) : " + expression;
+        expression = selector + " != 0u ? " + texture + ".sample(" + sampler + ", " + (hasOffset ? folded() : coord.coord) + slice + ", level(0.0f)) : " + expression;
     }
     state.Line("const " + type + " " + sample + " = " + expression + ";");
     const auto result = dref ? sample : UnpackImageTexel(state, access, sample);
@@ -1475,6 +1478,26 @@ void EmitQueryLod(MslEmitterState& state, const Access& access) {
     const auto texture = Texture(state, access);
     const auto sampler = Sampler(state, access);
     const auto coord = CoordF32(state, access, 0, texture);
+    if (state.program.Resources().stage != IrShaderStage::Pixel) {
+        // Upstream 1ef97e517: a compute LOD query takes its derivatives from quads of four
+        // consecutive lanes (GFX10, DerivativeGroupLinearKHR). MSL's calculate_*_lod exist in
+        // fragment functions only, so the LOD is computed here from the quad's coordinates
+        // (quad_shuffle_xor: lane ^ 1 is the x neighbour, lane ^ 2 the y neighbour; guest lanes are
+        // SIMD lanes in order, DECISIONS D25) as the isotropic log2 of the larger texel-space
+        // footprint. The clamped LOD is bounded by the view's levels only: MSL does not expose the
+        // sampler's LOD range or bias (TechnicalDebt metal-compute-lod).
+        if (state.program.Resources().stage != IrShaderStage::Compute) state.Fail(access.inst, "queries an implicit level of detail outside pixel and compute programs");
+        if (access.image.cube) state.Fail(access.inst, "queries the level of detail of a cube image in a compute program, which is not implemented");
+        const bool volume = access.image.dimension == RdnaImageDimension::Dim3D;
+        const auto vector = volume ? std::string("float3") : std::string("float2");
+        const auto at = state.Temporary("aps5_lq");
+        state.Line("const " + vector + " " + at + " = " + coord.coord + ";");
+        const auto size = vector + "(float(" + texture + ".get_width(0u)), float(" + texture + ".get_height(0u))" + (volume ? ", float(" + texture + ".get_depth(0u))" : std::string()) + ")";
+        state.Line("const float " + at + "_rho = max(length((quad_shuffle_xor(" + at + ", 1u) - " + at + ") * " + size + "), length((quad_shuffle_xor(" + at + ", 2u) - " + at + ") * " + size + "));");
+        state.Line("const float " + at + "_lod = log2(" + at + "_rho);");
+        state.Define(access.inst, "uint4(as_type<uint>(clamp(" + at + "_lod, 0.0f, float(" + texture + ".get_num_mip_levels() - 1u))), as_type<uint>(" + at + "_lod), 0u, 0u)");
+        return;
+    }
     state.Define(access.inst, "uint4(as_type<uint>(" + texture + ".calculate_clamped_lod(" + sampler + ", " + coord.coord + ")), as_type<uint>(" + texture + ".calculate_unclamped_lod(" + sampler + ", " + coord.coord + ")), 0u, 0u)");
 }
 
@@ -1515,23 +1538,13 @@ const IrValue& ImageAddress(MslEmitterState& state, const IrValue& inst, const I
     return *resolved;
 }
 
-struct TableSelection {
-    std::string metadata;
-    std::string element;
-    std::string mapped;
-};
-
-void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& mode, const TableSelection& table) {
+void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& mode) {
     const auto& mem = state.Memory(inst);
     const auto info = ImageOpcodeInfoOf(inst.Opcode());
     const auto& address = ImageAddress(state, inst, inst.Argument(info.needsSampler ? 2 : 1));
-    const Access access{inst, mem, mode, address, table.metadata, table.element, table.mapped};
-    if (!table.element.empty() && (info.access == ImageAccess::Write || info.access == ImageAccess::Atomic)) state.Fail(inst, info.access == ImageAccess::Write ? "stores through a bindless image table are unsupported" : "atomics through a bindless image table are unsupported");
-    if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) {
-        if (inst.Opcode() != IrOpcode::ImageRead || mem.dataBits != 32u) state.Fail(inst, "FMASK requires a 32-bit image read");
-        state.Define(inst, state.Arg(inst, 2) + " ? uint4(0x76543210u, 0xfedcba98u, 0u, 0u) : uint4(0u)");
-        return;
-    }
+    const Access access{inst, mem, mode, address};
+    // Upstream caae92c12: FMASK images are uint images read from guest memory (Fmask32_S8_F8); the
+    // identity Fmask8_S2_F1 mode is gone.
     if (mode.depthBits && mem.dataBits == 16u) state.Fail(inst, "depth bits require a 32-bit image result");
     if (info.access == ImageAccess::Atomic) {
         EmitAtomic(state, access);
@@ -1559,97 +1572,170 @@ void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& 
     }
 }
 
-// TableSlot/EmitIndirectImageSelector: the bindless table key (a handle argument) searched in the
-// flattened SRT's sorted (key, metadata index) mapping; the selected metadata index names the
-// heap element (ResourceMetadata.firstElement). Direct images keep their own metadata index.
-TableSelection TableSlot(MslEmitterState& state, const IrValue& inst, const MemoryInfo& mem, const ImageResource& image) {
-    TableSelection table;
-    if (image.indirectRoot != mem.resource) {
-        table.metadata = U(mem.resource);
-        return table;
+// --- image and sampler tables (upstream ImageTableAbi, MslAbi Version 15) ------------------------
+// SpirvImageEmitter.cpp EmitTableWord/EmitTableAccess: a table handle's dword offset selects a key of
+// the driver's table map; its word is a record of the map (null, or a poison code with the flag
+// set). Selected records give the mode, the T# dword 3 and the element of the texture (sampler)
+// array. Every failure records fault reason ImageTable with the poison index and yields zero.
+
+std::string TableMap(MslEmitterState& state) {
+    if (state.prologue.find("aps5_tmap ") == std::string::npos) {
+        const auto map = state.TableBuffer(DescriptorBindingKind::ImageTableMap, 0u);
+        state.AddPrologue("device const uint* aps5_tmap = reinterpret_cast<device const uint*>(" + map + ".address);");
     }
-    const auto* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
-    const auto& sources = state.program.Resources().descriptorSources;
-    if (handle == nullptr || image.source >= sources.size() || !sources[image.source].indirectImage.has_value() || sources[image.source].indirectImage->keyArg >= handle->ArgumentCount()) state.Fail(inst, "has invalid bindless image table key provenance");
-    if (image.indirectSearchIterations == 0u) state.Fail(inst, "has no bindless image table runtime mapping");
-    state.RequirePrelude(MslPreludeChunk::RuntimeBuffer);
-    const auto srt = state.TableBuffer(DescriptorBindingKind::FlattenedSrt, 0u);
-    const auto key = state.Value(handle->Argument(sources[image.source].indirectImage->keyArg));
-    const auto tag = state.Temporary("aps5_bt");
-    const auto mapping = U(image.indirectMappingOffset);
-    state.DeclareLocal("uint", tag + "_slot", "0u");
-    state.DeclareLocal("bool", tag + "_mapped", "false");
-    state.Line("{");
-    state.Indent();
-    state.Line("uint aps5_low = 0u;");
-    state.Line("uint aps5_high = aps5_srt_word(" + srt + ", " + mapping + ");");
-    state.Line(tag + "_slot = " + U(image.indirectRoot) + ";");
-    state.Line(tag + "_mapped = false;");
-    state.Line("for (uint aps5_step = 0u; aps5_step < " + U(image.indirectSearchIterations) + "; ++aps5_step) {");
-    state.Indent();
-    state.Line("const bool aps5_active = aps5_low < aps5_high;");
-    state.Line("const uint aps5_mid = (aps5_low + aps5_high) >> 1u;");
-    state.Line("const uint aps5_entry = " + mapping + " + ((aps5_active ? aps5_mid : 0u) << 1u) + 1u;");
-    state.Line("const uint aps5_key = aps5_srt_word(" + srt + ", aps5_entry);");
-    state.Line("const uint aps5_candidate = aps5_srt_word(" + srt + ", aps5_entry + 1u);");
-    state.Line("if (aps5_active && aps5_key == " + key + ") {");
-    state.Line("    " + tag + "_slot = aps5_candidate;");
-    state.Line("    " + tag + "_mapped = true;");
-    state.Line("}");
-    state.Line("const bool aps5_less = aps5_key < " + key + ";");
-    state.Line("if (aps5_active && aps5_less) aps5_low = aps5_mid + 1u;");
-    state.Line("if (aps5_active && !aps5_less) aps5_high = aps5_mid;");
-    state.Outdent();
-    state.Line("}");
-    state.Outdent();
-    state.Line("}");
-    table.metadata = tag + "_slot";
-    table.mapped = tag + "_mapped";
-    table.element = MetadataDword(state, table.metadata, offsetof(RuntimeAbi::ResourceMetadata, firstElement) / sizeof(std::uint32_t));
-    return table;
+    return "aps5_tmap";
 }
 
-void EmitImage(MslEmitterState& state, const IrValue& inst) {
-    state.RequirePrelude(MslPreludeChunk::Image);
-    const auto& mem = state.Memory(inst);
-    const auto& base = state.program.Resources().info.images.at(mem.resource);
+struct TableWord {
+    std::string code;
+    std::string address;
+    std::string poisoned;
+};
+
+std::string Poisoned(const std::string& value) {
+    return "((" + value + " & " + U(ImageTableAbi::PoisonFlag) + ") != 0u)";
+}
+
+TableWord EmitTableWord(MslEmitterState& state, const IrValue& inst, std::uint32_t source, std::uint32_t table, std::size_t argument) {
+    namespace Abi = ImageTableAbi;
+    const IrValue* handle = inst.Argument(argument)->Resolve();
+    const auto& sources = state.program.Resources().descriptorSources;
+    if (handle->ArgumentCount() == 0u || source >= sources.size() || !sources[source].tableColumn.has_value()) state.Fail(inst, "has an image table handle without its column");
+    const auto& column = *sources[source].tableColumn;
+    const auto map = TableMap(state);
+    const auto field = [&](std::uint32_t index) { return map + "[" + U(Abi::TableHeader(table) + index) + "]"; };
+    const auto t = state.Temporary("aps5_tw");
+    state.Line("const uint " + t + "_off = " + state.Value(handle->Argument(0)) + ";");
+    state.Line("const uint " + t + "_rel = " + t + "_off - " + U(column.addend) + ";");
+    state.Line("const uint " + t + "_rec = " + t + "_rel / " + U(column.stride) + ";");
+    state.Line("const bool " + t + "_in = " + t + "_rel - " + t + "_rec * " + U(column.stride) + " == 0u && " + t + "_rec < " + field(Abi::TableKeyCount) + ";");
+    state.Line("const uint " + t + "_mapped = " + map + "[" + t + "_in ? " + field(Abi::TableMapStart) + " + " + t + "_rec : 0u];");
+    state.Line("const uint " + t + "_fault = " + field(Abi::TableFault) + ";");
+    const auto base = "(ulong(" + field(Abi::TableBaseLow) + ") | (ulong(" + field(Abi::TableBaseHigh) + ") << 32))";
+    const auto outsideSnapshot = U(Abi::PoisonCode(Abi::OutsideSnapshotPoison));
+    TableWord word{t + "_code", t + "_addr", t + "_poisoned"};
+    if (column.address) {
+        // The record's address: base + (offset & ~3) + the sign-extended immediate (64-bit wrap).
+        const auto immediate = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(column.offset & ~3u)));
+        state.Line("const uint " + word.code + " = " + t + "_fault != 0u ? " + t + "_fault : (" + t + "_in ? " + t + "_mapped : " + outsideSnapshot + ");");
+        state.Line("const ulong " + word.address + " = " + base + " + ulong(" + t + "_off & ~3u) + " + MslHex(immediate) + "ul;");
+    } else {
+        // EmitScalarBufferDword: the dword at offset + immediate, inside the V#'s size.
+        state.Line("const ulong " + t + "_sum = ulong(" + t + "_off) + " + MslHex(column.offset) + "ul;");
+        state.Line("const uint " + t + "_byte = uint(" + t + "_sum) & ~3u;");
+        state.Line("const bool " + t + "_range = (" + t + "_sum >> 32) == 0ul && (" + field(Abi::TableSizeHigh) + " != 0u || " + t + "_byte < (" + field(Abi::TableSizeLow) + " & ~3u));");
+        state.Line("const uint " + word.code + " = " + t + "_fault != 0u ? " + t + "_fault : (" + t + "_in ? " + t + "_mapped : (" + t + "_range ? " + outsideSnapshot + " : " + field(Abi::TableOutsideCode) + "));");
+        state.Line("const ulong " + word.address + " = " + base + " + ulong(" + t + "_byte);");
+    }
+    state.Line("const bool " + word.poisoned + " = " + Poisoned(word.code) + ";");
+    return word;
+}
+
+void EmitTableFault(MslEmitterState& state, const IrValue& inst, const TableWord& word, const std::string& poison, const std::string& condition) {
+    const auto reason = static_cast<std::uint32_t>(BdaAbi::FaultReason::ImageTable);
+    state.Line("if (" + condition + ") " + MslRecordFault(state, reason, word.address, "(" + poison + " & " + U(~ImageTableAbi::PoisonFlag) + ")", MslB5Pc(inst)));
+}
+
+std::string TableZero(MslEmitterState& state, const IrValue& inst) {
+    switch (inst.Type()) {
+    case IrType::U32:
+    case IrType::U64:
+    case IrType::U32x4:
+        return MslType(inst.Type()) + "(0u)";
+    default:
+        state.Fail(inst, "has no zero result for an image table access");
+    }
+}
+
+struct TableAccessResult {
+    std::string valid = "true";
+    std::string flags = "0u";
+    bool unsupported = false;
+};
+
+TableAccessResult EmitTableAccess(MslEmitterState& state, const IrValue& inst, const MemoryInfo& mem, const ImageResource& base, bool tableSampler) {
+    namespace Abi = ImageTableAbi;
+    const auto map = TableMap(state);
+    const auto header = [&](std::uint32_t index) { return map + "[" + U(index) + "]"; };
+    const auto exec = "bool(" + state.Arg(inst, inst.ArgumentCount() - 1u) + ")";
+    TableAccessResult result;
+    std::string live = "true";
+    state.tableAccess = {};
+    if (base.table != NoTable) {
+        const auto word = EmitTableWord(state, inst, base.source, base.table, 0u);
+        EmitTableFault(state, inst, word, word.code, exec + " && " + word.poisoned);
+        if (base.tableOperation == TableOperation::Unsupported || state.program.Info().runtimeImageModes.at(mem.resource).empty()) {
+            if (inst.Type() != IrType::Void) state.Define(inst, TableZero(state, inst));
+            result.unsupported = true;
+            return result;
+        }
+        const auto t = state.Temporary("aps5_ti");
+        state.Line("const bool " + t + "_sel = " + word.code + " != " + U(Abi::NullCode) + " && !" + word.poisoned + ";");
+        state.Line("const uint " + t + "_rec = " + t + "_sel ? " + word.code + " : 0u;");
+        state.Line("const uint " + t + "_flags = " + map + "[" + t + "_rec + " + U(Abi::ImageRecordFlags) + "];");
+        state.Line("const uint " + t + "_d3 = " + map + "[" + t + "_rec + " + U(Abi::ImageRecordDword3) + "];");
+        state.Line("const uint " + t + "_elem = " + map + "[" + t + "_rec + " + U(Abi::ImageRecordElement) + "];");
+        state.Line("const bool " + t + "_rej = " + t + "_sel && " + Poisoned(t + "_flags") + ";");
+        EmitTableFault(state, inst, word, t + "_flags", exec + " && " + t + "_rej");
+        state.Line("const bool " + t + "_bounds = " + t + "_elem < " + header(Abi::HeaderElementCount) + ";");
+        EmitTableFault(state, inst, word, U(Abi::OutsideSnapshotPoison), exec + " && " + t + "_sel && !" + t + "_rej && !" + t + "_bounds");
+        state.Line("const bool " + t + "_chk = " + t + "_sel && !" + t + "_rej && " + t + "_bounds;");
+        state.Line("const uint " + t + "_drv = " + map + "[" + t + "_chk ? " + header(Abi::HeaderElementFaults) + " + " + t + "_elem : 0u];");
+        state.Line("const bool " + t + "_drej = " + t + "_chk && " + Poisoned(t + "_drv") + ";");
+        EmitTableFault(state, inst, word, t + "_drv", exec + " && " + t + "_drej");
+        state.Line("const uint " + t + "_at = " + header(Abi::HeaderElementBase) + " + " + t + "_elem;");
+        result.valid = "(" + t + "_chk && !" + t + "_drej)";
+        result.flags = t + "_flags";
+        live = t + "_sel";
+        state.tableAccess.element = t + "_at";
+        state.tableAccess.dword3 = t + "_d3";
+    }
+    if (tableSampler) {
+        const auto& sampler = state.program.Info().samplers.at(mem.sampler);
+        const auto word = EmitTableWord(state, inst, sampler.source, sampler.table, 1u);
+        const auto active = exec + " && " + live;
+        EmitTableFault(state, inst, word, word.code, active + " && " + word.poisoned);
+        const auto t = state.Temporary("aps5_ts");
+        state.Line("const bool " + t + "_sel = !" + word.poisoned + ";");
+        state.Line("const uint " + t + "_rec = " + t + "_sel ? " + word.code + " : 0u;");
+        state.Line("const uint " + t + "_flags = " + map + "[" + t + "_rec + " + U(Abi::SamplerRecordFlags) + "];");
+        state.Line("const uint " + t + "_elem = " + map + "[" + t + "_rec + " + U(Abi::SamplerRecordElement) + "];");
+        state.Line("const bool " + t + "_rej = " + t + "_sel && " + Poisoned(t + "_flags") + ";");
+        EmitTableFault(state, inst, word, t + "_flags", active + " && " + t + "_rej");
+        state.Line("const bool " + t + "_bounds = " + t + "_elem + " + U(Abi::SamplerEntryElements) + " <= " + header(Abi::HeaderSamplerCount) + ";");
+        EmitTableFault(state, inst, word, U(Abi::OutsideSnapshotPoison), active + " && " + t + "_sel && !" + t + "_rej && !" + t + "_bounds");
+        state.Line("const bool " + t + "_chk = " + t + "_sel && !" + t + "_rej && " + t + "_bounds;");
+        state.Line("const uint " + t + "_drv = " + map + "[" + t + "_chk ? " + header(Abi::HeaderSamplerFaults) + " + (" + t + "_elem >> 2u) : 0u];");
+        state.Line("const bool " + t + "_drej = " + t + "_chk && " + Poisoned(t + "_drv") + ";");
+        EmitTableFault(state, inst, word, t + "_drv", active + " && " + t + "_drej");
+        result.valid = "(" + result.valid + " && " + t + "_chk && !" + t + "_drej)";
+        state.tableAccess.samplerElement = t + "_elem";
+    }
+    state.tableAccess.active = true;
+    return result;
+}
+
+// A direct image's runtime modes, selected by its function constant (ImageBase + resource).
+void EmitDirectModes(MslEmitterState& state, const IrValue& inst, const MemoryInfo& mem, const ImageResource& base) {
     const auto modes = ResourceMaterializer::RuntimeImageModes(base);
-    const bool indirect = base.indirectRoot != ImageResource::NoIndirectImage;
-    TableSelection table;
-    if (indirect) table = TableSlot(state, inst, mem, base);
-    const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
-    const auto finish = [&] {
-        // TableResult: zeros for a key the table does not map.
-        if (!table.mapped.empty() && returnsValue) state.Line("if (!" + table.mapped + ") " + state.Name(inst) + " = " + MslType(inst.Type()) + "(0);");
-    };
-    if (modes.size() == 1u && !indirect) {
+    if (modes.size() == 1u) {
         state.Line("{");
         state.Indent();
-        EmitMode(state, inst, modes.front(), table);
+        EmitMode(state, inst, modes.front());
         state.Outdent();
         state.Line("}");
         return;
     }
-    const auto selector = indirect ? "(" + MetadataDword(state, table.metadata, offsetof(RuntimeAbi::ResourceMetadata, flags) / sizeof(std::uint32_t)) + " >> 1u)" : state.FunctionConstant(PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords, 0u);
+    const auto selectorId = PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords;
+    const auto selector = state.FunctionConstant(selectorId, 0u);
     // The result keeps its previous value for an invalid selector (the SPIR-V path: undefined).
     state.Line("switch (" + selector + ") {");
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         state.Line("case " + U(index) + ": {");
         state.Indent();
-        if (indirect) {
-            // ImageModeBase: a mode the bindless table never selects is compiled out.
-            const auto enabled = state.FunctionConstant(PipelineSpecialization::ImageModeBase + mem.resource * PipelineSpecialization::ImageModeStride + index, 1u);
-            state.Line("if (" + enabled + " != 0u) {");
-            state.Indent();
-            EmitMode(state, inst, modes[index], table);
-            state.Outdent();
-            state.Line("}");
-        } else {
-            const auto selectorId = PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords;
-            state.imageModeCase = {selectorId, index};
-            EmitMode(state, inst, modes[index], table);
-            state.imageModeCase = {0u, ~0u};
-        }
+        state.imageModeCase = {selectorId, index};
+        EmitMode(state, inst, modes[index]);
+        state.imageModeCase = {0u, ~0u};
         state.Line("break;");
         state.Outdent();
         state.Line("}");
@@ -1657,7 +1743,61 @@ void EmitImage(MslEmitterState& state, const IrValue& inst) {
     state.Line("default:");
     state.Line("    break;");
     state.Line("}");
-    finish();
+}
+
+// SpirvImageEmitter.cpp EmitImage with tables: a table image switches on the selected record's mode
+// (an invalid access takes no case and reads zero); a direct image read through a table sampler
+// runs only when the sampler entry is valid.
+void EmitTableImage(MslEmitterState& state, const IrValue& inst, const MemoryInfo& mem, const ImageResource& base, bool tableSampler) {
+    state.Line("{");
+    state.Indent();
+    const auto access = EmitTableAccess(state, inst, mem, base, tableSampler);
+    if (!access.unsupported) {
+        if (inst.Type() != IrType::Void) state.Define(inst, TableZero(state, inst));
+        if (base.table != NoTable) {
+            const auto& modes = state.program.Info().runtimeImageModes.at(mem.resource);
+            const auto mode = "((" + access.flags + " >> " + U(ImageTableAbi::ModeShift) + ") & " + U(ImageTableAbi::ModeMask) + ")";
+            state.Line("switch (" + access.valid + " ? " + mode + " : 0xffffffffu) {");
+            for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+                if (!TableModeEmitted(modes[index])) continue;
+                state.Line("case " + U(index) + ": {");
+                state.Indent();
+                EmitMode(state, inst, modes[index]);
+                state.Line("break;");
+                state.Outdent();
+                state.Line("}");
+            }
+            state.Line("default:");
+            state.Line("    break;");
+            state.Line("}");
+        } else {
+            state.Line("if (" + access.valid + ") {");
+            state.Indent();
+            EmitDirectModes(state, inst, mem, base);
+            state.Outdent();
+            state.Line("}");
+        }
+    }
+    state.tableAccess = {};
+    state.Outdent();
+    state.Line("}");
+}
+
+void EmitImage(MslEmitterState& state, const IrValue& inst) {
+    state.RequirePrelude(MslPreludeChunk::Image);
+    const auto& mem = state.Memory(inst);
+    const auto& base = state.program.Resources().info.images.at(mem.resource);
+    // Upstream d9e47d1e9/34525fdf7/c794273ab/55eefe9c5 replaced the bindless image search
+    // (ImageResource::indirectRoot) with image and sampler tables: a table map (ImageTableAbi) the
+    // driver materializes from the guest records, selecting array elements and image modes at run
+    // time and reporting bad entries through the fault buffer (MslAbi Version 15).
+    const auto& samplers = state.program.Resources().info.samplers;
+    const bool tableSampler = ImageOpcodeInfoOf(inst.Opcode()).needsSampler && mem.sampler < samplers.size() && samplers[mem.sampler].table != NoTable;
+    if (base.table != NoTable || tableSampler) {
+        EmitTableImage(state, inst, mem, base, tableSampler);
+        return;
+    }
+    EmitDirectModes(state, inst, mem, base);
 }
 
 

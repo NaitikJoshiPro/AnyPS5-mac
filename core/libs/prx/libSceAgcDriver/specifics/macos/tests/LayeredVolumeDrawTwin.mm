@@ -101,6 +101,11 @@ int main(int argc, char** argv) {
         const auto fieldColor = VolumeTarget(fieldVolume.Data());
         Run(*device, fieldColor, false, LayerFieldPixelCode, true);
         Check(fieldVolume.Data(), fieldColor, "a pixel shader reading the render target index of its packed ancillary word", LayerFieldBands);
+        // Upstream b2d988070: a thick SW_4KB_S_X volume (thick 4 KiB standard XOR detiling and write-back).
+        const GuestVolume thickVolume((VolumeTarget(nullptr, ColorTileMode::S4KBX).bytes + 65535u) & ~std::size_t{65535u});
+        const auto thickColor = VolumeTarget(thickVolume.Data(), ColorTileMode::S4KBX);
+        Run(*device, thickColor, false, PixelCode, false);
+        Check(thickVolume.Data(), thickColor, "thick SW_4KB_S_X vertex draw and writeback", WhiteBands);
         if (vertexOnly) {
             std::puts("layered volume vertex draw tests passed");
         } else if (target.mesh.has_value()) {

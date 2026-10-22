@@ -1,6 +1,7 @@
 // Work package D5: Metal twin of Graphics/src/PipelineCache.cpp (see MetalPipelineCache.h).
 #include "MetalPipelineCache.h"
 #include "ShaderCacheDirectory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -8,6 +9,7 @@
 #include <condition_variable>
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <unordered_set>
 #include <memory>
 #include <chrono>
@@ -152,6 +154,32 @@ SharedLibraries& Shared() {
     return *shared;
 }
 
+// The archive generations the first cache of this process chose for an archive stem (upstream
+// 8c8cd86cf in Metal idiom). Every later cache of the process (the windowed device replacing the
+// windowless one, compile-only devices) loads the same files and deletes none: a generation an
+// earlier cache of this process wrote, or loaded and still resolves lookups through, must stay.
+// Never destroyed, as SharedLibraries.
+struct ArchiveChoices {
+    std::mutex mutex;
+    std::map<std::filesystem::path, std::vector<std::filesystem::path>> chosen;
+};
+
+ArchiveChoices& Choices() {
+    static auto* choices = new ArchiveChoices;
+    return *choices;
+}
+
+// The process id of a generation file "<stem>.<20-digit ns>-<pid>.mtl4archive" (empty: the legacy
+// "<stem>.mtl4archive" or a foreign name).
+std::string GenerationProcess(const std::filesystem::path& path, const std::string& stem) {
+    const auto name = path.filename().string();
+    constexpr std::size_t Stamp = 20, Suffix = 12;
+    if (name.size() <= stem.size() + 1u + Stamp + 1u + Suffix) return {};
+    const auto rest = name.substr(stem.size() + 1u);
+    if (rest[Stamp] != '-') return {};
+    return rest.substr(Stamp + 1u, rest.size() - Stamp - 1u - Suffix);
+}
+
 }
 
 struct PipelineCache::Entry {
@@ -203,18 +231,55 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
             if ((a == legacy) != (b == legacy)) return a == legacy;
             return a < b;
         });
-        std::size_t loaded = generations.size();
-        for (std::size_t index = generations.size(); index-- > 0;) {
+        // Merge, not overwrite (upstream 8c8cd86cf in Metal idiom): a process holds several caches
+        // (the windowless device next to its windowed replacement), each writing its own generation,
+        // so the newest generation alone would drop the other devices' pipelines. The first cache of
+        // the process loads the newest readable generation together with the generations the same
+        // process wrote (same pid suffix) and deletes the older rest; later caches of the process
+        // load the generations this process has written so far and the same chosen set, and delete
+        // nothing. Every written generation is a superset of its hits from all loaded generations.
+        NSMutableArray<id<MTL4Archive>>* opened = [NSMutableArray array];
+        auto openGeneration = [&](const std::filesystem::path& path) {
             NSError* failure = nil;
-            archive = [device newArchiveWithURL:[NSURL fileURLWithPath:@(generations[index].c_str())] error:&failure];
-            if (archive != nil) {
-                loaded = index;
-                statistics.archiveLoaded = true;
-                break;
+            id<MTL4Archive> generation = [device newArchiveWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&failure];
+            if (generation == nil) {
+                std::fprintf(stderr, "[metal-pipelines] ignoring the unreadable archive %s: %s\n", path.c_str(), Describe(failure).c_str());
+                return false;
             }
-            std::fprintf(stderr, "[metal-pipelines] ignoring the unreadable archive %s: %s\n", generations[index].c_str(), Describe(failure).c_str());
+            [opened addObject:generation];
+            return true;
+        };
+        auto& choices = Choices();
+        std::lock_guard choiceLock(choices.mutex);
+        const auto key = directory / stem;
+        if (const auto earlier = choices.chosen.find(key); earlier != choices.chosen.end()) {
+            const auto self = std::to_string(::getpid());
+            for (std::size_t index = generations.size(); index-- > 0;) {
+                if (GenerationProcess(generations[index], stem) == self && std::find(earlier->second.begin(), earlier->second.end(), generations[index]) == earlier->second.end()) openGeneration(generations[index]);
+            }
+            for (const auto& path : earlier->second) openGeneration(path);
+        } else {
+            std::vector<std::filesystem::path> chosen;
+            std::size_t newest = generations.size();
+            std::string process;
+            for (std::size_t index = generations.size(); index-- > 0;) {
+                if (!chosen.empty() && (process.empty() || GenerationProcess(generations[index], stem) != process)) continue;
+                if (!openGeneration(generations[index])) continue;
+                if (chosen.empty()) {
+                    newest = index;
+                    process = GenerationProcess(generations[index], stem);
+                }
+                chosen.push_back(generations[index]);
+            }
+            for (std::size_t index = 0; index < newest && index < generations.size(); ++index) {
+                if (std::find(chosen.begin(), chosen.end(), generations[index]) == chosen.end()) std::filesystem::remove(generations[index], error);
+            }
+            choices.chosen.emplace(key, std::move(chosen));
         }
-        for (std::size_t index = 0; index < loaded && index < generations.size(); ++index) std::filesystem::remove(generations[index], error);
+        if (opened.count != 0) {
+            archives = [opened copy];
+            statistics.archiveLoaded = true;
+        }
         char unique[64];
         std::snprintf(unique, sizeof(unique), ".%020llu-%d.mtl4archive", static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()), static_cast<int>(::getpid()));
         archivePath = directory / (stem + unique);
@@ -230,6 +295,13 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
     NSError* error = nil;
     compiler = [device newCompilerWithDescriptor:compilerDescriptor error:&error];
     if (compiler == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no shader compiler: " + Describe(error));
+    plainCompiler = compiler;
+    if (serializer != nil) {
+        MTL4CompilerDescriptor* plainDescriptor = [MTL4CompilerDescriptor new];
+        plainDescriptor.label = @"aps5 unarchived";
+        plainCompiler = [device newCompilerWithDescriptor:plainDescriptor error:&error];
+        if (plainCompiler == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no shader compiler for unarchived pipelines: " + Describe(error));
+    }
 
     // The library store (D55) and its prewarm thread: one thread at background QoS, so it neither
     // takes the pipeline workers from the guest's draws nor a performance core from the guest.
@@ -419,6 +491,7 @@ void PipelineCache::prewarm(std::vector<StoredLibrary> stored) {
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> compiled{0};
     auto run = [&] {
+        pthread_setname_np("pipeline prewarm");
         pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
         for (std::size_t index = next.fetch_add(1); index < stored.size(); index = next.fetch_add(1)) {
             if (prewarmStop.load(std::memory_order_acquire)) break;
@@ -511,7 +584,7 @@ id<MTLComputePipelineState> PipelineCache::obtainCompute(const std::function<MTL
     @autoreleasepool {
         MTL4ComputePipelineDescriptor* descriptor = describe();
         NSError* error = nil;
-        if (archive != nil) {
+        for (id<MTL4Archive> archive in archives) {
             id<MTLComputePipelineState> found = [archive newComputePipelineStateWithDescriptor:descriptor error:&error];
             if (found != nil) {
                 {
@@ -557,7 +630,7 @@ id<MTLRenderPipelineState> PipelineCache::obtainRender(const std::function<MTL4P
     @autoreleasepool {
         MTL4PipelineDescriptor* descriptor = describe();
         NSError* error = nil;
-        if (archive != nil) {
+        for (id<MTL4Archive> archive in archives) {
             id<MTLRenderPipelineState> found = [archive newRenderPipelineStateWithDescriptor:descriptor error:&error];
             if (found != nil) {
                 {
@@ -594,6 +667,25 @@ id<MTLRenderPipelineState> PipelineCache::obtainRender(const std::function<MTL4P
         }, true);
         if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled %s in %.1f ms\n", what, elapsed);
         requestSave();
+        return pipeline;
+    }
+}
+
+id<MTLRenderPipelineState> PipelineCache::obtainUnarchivedRender(MTL4PipelineDescriptor* descriptor, const char* what) {
+    @autoreleasepool {
+        const auto start = std::chrono::steady_clock::now();
+        const SlowCompileReport report(what, 0u);
+        NSError* error = nil;
+        id<MTLRenderPipelineState> pipeline = [plainCompiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+        if (pipeline == nil) throw std::runtime_error(std::string("Metal device: ") + what + " creation failed: " + Describe(error));
+        const auto elapsed = Milliseconds(start);
+        {
+            std::lock_guard lock(mutex);
+            ++statistics.pipelinesCompiled;
+            ++statistics.pipelinesUnarchived;
+            statistics.compileMilliseconds += elapsed;
+        }
+        if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled %s (not archived) in %.1f ms\n", what, elapsed);
         return pipeline;
     }
 }
@@ -652,11 +744,29 @@ id<MTLRenderPipelineState> PipelineCache::buildRender(const RenderPipelineReques
     return obtainRender([this, request] { return renderDescriptor(request); }, "a render pipeline");
 }
 
+namespace {
+std::atomic<std::uint64_t> guestComputeCreated{0};
+std::atomic<std::uint64_t> guestComputeCreatedLocked{0};
+
+void NoteGuestComputePipeline() {
+    guestComputeCreated.fetch_add(1, std::memory_order_relaxed);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) guestComputeCreatedLocked.fetch_add(1, std::memory_order_relaxed);
+}
+}
+
+ComputePipelineCreation ComputePipelineCreationCounts() {
+    return {guestComputeCreated.load(std::memory_order_relaxed), guestComputeCreatedLocked.load(std::memory_order_relaxed)};
+}
+
 id<MTLComputePipelineState> PipelineCache::Compute(const ShaderRecompiler::RecompileResult& shader) {
-    return Compute(PipelineFunction::From(shader));
+    return compute(PipelineFunction::From(shader), true);
 }
 
 id<MTLComputePipelineState> PipelineCache::Compute(const PipelineFunction& function) {
+    return compute(function, false);
+}
+
+id<MTLComputePipelineState> PipelineCache::compute(const PipelineFunction& function, bool guest) {
     bool created = false;
     const auto entry = entryFor(ComputeKey(function), &created);
     std::unique_lock lock(entry->mutex);
@@ -679,6 +789,7 @@ id<MTLComputePipelineState> PipelineCache::Compute(const PipelineFunction& funct
         id<MTLComputePipelineState> pipeline = nil;
         try {
             pipeline = buildCompute(function);
+            if (guest) NoteGuestComputePipeline();
         } catch (const std::exception& error) {
             failure = error.what();
         }
@@ -713,6 +824,9 @@ void PipelineCache::PrepareCompute(const ShaderRecompiler::RecompileResult& shad
         std::lock_guard stats(mutex);
         ++statistics.backgroundTasks;
     }
+    // Counted here, on the requesting thread (upstream 7fae4549e counts the pipeline PrepareDispatch creates before
+    // the GPU mutex): the build itself runs on a worker, and the dispatch that later obtains it creates nothing.
+    NoteGuestComputePipeline();
     submit([this, entry, function = std::move(function)] {
         std::string failure;
         id<MTLComputePipelineState> pipeline = nil;
@@ -845,6 +959,7 @@ void PipelineCache::submit(std::function<void()> task) {
 }
 
 void PipelineCache::worker() {
+    pthread_setname_np("pipeline compile");
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     for (;;) {
         std::function<void()> task;
@@ -886,6 +1001,7 @@ void PipelineCache::requestSave() {
 }
 
 void PipelineCache::saver() {
+    pthread_setname_np("pipeline saver");
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     std::unique_lock lock(saverMutex);
     for (;;) {
@@ -896,28 +1012,34 @@ void PipelineCache::saver() {
         saveRequested = false;
         lock.unlock();
         const auto start = std::chrono::steady_clock::now();
-        Save();
+        const bool done = Save(false);
         const auto finished = std::chrono::steady_clock::now();
         lock.lock();
+        // A save skipped behind a pipeline creation is asked again for the next interval.
+        if (!done) saveRequested = true;
         nextSave = finished + std::max<std::chrono::steady_clock::duration>(SaveSpacing, (finished - start) * SaveCostFactor);
     }
 }
 
-void PipelineCache::Save() {
+bool PipelineCache::Save(bool waitForPipelines) {
     // Never destroyed: the first save runs early, so a function-local mutex would be destroyed at
     // exit() before the exit handler tears a live device (and its cache) down.
     static std::mutex* const saveMutex = new std::mutex;
     std::lock_guard saving(*saveMutex);
     std::uint64_t saved = 0;
     std::vector<std::function<void(NSArray<id<MTL4Archive>>*)>> replays;
+    std::vector<std::size_t> replayed;
     std::size_t known = 0;
     {
         std::lock_guard lock(mutex);
-        if (serializer == nil || archivePath.empty() || unsaved == 0) return;
+        if (serializer == nil || archivePath.empty() || unsaved == 0) return true;
         saved = unsaved;
         known = archived.size();
         for (std::size_t index = 0; index < known; ++index) {
-            if (!archived[index].captured) replays.push_back(archived[index].replay);
+            if (!archived[index].captured) {
+                replays.push_back(archived[index].replay);
+                replayed.push_back(index);
+            }
         }
     }
     @autoreleasepool {
@@ -926,7 +1048,7 @@ void PipelineCache::Save() {
         // the archive they came from.
         NSMutableArray<id<MTL4Archive>>* lookups = [NSMutableArray array];
         if (written != nil) [lookups addObject:written];
-        if (archive != nil) [lookups addObject:archive];
+        if (archives != nil) [lookups addObjectsFromArray:archives];
         const auto replayStart = std::chrono::steady_clock::now();
         for (auto& replay : replays) {
             @autoreleasepool {
@@ -945,7 +1067,18 @@ void PipelineCache::Save() {
         NSError* failure = nil;
         bool stored = false;
         {
-            std::unique_lock gate(serializerGate);
+            std::unique_lock gate(serializerGate, std::defer_lock);
+            if (waitForPipelines) gate.lock();
+            else if (!gate.try_lock()) {
+                // Busy: the replays above are in the serializer now and stay there for the next save,
+                // which must not capture them again. Captured twice, the flush crashed on macOS 27.0.1
+                // (dispatch_retain(NULL) in -[_MTLBinaryArchive materializeAirNTFromOnlineForSlice:
+                // entryList:] on the saver thread; SuperTuxKart at ~50 s, GATE5-STK2).
+                std::lock_guard lock(mutex);
+                for (const auto index : replayed) archived[index].captured = true;
+                if (Profile()) std::fprintf(stderr, "[metal-pipelines] save skipped behind a pipeline creation (%zu replayed, kept for the next save)\n", replays.size());
+                return false;
+            }
             stored = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];
             // Whatever succeeded or not, the serializer is empty now: everything noted so far must
             // be replayed before the next save (the first `known` entries were replayed above, the
@@ -958,13 +1091,13 @@ void PipelineCache::Save() {
         if (!stored) {
             std::fprintf(stderr, "[metal-pipelines] cannot write %s: %s\n", temporary.c_str(), Describe(failure).c_str());
             std::filesystem::remove(temporary, error);
-            return;
+            return true;
         }
         std::filesystem::rename(temporary, archivePath, error);
         if (error) {
             std::fprintf(stderr, "[metal-pipelines] cannot rename %s: %s\n", temporary.c_str(), error.message().c_str());
             std::filesystem::remove(temporary, error);
-            return;
+            return true;
         }
         // The pipelines just flushed are replayed from this file at the next save. Opened at its
         // final path: Metal resolves a lookup archive through its file (one opened at the temporary
@@ -982,6 +1115,7 @@ void PipelineCache::Save() {
     std::lock_guard lock(mutex);
     unsaved -= std::min(unsaved, saved);
     ++statistics.archiveSaves;
+    return true;
 }
 
 PipelineCacheStatistics PipelineCache::Statistics() const {

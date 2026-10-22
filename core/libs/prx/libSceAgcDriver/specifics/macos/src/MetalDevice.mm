@@ -17,10 +17,13 @@
 #include "MetalNoCopy.h"
 #include "MetalVmTrace.h"
 #include "BdaAbi.hpp"
+#include "ImageTableAbi.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "MslAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -487,14 +490,32 @@ void VulkanDevice::State::Sync() {
 
 // The BdaAbi fault buffer after a batch with dispatches completed: GPU stores through BDA addresses
 // are reported to the write tracker (written-page record), then a published fault record is raised.
-void VulkanDevice::State::CheckFaults() {
+void VulkanDevice::State::CheckFaults(std::uint64_t serial) {
     auto* words = static_cast<std::uint32_t*>(faults.contents);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> tableRanges;
+    if (serial != 0u) {
+        std::lock_guard lock(tableRangeMutex);
+        for (auto batch = batchTableRanges.begin(); batch != batchTableRanges.end() && batch->first <= serial;) {
+            tableRanges.insert(tableRanges.end(), batch->second.begin(), batch->second.end());
+            batch = batchTableRanges.erase(batch);
+        }
+    }
     if (words[Bda::WrittenOverflowWord] != 0u) {
         std::memset(faults.contents, 0, Bda::WrittenListWord * sizeof(std::uint32_t));
         throw std::runtime_error("Metal device: more than " + std::to_string(Bda::WrittenPageSlots) + " chunks of " + std::to_string(Bda::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     }
     if (const auto count = words[Bda::WrittenCountWord]; count != 0u) {
-        const bool valid = Bda::ForEachWrittenRange(words, [](std::uint64_t address, std::size_t bytes) { GuestMemory::MarkWritten(address, bytes); });
+        std::uint64_t selfWritten = 0;
+        bool selfWrite = false;
+        const bool valid = Bda::ForEachWrittenRange(words, [&](std::uint64_t address, std::size_t bytes) {
+            for (const auto& [base, size] : tableRanges) {
+                if (!selfWrite && size != 0u && address < base + size && base < address + bytes) {
+                    selfWrite = true;
+                    selfWritten = base;
+                }
+            }
+            GuestMemory::MarkWritten(address, bytes);
+        });
         for (std::uint32_t claim = 0; claim < std::min(count, Bda::WrittenPageSlots); ++claim) {
             const auto slot = words[Bda::WrittenListWord + claim];
             if (slot >= Bda::WrittenPageSlots) continue;
@@ -503,6 +524,9 @@ void VulkanDevice::State::CheckFaults() {
         }
         words[Bda::WrittenCountWord] = 0u;
         if (!valid) throw std::runtime_error("Metal device: invalid BDA written-page record");
+        // Upstream's BdaResources::markWrittenPages text.
+        if (selfWrite) lastFaultStage = 0u;
+        if (selfWrite) throw std::runtime_error("Metal device: image table at " + Hex(selfWritten) + " is written by its own dispatch");
     }
     Bda::Fault report {};
     std::memcpy(&report, faults.contents, sizeof(report));
@@ -518,6 +542,20 @@ void VulkanDevice::State::CheckFaults() {
     lastFaultStage = report.stage;
     if (report.reason == Bda::FaultReason::Unmapped) message += " (no guest allocation in the BDA page table covers it)";
     if (report.reason == Bda::FaultReason::Permission) message += " (a store to a read-only range of the BDA page table)";
+    if (report.reason == Bda::FaultReason::Overflow) message += " (Overflow)";
+    if (report.reason == Bda::FaultReason::InvalidTable) message += " (InvalidTable)";
+    if (report.reason == Bda::FaultReason::InvalidRectangle) message += " (InvalidRectangle)";
+    if (report.reason == Bda::FaultReason::Unaligned) message += " (Unaligned)";
+    if (report.reason == Bda::FaultReason::InvalidDescriptor) message += " (InvalidDescriptor)";
+    // MslAbi Version 15: upstream's report (BdaResources::CheckFault) from the bound tables' poison lists.
+    if (report.reason == Bda::FaultReason::ImageTable) throw std::runtime_error(Graphics::DescribeImageTableFault(report.stage, report.instruction, report.address, report.bytes));
+    // Upstream's report (BdaResources::CheckFault): the target address and the program counter of
+    // a call the relinker linked no callee for.
+    if (report.reason == Bda::FaultReason::UnlinkedCall) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "shader stage %u called address 0x%llx at program counter 0x%x, which no linked callee of that call matches", report.stage, static_cast<unsigned long long>(report.address), report.instruction);
+        throw std::runtime_error(text);
+    }
     throw std::runtime_error(message);
 }
 
@@ -652,6 +690,8 @@ void VulkanDevice::State::Teardown(bool atExit) noexcept {
         //     the queue (GuestBufferMemory.mm), once nothing recorded can use them.
         if (context.device != VK_NULL_HANDLE) {
             try {
+                // Upstream 619be6979: the shared snapshot copies of address-based builds go with the device.
+                Graphics::ClearSnapshotCopies(context.device);
                 Graphics::ClearImageMirrors(context.device);
                 Graphics::ClearHostImports(context.device);
             } catch (const std::exception& error) {
@@ -720,6 +760,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             if (![state->device supportsFamily:MTLGPUFamilyMetal4] || ![state->device supportsFamily:MTLGPUFamilyApple7]) throw std::runtime_error("Metal device: the GPU lacks the Metal 4 / Apple7 feature set this driver needs");
             NSError* error = nil;
             state->pipelines = std::make_unique<Graphics::Metal::PipelineCache>(state->device);
+            state->computePipelinesAtStart = Graphics::Metal::ComputePipelineCreationCounts().created;
             state->compiler = state->pipelines->Compiler();
             if (state->compiler == nil) throw std::runtime_error("Metal device: no shader compiler");
             // ImageGatherExtended + nonConstantImageOffsets (Target()): MSL's sample/gather take a
@@ -740,6 +781,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // Vertex and mesh functions write [[render_target_array_index]] (layered draws, upstream #3763; the SPIR-V
             // header names the layer export through SPV_EXT_shader_viewport_index_layer, as upstream's devices do).
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityShaderViewportIndexLayerEXT));
+            // Upstream 30e85a3a2: the front end reads it only for tessellation (Recompiler.cpp
+            // RequestInputInfo -> TessellationConfiguration::drawParameters), where the local program
+            // reads BaseInstance (the object function passes aps5_draw.firstInstance) and the hull its
+            // draw-relative instance (aps5_group.y, MslTessellation.cpp). BaseInstance in any other
+            // stage stays refused by the MSL backend.
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDrawParameters));
+            // MSL 2.3+ discard_fragment() demotes the fragment to a helper thread (its quad's derivatives stay defined),
+            // which is what OpDemoteToHelperInvocation does: the PA_SC_AA_MASK quad pixel mask discards its uncovered
+            // pixels that way (MslEntryPoint.cpp), so masked pixel programs with implicit-LOD sampling or cross-lane
+            // reads run (agc_driver_quad_pixel_mask), where a Vulkan device without the feature refuses them.
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDemoteToHelperInvocation));
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
@@ -800,14 +852,44 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             context.shaderClipDistance = true;
             context.shaderCullDistance = true;
             context.viewportIndexLayer = true;
+            // Upstream 53212b18a remaps a viewport depth range outside [0, 1] into the vertex shader
+            // (Graphics::ApplyDepthRemap) when the device lacks VK_EXT_depth_range_unrestricted; the MSL
+            // backend has no remap, so the Metal device keeps passing the guest range to MTLViewport as it
+            // did before (MetalDraw.mm) and Target().depthRangeRemap stays false.
+            context.depthRangeUnrestricted = true;
+            // VkPipelineRasterizationStateCreateInfo::depthClampEnable: MetalDraw.mm sets
+            // MTLDepthClipModeClamp for a draw with the guest's depth clamp.
+            context.depthClamp = true;
+            // The color sample counts the GPU renders (the twins' harness reports the same), and
+            // multisampled storage images: Metal shaders cannot write texture2d_ms, so guest MSAA
+            // storage goes through the target's storage shadow (DECISIONS D22/D28,
+            // MultisampleStorageTexture), which is what Context::storageImageMultisample promises.
+            VkSampleCountFlags colorSamples = 0;
+            for (const std::uint32_t count : {1u, 2u, 4u, 8u}) {
+                if ([state->device supportsTextureSampleCount:count]) colorSamples |= count;
+            }
+            context.limits.framebufferColorSampleCounts = colorSamples;
+            // Depth targets render at the same counts (MetalDraw.mm attaches multisampled depth
+            // textures of the draw's sample count; supportsTextureSampleCount covers every format).
+            context.limits.framebufferDepthSampleCounts = colorSamples;
+            context.storageImageMultisample = true;
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
             Graphics::Metal::DescribeMemory(context, state->device);
+            // Upstream 8cda58273: an allocation the heap refuses releases the texture caches and retries.
+            context.cacheReclaim = Graphics::ReleaseTextureCaches;
             context.bufferPool = std::make_shared<Graphics::BufferPool>(context);
             state->recorder = std::make_unique<Graphics::Recorder>(context, true);
             context.recorder = state->recorder.get();
             state->recorder->Activate();
             Graphics::PrepareImportWatch(context);
+            // Image and sampler tables (MslAbi Version 15): arrays of MTLResourceIDs in the stream, so
+            // the bounds are the ImageTableAbi budgets, the Tier 2 argument buffer texture limit
+            // (500,000 on Apple GPUs, Metal Feature Set Tables) and the device's sampler limit.
+            constexpr std::uint64_t ArgumentBufferTextures = 500000u;
+            context.imageTableCapacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint64_t>(ShaderRecompiler::RuntimeAbi::StageCount) * ShaderRecompiler::ImageTableAbi::ImageElementBudget, ArgumentBufferTextures));
+            const auto samplerLimit = std::min<std::uint64_t>(ShaderRecompiler::ImageTableAbi::SamplerElementBudget, static_cast<std::uint64_t>(state->device.maxArgumentBufferSamplerCount));
+            context.samplerTableCapacity = static_cast<std::uint32_t>(samplerLimit - samplerLimit % ShaderRecompiler::ImageTableAbi::SamplerEntryElements);
             // The image cache's Graphics twins (Texture/ShaderResources, D4/D5) take the complete Context.
             state->images->Attach(state->context);
             // Presentation (D6): the window's Metal layer, or headless targets when it has none.
@@ -829,6 +911,33 @@ VulkanDevice::~VulkanDevice() {
 
 ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePipelineCapture&, std::span<const std::byte>) {
     Unimplemented("ReplayComputePipeline (Vulkan pipeline captures)", "work package D1");
+}
+
+// Upstream 4aafda8e3 journals the compute pipelines of a run (Graphics/PipelineJournal) and builds
+// them ahead on the next run's device. The Metal device keeps that job in its pipeline cache: the
+// MTL4Archive persists every compiled pipeline and the prewarm thread recompiles the stored
+// libraries at startup (PipelineCache.mm), so no journal replay starts here. The hook still builds
+// a compute result through the cache (false when the cache already held the pipeline: no guest
+// pipeline was created by this call; a concurrent build on another thread may blur that answer).
+bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool) {
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    if (state->pipelines == nullptr || shader.msl.empty() || shader.msl.Reflection().stage != Abi::Stage::Kernel) return false;
+    const auto before = Graphics::Metal::ComputePipelineCreationCounts().created;
+    state->pipelines->Compute(shader);
+    return Graphics::Metal::ComputePipelineCreationCounts().created != before;
+}
+
+void VulkanDevice::startJournalReplay() {
+}
+
+void VulkanDevice::WaitForPipelineJournalReplay() {
+    startJournalReplay();
+}
+
+// Guest compute pipelines the pipeline cache built since this device's cache was created (the count
+// is process-wide: two live devices building at once share it; tests run one device at a time).
+std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
+    return Graphics::Metal::ComputePipelineCreationCounts().created - state->computePipelinesAtStart;
 }
 
 std::string VulkanDevice::DeviceName() const {
@@ -914,6 +1023,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
         return value == nullptr || value[0] != '0';
     }();
     target.float32DenormFlushNative = nativeF32Flush;
+    // Upstream ac14d6317's float32FlushToZero (a SPIR-V DenormFlushToZero mode its startup probe vouches
+    // for) stays false: the MSL backend's native flush is float32DenormFlushNative above (D54).
     // DECISIONS D62: wave64 compute programs without cross-lane dependences run at one guest lane per
     // invocation (MslLaneLocal.cpp). APS5_MSL_WAVE64_LANE_LOCAL=0 keeps the two-half layout.
     static const bool wave64LaneLocal = [] {
@@ -942,6 +1053,21 @@ std::uint32_t VulkanDevice::VendorId() const {
 
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t) const {
     return Target();
+}
+
+// Upstream 7a6cc7178 (VK_EXT_subgroup_size_control computeFullSubgroups) spans a wave64 program over
+// two full 32-lane subgroups (SpirvTarget::spannedWaves, opt-in). Metal guarantees no full SIMD
+// groups for a dispatch, and the MSL backend runs wave64 its own way (two halves or lane-local,
+// DECISIONS D62), so the Metal device reports no full-subgroup guarantee.
+bool VulkanDevice::ComputeFullSubgroups() const {
+    return false;
+}
+
+// Upstream 03f4f6718e bounds the barycentric tessellation emulation by the fragment input limit.
+// Metal Feature Set Tables: 124 scalar fragment inputs on Apple GPUs (the bound Target() uses for
+// mesh and tessellation varyings).
+std::uint32_t VulkanDevice::MaxFragmentInputComponents() const {
+    return 124u;
 }
 
 VkDevice VulkanDevice::Device() const {
@@ -984,6 +1110,8 @@ void VulkanDevice::WaitIdle() {
 
 void VulkanDevice::PrepareForReplacement() {
     GuestMemory::AssertGpuLockHeld("VulkanDevice::PrepareForReplacement");
+    // Upstream 81e3db853: library prebuilds still queued name this device; they finish first.
+    DriverDetail::AwaitLibraryPrebuilds();
     WaitIdle();
 }
 
@@ -1007,6 +1135,9 @@ void VulkanDevice::StoreIdleResults(bool reapFirst) {
     if (!Graphics::StorageTexture::AnyPending()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    // Upstream e3ce9bac0: the store holds a guest allocation lease (under the GPU mutex, the order of
+    // the other lease holders), so an unmap waits for it and a store during an unmap drops its results.
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     Graphics::StorageTexture::FlushAllPending("idle");
     SubmitRecorded(reapFirst);
 }
@@ -1046,6 +1177,9 @@ void VulkanDevice::ReapRecorded() {
 // no copied writers (every guest buffer is wrapped in place), so no label waits behind a write-back
 // completion (5).
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    // Upstream d756f525f: APS5_STORE_AT_LABEL stores every pending storage-image result before each GPU label.
+    static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
+    if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (state->recorder == nullptr || bytes.empty() || bytes.size() > 65536u || address % 4u != 0u || bytes.size() % 4u != 0u) return 4;
     auto& recorder = *state->recorder;
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
@@ -1138,8 +1272,9 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         stream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, AnyStage);
         Recorder::CountBarriers(Recorder::CommandClass::Fill);
         recorder.MarkCovered(TransferredAccess);
-        if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) {
-            recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
+        // Upstream fac197954: any uniform word fill is noted with its word (HTILE words pending fills leave).
+        if (uniform) {
+            recorder.NotePendingWordFill(address, bytes, pattern[0]);
         } else {
             recorder.NotePendingWrite(address, bytes);
         }
@@ -1153,6 +1288,30 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t) {
     return false;
 }
 
+// Upstream 396b5189a (#4496): only a label a completion will store counts here; a label stored by
+// the GPU stream is ordered by the copy's barrier. APS5_COPY_SYNC=1 (upstream's debug aid) treats every
+// range as stored by a completion. Upstream also counts its copied writers' write-backs (D5, not on Metal).
+bool VulkanDevice::completionStoresOver(std::uint64_t address, std::size_t bytes) const {
+    static const bool alwaysSync = std::getenv("APS5_COPY_SYNC") != nullptr;
+    if (alwaysSync) return true;
+    return Recorder::PendingCompletionLabels() != 0 && state->recorder->CompletionLabelIn(address, bytes);
+}
+
+bool VulkanDevice::copyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const {
+    return state->recorder->PendingWriteOverlaps(address, bytes) && completionStoresOver(address, bytes);
+}
+
+// Upstream e04111bb5: CopyBuffer records the copy without waiting (path 1) when neither range waits
+// on a completion and both have host imports (upstream also takes a copy between live storage images,
+// path 3, which the Metal CopyBuffer does not; it flushes their pending results instead).
+bool VulkanDevice::GpuCopyPossible(std::uint64_t destination, std::uint64_t source, std::size_t bytes) const {
+    if (state->recorder == nullptr || bytes == 0u || copyWaitsOnCompletions(source, bytes) || copyWaitsOnCompletions(destination, bytes)) return false;
+    @autoreleasepool {
+        std::uint64_t offset = 0;
+        return state->ImportOf(destination, bytes, &offset) != nil && state->ImportOf(source, bytes, &offset) != nil;
+    }
+}
+
 // Upstream's rule over the recorder (VulkanDevice.cpp CopyBuffer) without the parts other
 // packages own (storage images D4, unit shadows D3, copied writers D5): path 0 copies on the CPU
 // when neither range has an unsettled recorded write, a pending label or an in-place reader;
@@ -1161,9 +1320,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     CopyOutcome outcome {2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (state->recorder == nullptr || bytes == 0u) return outcome;
     auto& recorder = *state->recorder;
-    // Upstream 396b5189a (#4496): only a label a completion will store counts here; a label stored by
-    // the GPU stream is ordered by the copy's barrier.
-    const auto completionStoreOverlaps = [&](std::uint64_t address) { return Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes); };
+    const auto completionStoreOverlaps = [&](std::uint64_t address) { return completionStoresOver(address, bytes); };
     bool settledBySignal = false;
     // Pending resident-image results over either range are stored first (upstream copies between
     // the storage images instead, CopyOutcome path 3; not ported: TechnicalDebt metal-d6-bring-up-draws).
@@ -1200,8 +1357,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     @autoreleasepool {
         std::uint64_t probeOffset = 0;
         if (state->ImportOf(destination, bytes, &probeOffset) == nil || state->ImportOf(source, bytes, &probeOffset) == nil) return outcome;
-        const bool waitSource = recorder.PendingWriteOverlaps(source, bytes) && completionStoreOverlaps(source);
-        const bool waitDestination = recorder.PendingWriteOverlaps(destination, bytes) && completionStoreOverlaps(destination);
+        const bool waitSource = copyWaitsOnCompletions(source, bytes);
+        const bool waitDestination = copyWaitsOnCompletions(destination, bytes);
         if (waitSource || waitDestination) {
             outcome.synced = true;
             const auto start = std::chrono::steady_clock::now();
@@ -1255,7 +1412,28 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
     return {};
 }
 
-std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t) {
+// Upstream 7fae4549e/da47083cc create compute pipelines in PrepareDispatch, before the GPU mutex.
+// The Metal device already does (PrepareDispatch below starts the build on the pipeline cache's
+// workers through PrepareCompute, which hold no GPU mutex); the cache counts each guest pipeline it builds (compiled or an
+// archive hit) and whether the obtaining thread held the GPU mutex.
+VulkanDevice::ComputePipelineCreation VulkanDevice::ComputePipelineCounts() {
+    const auto counts = Graphics::Metal::ComputePipelineCreationCounts();
+    return {counts.created, counts.underGpuMutex};
+}
+
+// Upstream 89d255c5f (dispatch moves) and 2a15be09c (DCC key pre-syncs) work on the Vulkan
+// device's compute templates and its stage-A pre-sync. The Metal device prepares no resources in
+// PrepareDispatch and binds every dispatch's buffers by address at the record, so it neither moves
+// template buffers nor pre-syncs: the counts stay zero.
+VulkanDevice::DispatchMoveCount VulkanDevice::DispatchMoveCounts() {
+    return {};
+}
+
+VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
+    return {};
+}
+
+std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot>, std::uint64_t, std::uint64_t) {
     // As upstream: an incompatible runtime ABI is refused before anything is prepared.
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     // The pipeline starts building on the cache's workers; Dispatch waits for it.
@@ -1349,14 +1527,41 @@ void VulkanDevice::State::PlanBindings(const ShaderRecompiler::RecompileResult& 
     }
 }
 
+namespace {
+// Upstream d9e47d1e9's image table binds at RuntimeAbi::ImageTableBinding (StageCount x
+// Binding::Count, past every stage group): `binding % Count` would read it as group StageCount's
+// first binding, so it is named here (MslAbi Version 15 gives every stage function its own entry).
+// Upstream 603dc01db put the image storage table at that binding and moved the image table one past.
+ShaderRecompiler::RuntimeAbi::Binding TableKind(std::uint32_t binding) {
+    if (binding == ShaderRecompiler::RuntimeAbi::ImageTableBinding) return ShaderRecompiler::RuntimeAbi::Binding::ImageTable;
+    if (binding == ShaderRecompiler::RuntimeAbi::ImageStorageTableBinding) return ShaderRecompiler::RuntimeAbi::Binding::ImageStorageTable;
+    if (binding > ShaderRecompiler::RuntimeAbi::ImageTableBinding) throw std::runtime_error("Metal device: RuntimeAbi binding " + std::to_string(binding) + " lies past the image table binding");
+    return static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
+}
+
+bool TableRole(ShaderRecompiler::DescriptorRole role) {
+    return role == ShaderRecompiler::DescriptorRole::ImageTable || role == ShaderRecompiler::DescriptorRole::ImageStorageTable || role == ShaderRecompiler::DescriptorRole::SamplerTable || role == ShaderRecompiler::DescriptorRole::ImageTableMap;
+}
+}
+
 void VulkanDevice::State::PlanImages(const ShaderRecompiler::RecompileResult& shader, Graphics::Metal::ImageBindings& imageBindings, StageBindings& plan) {
     const auto& reflection = shader.msl.Reflection();
     // Pairs samplers with images (ANISO_OVERRIDE, FORCE_DEGAMMA) and checks bindless metadata.
     imageBindings.Prepare(shader);
     if (reflection.table.bytes != 0u) {
         for (const auto& binding : shader.bindings) {
+            const auto kind = TableKind(binding.binding);
+            if (TableRole(binding.role)) {
+                // MslAbi Version 15: the build's arrays of texture and sampler MTLResourceIDs (one
+                // per element of the stage's table) and its finalized map (two words per entry).
+                if (reflection.table.Find(kind) == nullptr) continue;
+                const auto count = binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap ? (binding.guestDescriptor.size() + 1u) / 2u : static_cast<std::size_t>(binding.count);
+                std::vector<std::uint64_t> entries(std::max<std::size_t>(count, 1u), 0u);
+                imageBindings.Write(binding, entries);
+                plan.tableArrays.emplace_back(kind, std::move(entries));
+                continue;
+            }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages && binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
-            const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
             const auto* range = reflection.table.Find(kind);
             if (range == nullptr) continue;
             std::vector<std::uint64_t> entries(std::min(binding.count, range->count), 0u);
@@ -1412,8 +1617,9 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
     std::memset(upload.host, 0, reflection.table.bytes);
     auto* table = upload.host;
     for (const auto& binding : shader.bindings) {
+        const auto kind = TableKind(binding.binding);
+        if (TableRole(binding.role)) continue;  // plan.tableArrays, below
         const auto group = binding.binding / static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
-        const auto kind = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
         if (group != static_cast<std::uint32_t>(reflection.group)) throw std::runtime_error("Metal device: a binding belongs to another stage group");
         const auto* range = reflection.table.Find(kind);
         if (range == nullptr) continue;
@@ -1492,11 +1698,27 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
             break;
         case ShaderRecompiler::DescriptorRole::GuestImages:
         case ShaderRecompiler::DescriptorRole::GuestSamplers:
+        case ShaderRecompiler::DescriptorRole::ImageTable:
+        case ShaderRecompiler::DescriptorRole::ImageStorageTable:
+        case ShaderRecompiler::DescriptorRole::SamplerTable:
+        case ShaderRecompiler::DescriptorRole::ImageTableMap:
             break;
         }
     }
     for (const auto& [offset, values] : plan.imageEntries) {
         if (!values.empty()) std::memcpy(table + offset, values.data(), values.size() * sizeof(std::uint64_t));
+    }
+    // MslAbi Version 15: each table array lives in the stream (resident with the upload arena; the
+    // textures it names are the image cache's, resident while tracked, and the build that holds them
+    // is kept by the batch), and every entry of its range points at it (ImageTableSlots for images).
+    for (const auto& [kind, values] : plan.tableArrays) {
+        const auto* range = reflection.table.Find(kind);
+        if (range == nullptr) continue;
+        const auto bytes = values.size() * sizeof(std::uint64_t);
+        if (bytes > 0xffffffffu) throw std::runtime_error("Metal device: an image or sampler table exceeds 4 GiB");
+        const auto data = stream.Write(std::as_bytes(std::span<const std::uint64_t>(values)), 16u);
+        auto* entries = reinterpret_cast<Abi::BufferEntry*>(table + range->offset);
+        for (std::uint32_t entry = 0; entry < range->count; ++entry) entries[entry] = {data.address, static_cast<std::uint32_t>(bytes), 0u};
     }
     return upload.address;
 }
@@ -1515,16 +1737,22 @@ void VulkanDevice::State::NoteBindings(const StageBindings& plan) {
     if (!plan.writes.empty()) recorder->NotePendingWrites(plan.writes);
 }
 
-void VulkanDevice::State::CheckFaultsOnComplete(bool draw) {
+void VulkanDevice::State::CheckFaultsOnComplete(bool draw, std::vector<std::pair<std::uint64_t, std::uint64_t>> tableRanges) {
+    const auto serial = recorder->OpenSerial();
+    if (!tableRanges.empty()) {
+        std::lock_guard lock(tableRangeMutex);
+        auto& ranges = batchTableRanges[serial];
+        ranges.insert(ranges.end(), tableRanges.begin(), tableRanges.end());
+    }
     // Faults and written pages of this batch's commands (one shared record) when it completes. As
     // upstream (BdaResources::CheckFault in a completion): a fault record throws, which the recorder
     // reports on stderr ("[gpu] deferred write-back failed: ...") without failing the wait. A
     // draw's graphics-stage fault is also kept for WaitIdle: upstream's draw over non-resident
     // targets runs synchronously and throws it from Draw (agc_driver_pixel_interlock).
-    recorder->OnComplete([this, draw] {
+    recorder->OnComplete([this, draw, serial] {
         if (!tearingDown) {
             try {
-                CheckFaults();
+                CheckFaults(serial);
             } catch (...) {
                 constexpr std::uint32_t ComputeStage = 4u;  // IrShaderStage::Compute in Bda::Fault::stage
                 if (draw && lastFaultStage != ComputeStage) {
@@ -1536,7 +1764,7 @@ void VulkanDevice::State::CheckFaultsOnComplete(bool draw) {
             return;
         }
         try {
-            CheckFaults();
+            CheckFaults(serial);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[metal] %s\n", error.what());
         }
@@ -1593,7 +1821,14 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         std::memcpy(push.data(), shader.pushConstants.data(), shader.pushConstants.size());
     }
     const std::uint64_t tableAddress = WriteTable(shader, snapshots, stream, plan, std::span<std::byte>(push).first(shader.pushConstants.size()));
-    const auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    auto indirect = indirectArguments != 0u ? Wrap(indirectArguments, 12u) : 0u;
+    if (indirect != 0u) {
+        // e54d2f35fe (VulkanDevice.cpp RecordDispatchArguments): the group counts are checked
+        // against the device limit on the GPU into a 12-byte copy, dispatched from when the
+        // kernel built; otherwise read from the guest unchecked.
+        const auto checked = stream.Allocate(12u, 16u);
+        if (recorder.RecordDispatchArguments(Graphics::Metal::Handle(stream), indirect, checked.address)) indirect = checked.address;
+    }
     const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     std::vector<std::uint64_t> driverAddresses;
     std::vector<MTLSize> chunkGroups;
@@ -1647,7 +1882,7 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
         plan.reads.pop_back();
     }
     NoteBindings(plan);
-    CheckFaultsOnComplete();
+    CheckFaultsOnComplete(false, imageBindings.TableRanges());
     if (Trace() && std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::Gds; })) {
         // After the dispatch completes: what the CPU sees in GDS dwords 4-7, and what the GPU sees
         // through the bound mapping (copied into a fresh buffer behind the dispatch).
@@ -1719,6 +1954,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
             return outcome;
         }
         const auto start = std::chrono::steady_clock::now();
+        // Upstream f6c8e8474: an address-based producer of the counts is not a noted pending write;
+        // the recorder first finishes up to the newest batch recorded with a lease.
+        Graphics::FinishLeaseWork();
         std::array<std::uint32_t, 3> groups {};
         GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4u);
         outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1755,6 +1993,9 @@ void VulkanDevice::NoteRecipe(RecipeEvent, RecipeKind) {
 
 Graphics::Context VulkanDevice::graphicsContext() const {
     if (state->recorder == nullptr) Unimplemented("the Graphics::Context of a compile-only device", "work package D1");
+    // Upstream's graphics context carries the texture detiler and the image caches: on Metal that is
+    // the image cache's copy of the device Context (ImageCache::Attach), once attached.
+    if (state->images != nullptr && state->images->ImageContext() != nullptr) return *state->images->ImageContext();
     return state->context;
 }
 

@@ -52,10 +52,13 @@ int APS5_VABI defaultPosixAlign(void** pointer, std::size_t alignment, std::size
     catch (const std::length_error&) { return 12; }
 }
 
+int APS5_VABI defaultStatsFast(void* stats) { return GuestHeap::GuestHeapStatsFast_nid_postfix(stats); }
+
 std::array<void*, 10> defaultApi() {
     return {reinterpret_cast<void*>(defaultAllocate), reinterpret_cast<void*>(defaultFree),
         reinterpret_cast<void*>(defaultCalloc), reinterpret_cast<void*>(defaultReallocate),
-        reinterpret_cast<void*>(defaultAlign), nullptr, reinterpret_cast<void*>(defaultPosixAlign)};
+        reinterpret_cast<void*>(defaultAlign), nullptr, reinterpret_cast<void*>(defaultPosixAlign), nullptr,
+        reinterpret_cast<void*>(defaultStatsFast)};
 }
 
 class CallbackScope {
@@ -89,7 +92,10 @@ const void* replacementTable(const void* processParameters) {
 // _init_env, and libSceLibcInternal's malloc still works for them on the console. The first heap call
 // then sets the heap up as _init_env would: the title's replacement table when its process parameters
 // carry one, the default heap otherwise.
-void ensureRegistered() {
+// installDefault is false for the heap queries (malloc_stats_fast, malloc_usable_size): they initialize a
+// title's replacement table like upstream's lazy path, but a query alone never installs the default heap,
+// so a later _init_env (or ApplicationHeapInitialize) can still register the title's allocator.
+void ensureRegistered(bool installDefault) {
     {
         std::lock_guard lock(heapMutex);
         if (heapApi[0] != nullptr || heapFailure || heapFinalized) return;
@@ -104,14 +110,23 @@ void ensureRegistered() {
         ApplicationHeapInitialize_nid_no_patch(processParameters);
         return;
     }
+    if (!installDefault) return;
     std::lock_guard lock(heapMutex);
     if (heapApi[0] == nullptr && !heapFailure && !heapFinalized) heapApi = defaultApi();
 }
 
+// Upstream's lazy initialization entry point; ensureRegistered also covers titles without a replacement table.
+void ensureInitialized(std::unique_lock<std::mutex>& lock, bool installDefault = true) {
+    if (heapApi[0] != nullptr || heapFailure || heapFinalized) return;
+    lock.unlock();
+    ensureRegistered(installDefault);
+    lock.lock();
+}
+
 template<typename TCallback>
 TCallback callback(std::size_t index) {
-    ensureRegistered();
-    std::lock_guard lock(heapMutex);
+    std::unique_lock lock(heapMutex);
+    ensureInitialized(lock);
     if (heapFailure) std::rethrow_exception(heapFailure);
     if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
     if (heapApi[index] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -178,6 +193,10 @@ void ApplicationHeapInitialize_nid_no_patch(const void* processParameters) {
             const auto* replacement = read<const void*>(libcParameters, 0x30);
             if (read<std::uint64_t>(replacement, 0) != 0x78 || read<std::uint64_t>(replacement, 8) != 2) throw std::runtime_error("application heap: unsupported allocator replacement table");
             std::array<void*, 10> api;
+            if (ApplicationGuestHeapApi_nid_no_patch(api.data())) {
+                ApplicationHeapRegister_nid_no_patch(api.data());
+                return;
+            }
             std::memcpy(api.data(), static_cast<const std::byte*>(replacement) + 0x20, sizeof(api));
             ApplicationHeapRegister_nid_no_patch(api.data());
             const auto initialize = read<Initialize>(replacement, 0x10);
@@ -227,8 +246,23 @@ void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes
     return pointer;
 }
 
+extern "C" void* APS5_VABI scriptingGetMem_nid_postfix(std::size_t alignment, std::size_t bytes) {
+    alignment = std::max<std::size_t>(alignment, 16);
+    if ((alignment & (alignment - 1)) != 0) return nullptr;
+    try {
+        return GuestHeap::GuestHeapAlign_nid_postfix(alignment, bytes);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    } catch (const std::length_error&) {
+        return nullptr;
+    }
+}
+
+extern "C" void APS5_VABI scriptingFreeMem_nid_postfix(void* pointer) {
+    GuestHeap::GuestHeapFree_nid_postfix(pointer);
+}
+
 void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std::size_t alignment) {
-    ensureRegistered();
     if (bytes == 0) {
         ApplicationHeapFree_nid_no_patch(pointer);
         return nullptr;
@@ -236,7 +270,8 @@ void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std:
     requireAlignment(alignment);
     Realign realign;
     {
-        std::lock_guard lock(heapMutex);
+        std::unique_lock lock(heapMutex);
+        ensureInitialized(lock);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -274,7 +309,8 @@ int ApplicationHeapPosixAlign_nid_no_patch(void** pointer, std::size_t alignment
 int ApplicationHeapStatsFast_nid_no_patch(void* stats) {
     Stats statsFast;
     {
-        std::lock_guard lock(heapMutex);
+        std::unique_lock lock(heapMutex);
+        ensureInitialized(lock, false);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
@@ -288,7 +324,8 @@ int ApplicationHeapStatsFast_nid_no_patch(void* stats) {
 std::size_t ApplicationHeapUsableSize_nid_no_patch(void* pointer) {
     UsableSize usableSize = nullptr;
     {
-        std::lock_guard lock(heapMutex);
+        std::unique_lock lock(heapMutex);
+        ensureInitialized(lock, false);
         if (heapFailure) std::rethrow_exception(heapFailure);
         if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
         if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");

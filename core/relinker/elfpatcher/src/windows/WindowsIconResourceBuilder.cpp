@@ -38,6 +38,9 @@ void validatePng(const std::vector<std::uint8_t>& bytes, const std::filesystem::
         const auto length = readBigEndian(bytes, offset);
         if (length > bytes.size() - offset - 12) fail("truncated chunk data");
         const auto type = readBigEndian(bytes, offset + 4);
+        for (std::size_t index = offset + 4; index < offset + 8; ++index)
+            if (!((bytes[index] >= 'A' && bytes[index] <= 'Z') || (bytes[index] >= 'a' && bytes[index] <= 'z')))
+                fail("invalid chunk type");
         std::uint32_t crc = 0xffffffffu;
         for (std::size_t index = offset + 4; index < offset + 8 + length; ++index) {
             crc ^= bytes[index];
@@ -71,6 +74,12 @@ void validatePng(const std::vector<std::uint8_t>& bytes, const std::filesystem::
 }
 
 PeDirectory WindowsIconResourceBuilder::Build(const std::vector<std::uint8_t>& png, const std::filesystem::path& iconPath, std::vector<PeSection>& sections, const std::uint32_t nextRva) const {
+    if (nextRva < LoadRva || nextRva % SectionAlignment != 0)
+        throw Domain::RelinkerException("Invalid Windows resource section RVA", nextRva);
+    if (std::any_of(sections.begin(), sections.end(), [](const auto& section) { return section.Name == ".rsrc"; }))
+        throw Domain::RelinkerException("Duplicate Windows resource section");
+    if (!sections.empty() && nextRva < AlignRva(static_cast<std::uint64_t>(sections.back().Rva) + sections.back().Data.size()))
+        throw Domain::RelinkerException("Windows resource section overlaps preceding section", nextRva);
     if (png.size() > 0x7fffffffu - 184) throw Domain::RelinkerException("Invalid Windows icon size");
     validatePng(png, iconPath);
     std::vector<std::uint8_t> data(184 + png.size());

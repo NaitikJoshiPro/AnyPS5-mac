@@ -1,8 +1,9 @@
 # Skips the macOS (Metal) GPU suite may report, checked by tools/check_skips.py --job macos (docs/mac/M2_DESIGN.md D-M2-8).
 # One line per test: <test> | <reason: Python regex searched in the test's "skipped, ..." line, no "|"> | <docs/dev/TechnicalDebt.md anchor>
 # Only documented Apple GPU or Metal limits belong here (TechnicalDebt.md "Metal skips (macOS)"), and Vulkan-internal
-# tests whose behaviour has no Metal counterpart. f64 and 64-bit atomics are emulated, never allowlisted. A line whose
-# test ran instead of skipping is reported as stale: remove it.
+# tests whose behaviour has no Metal counterpart, and tests of another host OS's kernel API that macOS lacks (Linux udmabuf).
+# Metal driver features not written yet are never listed: their tests skip naming the TechnicalDebt anchor and fail the check.
+# f64 and 64-bit atomics are emulated, never allowlisted. A line whose test ran instead of skipping is reported as stale: remove it.
 agc_driver_draw_cache_reuse | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
 agc_pipeline_library | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_pipeline_library_off | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
@@ -18,3 +19,37 @@ agc_driver_pipeline_optimized_readback_d16_fast | graphics pipeline libraries ar
 agc_driver_pipeline_optimized_readback_d32 | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 agc_driver_pipeline_optimized_readback_d32_fast | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
 guest_video_out_high_frame_rate | current display does not provide 120 Hz | metal-display-120hz
+agc_driver_draw_cache_reuse_verify | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_draw_cache_reuse_inline | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_host_import_sparse | udmabuf imports are Linux only | metal-linux-udmabuf
+agc_driver_sparse_dma_buf_import | udmabuf imports are Linux only | metal-linux-udmabuf
+agc_pipeline_journal | the Metal device keeps no pipeline journal | metal-pipeline-journal
+agc_pipeline_library_clear_waits_for_build | graphics pipeline libraries are unavailable | metal-graphics-pipeline-libraries
+agc_pipeline_store_lazy_buffer_pool | the device has no Vulkan pipeline store | metal-vulkan-internal-tests
+agc_draw_descriptors | the device writes no Vulkan descriptor sets | metal-vulkan-internal-tests
+agc_driver_dcc_key_presync | no stage-A dispatch preparation | metal-dispatch-templates
+agc_driver_resource_cache_growth | buffer-only dispatches never enter the resource cache | metal-dispatch-templates
+agc_driver_dispatch_move | SKIP_RETURN_CODE=77 | metal-dispatch-templates
+agc_driver_dispatch_move_depth | SKIP_RETURN_CODE=77 | metal-dispatch-templates
+agc_driver_pipeline_journal | the pipeline journal is Vulkan-only | metal-pipeline-journal
+agc_driver_draw_cache_relocation | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_command_batch_failure | the device has no Vulkan command batches | metal-vulkan-internal-tests
+agc_descriptor_cache_failure | the device has no Vulkan descriptor pools | metal-vulkan-internal-tests
+agc_driver_indirect_arguments_pending_producer | Recorder::HoldNextSubmit holds a Vulkan timeline-semaphore submit | metal-vulkan-internal-tests
+agc_driver_multisample_readback | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_depth | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint8 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint16 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint64 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint128 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_retirement | the retirement fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_fill_host_only | Metal devices on one GPU share one VkDevice handle | metal-shared-device-handle
+agc_driver_prepared_shaders_abi_deferred_rectangle_pairs | the MSL backend builds rectangle pairs | metal-vulkan-internal-tests
+agc_driver_rect_list_corner | device has no tessellation | metal-vulkan-internal-tests
+agc_driver_native_depth_bda_clear | does not retain guest write watching for native clear imports | metal-d3-import-watch
+agc_shadowed_key_stores | imports no watched host memory under a unit shadow | metal-d3-import-watch
+agc_driver_image_table_vouched_lookups | no host import probe result | metal-d3-import-watch
+agc_driver_prepared_graphics_prebuild_0 | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_prepared_graphics_prebuild_1 | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_prepared_graphics_prebuild_unset | SKIP_RETURN_CODE=77 | metal-graphics-pipeline-libraries
+agc_driver_multisampled_pass_order | captures Vulkan pipeline barriers | metal-vulkan-internal-tests

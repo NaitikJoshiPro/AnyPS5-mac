@@ -49,6 +49,8 @@ int APS5_VABI sceAudioOutGetLastOutputTime(int, std::uint64_t*);
 int APS5_VABI sceUserServiceGetInitialUser(int*);
 int APS5_VABI sceUserServiceGetUserName(int, char*, std::size_t);
 int APS5_VABI sceUserServiceGetLoginUserIdList(void*);
+int APS5_VABI sceUserServiceInitialize(const void*);
+int APS5_VABI sceUserServiceTerminate();
 }
 
 namespace {
@@ -179,12 +181,15 @@ void UserService(std::uintptr_t base) {
     auto* user = At<int>(base, 0xa00);
     auto* name = At<char>(base, 0xa40);
     auto* list = At<std::int32_t>(base, 0xb00);
+    // The login list needs an initialized user service, as on the console.
+    Require(sceUserServiceInitialize(nullptr) == 0, "sceUserServiceInitialize");
     NoFaults(base, "sceUserServiceGet*", [&] {
         Require(sceUserServiceGetInitialUser(user) == 0, "sceUserServiceGetInitialUser");
         Require(sceUserServiceGetUserName(InitialUser, name, 32) == 0, "sceUserServiceGetUserName");
         Require(sceUserServiceGetLoginUserIdList(list) == 0, "sceUserServiceGetLoginUserIdList");
     });
     Require(Host(user) == InitialUser && GuestArena::HostPointer(name)[0] != 0 && Host(list) == InitialUser, "UserService: wrong values");
+    Require(sceUserServiceTerminate() == 0, "sceUserServiceTerminate");
 }
 
 }

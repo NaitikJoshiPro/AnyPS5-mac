@@ -42,7 +42,9 @@ constexpr FormatEntry kFormatLookup[] = {
     {29, VK_FORMAT_R16G16_SFLOAT, 4, false},
     {36, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, false},
     {50, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, false},
+    {51, VK_FORMAT_A2B10G10R10_SNORM_PACK32, 4, false},
     {54, VK_FORMAT_A2B10G10R10_UINT_PACK32, 4, false},
+    {55, VK_FORMAT_A2B10G10R10_SINT_PACK32, 4, false},
     {56, VK_FORMAT_R8G8B8A8_UNORM, 4, false},
     {57, VK_FORMAT_R8G8B8A8_SNORM, 4, false},
     {60, VK_FORMAT_R8G8B8A8_UINT, 4, false},
@@ -115,7 +117,7 @@ VkFormat ResolveTextureFormat(std::uint32_t guestFormat) {
 
 std::uint32_t SrgbDecodeFormats(PFN_vkGetPhysicalDeviceFormatProperties formatProperties, VkPhysicalDevice physical) {
     const char* forced = std::getenv("APS5_SRGB_SHADER_DECODE");
-    const bool always = forced != nullptr && std::strcmp(forced, "1") == 0;
+    const bool always = forced != nullptr && (std::strcmp(forced, "1") == 0 || std::strcmp(forced, "copy") == 0);
     const auto sampled = [&](ShaderRecompiler::IrBufferFormat format) {
         VkFormatProperties properties{};
         formatProperties(physical, ResolveTextureFormat(static_cast<std::uint32_t>(format)), &properties);
@@ -129,9 +131,30 @@ std::uint32_t SrgbDecodeFormats(PFN_vkGetPhysicalDeviceFormatProperties formatPr
 }
 
 VkFormat SampledTextureFormat(const Context& context, std::uint32_t guestFormat) {
+    if (IsRepackedTextureFormat(guestFormat)) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     const auto format = static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat);
     if ((context.srgbDecodeFormats & ShaderRecompiler::SrgbDecodeBit(format)) == 0u) return ResolveTextureFormat(guestFormat);
     return ResolveTextureFormat(static_cast<std::uint32_t>(ShaderRecompiler::SrgbUnormFormat(format)));
+}
+
+std::uint32_t SrgbCopyFormats(PFN_vkGetPhysicalDeviceFormatProperties formatProperties, VkPhysicalDevice physical, std::uint32_t decodeFormats) {
+    const char* forced = std::getenv("APS5_SRGB_SHADER_DECODE");
+    if (forced != nullptr && std::strcmp(forced, "1") == 0) return 0u;
+    VkFormatProperties target{};
+    formatProperties(physical, VK_FORMAT_R8G8B8A8_UNORM, &target);
+    if ((target.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0) return 0u;
+    std::uint32_t formats = 0;
+    for (const auto format : {ShaderRecompiler::IrBufferFormat::Format8Srgb, ShaderRecompiler::IrBufferFormat::Format8_8Srgb}) {
+        if ((decodeFormats & ShaderRecompiler::SrgbDecodeBit(format)) == 0u) continue;
+        VkFormatProperties source{};
+        formatProperties(physical, ResolveTextureFormat(static_cast<std::uint32_t>(ShaderRecompiler::SrgbUnormFormat(format))), &source);
+        if ((source.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0) formats |= ShaderRecompiler::SrgbDecodeBit(format);
+    }
+    return formats;
+}
+
+bool SrgbExpandsToRgba8(const Context& context, std::uint32_t guestFormat) {
+    return (context.srgbCopyFormats & ShaderRecompiler::SrgbDecodeBit(static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat))) != 0u;
 }
 
 bool IsSrgbTextureFormat(std::uint32_t guestFormat) {
@@ -164,6 +187,7 @@ VkComponentSwizzle TextureComponentChannel(std::uint32_t guestFormat, VkComponen
         case 133: return bgrb[index];
         case 134: return bgra[index];
         case 136: return argb[index];
+        case 43: return bgra[index];
         default: return component;
     }
 }
@@ -174,6 +198,14 @@ std::uint32_t BytesPerElement(std::uint32_t guestFormat) {
 
 bool IsConvertedTextureFormat(std::uint32_t guestFormat) {
     return remapGuestFormat(guestFormat) != guestFormat;
+}
+
+bool IsRepackedTextureFormat(std::uint32_t guestFormat) {
+    return guestFormat == static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format10_11_11Float);
+}
+
+std::uint32_t RepackTextureWord(std::uint32_t word) {
+    return ((word >> 21u) & 0x7ffu) | (((word >> 10u) & 0x7ffu) << 11u) | ((word & 0x3ffu) << 22u);
 }
 
 std::optional<std::uint32_t> FindGuestColorTargetFormat(VkFormat format, std::uint32_t elementBytes) {

@@ -60,6 +60,9 @@ void Check(const fs::path& file, std::uint32_t& vertex, std::uint32_t& fragment)
     // not the guest program's: Reflection::usesDiscard does not count it.
     const auto conservative = ShaderRecompiler::MslConservative::FragmentText();
     if (const auto at = source.find(conservative); at != std::string::npos) source.erase(at, conservative.size());
+    // So is the uniform sample mask's discard (APS5_SAMPLE_MASK, MslAbi Version 15).
+    const std::string hostMask(ShaderRecompiler::MslAbi::SampleMaskDiscardText);
+    if (const auto at = source.find(hostMask); at != std::string::npos) source.erase(at, hostMask.size());
     Require(reflection.abiVersion == ShaderRecompiler::MslAbi::Version, name + ": unexpected MslAbi version");
     if (reflection.stage == ShaderRecompiler::MslAbi::Stage::Vertex) {
         ++vertex;

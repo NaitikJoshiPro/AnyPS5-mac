@@ -95,6 +95,20 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
     LibcAwaitExit_nid_postfix();
 }
 
+extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
+    return AgcDriver::DriverDetail::Driver::Get().ReserveEopFlip(info);
+}
+
+extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
+    AgcDriver::DriverDetail::Driver::Get().SubmitFlip(info);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().DispatchesAdoptedAhead();
+}
+
 extern "C" void AgcDriverRegisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
     AgcDriver::RegisterVideoOutput(handle, output);
 }

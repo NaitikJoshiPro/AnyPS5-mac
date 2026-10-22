@@ -14,6 +14,7 @@ static void Require(bool value) { if (!value) throw std::runtime_error("packed p
 
 constexpr std::uint32_t UnmodelledBits = 0xE000F0FFu;
 constexpr std::uint32_t SelectOther = 0x5A3C9E17u;
+static bool Iterated = true;
 
 struct Row {
     std::uint32_t sample;
@@ -41,6 +42,7 @@ static void RequireField(const IrValue& user, StageInputKind kind, std::uint32_t
 
 static IrBlock& Begin(IrProgram& program) {
     program.Resources().stage = IrShaderStage::Pixel;
+    program.Metadata().pixelIteratesSamples = Iterated;
     program.Resources().resourceTrackingComplete = true;
     auto& block = program.CreateBlock();
     program.SetEntryBlock(block);
@@ -81,6 +83,7 @@ static void Lower(IrProgram& program) {
 static void ExtractVector(std::uint32_t offset, std::uint32_t count, StageInputKind kind, std::uint32_t fieldOffset) {
     IrProgram program;
     program.Resources().stage = IrShaderStage::Pixel;
+    program.Metadata().pixelIteratesSamples = Iterated;
     program.Resources().resourceTrackingComplete = true;
     auto& block = program.CreateBlock();
     program.SetEntryBlock(block);
@@ -102,6 +105,7 @@ static void ExtractVector(std::uint32_t offset, std::uint32_t count, StageInputK
 static void ExtractVectorMaskedCopy(std::uint32_t offset, std::uint32_t count, StageInputKind kind, std::uint32_t fieldOffset) {
     IrProgram program;
     program.Resources().stage = IrShaderStage::Pixel;
+    program.Metadata().pixelIteratesSamples = Iterated;
     program.Resources().resourceTrackingComplete = true;
     auto& block = program.CreateBlock();
     program.SetEntryBlock(block);
@@ -177,7 +181,7 @@ static std::uint32_t Evaluate(const IrValue* value, const Row& row) {
     throw std::runtime_error("packed pixel ancillary evaluation reached an unsupported value");
 }
 static std::uint32_t PackedWord(const Row& row) {
-    return UnmodelledBits | (row.sample << 8u) | (row.layerExported ? row.layer << 16u : 0u);
+    return UnmodelledBits | ((Iterated ? row.sample : 0u) << 8u) | (row.layerExported ? row.layer << 16u : 0u);
 }
 static void Values(IrOpcode opcode, std::uint32_t offset, std::uint32_t count, bool throughSelect) {
     IrProgram program;
@@ -443,6 +447,16 @@ static bool BuiltinRemains(const IrProgram& program, StageInputKind kind) {
 static bool AncillaryRemains(const IrProgram& program) {
     return BuiltinRemains(program, StageInputKind::PackedAncillary);
 }
+static void PerPixelSampleNumber(bool throughSelect) {
+    IrProgram program;
+    auto& user = Build(program, IrOpcode::BitFieldUExtract, 8u, 4u, throughSelect);
+    Lower(program);
+    Require(!BuiltinRemains(program, StageInputKind::SampleId));
+    for (const Row& row : Rows) {
+        const std::uint32_t word = throughSelect && !row.frontFacing ? SelectOther : PackedWord(row);
+        Require(Evaluate(&user, row) == BitField(word, 8u, 4u, false));
+    }
+}
 static void ExportedWholeWord() {
     IrProgram program;
     auto& entry = Begin(program);
@@ -476,12 +490,12 @@ static void ExportedWholeWord() {
     static_cast<void>(builder.Emit(IrOpcode::Return, IrType::Void, {}));
     LowerMasked(program, true);
     Require(!AncillaryRemains(program) && program.Info().rasterPrimitive);
-    Require(BuiltinRemains(program, StageInputKind::LayerExported));
+    Require(BuiltinRemains(program, StageInputKind::LayerExported) && BuiltinRemains(program, StageInputKind::SampleId) == Iterated);
     const IrValue* word = carried.Argument(0)->Resolve();
     constexpr std::array<Row, 7> words {{{0u, 0u, false, RasterPrimitive::Triangle}, {0u, 0u, false, RasterPrimitive::Rectangle}, {0u, 0u, false, RasterPrimitive::Line}, {15u, 0x1FFFu, false, RasterPrimitive::Point}, {3u, 0x7FFu, false, RasterPrimitive::Triangle},
         {15u, 0x7FFu, false, RasterPrimitive::Point, true}, {3u, 5u, false, RasterPrimitive::Triangle, true}}};
     for (const Row& row : words) {
-        Require(Evaluate(word, row) == (static_cast<std::uint32_t>(row.primitive) | (row.sample << 8u) | (row.layerExported ? row.layer << 16u : 0u)));
+        Require(Evaluate(word, row) == (static_cast<std::uint32_t>(row.primitive) | ((Iterated ? row.sample : 0u) << 8u) | (row.layerExported ? row.layer << 16u : 0u)));
     }
 }
 static void WholeWordReplacesRefusal(HelperRead read) {
@@ -493,7 +507,9 @@ static void WholeWordReplacesRefusal(HelperRead read) {
     const Row row {9u, 0x123u, false, RasterPrimitive::Rectangle};
     Require(Evaluate(built.written->Argument(2), row) == (3u | (9u << 8u)));
 }
-enum class StartingQuad { Kept, BallotAfterBranch, BallotOfOtherLanes, ComputeStage };
+// HostExec*: the active words are the pixel-stage host exec word, WQM(ballot(true)) halves,
+// as an ACO s_mov_b64 s[0:1], exec / s_wqm_b64 exec, exec prologue reads them (upstream 27b196bee0).
+enum class StartingQuad { Kept, BallotAfterBranch, BallotOfOtherLanes, ComputeStage, HostExecKept, HostExecOtherLanes };
 
 static IrValue& StartingQuadMasked(IrProgram& program, StartingQuad shape) {
     auto& entry = Begin(program);
@@ -513,12 +529,20 @@ static IrValue& StartingQuadMasked(IrProgram& program, StartingQuad shape) {
     builder.SetInsertionPoint(entry);
     IrValue& ancillary = AncillaryBuiltin(builder);
     IrValue& helper = builder.Emit(IrOpcode::GetBuiltin, IrType::U32, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::HelperInvocation)), &builder.Constant(0u)});
-    IrValue& started = shape == StartingQuad::BallotOfOtherLanes ? FrontFacingBuiltin(builder) : builder.IEqual(helper, builder.Constant(0u));
+    const bool otherLanes = shape == StartingQuad::BallotOfOtherLanes || shape == StartingQuad::HostExecOtherLanes;
+    IrValue& started = otherLanes ? FrontFacingBuiltin(builder) : builder.IEqual(helper, builder.Constant(0u));
     IrValue& live = builder.Emit(IrOpcode::Ballot, IrType::Vec4U32, {&started});
     builder.SetInsertionPoint(*tail);
     IrValue& active = builder.Emit(IrOpcode::Ballot, IrType::Vec4U32, {&builder.ConstantBool(true)});
-    IrValue& low = builder.BitwiseAnd(builder.CompositeExtract(live, 0u), builder.CompositeExtract(active, 0u));
-    IrValue& high = builder.BitwiseAnd(builder.CompositeExtract(live, 1u), builder.CompositeExtract(active, 1u));
+    IrValue* activeLow = &builder.CompositeExtract(active, 0u);
+    IrValue* activeHigh = &builder.CompositeExtract(active, 1u);
+    if (shape == StartingQuad::HostExecKept || shape == StartingQuad::HostExecOtherLanes) {
+        IrValue& hostQuads = builder.Emit(IrOpcode::WqmU64, IrType::U64, {&builder.Emit(IrOpcode::CompositeConstructU64, IrType::U64, {activeLow, activeHigh})});
+        activeLow = &builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&hostQuads, &builder.Constant(0u)});
+        activeHigh = &builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&hostQuads, &builder.Constant(1u)});
+    }
+    IrValue& low = builder.BitwiseAnd(builder.CompositeExtract(live, 0u), *activeLow);
+    IrValue& high = builder.BitwiseAnd(builder.CompositeExtract(live, 1u), *activeHigh);
     IrValue& quads = builder.Emit(IrOpcode::WqmU64, IrType::U64, {&builder.Emit(IrOpcode::CompositeConstructU64, IrType::U64, {&low, &high})});
     IrValue& lane = LaneBit(builder, builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&quads, &builder.Constant(0u)}), builder.Emit(IrOpcode::CompositeExtractU64, IrType::U32, {&quads, &builder.Constant(1u)}));
     IrValue& kept = builder.Select(lane, builder.Constant(SelectOther), ancillary);
@@ -540,9 +564,9 @@ static const IrValue* StartingQuadExported(IrProgram& program, StartingQuad shap
     }
     return nullptr;
 }
-static void StartingQuadOnly() {
+static void StartingQuadOnly(StartingQuad shape = StartingQuad::Kept) {
     IrProgram program;
-    const IrValue* value = StartingQuadExported(program, StartingQuad::Kept);
+    const IrValue* value = StartingQuadExported(program, shape);
     Require(value != nullptr && value->HasImmediate() && value->ImmediateU32() == SelectOther);
 }
 static void StartingQuadOutsidePixel() {
@@ -617,5 +641,15 @@ int main() {
     StartingQuadOnly();
     StartingQuadRefused(StartingQuad::BallotAfterBranch);
     StartingQuadRefused(StartingQuad::BallotOfOtherLanes);
+    StartingQuadOnly(StartingQuad::HostExecKept);
+    StartingQuadRefused(StartingQuad::HostExecOtherLanes);
     StartingQuadOutsidePixel();
+    Iterated = false;
+    PerPixelSampleNumber(false);
+    PerPixelSampleNumber(true);
+    Values(IrOpcode::BitFieldUExtract, 8u, 4u, false);
+    Values(IrOpcode::BitFieldUExtract, 16u, 13u, false);
+    MergedValues(IrOpcode::BitFieldUExtract, 8u, 4u, false);
+    ExtractVector(16u, 11u, StageInputKind::Layer, 0u);
+    ExportedWholeWord();
 }

@@ -1,8 +1,10 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -83,6 +85,8 @@ public:
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
+    std::uint64_t OpenSerial() const { return submissions + 1; }
+    std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
@@ -96,10 +100,20 @@ public:
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32, Index16Restart, Index32Restart };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawSnapshotEntries = 1024;
+    static constexpr std::size_t UnwrittenSnapshotEntries = 4096;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
+    std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);
+    void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
+    struct UploadSlice {
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+        std::byte* bytes = nullptr;
+    };
+    UploadSlice DrawUpload(std::size_t bytes);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -107,6 +121,7 @@ public:
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
+    void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
@@ -121,8 +136,10 @@ public:
         std::uint64_t end;
         std::uint64_t note;
         int value;
+        std::int64_t word = -1;
     };
     std::vector<PendingWrite> PendingWritesOver(std::uint64_t address, std::size_t bytes) const;
+    void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
     // an import, an address-based build's leased heaps, indirect arguments, a GPU-direct storage
@@ -135,6 +152,9 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
+    static bool ValidReadList(const ReadList& ranges);
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
     // query per hit). `ignoreSignaled` false: every in-flight batch counts, whatever its fence.
@@ -159,6 +179,7 @@ public:
     static ReadStatistics ReadCounts();
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -175,10 +196,12 @@ public:
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
     // Ends and submits the open batch without waiting.
     void Submit();
+    void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
     // ever submitted); WaitSerial(serial) then covers all recorded work.
     std::uint64_t SubmitAndEpoch();
     bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
+    bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments);
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
@@ -461,6 +484,8 @@ public:
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
     static bool MergeBarriers();
     static void CountMerged(CommandClass which);
+    static bool BarrierBatch();
+    static bool ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered);
     // Hazard tracker, counting mode (APS5_BARRIER_VALIDATE=1): every command tells the tracker
     // what it reads and writes (guest ranges through host imports, images) with its stage before
     // it is recorded; the tracker simulates barriers emitted only on a hazard against the accesses
@@ -526,6 +551,7 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
+        std::vector<std::int64_t> writeWords;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;
@@ -533,8 +559,15 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        struct ReadListNote {
+            std::shared_ptr<const ReadList> ranges;
+            std::size_t position;
+            ReadKind kind;
+        };
+        std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        std::uint64_t traceId = 0;
         bool submitted = false;
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
@@ -686,6 +719,9 @@ private:
     VkPipelineLayout dumpLayout = VK_NULL_HANDLE;
     VkPipeline dumpPipeline = VK_NULL_HANDLE;
     std::shared_ptr<void> segmentPools;
+    int dispatchArgumentState = 0;
+    VkPipelineLayout dispatchArgumentLayout = VK_NULL_HANDLE;
+    VkPipeline dispatchArgumentPipeline = VK_NULL_HANDLE;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);
@@ -735,17 +771,19 @@ private:
     bool syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site);
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
+    void discard(std::unique_ptr<Batch> batch) noexcept;
+    void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
-    // The first noted read of `batch` overlapping [address, end), or null.
-    static const Batch::Read* readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
-    void publishPendingWrites() const;
+    void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).
-    bool noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel = false, int value = -1);
+    bool noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel = false, int value = -1, std::int64_t word = -1);
     // Appends one range to `batch` (open or in flight) and publishes the snapshot if needed.
     void noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel = false);
     void noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion = false);
@@ -767,6 +805,8 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    VkSemaphore submitHold = VK_NULL_HANDLE;
+    std::uint64_t submitHoldValue = 0;
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
@@ -790,9 +830,12 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
+    mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
+    std::shared_ptr<Buffer> drawUpload;
+    VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
@@ -814,6 +857,15 @@ private:
         std::size_t bytes = 0;
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    struct UnwrittenSnapshot {
+        std::size_t bytes;
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+    };
+    std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    std::array<std::uint64_t, 3> unwrittenStamp{};
+    std::size_t unwrittenBytes = 0;
+    void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
@@ -825,6 +877,8 @@ private:
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
+    mutable bool publishedWriteRangesValid = false;
 };
 
 }

@@ -170,6 +170,8 @@ void TableTypesCheck(id<MTLDevice> device) {
     using ShaderRecompiler::RuntimeAbi::Binding;
     std::vector<ShaderRecompiler::MslAbi::TableBinding> bindings;
     for (std::uint32_t kind = 0; kind < static_cast<std::uint32_t>(Binding::Count); ++kind) bindings.push_back({static_cast<Binding>(kind), 2u});
+    // MslAbi Version 15: the image table's ImageTableSlots typed array entries.
+    bindings.push_back({Binding::ImageTable, ShaderRecompiler::MslAbi::ImageTableSlots});
     const auto layout = ShaderRecompiler::MslAbi::LayoutTable(bindings);
     std::string source = "#include <metal_stdlib>\nusing namespace metal;\n\n" + std::string(ShaderRecompiler::MslCorePrelude(ShaderRecompiler::MslPreludeChunk::Common).text) + ShaderRecompiler::MslTableDeclaration(layout);
     source += "kernel void aps5_main(device const Aps5Table& aps5_table [[buffer(0)]], device uint* out [[buffer(1)]]) {\n    uint width = 0u;\n";
@@ -178,6 +180,10 @@ void TableTypesCheck(id<MTLDevice> device) {
         const auto field = "aps5_table." + ShaderRecompiler::MslTableField(range.binding) + "[1]";
         source += "    width += is_null_texture(" + field + ") ? 0u : " + field + ".get_width();\n";
     }
+    // A table access as MslImage.cpp emits it: a texture and a sampler read through the arrays.
+    source += "    {\n        const uint e = out[1];\n        texture2d<float> t = aps5_table.image_table.k1.address[e].value;\n";
+    source += "        width += is_null_texture(t) ? 0u : uint(t.sample(aps5_table.sampler_table[0].address[e + 1u].value, float2(0.5f), level(0.0f)).x);\n";
+    source += "        depth2d<float> d = aps5_table.image_table.k22.address[e].value;\n        width += is_null_texture(d) ? 0u : d.get_width();\n    }\n";
     source += "    out[0] = width + aps5_table.buffers[1].bytes;\n}\n";
     id<MTLLibrary> library = CompileLibrary(device, "descriptor table types", source);
     NSError* error = nil;

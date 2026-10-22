@@ -367,6 +367,15 @@ IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
     return ir.LogicalOr(infZero(lhsMagnitude, rhsMagnitude), infZero(rhsMagnitude, lhsMagnitude));
 }
 
+IrValue& TranslationContext::invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct) {
+    IrValue* noNan = &ir.ConstantBool(true);
+    for (IrValue* source : sources) {
+        IrValue& nan = ir.UGreaterThan(ir.BitwiseAnd(ir.BitCastU32(*source), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u));
+        noNan = &ir.LogicalAnd(*noNan, ir.LogicalNot(nan));
+    }
+    return ir.LogicalOr(invalidProduct, *noNan);
+}
+
 IrU32 TranslationContext::quietNan16(IrU32 bits) {
     return ieeeMode ? IrU32(ir.BitwiseOr(bits.Value(), ir.Constant(0x0200u))) : bits;
 }
@@ -453,8 +462,7 @@ IrU32 TranslationContext::readScalarCode(std::uint32_t code) {
         case 235u:
         case 236u:
         case 237u:
-        case 238u:
-            throw std::runtime_error("TranslationContext::readScalarCode: the scalar aperture source " + RdnaOperandToString(DecodeRdnaScalarSource(code, 0u)) + " is not modelled");
+        case 238u: return readRawU32(DecodeRdnaScalarSource(code, 0u));
         default: return IrU32(ir.Constant(0u));
     }
 }
@@ -487,8 +495,7 @@ IrU32 TranslationContext::readRawU32(const RdnaOperand& operand) {
         case RdnaOperandKind::SrcSharedBase:
         case RdnaOperandKind::SrcSharedLimit:
         case RdnaOperandKind::SrcPrivateBase:
-        case RdnaOperandKind::SrcPrivateLimit:
-            throw std::runtime_error("TranslationContext::readRawU32: the scalar aperture source " + RdnaOperandToString(operand) + " is not modelled");
+        case RdnaOperandKind::SrcPrivateLimit: return IrU32(ir.Constant(static_cast<std::uint32_t>(RdnaApertureSourceValue(operand))));
         default: throw std::runtime_error("TranslationContext::readRawU32 invalid decoded operand used as a raw U32 source");
     }
 }

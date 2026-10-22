@@ -1,6 +1,7 @@
 #include "SceTypes.hpp"
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 struct GuestBarrier;
@@ -23,7 +24,11 @@ static constexpr int BARRIER_SERIAL_THREAD = -1;
 static constexpr unsigned WAITERS = 4;
 static constexpr int ROUNDS = 25;
 
-static void Require(bool value) { if (!value) std::abort(); }
+static void Require(bool value, int line = __builtin_LINE()) {
+    if (value) return;
+    std::fprintf(stderr, "scePthreadBarrier check failed at line %d\n", line);
+    std::abort();
+}
 
 struct Context {
     GuestBarrier* barrier = nullptr;
@@ -54,8 +59,11 @@ int main() {
     Require(scePthreadBarrierattrInit(&attr) == 0 && attr != nullptr);
     Require(scePthreadBarrierattrGetpshared(&attr, &pshared) == 0 && pshared == 0);
     Require(scePthreadBarrierattrSetpshared(&attr, 2) == SCE_KERNEL_ERROR_EINVAL);
-    Require(scePthreadBarrierattrSetpshared(&attr, 1) == 0);
-    Require(scePthreadBarrierattrGetpshared(&attr, &pshared) == 0 && pshared == 1);
+    // The PS5 accepts only PTHREAD_PROCESS_PRIVATE (upstream db504f6b9c, firmware 12.70).
+    Require(scePthreadBarrierattrSetpshared(&attr, 1) == SCE_KERNEL_ERROR_EINVAL);
+    Require(scePthreadBarrierattrSetpshared(&attr, 0) == 0);
+    pshared = -1;
+    Require(scePthreadBarrierattrGetpshared(&attr, &pshared) == 0 && pshared == 0);
 
     GuestBarrier* invalid = nullptr;
     Require(scePthreadBarrierInit(nullptr, &attr, 1, "null") == SCE_KERNEL_ERROR_EINVAL);

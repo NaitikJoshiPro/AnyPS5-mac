@@ -7,7 +7,9 @@
 // Upstream's exits for a device without host imports or write watching are requirements here: the Metal device
 // has both, so a pass means every check ran. Its imports are compared, not watched (DECISIONS D19), so upstream's
 // watched-only reuse check becomes the check that no snapshot of the unwatched block is kept.
-// Expected values are upstream's.
+// Upstream sync 3: the case that built resources keep the cap they were built with (raising the cap to 64 MiB
+// leaves the large input in place on a second PrepareDrawBindings) is ported as written; ShaderResources.mm keeps the
+// cap in maxDrawSnapshotBytes like upstream. Expected values are upstream's.
 
 #include "RecorderTwinHarness.h"
 #include "RecorderTwins.h"
@@ -125,6 +127,19 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Require(inPlace[0] == std::byte{0x33} && std::all_of(inPlace, inPlace + largeBytes, [](std::byte value) { return value == std::byte{0x33}; }), "in-place bound input did not observe CPU write");
         std::memset(block, 0x11, bytes);
         snapshotRecorder.Sync();
+#ifdef _WIN32
+        Require(_putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "64") == 0, "cannot raise snapshot cap");
+#else
+        Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "64", 1) == 0, "cannot raise snapshot cap");
+#endif
+        const auto again = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(again != nullptr && again->snapshots.size() == 1 && again->snapshots[0].address == smallAddress, "built resources read the draw snapshot cap again instead of keeping the one they were built with");
+        snapshotRecorder.Sync();
+#ifdef _WIN32
+        Require(_putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "1") == 0, "cannot restore snapshot cap");
+#else
+        Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1) == 0, "cannot restore snapshot cap");
+#endif
     }
     const auto firstAddress = address + 4096;
     constexpr std::size_t firstBytes = 600 * 1024;

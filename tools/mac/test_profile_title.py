@@ -95,8 +95,9 @@ FEX_SAMPLE = """[fex-sample] sampling guest threads every 2 ms, report every 15 
 [fex-sample]          rax=4150029f rcx=500145300
 [fex-sample]    30.0% rip 0x1000 app.elf+0x397ee jit
 [fex-sample]    10.0% rip 0x104e7ec70 ?+0x104e7ec70 host libSceAgcDriver.prx`Submit+0x8
-[fex-sample] thread 3 "worker": 200 samples, 4 distinct RIPs
-[fex-sample]   100.0% rip 0x2000 app.elf+0x10 jit
+[fex-sample] thread 3 "worker": 200 samples, 4 distinct RIPs; jit 60.0% dispatcher 20.0% stub 10.0% native 10.0%
+[fex-sample]    60.0% rip 0x2000 app.elf+0x10 jit
+[fex-sample]    20.0% rip 0x2004 app.elf+0x14 dispatcher 0xfc00001000
 """
 
 
@@ -130,6 +131,11 @@ class SampleTests(unittest.TestCase):
                 ("stat", "libsystem_kernel.dylib"))
         self.assertEqual(pp.classify_stack(path), ("kernel: file I/O", "ResolvePath_nid_no_patch"))
 
+    def test_guest_event_flag_is_not_a_gpu_wait(self):
+        path = (("sceKernelWaitEventFlag", "libkernel.prx"), ("TimedWait::Condition::Wait()", "libkernel.prx"),
+                ("__psynch_cvwait", "libsystem_kernel.dylib"))
+        self.assertEqual(pp.classify_stack(path)[0], "wait: other")
+
     def test_short_symbol(self):
         self.assertEqual(pp.short_symbol("A::(anonymous namespace)::Wait(id<X>, unsigned long) const"), "A::{anon}::Wait")
         self.assertEqual(pp.short_symbol("std::f<std::g<int>>(int)"), "std::f")
@@ -162,6 +168,28 @@ class CountsTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["p_ipc"], 2.0)
         self.assertAlmostEqual(rows[0]["p_ghz"], 4.0)  # 3e6 cycles in 0.75 ms
         self.assertAlmostEqual(rows[1]["p_share"], 0.0)  # a thread started inside the window counts from zero
+
+
+class ProcessCounterTests(unittest.TestCase):
+    def test_decode_and_diff(self):
+        task = struct.pack("<6Q12i", 1, 2, 3, 4, 5, 6, 0, 100, 0, 0, 0, 0, 10, 20, 1000, 8, 2, 31)
+        self.assertEqual(pp.decode_task_info(task)["csw"], 1000)
+        usage = bytearray(16 + 8 * 60)
+        struct.pack_into("<Q", usage, 16 + 8 * 0, 1000)   # user
+        struct.pack_into("<Q", usage, 16 + 8 * 1, 500)    # system
+        struct.pack_into("<Q", usage, 16 + 8 * 24, 1200)  # user-interactive QoS
+        struct.pack_into("<Q", usage, 16 + 8 * 34, 2000)  # runnable
+        decoded = pp.decode_rusage(bytes(usage))
+        self.assertEqual(decoded["runnable"], 2000)
+        before = {"task": pp.decode_task_info(task), "rusage": {key: 0 for key in pp.RUSAGE_FIELDS}}
+        later = struct.pack("<6Q12i", 1, 2, 3, 4, 5, 6, 0, 300, 0, 0, 0, 0, 30, 60, 3000, 8, 2, 31)
+        after = {"task": pp.decode_task_info(later), "rusage": decoded}
+        diff = pp.diff_process_counters(before, after, ns_per_tick=1e6, seconds=2.0)  # 1 ms per tick
+        self.assertAlmostEqual(diff["csw_per_s"], 1000.0)
+        self.assertAlmostEqual(diff["syscalls_unix_per_s"], 20.0)
+        self.assertAlmostEqual(diff["cpu_ms"], 1500.0)
+        self.assertAlmostEqual(diff["runnable_wait_ms"], 500.0)
+        self.assertAlmostEqual(diff["qos_ms"]["user_interactive"], 1200.0)
 
 
 class PowermetricsTests(unittest.TestCase):
@@ -198,9 +226,27 @@ class LogLineTests(unittest.TestCase):
         self.assertEqual([rip["kind"] for rip in first], ["host", "jit", "host"])
         summary = pp.summarize_fex_sample(windows)
         self.assertEqual(summary["samples"], 1200)
-        self.assertAlmostEqual(summary["kinds"]["jit"], 300 + 200)
+        self.assertAlmostEqual(summary["kinds"]["jit"], 300 + 120)
+        self.assertEqual(windows[0]["threads"][1]["kinds"], {"jit": 60.0, "dispatcher": 20.0, "stub": 10.0, "native": 10.0})
+        self.assertAlmostEqual(summary["exact_kinds"]["dispatcher"], 40.0)
+        self.assertEqual(windows[0]["threads"][1]["rips"][1]["kind"], "dispatcher")
         self.assertAlmostEqual(summary["kinds"]["native wait/syscall/signal"], 500)
-        self.assertAlmostEqual(summary["kinds"]["native work"], 100)
+        self.assertAlmostEqual(summary["kinds"]["native work"], 100 + 40)
+
+
+class FexStatsTests(unittest.TestCase):
+    def test_parse(self):
+        line = ("[fex-stats] window 2: 30.0 s, 57 guest threads; JIT 1200 blocks in 350.5 ms (292.1 us each), lookup-cache "
+                "misses 40000, cache lock read 1.5 ms write 0.2 ms, disk cache 900 hits 300 misses (12.0 ms lookup), SMC 3; "
+                "total JIT 5000 blocks in 2000.0 ms")
+        rows = pp.parse_fex_stats("noise\n" + line + "\n")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["window"], 2)
+        self.assertEqual(rows[0]["jit_blocks"], 1200)
+        self.assertAlmostEqual(rows[0]["jit_ms"], 350.5)
+        self.assertEqual(rows[0]["cache_misses"], 40000)
+        self.assertEqual(rows[0]["disk_misses"], 300)
+        self.assertEqual(rows[0]["smc"], 3)
 
 
 class TraceTests(unittest.TestCase):
@@ -235,8 +281,12 @@ class ReportTests(unittest.TestCase):
             level = {"instructions": 0, "cycles": 0, "time": 0, "energy_nj": 0}
             Path(f"{base}-threadcounts.json").write_text(json.dumps({
                 "ns_per_tick": 1.0, "t0": 0.0, "t1": 1.0, "before": {"5": {"name": "", "levels": [level, level]}},
-                "after": {"5": {"name": "w", "levels": [dict(level, time=500_000), level]}}}))
+                "after": {"5": {"name": "w", "levels": [dict(level, time=500_000_000), level]}}}))
             result = profile_title.build_report(Path(directory), "T", "x")
+            row = profile_title.compare_row(result)
+            self.assertEqual(row["tag"], "x")
+            self.assertAlmostEqual(row["cores"], 0.5)
+            self.assertIn("| x |", profile_title.compare(Path(directory), "T", ["x"]))
             self.assertIn("sample", result)
             self.assertEqual(result["threads_cpu"]["rows"][0]["name"], "w")
             text = Path(f"{base}-profile.md").read_text()

@@ -7,6 +7,11 @@ set_target_properties(agc_metal_tessellator_tests PROPERTIES CXX_STANDARD 20 CXX
 set_source_files_properties(${CMAKE_SOURCE_DIR}/3rdparty/d3d11-tessellator/tessellator.cpp PROPERTIES COMPILE_OPTIONS "-w")
 add_test(NAME agc_metal_tessellator COMMAND agc_metal_tessellator_tests)
 set_tests_properties(agc_metal_tessellator PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+# agc_driver_tessellation runs through TessellationTwin.mm (twins/UPSYNC3-tests.cmake), which links the stages
+# with LinkMslTessellation to check the partitioning upstream reads from the SPIR-V.
+if(TARGET agc_driver_tessellation_tests)
+    target_include_directories(agc_driver_tessellation_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/shader/recompiler/MetalBackend/include $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
 # agc_metal_msl_tessellation: tests/execution/Tessellation.cpp's local, hull and domain programs as MSL
 # tessellation libraries, linked (LinkMslTessellation) into object and mesh functions for every
 # domain, partitioning and topology and into mesh render pipelines with the pixel program (compile

@@ -25,6 +25,8 @@ int APS5_VABI setcontext_nid_postfix(const UserUcontext* context);
 void APS5_VABI makecontext_nid_postfix(UserUcontext* context, ContextEntry entry, int count, ...);
 [[gnu::returns_twice]] int APS5_VABI setjmp_nid_postfix(std::uint64_t* buffer);
 [[noreturn]] void APS5_VABI longjmp_nid_postfix(std::uint64_t* buffer, int value);
+[[gnu::returns_twice]] int APS5_VABI sigsetjmp_nid_postfix(std::uint64_t* buffer, int saveMask);
+[[noreturn]] void APS5_VABI siglongjmp_nid_postfix(std::uint64_t* buffer, int value);
 int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSet);
 int* APS5_VABI __error_nid_postfix();
 
@@ -151,9 +153,11 @@ Stack g_jobStack;
 Stack g_exitStack;
 std::uint64_t g_arguments[6] = {};
 int g_entries = 0;
+bool g_contextChainEnded = false;
 Fibre g_dispatcher = {};
 Fibre g_job = {};
 int g_jobRuns = 0;
+bool g_signalJumps = false;
 
 void Require(bool value, const char* what) {
     if (!value) {
@@ -192,6 +196,23 @@ void ThrowAndCatch() {
         caught = true;
     }
     Require(caught, "a host exception is caught on a context stack");
+}
+
+[[gnu::noinline]] void WalkContextChain() {
+    auto* frame = static_cast<std::uintptr_t*>(__builtin_frame_address(0));
+    const auto low = reinterpret_cast<std::uintptr_t>(g_contextStack.bytes);
+    const auto high = low + StackBytes;
+    for (int depth = 0; depth < 100; ++depth) {
+        const auto address = reinterpret_cast<std::uintptr_t>(frame);
+        if (address < low || address + 2 * sizeof(std::uintptr_t) > high) return;
+        if (frame[1] == 0) {
+            g_contextChainEnded = frame[0] == 0;
+            return;
+        }
+        auto* next = reinterpret_cast<std::uintptr_t*>(frame[0]);
+        if (reinterpret_cast<std::uintptr_t>(next) <= address) return;
+        frame = next;
+    }
 }
 
 [[gnu::noinline]] void GrowStack(int depth) {
@@ -342,6 +363,7 @@ extern "C" void APS5_VABI ContextBody(std::uint64_t first, std::uint64_t second,
     g_arguments[4] = fifth;
     g_arguments[5] = sixth;
     CheckStackBounds(&g_contextStack, "the stack bounds follow setcontext onto the context stack");
+    WalkContextChain();
     ThrowAndCatch();
     ++g_entries;
 }
@@ -352,6 +374,14 @@ namespace {
 
 [[gnu::noinline]] void Switch(Fibre* from, Fibre* to) {
     from->started = 1;
+    if (g_signalJumps) {
+        if (sigsetjmp_nid_postfix(from->jump, 1) == 0) {
+            if (to->started) siglongjmp_nid_postfix(to->jump, 1);
+            setcontext_nid_postfix(&to->context);
+            Require(false, "setcontext into the job returned");
+        }
+        return;
+    }
     if (setjmp_nid_postfix(from->jump) == 0) {
         if (to->started) longjmp_nid_postfix(to->jump, 1);
         setcontext_nid_postfix(&to->context);
@@ -364,7 +394,7 @@ namespace {
 extern "C" void APS5_VABI JobEntry() {
     for (;;) {
         ++g_jobRuns;
-        CheckStackBounds(&g_jobStack, "the stack bounds follow longjmp onto the job stack");
+        CheckStackBounds(&g_jobStack, g_signalJumps ? "the stack bounds follow siglongjmp onto the job stack" : "the stack bounds follow longjmp onto the job stack");
         ThrowAndCatch();
         Switch(&g_job, &g_dispatcher);
     }
@@ -394,6 +424,7 @@ void CheckMakecontext() {
         Require(false, "setcontext into the made context returned");
     }
     Require(g_entries == 1, "the made context runs once and resumes uc_link");
+    Require(g_contextChainEnded, "the frame chain of a made context ends on its stack at a frame whose saved frame pointer and return address are 0");
     for (unsigned index = 0; index < 6; ++index) Require(g_arguments[index] == 0x8000000000000001ull + index, "makecontext passes six 64-bit arguments");
     const auto stackLow = reinterpret_cast<std::uint64_t>(g_contextStack.bytes);
     Require(EntryStackPointer > stackLow && EntryStackPointer < stackLow + StackBytes, "the made context runs on its own stack");
@@ -406,7 +437,11 @@ void CheckMakecontext() {
 #endif
 }
 
-void CheckJumpBuffers() {
+void CheckJumpBuffers(bool signalJumps) {
+    g_signalJumps = signalJumps;
+    g_jobRuns = 0;
+    g_dispatcher = {};
+    g_job = {};
 #ifdef _WIN32
     ULONG_PTR threadLow = 0;
     ULONG_PTR threadHigh = 0;
@@ -424,7 +459,7 @@ void CheckJumpBuffers() {
         ULONG_PTR low = 0;
         ULONG_PTR high = 0;
         GetCurrentThreadStackLimits(&low, &high);
-        Require(low == threadLow && high == threadHigh, "the stack bounds follow longjmp back to the thread stack");
+        Require(low == threadLow && high == threadHigh, signalJumps ? "the stack bounds follow siglongjmp back to the thread stack" : "the stack bounds follow longjmp back to the thread stack");
 #endif
     }
 }
@@ -470,7 +505,8 @@ int main(int argc, char** argv) {
     CheckSignalMask();
     std::thread([] {
         CheckMakecontext();
-        CheckJumpBuffers();
+        CheckJumpBuffers(false);
+        CheckJumpBuffers(true);
         GrowStack(32);
     }).join();
     return 0;
