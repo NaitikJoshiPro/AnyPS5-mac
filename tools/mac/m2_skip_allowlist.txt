@@ -56,3 +56,6 @@ agc_driver_multisample_retirement | the retirement fixture drives Vulkan device 
 agc_driver_multisample_fill_host_only | Metal devices on one GPU share one VkDevice handle | metal-shared-device-handle
 agc_driver_prepared_shaders_abi_deferred_rectangle_pairs | the MSL backend builds rectangle pairs | metal-vulkan-internal-tests
 agc_driver_rect_list_corner | device has no tessellation | metal-vulkan-internal-tests
+agc_driver_sample_order | the guest sample order is not on Metal | metal-sample-order
+agc_driver_sample_order_grid_reference | 2x2 sample location grids are not on Metal | metal-sample-location-grid
+agc_driver_sample_order_recipe_depth_locations | the Metal device reports no custom sample locations | metal-sample-order
