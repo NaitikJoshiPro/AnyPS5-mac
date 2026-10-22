@@ -18,6 +18,7 @@
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -319,6 +320,10 @@ struct RecorderObjects {
     id<MTL4CommandQueue> queue = nil;
     // The timeline: every Submit signals the batch serial after its commit.
     id<MTLSharedEvent> timeline = nil;
+    // The serial a pooled image heap released now must wait for (BufferPool::AttachTimeline): the
+    // open batch's while one is open, else the newest submitted batch's.
+    std::atomic<std::uint64_t> retireSerial{0};
+    std::shared_ptr<Graphics::BufferPool> pool;
     // The recorder's own long-lived buffers (occlusion visibility pools), attached to the queue.
     id<MTLResidencySet> residency = nil;
     std::shared_ptr<UploadArena> arena;
@@ -1259,6 +1264,9 @@ Recorder::Recorder(const Context& context, bool) : context(context), id(nextReco
     objects->arena = std::make_shared<Metal::UploadArena>(objects->device, objects->queue);
     const auto frequency = [objects->device queryTimestampFrequency];
     objects->nanosecondsPerTick = frequency != 0 ? 1e9 / static_cast<double>(frequency) : 1.0;
+    // Pooled image heaps retire on this timeline (metal-image-memory-pool).
+    objects->pool = Graphics::GetBufferPool(context);
+    objects->pool->AttachTimeline((__bridge const void*)objects->timeline, &objects->retireSerial);
     metal = std::move(objects);
     {
         std::lock_guard lock(liveRecordersMutex);
@@ -1275,6 +1283,8 @@ Recorder::~Recorder() {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
     holdKept.clear();
+    // Every batch completed (Sync above): the heaps released behind them may be reused.
+    if (metal != nullptr && metal->pool != nullptr) metal->pool->DetachTimeline(&metal->retireSerial);
     if (activeRecorder == this) {
         activeRecorder = nullptr;
         pendingWrites.store(nullptr, std::memory_order_release);
@@ -1732,6 +1742,7 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        metal->retireSerial.store(submissions + 1, std::memory_order_release);
         if (PerformanceTrace::Recording()) {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3765,6 +3776,7 @@ void Recorder::Submit() {
     [metal->timeline notifyListener:ProgressListener() atValue:serial block:ProgressBlock()];
     batch->submitted = true;
     batch->serial = ++submissions;
+    metal->retireSerial.store(submissions, std::memory_order_release);
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -4327,6 +4339,8 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
     release(*batch);
+    // Nothing of the discarded batch reaches the GPU: released heaps wait only for the submitted ones.
+    if (metal != nullptr) metal->retireSerial.store(submissions, std::memory_order_release);
     try {
         publishPendingWrites();
     } catch (...) {

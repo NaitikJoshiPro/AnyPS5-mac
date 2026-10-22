@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MetalObjects.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -91,6 +92,15 @@ public:
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::uint32_t* allocatedType = nullptr);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
+    // Image heaps retire on the timeline: a heap released while a batch that may still use its image
+    // is open or in flight returns to the free list only once every attached timeline (a recorder's
+    // MTLSharedEvent, passed as `timeline`) reached the serial its `retireSerial` named at the
+    // release (the open batch's serial, or the newest submitted one when none is open). Until then
+    // it is pending: not handed out, but freed by trims and evictions (the old texture keeps its own
+    // reference to the heap). Detach once the recorder's batches all completed.
+    void AttachTimeline(const void* timeline, const std::atomic<std::uint64_t>* retireSerial);
+    void DetachTimeline(const std::atomic<std::uint64_t>* retireSerial) noexcept;
+    std::size_t PendingImages();
     // Counters (cumulative) for tests and the [bufferpool] line.
     struct TierCounts {
         std::uint64_t hits, misses, evictions;
@@ -144,6 +154,15 @@ private:
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
     bool evictOldestImage(std::vector<BufferAllocation>& evicted);
     bool imagePooled(VkDeviceSize bytes, std::uint32_t memoryType) const;
+    struct PendingImage {
+        BufferAllocation allocation;
+        // (retireSerial word of an attached timeline, the serial it must reach)
+        std::vector<std::pair<const std::atomic<std::uint64_t>*, std::uint64_t>> serials;
+    };
+    std::vector<std::pair<const std::atomic<std::uint64_t>*, std::uint64_t>> retireSerials();
+    bool retired(const PendingImage& image);
+    void retainImage(const BufferAllocation& allocation, std::vector<BufferAllocation>& evicted);
+    void drainRetiredImages(std::vector<BufferAllocation>& evicted);
     bool heapOverBudget();
     VkDeviceMemory allocateImageHeap(VkDeviceSize bytes, std::uint32_t memoryType, const char* operation);
     static std::size_t MaxSlots();
@@ -163,6 +182,8 @@ private:
     std::uint64_t imageMisses = 0;
     std::uint64_t imageEvictions = 0;
     std::list<Slot*> imageOrder;
+    // Released image heaps waiting for their batches (oldest first), under `mutex`.
+    std::deque<PendingImage> pendingImages;
     std::uint64_t clock = 0;
     // The Metal device, the queue the residency set is attached to, and the set (BufferPool.mm).
     std::unique_ptr<Metal::PoolObjects, Metal::ObjectsDeleter> metal;
