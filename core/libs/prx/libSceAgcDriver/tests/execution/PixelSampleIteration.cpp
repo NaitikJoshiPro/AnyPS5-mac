@@ -177,7 +177,10 @@ void Draw(AgcDriver::VulkanDevice& device, const Pass& pass) {
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     std::vector<AgcDriver::Graphics::CompiledShader> shaders{{ShaderStage::Vertex, &vertexResult, 0}};
     ShaderRecompiler::RecompileResult geometry;
-    if (pixelResult.barycentricEmulation.active) {
+    // The MSL backend has no geometry stage: its emulated barycentrics are triangle-vertices draws
+    // the Metal device runs itself (MslAbi Version 5, as InterpolationF16.cpp).
+    const bool msl = target.backend == ShaderRecompiler::ShaderBackend::Msl;
+    if (pixelResult.barycentricEmulation.active && !msl) {
         geometry = ShaderRecompiler::BuildBarycentricGeometryShader(vertexResult, pixelResult, target, device.GeometryLimits());
         shaders.push_back({ShaderStage::Geometry, &geometry, 0});
     }
