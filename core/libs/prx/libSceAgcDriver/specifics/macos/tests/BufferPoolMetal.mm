@@ -25,10 +25,13 @@
 // release returns) and ImageMemoryOverBudget (the heap's reported usage over its budget): Metal cannot be made to
 // refuse a heap on demand, nor its allocated bytes to exceed the recommended working set
 // (TechnicalDebt metal-image-memory-pool-tests).
+// Metal: ImageHeapRetiresOnTimeline (TechnicalDebt metal-image-memory-pool): a heap released while a recorder's batch is
+// open or in flight is not handed out until the recorder's timeline reaches that batch.
 
 #include "MetalTestDevice.h"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <array>
 #include <cstdint>
@@ -393,6 +396,64 @@ void ImageInPooledHeap(const Context& device, id<MTLDevice> metal) {
     ReleaseImageMemory(context, again, sized.size, BufferPool::PrivateImageMemory);
 }
 
+// Metal (metal-image-memory-pool): textures placed in pooled heaps are bound by raw MTLTexture (pass attachments,
+// residency), so a heap released while a batch that may use its image is open or in flight must not take a new image
+// until that batch completed. The batch is held on the GPU by a queue wait on an event the test signals.
+void ImageHeapRetiresOnTimeline(const Context& device, id<MTLDevice> metal) {
+    const auto context = Fresh(device);
+    const auto pool = GetBufferPool(context);
+    const auto base = pool->Counts();
+    const auto made = [&] { return pool->Counts().made - base.made; };
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = MiB;
+    allocation.memoryTypeIndex = BufferPool::PrivateImageMemory;
+    id<MTL4CommandQueue> queue = Metal::QueueOf(context);
+    id<MTLSharedEvent> gate = [metal newSharedEvent];
+    Expect(queue != nil && gate != nil, "no queue or gate event for the retirement check");
+    if (queue == nil || gate == nil) return;
+    std::unique_ptr<Recorder> recorder;
+    VkDeviceMemory first = VK_NULL_HANDLE;
+    VkDeviceMemory second = VK_NULL_HANDLE;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder = std::make_unique<Recorder>(context);
+        recorder->Activate();
+        first = AllocateImageMemory(context, allocation, 1u, "test image");
+        recorder->Commands();
+        ReleaseImageMemory(context, first, MiB, BufferPool::PrivateImageMemory);
+        Expect(pool->PendingImages() == 1 && pool->RetainedImages() == 0, "a heap released while a batch is open is not pending (" + std::to_string(pool->PendingImages()) + " pending, " + std::to_string(pool->RetainedImages()) + " retained)");
+        second = AllocateImageMemory(context, allocation, 1u, "test image");
+        Expect(second != first && made() == 2, "a heap released while a batch is open was handed to the next image");
+        [queue waitForEvent:gate value:1];
+        recorder->Submit();
+        const auto third = AllocateImageMemory(context, allocation, 1u, "test image");
+        Expect(third != first && made() == 3, "a heap released before its batch was submitted was handed out while the batch is in flight");
+        ReleaseImageMemory(context, third, MiB, BufferPool::PrivateImageMemory);
+        Expect(pool->PendingImages() == 2, "a heap released while a batch is in flight is not pending");
+    }
+    gate.signaledValue = 1;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder->Sync();
+        const auto again = AllocateImageMemory(context, allocation, 1u, "test image");
+        Expect(again == first && made() == 3 && pool->PendingImages() == 0 && pool->RetainedImages() == 1, "a heap whose batches completed did not return to the pool oldest first");
+        // Idle recorder (every batch completed, none open): a release is reusable at once.
+        ReleaseImageMemory(context, again, MiB, BufferPool::PrivateImageMemory);
+        Expect(pool->PendingImages() == 0 && pool->RetainedImages() == 2, "a heap released with no batch open or in flight is not retained at once");
+        ReleaseImageMemory(context, second, MiB, BufferPool::PrivateImageMemory);
+        // A second open batch makes a release pending again; the recorder's teardown (timeline detached) retires it.
+        recorder->Commands();
+        const auto held = AllocateImageMemory(context, allocation, 1u, "test image");
+        ReleaseImageMemory(context, held, MiB, BufferPool::PrivateImageMemory);
+        Expect(pool->PendingImages() == 1, "a heap released while a second batch is open is not pending");
+        recorder->Sync();
+        recorder.reset();
+    }
+    Expect(pool->PendingImages() == 0 && pool->RetainedImages() == 2, "detaching the recorder's timeline did not retire its pending heaps (" + std::to_string(pool->PendingImages()) + " pending, " + std::to_string(pool->RetainedImages()) + " retained)");
+    const auto counts = pool->Counts();
+    Expect(counts.resident == counts.made - counts.destroyed, "the pool's residency set holds " + std::to_string(counts.resident) + " allocations, not the " + std::to_string(counts.made - counts.destroyed) + " alive or retained");
+}
+
 // Metal: pooled buffers are resident on the queue (a GPU copy into them lands), and every
 // allocation alive or retained is in the pool's residency set.
 void ResidentForTheGpu(const Context& device) {
@@ -452,6 +513,7 @@ int main(int argc, char** argv) {
             ResidentForTheGpu(device.context);
             ImageMemoryReuse(device.context);
             ImageInPooledHeap(device.context, device.device);
+            ImageHeapRetiresOnTimeline(device.context, device.device);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "%s\n", error.what());
             return 1;
