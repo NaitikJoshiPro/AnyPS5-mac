@@ -156,7 +156,9 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     if (!RoundLength(length, rounded) || (protection & ~7) != 0)
         return failed(GuestInvalid);
     if ((flags & (GuestMapExclusive | GuestMapFixed)) == GuestMapExclusive) return failed(GuestInvalid);
-    const int mappingFlags = flags & ~GuestAlignedSuper;
+    if ((flags & (GuestShared | GuestPrivate)) == (GuestShared | GuestPrivate)) return failed(GuestInvalid);
+    int mappingFlags = flags & ~GuestAlignedSuper;
+    if ((mappingFlags & (GuestShared | GuestPrivate | GuestAnonymous)) == GuestAnonymous) mappingFlags |= GuestPrivate;
     const bool fixedAnonymous = (mappingFlags & ~(GuestMapFixed | GuestMapExclusive)) == (GuestPrivate | GuestAnonymous)
                                 && (mappingFlags & GuestMapFixed) != 0;
     if (mappingFlags == (GuestPrivate | GuestAnonymous) || fixedAnonymous) {
