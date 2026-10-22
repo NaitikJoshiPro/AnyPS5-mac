@@ -18,6 +18,8 @@ int requireOne(const char* function, int value) {
 
 }
 
+struct KeyboardDeviceInfo;
+
 extern "C" {
 
 int APS5_VABI sceKeyboardInit(void) {
