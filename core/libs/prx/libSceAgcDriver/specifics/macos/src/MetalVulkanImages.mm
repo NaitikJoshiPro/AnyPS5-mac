@@ -410,7 +410,11 @@ VkResult CreateImageInMemory(VkDevice deviceHandle, const VkImageCreateInfo* inf
         *image = VK_NULL_HANDLE;
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
-    // Not tracked: the heap is resident through the buffer pool's residency set while it lives.
+    // Tracked like an owning texture: the heap is in its buffer pool's residency set, but that set is
+    // attached only to the pool's own queue (none for a pool made from a queue-less context), while the
+    // texture is used on the device's queue, whose image cache set covers it (MTL_DEBUG_LAYER: "Texture
+    // is not resident"). DestroyImage untracks it.
+    if (auto* cache = ImageCache::For(device)) cache->Track(texture);
     return FinishImage(device, info, descriptor, texture, image);
 }
 
