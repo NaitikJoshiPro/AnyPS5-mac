@@ -20,6 +20,7 @@
 #include "prx/libc/include/Shutdown.hpp"
 #include <array>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -332,6 +333,12 @@ private:
     void execute(const Submission& submission);
     void deliverGuestEopInterrupt(std::uint32_t queue);
     void deliverFlipEopInterrupt(std::uint32_t queue);
+    // An end-of-pipe interrupt (guest EOP or flip) delivered when the device's recorded work completes
+    // (VulkanDevice::AfterRecordedWork): counted until delivered, so WaitIdle returns only after every
+    // interrupt the packets it waited for owe has been raised. False: nothing recorded, deliver now.
+    template <typename TDevice>
+    bool deferInterrupt(TDevice& device, std::function<void()> deliver, bool reapFirst);
+    void interruptDelivered();
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();
     void reapCompletionLabels();
@@ -348,6 +355,11 @@ private:
     std::atomic<std::uint64_t> flipsCounted{0};
     std::atomic<std::uint64_t> flipSerial{0};
     std::atomic<std::uint64_t> flipBatchesUnsignaled{0};
+
+    // Deferred interrupts not yet delivered (deferInterrupt), and their wake for WaitIdle.
+    std::mutex deferredInterruptMutex;
+    std::condition_variable deferredInterruptChanged;
+    std::uint64_t deferredInterrupts = 0;
 
     std::mutex eopSelfSignalMutex;
     std::unordered_map<std::uint32_t, std::uint32_t> eopSelfSignalFlips;
@@ -452,6 +464,30 @@ private:
     ValidateCounters validateCounters;
 
 };
+
+template <typename TDevice>
+bool Driver::deferInterrupt(TDevice& device, std::function<void()> deliver, bool reapFirst) {
+    {
+        std::lock_guard lock(deferredInterruptMutex);
+        ++deferredInterrupts;
+    }
+    bool deferred = false;
+    try {
+        deferred = device.AfterRecordedWork([this, deliver = std::move(deliver)] {
+            // Counted down even when the delivery throws (the batch's completion reports it).
+            struct Done {
+                Driver* driver;
+                ~Done() { driver->interruptDelivered(); }
+            } done{this};
+            deliver();
+        }, reapFirst);
+    } catch (...) {
+        interruptDelivered();
+        throw;
+    }
+    if (!deferred) interruptDelivered();
+    return deferred;
+}
 
 }
 
