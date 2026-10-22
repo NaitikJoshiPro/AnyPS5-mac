@@ -859,6 +859,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // backend has no remap, so the Metal device keeps passing the guest range to MTLViewport as it
             // did before (MetalDraw.mm) and Target().depthRangeRemap stays false.
             context.depthRangeUnrestricted = true;
+            // Upstream sets singlePassStorage when the device reads and writes storage images without a
+            // format (shaderStorageImageRead/WriteWithoutFormat, VulkanDevice.cpp). MSL textures are typed
+            // by component type, not format, and the detile kernels take the image with read access to
+            // retile and write access to detile (TextureDetiler.mm), which every color element format
+            // (R8/R16/R32/RG32/RGBA32 Uint) has on Apple7+, so storage moves go straight between the
+            // image and guest memory in one pass (Texture.mm StorageTexture::singlePass).
+            context.singlePassStorage = true;
             // Depth clamping is MTLDepthClipModeClamp (MetalDraw.mm, from the guest's DB_RENDER_CONTROL clamp), and
             // negative-one-to-one clip z is mapped in the vertex function (DepthNegativeOneToOneMacro): the features
             // VK_EXT_depth_clip_control and depthClamp promise (agc_driver_depth_range_remap_draw, its Metal twin).
