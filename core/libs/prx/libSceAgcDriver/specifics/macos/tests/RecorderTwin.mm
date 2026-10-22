@@ -46,6 +46,8 @@ constexpr Mode Modes[] = {
     // Upstream 6b6c701636 (UPSYNC5) modes: --queued-write-groups-only gains QueuedWriteOrder's checks (eef987ae7b,
     // Upsync3RecorderModesA.mm) and --idle-publish-wait-only (db3af40970) is ported in D3RecorderModes.mm, the DCC
     // clear-key hand-over's --clear-hand-over-only (92063916d2, b176274da1) in ClearHandOverTwin.mm.
+    // Upstream 661f8b7171 (UPSYNC4) modes owed at GATE5: --read-written-staging-only, --storage-write-back-only and
+    // --writeback-blocks-only are ported in StorageWriteBackTwin.mm.
     {"--draw-descriptors-only", "agc_draw_descriptors", nullptr,
      "skipped, the device writes no Vulkan descriptor sets: the checks count vkUpdateDescriptorSets writes per set, and Metal descriptor tables are written into the per-batch upload ring"},
     // Modes upstream registers only under if(WIN32) (Windows host import settles, write-watch probes and mappings);
