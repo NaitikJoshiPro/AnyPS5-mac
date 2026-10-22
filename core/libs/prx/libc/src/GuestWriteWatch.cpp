@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
@@ -392,6 +393,7 @@ public:
         });
         erase(begin, end);
         _ranges.emplace(begin, Range{end, std::move(pages)});
+        forgetSubpages(begin, end);
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
@@ -400,6 +402,7 @@ public:
         end = pageEnd(end);
         if (end <= begin) return false;
         const Lock lock(_lock);
+        forgetSubpages(begin, end);
         return erase(begin, end);
     }
 
@@ -434,15 +437,44 @@ public:
                 state &= static_cast<std::uint8_t>(~Fresh);
                 if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
                 else runs.emplace_back(page, page + _page);
-                for (const auto& [first, last] : _hostWrites)
-                    if (page >= first && page < last) return;
+                for (const auto& [first, last] : _hostWrites) {
+                    if (page >= first && page < last) {
+                        // Still open to the host write: reported whole, nothing to compare with later.
+                        if (const auto found = _subpages.find(page); found != _subpages.end()) found->second.copied = false;
+                        return;
+                    }
+                }
                 state &= static_cast<std::uint8_t>(~Written);
                 if ((state & PROT_WRITE) != 0) state |= Protected;
             });
             for (const auto& [first, last] : runs) protect(first, last);
+            // After protect: the compared pages are read-only again, so their bytes hold still and a
+            // later store faults into the next collection.
+            if (!_subpages.empty()) runs = storedSubpages(runs);
         }
         for (const auto& [first, last] : runs) written(context, first, last);
         return true;
+    }
+
+    void TrackSubpages(std::uintptr_t begin, std::uintptr_t end, bool track) {
+        if (!_available || end <= begin || _page <= Subpage || _page / Subpage > 32) return;
+        const Lock lock(_lock);
+        const auto first = pageStart(begin);
+        const auto last = pageStart(end - 1);
+        const auto edge = [&](std::uintptr_t page) {
+            // A host page the range covers whole holds no store outside it.
+            if (page >= begin && page + _page <= end) return;
+            if (track) {
+                auto [found, inserted] = _subpages.try_emplace(page);
+                if (inserted) found->second.bytes.reset(new std::byte[_page]);
+                ++found->second.references;
+                return;
+            }
+            const auto found = _subpages.find(page);
+            if (found != _subpages.end() && --found->second.references == 0) _subpages.erase(found);
+        };
+        edge(first);
+        if (last != first) edge(last);
     }
 
     void ProtectionChanged(std::uintptr_t begin, std::uintptr_t end, int protection) {
@@ -451,6 +483,7 @@ public:
         end = pageEnd(end);
         if (end <= begin) return;
         const Lock lock(_lock);
+        forgetSubpages(begin, end);
         forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
             state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
         });
@@ -458,12 +491,15 @@ public:
 
     void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
         if (!_available || end <= begin) return;
+        const auto written = begin;
+        const auto writtenEnd = end;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (end <= begin) return;
         const Lock lock(_lock);
         _hostWrites.emplace_back(begin, end);
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
+            if (!_subpages.empty()) noteSubpageStore(page, state, written, writtenEnd);
             if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(GuestArena::HostAddress(page)), _page, state & ProtectionMask);
             state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
         });
@@ -583,6 +619,14 @@ private:
         --it;
         if (page >= it->second.end) return false;
         auto& state = it->second.pages[(page - it->first) / _page];
+        if (!_subpages.empty()) {
+            // The fault address is exact, but an access may start a little before it (a DC ZVA
+            // reports any address of its 64-byte block) or run past it (a pair of 16-byte stores):
+            // the parts of the 64-byte block holding it and of the 64 bytes from it. A second thread
+            // that faulted on the page before the first one opened it adds its parts here too.
+            const auto stored = GuestArena::GuestAddress(address);
+            noteSubpageStore(page, state, stored & ~std::uintptr_t{63}, stored + 64);
+        }
         if ((state & Protected) != 0) {
             state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
             ::mprotect(reinterpret_cast<void*>(GuestArena::HostAddress(page)), _page, state & ProtectionMask);
@@ -630,6 +674,75 @@ private:
         flush(previous);
     }
 
+    std::uint32_t subpageBits(std::uintptr_t page, std::uintptr_t begin, std::uintptr_t end) const {
+        begin = std::max(begin, page);
+        end = std::min(end, page + _page);
+        if (end <= begin) return 0;
+        std::uint32_t bits = 0;
+        for (auto index = (begin - page) / Subpage; index <= (end - 1 - page) / Subpage; ++index) bits |= std::uint32_t{1} << index;
+        return bits;
+    }
+
+    std::uint32_t allSubpages() const {
+        return subpageBits(0, 0, _page);
+    }
+
+    // A store about to open a tracked page (a fault, a host write): the first one since the page was
+    // armed copies the page as it still is (no store can land before the page is opened) and records
+    // the parts it stores to; while the page stays open, host writes add their parts. Runs in the
+    // fault handler: no allocation, the copy buffer exists since TrackSubpages.
+    void noteSubpageStore(std::uintptr_t page, std::uint8_t state, std::uintptr_t begin, std::uintptr_t end) {
+        const auto found = _subpages.find(page);
+        if (found == _subpages.end()) return;
+        auto& entry = found->second;
+        if ((state & Protected) != 0) {
+            entry.copied = (state & PROT_READ) != 0;
+            if (entry.copied) std::memcpy(entry.bytes.get(), reinterpret_cast<const void*>(GuestArena::HostAddress(page)), _page);
+            entry.stored = subpageBits(page, begin, end);
+        } else if (entry.copied) {
+            entry.stored |= subpageBits(page, begin, end);
+        }
+    }
+
+    void forgetSubpages(std::uintptr_t begin, std::uintptr_t end) {
+        for (auto it = _subpages.lower_bound(pageStart(begin)); it != _subpages.end() && it->first < end; ++it) it->second.copied = false;
+    }
+
+    // Collected runs of whole pages narrowed, on tracked pages, to the parts stored to: the parts the
+    // opening store recorded and the parts whose bytes differ from its copy. A tracked page without a
+    // copy is reported whole. Every reported tracked page is armed again (or still open to a host
+    // write), so its copy is dropped; the next opening store takes a new one.
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> storedSubpages(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& runs) {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> narrowed;
+        const auto append = [&](std::uintptr_t first, std::uintptr_t last) {
+            if (!narrowed.empty() && narrowed.back().second == first) narrowed.back().second = last;
+            else narrowed.emplace_back(first, last);
+        };
+        for (const auto& [first, last] : runs) {
+            auto cursor = first;
+            for (auto it = _subpages.lower_bound(first); it != _subpages.end() && it->first < last; ++it) {
+                const auto page = it->first;
+                auto& entry = it->second;
+                if (cursor < page) append(cursor, page);
+                std::uint32_t stored = allSubpages();
+                if (entry.copied) {
+                    stored = entry.stored;
+                    const auto* current = reinterpret_cast<const std::byte*>(GuestArena::HostAddress(page));
+                    for (std::uintptr_t index = 0; index < _page / Subpage; ++index) {
+                        if ((stored >> index & 1u) == 0 && std::memcmp(current + index * Subpage, entry.bytes.get() + index * Subpage, Subpage) != 0) stored |= std::uint32_t{1} << index;
+                    }
+                }
+                entry.copied = false;
+                for (std::uintptr_t index = 0; index < _page / Subpage; ++index) {
+                    if ((stored >> index & 1u) != 0) append(page + index * Subpage, page + (index + 1) * Subpage);
+                }
+                cursor = page + _page;
+            }
+            if (cursor < last) append(cursor, last);
+        }
+        return narrowed;
+    }
+
     bool covers(std::uintptr_t begin, std::uintptr_t end) const {
         auto it = _ranges.upper_bound(begin);
         if (it == _ranges.begin()) return false;
@@ -668,10 +781,25 @@ private:
         return removed;
     }
 
+    // The tracker's page (GuestMemory.cpp WritePageBytes): the precision TrackSubpages gives a larger
+    // host page.
+    static constexpr std::uintptr_t Subpage = 4096;
+
+    // A tracked host page: how many tracked ranges have an edge in it, and, once a store opened it
+    // after it was armed, a copy of its bytes from before that store and the parts stores are known
+    // to have touched (bit per Subpage).
+    struct Subpages {
+        unsigned references = 0;
+        std::uint32_t stored = 0;
+        bool copied = false;
+        std::unique_ptr<std::byte[]> bytes;
+    };
+
     const std::uintptr_t _page = static_cast<std::uintptr_t>(::getpagesize());
     bool _available = false;
     Mutex _lock;
     std::map<std::uintptr_t, Range> _ranges;
+    std::map<std::uintptr_t, Subpages> _subpages;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
     struct sigaction _previousBus {};
     struct sigaction _previousSegv {};
@@ -825,6 +953,24 @@ bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t
     static_cast<void>(written);
     static_cast<void>(context);
     return false;
+#endif
+}
+
+void GuestWriteWatchTrackSubpages_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+#if defined(__APPLE__)
+    if (bytes != 0 && address + bytes > address) Watch::Get().TrackSubpages(address, address + bytes, true);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+void GuestWriteWatchUntrackSubpages_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+#if defined(__APPLE__)
+    if (bytes != 0 && address + bytes > address) Watch::Get().TrackSubpages(address, address + bytes, false);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
 #endif
 }
 

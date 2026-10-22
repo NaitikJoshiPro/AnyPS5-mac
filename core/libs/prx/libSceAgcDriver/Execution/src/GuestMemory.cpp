@@ -43,6 +43,7 @@
 #include <mach/mach_vm.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #else
 #include <cerrno>
 #include <cstdint>
@@ -896,6 +897,8 @@ struct WindowCopy {
     std::span<const std::uint64_t> hashes;
 
     bool Holds(std::uintptr_t page) const {
+        // A page outside the hashed window (a collect reports whole host pages) has no copy to compare.
+        if (page < first || (page - first) / WritePageBytes >= hashes.size()) return false;
         return HashPage(reinterpret_cast<const std::byte*>(GuestArena::HostRange(page, WritePageBytes))) == hashes[(page - first) / WritePageBytes]; // alias if displaced (D31, D33)
     }
 };
@@ -1356,10 +1359,22 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     if (end <= begin) return;
     ++runs.stamped;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
-    if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
-    else tracker.noteWalkStore(begin, end, generation);
+#ifdef __APPLE__
+    // The import ran under a host write over its whole window (ImportWatched), which opens and
+    // reports every 16 KiB host page of it: whether a page was stored to is only known from its
+    // bytes, so only a 4 KiB page that no longer holds its window copy counts as a CPU store.
+    const bool windowStores = runs.window != nullptr && kind != StampKind::Driver;
+#else
+    const bool windowStores = false;
+#endif
+    if (kind == StampKind::Driver) tracker.noteWalkStore(begin, end, generation);
+    else if (!windowStores) tracker.noteCpuStore(begin, end, generation);
     if (runs.window != nullptr) {
-        for (auto page = begin; page < end; page += WritePageBytes) tracker.stamp(tracker.blockOf(page), generation, runs.window->Holds(page) ? StampKind::ImportWindow : kind);
+        for (auto page = begin; page < end; page += WritePageBytes) {
+            const bool holds = runs.window->Holds(page);
+            if (windowStores && !holds) tracker.noteCpuStore(page, page + WritePageBytes, generation);
+            tracker.stamp(tracker.blockOf(page), generation, holds ? StampKind::ImportWindow : kind);
+        }
     } else {
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
     }
@@ -1644,16 +1659,30 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
             begin = end;
         }
     }
-    std::vector<std::uint64_t> hashes(static_cast<std::size_t>((stop - first) / page), 0);
+#ifdef __APPLE__
+    // The collect after the import reports whole 16 KiB host pages: the window hashes the host pages
+    // the spans touch, so a neighbor sharing one is compared too instead of read as stored.
+    const auto hostPage = static_cast<std::uint64_t>(::getpagesize());
+    const auto hostFirst = first & ~(hostPage - 1);
+    const auto hostStop = (stop + hostPage - 1) & ~(hostPage - 1);
+#else
+    const auto hostPage = page;
+    const auto hostFirst = first;
+    const auto hostStop = stop;
+#endif
+    std::vector<std::uint64_t> hashes(static_cast<std::size_t>((hostStop - hostFirst) / page), 0);
     for (const auto& [begin, end] : spans) {
         CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
-        for (auto cursor = begin; cursor < end; cursor += page) {
-            hashes[static_cast<std::size_t>((cursor - first) / page)] = HashPage(reinterpret_cast<const std::byte*>(GuestArena::HostRange(cursor, page))); // alias if displaced (D31, D33)
+        // The rest of a host page shares its mapping and protection with the span's part.
+        const auto hashBegin = begin & ~(hostPage - 1);
+        const auto hashEnd = (end + hostPage - 1) & ~(hostPage - 1);
+        for (auto cursor = hashBegin; cursor < hashEnd; cursor += page) {
+            hashes[static_cast<std::size_t>((cursor - hostFirst) / page)] = HashPage(reinterpret_cast<const std::byte*>(GuestArena::HostRange(cursor, page))); // alias if displaced (D31, D33)
         }
     }
     std::erase_if(spans, [&](const auto& span) { return !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true); });
     if (!runImport()) return false;
-    const WindowCopy window{first, hashes};
+    const WindowCopy window{hostFirst, hashes};
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
         if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) continue;
@@ -1828,6 +1857,31 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return true;
 #endif
     return tracker.storedOver(address, address + bytes, generation, false);
+}
+
+TrackedStorePrecision::~TrackedStorePrecision() {
+    Clear();
+}
+
+void TrackedStorePrecision::Track(std::span<const std::pair<std::uint64_t, std::size_t>> ranges) {
+    Clear();
+#ifdef __APPLE__
+    tracked.reserve(ranges.size());
+    for (const auto& [address, bytes] : ranges) {
+        if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) continue;
+        GuestWriteWatch::GuestWriteWatchTrackSubpages_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+        tracked.emplace_back(address, bytes);
+    }
+#else
+    static_cast<void>(ranges);
+#endif
+}
+
+void TrackedStorePrecision::Clear() noexcept {
+#ifdef __APPLE__
+    for (const auto& [address, bytes] : tracked) GuestWriteWatch::GuestWriteWatchUntrackSubpages_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+#endif
+    tracked.clear();
 }
 
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
