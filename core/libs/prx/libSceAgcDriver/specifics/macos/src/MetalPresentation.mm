@@ -249,23 +249,27 @@ public:
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        changed.notify_one();
+        changed.notify_all();
         if (worker.joinable()) worker.join();
     }
 
     // `screenshot` (upstream e3125e43af): the frame is the screenshot key's PNG, written whether or not
     // frame dumps are on.
+    // Upstream 3ed129ab33: a frame that does not fit the queue waits for the writer (which notifies after
+    // each file); only a frame larger than the whole queue fails.
     void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::vector<std::byte> pixels, bool screenshot = false) {
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
         if (stopping) Fail("frame dump writer has stopped");
-        if (pixels.size() > MaxBytes - queuedBytes) Fail("frame dump queue exceeded 64 MiB");
         if (!screenshot && !frameDumpOutput.Enabled_nid_no_patch()) return;
+        if (pixels.size() > MaxBytes) Fail("a frame dump exceeds the 64 MiB queue");
+        changed.wait(lock, [&] { return stopping || pixels.size() <= MaxBytes - queuedBytes; });
+        if (stopping) Fail("frame dump writer has stopped");
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp queued (%ux%u)\n", index, width, height);
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, screenshot, std::move(pixels)});
         queuedBytes += bytes;
-        changed.notify_one();
+        changed.notify_all();
     }
 
     bool Idle() {
@@ -297,12 +301,14 @@ private:
                         std::fprintf(stderr, "[gpu] screenshot saved: %s\n", Screenshot::Write(GetAppTitleId_nid_postfix().value, frame.width, frame.height, frame.pixels).string().c_str());
                         std::lock_guard lock(mutex);
                         queuedBytes -= frame.pixels.size();
+                        changed.notify_all();
                         continue;
                     }
                     WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, 1u);
                     if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp written (%ux%u)\n", frame.index, frame.width, frame.height);
                     std::lock_guard lock(mutex);
                     queuedBytes -= frame.pixels.size();
+                    changed.notify_all();
                 }
             }
         } catch (const std::exception& error) {
