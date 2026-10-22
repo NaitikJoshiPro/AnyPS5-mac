@@ -217,6 +217,9 @@ private:
     mutable std::uint64_t fingerprint = 0;
 };
 
+// The context CLEAR_STATE leaves. SPI_PS_IN_CONTROL (0x1b6) clears to NUM_INTERP = 2 like the GFX10
+// golden clear state, which radeonsi's si_set_tracked_regs_to_clear_state assumes: after a CLEAR_STATE
+// it skips writing SPI_PS_IN_CONTROL for a pixel shader with two interpolants.
 inline Registers BuildInitialContextRegisters() {
     Registers result{
         {0x200, 0}, {0x201, 0}, {0x202, 0xcc0010}, {0x203, 0},
@@ -227,7 +230,7 @@ inline Registers BuildInitialContextRegisters() {
         {0x90, 0x80000000}, {0x91, 0x40004000},
         {0x105, 0}, {0x106, 0}, {0x107, 0}, {0x108, 0},
         {0x10b, 0}, {0x10c, 0}, {0x10d, 0},
-        {0x1b1, 0}, {0x1b3, 0}, {0x1b4, 0}, {0x1b6, 0}, {0x1c3, 0}, {0x1c4, 0}, {0x1c5, 0},
+        {0x1b1, 0}, {0x1b3, 0}, {0x1b4, 0}, {0x1b6, 2}, {0x1c3, 0}, {0x1c4, 0}, {0x1c5, 0},
         {0x1ff, 0}, {0x280, 0x00080008}, {0x281, 0xffff0000}, {0x292, 2}, {0x293, 0}, {0x29b, 0},
         {0x2ce, 0}, {0x2d3, 0}, {0x2d5, 0}, {0x2d6, 0}, {0x2db, 0},
         {0x2dc, 0xaa00}, {0x2df, 0}, {0x2e4, 0}, {0x2f8, 0}, {0x2f9, 0x2d},
