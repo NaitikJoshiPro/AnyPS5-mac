@@ -114,7 +114,7 @@ def main():
         # Zero padding after the table (up to the first segment's file data) gives it more slots.
         result, elf = relink(relinker, directory, "zero-padding-slots", fixture(6))
         headers = program_headers(elf)
-        assert [header for header in headers if header[0] == PT_GNU_EH_FRAME] == [EH_FRAME_HEADER], headers
+        assert [header for header in headers if header[0] == PT_GNU_EH_FRAME] == [EH_FRAME_OUTPUT], headers
         # Upstream now always emits a PT_GNU_STACK (synthesised when the input has none): 8 headers, table in place.
         assert len(headers) == 8, headers
         assert struct.unpack_from("<Q", elf, 0x20)[0] == 64, "Zero padding must extend the table in place"
