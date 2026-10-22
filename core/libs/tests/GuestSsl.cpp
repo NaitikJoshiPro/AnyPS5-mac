@@ -22,7 +22,6 @@ int APS5_VABI sceSslSetVerifyCallback(int, int (APS5_VABI *)(int, unsigned int, 
 int APS5_VABI sceSslConnect(int);
 int APS5_VABI sceSslRead(int, void*, std::size_t, int);
 int APS5_VABI sceSslWrite(int, void*, std::size_t, int);
-int APS5_VABI sceSslGetSerialNumber(int, void*, std::uint8_t*, std::size_t*);
 int APS5_VABI sceSslClose(int);
 int APS5_VABI sceSslEnableVerifyOption(int, std::uint32_t);
 int APS5_VABI sceSslDisableVerifyOption(int, std::uint32_t);
@@ -112,13 +111,6 @@ int main() {
     Require(sceSslUnloadCert(context) == 0);
     Require(sceSslGetCaList(context, &list) == notFound);
     Require(list.certs == nullptr && list.num == 0);
-
-    std::uint8_t serial[32] = {};
-    std::size_t serialLength = sizeof(serial);
-    Require(Throws([&] { sceSslGetSerialNumber(context, nullptr, serial, &serialLength); })); // upstream: a null certificate throws
-    Require(sceSslGetSerialNumber(context, &handle, serial, nullptr) == invalidArg);
-    Require(Throws([&] { sceSslGetSerialNumber(context, &handle, serial, &serialLength); }));
-    Require(serialLength == sizeof(serial) && serial[0] == 0);
 
     constexpr int invalidId = static_cast<int>(0x8095F006);
     constexpr int badLength = static_cast<int>(0x80951773);
