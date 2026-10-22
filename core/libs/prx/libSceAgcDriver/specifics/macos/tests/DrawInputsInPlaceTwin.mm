@@ -1,4 +1,5 @@
-// Metal twin of tests/Recorder.cpp's --draw-inputs-in-place-only mode (agc_draw_inputs_in_place). The test
+// Metal twin of tests/Recorder.cpp's --draw-inputs-in-place-only and --draw-inputs-copied-only modes
+// (agc_draw_inputs_in_place, agc_draw_inputs_copied). The test
 // function (drawInputInPlaceTests, Recorder.cpp:2037-2131) is copied unchanged. It checks the draw-input
 // primitives of Graphics/src/Draw.cpp (InPlaceDrawInput, InPlaceIndexRange, compiled unchanged on macOS) over
 // Metal host imports (GuestBufferMemory.mm: no-copy buffers over 16 KiB pages of write-watched memory) and the
@@ -23,7 +24,7 @@
 
 namespace {
 
-void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
+void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied = false) {
     auto context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
@@ -52,6 +53,12 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     context.recorder = &recorder;
     recorder.Sync();
     const auto vertices = address + 4096;
+    context.drawInputsInPlace = !copied;
+    if (copied) {
+        Require(InPlaceDrawInput(context, vertices, 256, 4) == nullptr, "an imported draw input was bound in place where draw inputs are copied");
+        Require(!recorder.PendingReadOverlaps(vertices, 256), "a copied draw input's read was noted as an in-place read");
+        return;
+    }
     const auto* import = InPlaceDrawInput(context, vertices, 256, 4);
     Require(import != nullptr && import->base <= vertices && vertices + 256 <= import->base + import->bytes, "an imported draw input was not bound in place");
     const auto read = recorder.DescribePendingRead(vertices, 256);
@@ -144,6 +151,15 @@ const bool registered = AgcDriver::MetalTwins::RegisterRecorderMode("--draw-inpu
     return RunMode([](const Device& device, Recorder& recorder) {
         drawInputInPlaceTests(device, recorder);
         std::cout << "In-place draw input tests passed\n";
+    });
+});
+
+// --draw-inputs-copied-only (agc_draw_inputs_copied): upstream's same function with copied = true; draw
+// inputs are copied, so an imported input is never bound in place nor noted as an in-place read.
+const bool registeredCopied = AgcDriver::MetalTwins::RegisterRecorderMode("--draw-inputs-copied-only", [] {
+    return RunMode([](const Device& device, Recorder& recorder) {
+        drawInputInPlaceTests(device, recorder, true);
+        std::cout << "Copied draw input tests passed\n";
     });
 });
 

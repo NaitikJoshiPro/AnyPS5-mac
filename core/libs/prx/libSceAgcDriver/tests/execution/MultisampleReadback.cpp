@@ -492,6 +492,14 @@ void CheckUpload(const Context& context) {
 int main(int argc, char** argv) {
     try {
         CheckSupportSelection();
+#ifdef __APPLE__
+        // The readback fixture records its multisampled draws and copies through Vulkan device
+        // functions and the Vulkan pipeline cache, which the Metal device has none of
+        // (TechnicalDebt metal-vulkan-internal-tests); Metal MSAA targets are checked by
+        // agc_multisample_guest_access and agc_driver_msaa_dcc_clear_*.
+        std::puts("skipped, the readback fixture drives Vulkan device functions the Metal device has none of");
+        return VulkanTestSkipped;
+#endif
         const std::string mode = argc == 1 ? "uint32" : argv[1];
         VkFormat format = VK_FORMAT_R32_UINT;
         std::uint32_t bytes = 4u;

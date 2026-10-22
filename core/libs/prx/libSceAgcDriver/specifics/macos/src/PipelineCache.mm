@@ -1057,6 +1057,7 @@ bool PipelineCache::Save(bool waitForPipelines) {
     std::lock_guard saving(*saveMutex);
     std::uint64_t saved = 0;
     std::vector<std::function<void(NSArray<id<MTL4Archive>>*)>> replays;
+    std::vector<std::size_t> replayed;
     std::size_t known = 0;
     {
         std::lock_guard lock(mutex);
@@ -1064,7 +1065,10 @@ bool PipelineCache::Save(bool waitForPipelines) {
         saved = unsaved;
         known = archived.size();
         for (std::size_t index = 0; index < known; ++index) {
-            if (!archived[index].captured) replays.push_back(archived[index].replay);
+            if (!archived[index].captured) {
+                replays.push_back(archived[index].replay);
+                replayed.push_back(index);
+            }
         }
     }
     @autoreleasepool {
@@ -1094,7 +1098,15 @@ bool PipelineCache::Save(bool waitForPipelines) {
         {
             std::unique_lock gate(serializerGate, std::defer_lock);
             if (waitForPipelines) gate.lock();
-            else if (!gate.try_lock()) return false;
+            else if (!gate.try_lock()) {
+                // Busy: the replays above are in the serializer now and stay there for the next save,
+                // which must not capture them again. Captured twice, the flush crashed on macOS 27.0.1
+                // (dispatch_retain(NULL) in -[_MTLBinaryArchive materializeAirNTFromOnlineForSlice:
+                // entryList:] on the saver thread; SuperTuxKart at ~50 s, GATE5-STK2).
+                std::lock_guard lock(mutex);
+                for (const auto index : replayed) archived[index].captured = true;
+                return false;
+            }
             stored = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];
             // Whatever succeeded or not, the serializer is empty now: everything noted so far must
             // be replayed before the next save (the first `known` entries were replayed above, the

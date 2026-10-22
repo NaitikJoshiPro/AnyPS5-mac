@@ -43,3 +43,17 @@ agc_driver_prepared_graphics_prebuild_unset | SKIP_RETURN_CODE=77 | metal-graphi
 agc_driver_native_depth_bda_clear | the device does not retain guest write watching for native clear imports | metal-d3-import-watch
 agc_shadowed_key_stores | the device imports no watched host memory under a unit shadow | metal-d3-import-watch
 agc_driver_image_table_vouched_lookups | the Metal import write-protection probe \(not implemented\) | metal-d3-import-watch
+agc_driver_multisample_readback | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_depth | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint8 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint16 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint64 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_uint128 | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_retile | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_depth_retile | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_readback_upload | the readback fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_retirement | the retirement fixture drives Vulkan device functions | metal-vulkan-internal-tests
+agc_driver_multisample_fill_host_only | Metal devices on one GPU share one VkDevice handle | metal-shared-device-handle
+agc_driver_prepared_shaders_abi_deferred_rectangle_pairs | the MSL backend builds rectangle pairs | metal-vulkan-internal-tests
+agc_driver_rect_list_corner | device has no tessellation | metal-vulkan-internal-tests
+agc_driver_multisampled_pass_order | captures Vulkan pipeline barriers | metal-vulkan-internal-tests

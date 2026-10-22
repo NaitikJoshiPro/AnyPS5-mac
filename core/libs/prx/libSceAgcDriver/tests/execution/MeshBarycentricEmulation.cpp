@@ -83,7 +83,7 @@ void ExpectRejected(TAction action, const std::string& reason) {
     Require(false, "the validator accepted a draw it must reject (" + reason + ")");
 }
 
-std::uint32_t DecorationWord(const ShaderRecompiler::RecompileResult& result, spv::Decoration decoration) {
+[[maybe_unused]] std::uint32_t DecorationWord(const ShaderRecompiler::RecompileResult& result, spv::Decoration decoration) {
     const auto& words = result.spirv.Words();
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
@@ -93,7 +93,7 @@ std::uint32_t DecorationWord(const ShaderRecompiler::RecompileResult& result, sp
     return 0u;
 }
 
-void CheckValidator(AgcDriver::VulkanDevice& device, const AgcDriver::Pm4::DrawParameters& draw, const AgcDriver::Graphics::State& state, const ShaderRecompiler::RecompileResult& meshResult, const ShaderRecompiler::RecompileResult& pixelResult, std::uint32_t pixelOffset) {
+[[maybe_unused]] void CheckValidator(AgcDriver::VulkanDevice& device, const AgcDriver::Pm4::DrawParameters& draw, const AgcDriver::Graphics::State& state, const ShaderRecompiler::RecompileResult& meshResult, const ShaderRecompiler::RecompileResult& pixelResult, std::uint32_t pixelOffset) {
     const auto rejected = [&](const ShaderRecompiler::RecompileResult& mesh, const ShaderRecompiler::RecompileResult& pixel, const std::string& reason) {
         const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Mesh, &mesh, 0}, {ShaderStage::Fragment, &pixel, pixelOffset}}};
         ExpectRejected([&] { device.Draw(state, draw, shaders); }, reason);
@@ -187,7 +187,11 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
+#ifndef __APPLE__
+    // Pipeline.cpp's SPIR-V module validator; Metal draws build MSL and never validate SPIR-V
+    // (TechnicalDebt metal-vulkan-internal-tests).
     if (pixelCode.data() == BarycentricPixelCode.data()) CheckValidator(device, draw, state, pairedMesh, pixelResult, PixelPushOffset(meshPush, target));
+#endif
     device.Draw(state, draw, shaders);
     device.WaitIdle();
     return pixelResult;

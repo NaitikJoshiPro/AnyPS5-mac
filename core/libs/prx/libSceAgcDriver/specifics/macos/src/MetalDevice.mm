@@ -1890,6 +1890,12 @@ void VulkanDevice::State::RecordCompute(const ShaderRecompiler::RecompileResult&
             Recorder::CountBarriers(Recorder::CommandClass::DispatchLeading);
             indirect = counts.address;
         }
+    } else if (indirect != 0u) {
+        // e54d2f35fe (VulkanDevice.cpp RecordDispatchArguments): the group counts are checked
+        // against the device limit on the GPU into a 12-byte copy, dispatched from when the
+        // kernel built; otherwise read from the guest unchecked.
+        const auto checked = stream.Allocate(12u, 16u);
+        if (recorder.RecordDispatchArguments(Graphics::Metal::Handle(stream), indirect, checked.address)) indirect = checked.address;
     }
     const auto pushAddress = stream.Write(std::span<const std::byte>(push), 16u).address;
     std::vector<std::uint64_t> driverAddresses;

@@ -253,6 +253,18 @@ bool holdsStartingLanes(const IrProgram& program, const IrValue& word, std::uint
     if (word.Opcode() == IrOpcode::BitwiseOr32) {
         return holdsStartingLanes(program, resolveArg(word, 0), index, depth + 1u) || holdsStartingLanes(program, resolveArg(word, 1), index, depth + 1u);
     }
+    if (word.Opcode() == IrOpcode::CompositeExtractU64) {
+        // WQM only adds lanes, and quads never straddle the 32-bit halves, so the
+        // matching half of WQM(lanes) holds whatever that half of lanes holds. This
+        // is the pixel-stage host exec word (exec & WQM(ballot(true))) that an
+        // s_mov_b64/s_wqm_b64 exec prologue reads.
+        if (!isImmediateU32(resolveArg(word, 1), index)) return false;
+        const auto& wqm = resolveArg(word, 0);
+        if (wqm.Opcode() != IrOpcode::WqmU64) return false;
+        const auto& lanes = resolveArg(wqm, 0);
+        if (lanes.Opcode() != IrOpcode::CompositeConstructU64 || index > 1u) return false;
+        return holdsStartingLanes(program, resolveArg(lanes, index), index, depth + 1u);
+    }
     if (word.Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediateU32(resolveArg(word, 1), index)) return false;
     const auto& ballot = resolveArg(word, 0);
     if (ballot.Opcode() != IrOpcode::Ballot || !runsAllStartingLanes(program, ballot.Parent())) return false;

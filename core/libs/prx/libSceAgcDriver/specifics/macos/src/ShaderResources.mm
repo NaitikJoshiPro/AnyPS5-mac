@@ -3661,7 +3661,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
             ++vouched;
         }
-        if (vouched != 0) TextureCounts().tablesReused.fetch_add(vouched, std::memory_order_relaxed);
+        // A vouched table is served again as bound, without a resolve: what upstream counts as a
+        // replay of the epoch's table when table replay is on (ImageTableReuses().replayed).
+        if (vouched != 0) (TableReplay() ? TextureCounts().tablesReplayed : TextureCounts().tablesReused).fetch_add(vouched, std::memory_order_relaxed);
     }
     return finish(fast, true);
 }

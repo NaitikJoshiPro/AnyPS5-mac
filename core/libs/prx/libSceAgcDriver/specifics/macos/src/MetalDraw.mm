@@ -874,6 +874,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         indexBegin = draw.indexAddress;
         indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
         if (indexBegin == 0u || indexBytes == 0u) Fail("an indexed draw without an index buffer");
+        // Upstream Draw.cpp: an index range the guest cannot read (unmapped, or a sparse range
+        // without backing) is refused before it is wrapped.
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(indexBegin), static_cast<std::size_t>(indexBytes), draw.indexSize);
         fetchPlan.reads.push_back({indexBegin, indexBegin + indexBytes});
     }
 
@@ -2068,6 +2071,12 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck) {
 }
 
+// Upstream Pipeline.cpp: an overrasterized draw (a multisampled rasterizer into one-sample color
+// targets) needs merged coverage reduction, which Metal has no counterpart of (render pass sample
+// counts must match): refused as on a Vulkan device without the extension
+// (TechnicalDebt metal-mixed-samples).
+constexpr const char* MergedCoverageRefusal = "Metal draw: an overrasterized draw (a multisampled rasterizer into one-sample color targets) requires VK_NV_framebuffer_mixed_samples with merged coverage reduction, which Metal render passes have no counterpart of";
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
     if (recipe != nullptr) *recipe = nullptr;
     for (const auto& shader : shaders) {
@@ -2075,6 +2084,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
     }
     if (state->recorder == nullptr) throw std::runtime_error("Metal device: a compile-only device cannot draw");
+    if (graphics.mergedCoverage) throw std::runtime_error(MergedCoverageRefusal);
     const Graphics::CompiledShader* vertex = nullptr;
     const Graphics::CompiledShader* fragment = nullptr;
     Graphics::Metal::TessellationStages tessellation;
@@ -2115,6 +2125,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    if (graphics.mergedCoverage) return std::string(MergedCoverageRefusal);
     const bool meshPath = graphics.stages.path == Graphics::ShaderPath::Geometry && graphics.stages.mesh;
     const bool tessellationPath = graphics.stages.path == Graphics::ShaderPath::Tessellation && graphics.stages.tessellation;
     if (graphics.stages.path != Graphics::ShaderPath::Vertex && !meshPath && !tessellationPath) return std::string("Metal draw (work package D6): the geometry path without a mesh configuration and tessellation plus geometry are not implemented");
@@ -2168,11 +2179,26 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
         Graphics::ResolveMultisampleTarget(*imageContext, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip, destination.depthSlice, 1u, destination.arraySlice));
         return;
     }
+    if (pass.mode == Graphics::ColorMetadataPass::Mode::FmaskDecompress) {
+        // Upstream Draw.cpp RunColorMetadataPass: an FMASK decompress expands a pending CMASK fast
+        // clear into the target's multisample host image.
+        const auto* imageContext = state->images->ImageContext();
+        if (imageContext == nullptr) Fail("a CB FMASK decompress without the device's image context");
+        for (const auto& color : pass.targets) Graphics::MaterializeMultisampleTargetClear(*imageContext, color);
+        return;
+    }
     // DCC targets (upstream Draw.cpp RunColorMetadataPass): fast-clear keys store the clear texel and comp-to-single
     // keys each block's first texel in guest memory, and the keys are left uncompressed, exactly as before a draw
     // (MaterializeDcc). The image cache's resident image of the target, if any, reloads from guest memory.
     const auto* imageContext = state->images->ImageContext();
     for (const auto& color : pass.targets) {
+        // A multisampled target is its host image (as in a draw above): its guest memory holds no
+        // samples, so the pass expands the pending CMASK clear into the host image instead.
+        if (color.samples > 1u) {
+            if (imageContext == nullptr) Fail("a CB metadata pass over a multisampled target without the device's image context");
+            Graphics::MaterializeMultisampleTargetClear(*imageContext, color);
+            continue;
+        }
         std::shared_ptr<Graphics::StorageTexture> resident;
         if (color.tileMode != Graphics::ColorTileMode::Linear && imageContext != nullptr) {
             resident = Graphics::CachedStorageSurface(*imageContext, Graphics::SurfaceForTarget(color));

@@ -525,6 +525,12 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+#ifdef __APPLE__
+        // The fixture retires MSAA VkImage allocations through the Vulkan device function resolver,
+        // which the Metal device has none of (TechnicalDebt metal-vulkan-internal-tests).
+        std::puts("skipped, the retirement fixture drives Vulkan device functions the Metal device has none of");
+        return VulkanTestSkipped;
+#endif
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         Require((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) != 0, "the retirement fixture needs 4x color targets");
         Run run(*device);
