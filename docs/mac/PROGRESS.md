@@ -494,3 +494,46 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
 - Verified: `nice -n 10 ninja -C build-rebase5 -j4 -k 0` rc 0 after each commit. After the reconfigure, 2947 steps rc 0; ImageTableReuse.cpp and GuestQsortS.cpp compiled.
 - NOT run: everything. Owed on top of REBASE5's list: agc_driver_image_table_reuse on Metal (whether upstream's reuse/resolution counts hold on the Metal table cache is unverified), guest_qsort_s, and a present A/B with and without APS5_NO_PRESENT_EPOCH.
 - Disk: 28.33G of 100G. Live build dirs: build-sync4 and build-rebase5.
+
+## 2026-10-22 — M3/M4 GATE5: land5 gated, fixed and landed (upstream 661f8b7171 + perf5 + drvd-land2 + waste1 + FIX6)
+- Branch land5 (wt/rebase5, build-rebase5, BUILD_TESTING=ON): 1ba30dbdfa → bf599c3ef1 plus docs. 60 fix/test commits, one topic each, made by GATE5 and its sub-agents. None of this had been tested before the gate.
+- CPU: `ctest --test-dir build-rebase5 -LE gpu -j6 --timeout 300`. The first run gave 5345/5372, with 27 deterministic failures, all from UPSYNC4's untested ports.
+  - Fixed: request_serializer test (v39 layout); host_import_inventory (30 new libSystem imports classified; statvfs, mach_vm_read_overwrite and mach_vm_write shimmed); relinker amd64_only_converter and linux_eh_frame_header vs D29.
+  - Fixed: the AGC driver memory at 0xfe0000000 is mapped at its displaced alias; file-backed and shm mmap on macOS; arena and app-heap tests.
+  - Fixed: PreciseMonotonicNanos read CLOCK_UPTIME_RAW against steady_clock deadlines, so waits lasted hours (precise_wait, select, audio3d and audio_in hangs). LoadExec accepts an arm64 Mach-O. Strict IPv4 inet_pton. PATH_MAX on macOS.
+  - Fixed: guest long double on arm64 in the compiler-rt and exact math exports. The bridge refuses `_Complex long double` (TechnicalDebt arm64-complex-long-double). Unwinder host tests run on x86-64 only (arm64-host-native-unwinder-tests).
+  - Final run (bf599c3ef1): **5370/5370**.
+- GPU: `gpu_suite --validation G1 G3 G4 G6 G7` plus the owed tests (agc_metal_msl_upstream_parity, agc_progress, agc_driver_stage_image_bindings, mesh per-vertex, agc_metal_draw_index_gather, agc_driver_storage_gpu_snapshot, agc_driver_store_over_untracked, agc_driver_image_table_reuse, agc_driver_compute_fs_table_calls).
+  - First run: 542/629, 45 failures. 42 G1 tests failed to compile MSL because aps5_bda_anchor named a variable `device`, an MSL keyword (d18e55aa48).
+  - The 13 regressions in tests that passed on adaf8b6536 are all fixed: buffer atomics on an unaligned V# base, BufferPool over maxBufferLength, MSAA sources recorded for reuse, mesh draws shorter than one primitive, queue-0 flip EOP reap, D41 rect-output refusal order, a null V# with no placeholder VkBuffer, MSAA-array shape match, recorder-logic, BDA, import-window and wave-LDS twins.
+  - New upstream tests ported or fixed:
+    - indirect dispatch group counts are limit-checked (RecordDispatchArguments);
+    - FmaskDecompress branch;
+    - flat scratch stores per lane;
+    - unreadable index range refused before the draw;
+    - depth clamp and depth sample counts reported;
+    - mixed-sample draws refused cleanly;
+    - lds stride, BDA anchor and image-table replay counter;
+    - recorder modes ported: draw_inputs_copied, deferred_failure_report, gpu_timing complete and incomplete (readGpuTiming drops batches with unended ranges);
+    - Vulkan-internal MSAA readback, retirement, fill-host-only, validator, rect-pair and pass-order checks skip on Metal with an allowlist line and an anchor.
+  - Final full run (b2ef739478, logs/gate5/gs-final): 567/629, 50 skips, 12 failures. **Every failure is a new upstream test that never passed on Metal** (TechnicalDebt metal-upsync4-owed-tests): image_table (timeout), lookup_log_fits_build, layered_array_color_draw, msaa_dcc_clear_2/4/8, pixel_sample_iteration, read_written_staging, storage_write_back, storage_writeback_blocks, agc_driver (#5480 GPU small copy), plus host_import_lifetime (flaky, below).
+  - 5 skip-check errors remain unallowlisted on purpose: real gaps (pixel_implicit_derivatives, address_passes ×2, pipelined_dispatch_item, rect_list_indirect).
+  - After the late fixes (182df07ebd..bf599c3ef1), G1 G3 G4 G6 plus prepared, pipeline-cache and mesh tests were rerun (gs-final2, gs-final3, gs-final4). Same failure set, plus two tests that flake with and without validation: agc_storage_split_writeback (2 of 4 failed; "one import covers both ranges", suspect address-dependent power-of-two joins from c09579c8d6) and agc_driver_host_import_lifetime (2 of 4 failed; a race check). Both passed in gs-all1 and gs-final on this branch.
+- MTLCompilerService crash under validation: from 01:40, every validated suite failed the agc_metal_recorder canary (patchReflection SIGSEGV), as on 2026-10-15. The cause is a **poisoned shader-validation cache**. Moving `$(getconf DARWIN_USER_CACHE_DIR)com.apple.metal/*_ShaderValidation` aside fixed it at once; the 2.1 GB of moved cache was then deleted. Those directories are created only by MTL_SHADER_VALIDATION runs.
+- SuperTuxKart regressions (it was alive 90 s at adaf8b6536). Each one hid the next:
+  1. Upstream 27b196bee0 put the pixel EXEC word through WqmU64, and ConstantFolder's holdsStartingLanes stopped folding ACO's s_wqm prologue. Pixel shaders then took barycentric emulation for no reason, and STK died at "per-vertex fragment inputs of rect lists". Fixed in 73d3c19df0 (shared code; an upstream PR candidate). Test: pixel_ancillary.
+  2. 'submission did not retire in 5 s', cold compiler: the D55 prewarm of a shared library store full of other titles' libraries (not new code). It went away once warm. TechnicalDebt metal-first-frame-compile.
+  3. Pipeline saver SIGSEGV in serializeAsArchiveAndFlushToURL. Fixed by c81dd756e4 (a busy-skipped save keeps its replays captured) and 543b889e8f (mesh render pipelines bypass the archive).
+  4. "interpolation parameter reference is out of range (0 inputs)": CLEAR_STATE left SPI_PS_IN_CONTROL at 0, while radeonsi assumes the GFX10 golden 0x2 and leaves the write out. Fixed in 182df07ebd, then narrowed to the CLEAR_STATE and push-clear packets only (a18343e285, bf599c3ef1), so registration-time decoding keeps 0. Other golden-state differences: TechnicalDebt clear-state-golden-values.
+- Titles at bf599c3ef1 (title_run, run dirs runs/m3/*-gate5 relinked with land5's relinker, --audio-file, headless), all with 0 validation errors:
+  - DOOM: 60 s alive, 6 frames, with and without --validation.
+  - Showcase 1.0.2: 70 s alive, 6 frames, with and without.
+  - UI Lab: alive 60 s with 6 frames under --validation (new). Without validation it hits "submission retirement failed" at 6.6 s, as before (D56).
+  - STK: 90 s alive, 1 frame, with and without (it had regressed to 17 s at 8f26deae68).
+- Commands:
+  - `ctest --test-dir build-rebase5 -LE gpu -j6 --timeout 300`
+  - `python3 tools/mac/gpu_suite.py --build build-rebase5 --validation --out .mac-work/logs/gate5/gs-final G1 G3 G4 G6 G7 <owed tests>`
+  - `python3 tools/mac/title_run.py run <ID>-gate5 --build wt/rebase5/build-rebase5 --seconds N [--validation] --audio-file ...`
+- Logs: .mac-work/logs/gate5/ (ctest*.log, gs-*, titles/, stk2..4/).
+- Disk: TOTAL used by project 31.57G of 100G. Live build dirs: build-rebase5, build-sync5 (UPSYNC5). wt/sync4/build-sync4 is superseded.
+- Next: the metal-upsync4-owed-tests list (image_table bisect, layered 2D-array draws, MSAA DCC watch, read_written_staging and the storage write-back ports, lookup log BDA ABI on MSL); STK's per-title library store; upstream PR for 73d3c19df0 and the SPI_PS_IN_CONTROL clear state.
