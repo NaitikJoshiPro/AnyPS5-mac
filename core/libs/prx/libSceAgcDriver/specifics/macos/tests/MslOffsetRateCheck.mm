@@ -72,12 +72,18 @@ fragment void offset_rate_pull_center(PullIn in [[stage_in]], device atomic_uint
 }
 )";
 
-std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> library, const char* fragment) {
+// `attached`: the pass has a memoryless 4x color attachment the function never writes (write mask none), versus a
+// pass without attachments (defaultRasterSampleCount).
+std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> library, const char* fragment, bool attached) {
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = [library newFunctionWithName:@"offset_rate_vertex"];
     descriptor.fragmentFunction = [library newFunctionWithName:@(fragment)];
     Require(descriptor.fragmentFunction != nil, std::string(fragment) + ": no function");
     descriptor.rasterSampleCount = Samples;
+    if (attached) {
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
+        descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+    }
     NSError* error = nil;
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
     Require(pipeline != nil, std::string(fragment) + ": no pipeline: " + Describe(error));
@@ -88,6 +94,18 @@ std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibra
     pass.renderTargetWidth = TargetSize;
     pass.renderTargetHeight = TargetSize;
     pass.defaultRasterSampleCount = Samples;
+    if (attached) {
+        MTLTextureDescriptor* target = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:TargetSize height:TargetSize mipmapped:NO];
+        target.textureType = MTLTextureType2DMultisample;
+        target.sampleCount = Samples;
+        target.storageMode = MTLStorageModeMemoryless;
+        target.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> texture = [device newTextureWithDescriptor:target];
+        Require(texture != nil, std::string(fragment) + ": no memoryless 4x target");
+        pass.colorAttachments[0].texture = texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    }
     id<MTLCommandBuffer> commands = [queue commandBuffer];
     id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
     [encoder setRenderPipelineState:pipeline];
@@ -115,14 +133,16 @@ int main() {
             id<MTLLibrary> library = [device newLibraryWithSource:@(Source) options:[MTLCompileOptions new] error:&error];
             Require(library != nil, "the probe MSL does not compile: " + Describe(error));
             id<MTLCommandQueue> queue = [device newCommandQueue];
-            const auto offset = Count(device, queue, library, "offset_rate_offset");
-            const auto center = Count(device, queue, library, "offset_rate_center");
-            const auto sample = Count(device, queue, library, "offset_rate_sample");
-            const auto pullCenter = Count(device, queue, library, "offset_rate_pull_center");
-            std::printf("fragment invocations over %u pixels at %ux: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u\n", TargetSize * TargetSize, Samples, offset, center, sample, pullCenter);
-            Require(center == TargetSize * TargetSize, "a plain center_perspective function did not run once per pixel");
-            Require(sample == TargetSize * TargetSize * Samples, "an interpolate_at_sample([[sample_id]]) function did not run once per sample");
-            Require(offset == center, "an interpolate_at_offset function runs at a different rate than a center_perspective one");
+            const char* names[4] = {"offset_rate_offset", "offset_rate_center", "offset_rate_sample", "offset_rate_pull_center"};
+            std::uint32_t counts[2][4] = {};
+            for (int attached = 0; attached < 2; ++attached) {
+                for (int i = 0; i < 4; ++i) counts[attached][i] = Count(device, queue, library, names[i], attached != 0);
+                std::printf("fragment invocations over %u pixels at %ux %s: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u\n", TargetSize * TargetSize, Samples, attached != 0 ? "with an unwritten color attachment" : "without attachments", counts[attached][0], counts[attached][1], counts[attached][2], counts[attached][3]);
+            }
+            const auto* rates = counts[1];
+            Require(rates[1] == TargetSize * TargetSize, "a plain center_perspective function did not run once per pixel");
+            Require(rates[2] == TargetSize * TargetSize * Samples, "an interpolate_at_sample([[sample_id]]) function did not run once per sample");
+            Require(rates[0] == rates[1] && rates[3] == rates[1], "a pull-model interpolate_at_offset or interpolate_at_center function runs at a different rate than a center_perspective one");
         }
         std::puts("msl offset rate check passed");
         return 0;
