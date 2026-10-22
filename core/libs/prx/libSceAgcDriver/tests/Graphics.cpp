@@ -4645,8 +4645,10 @@ void InitialContextTests() {
     Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_CL_VTE_CNTL") == std::string::npos, "the draw pre-check refused window-space positions");
     queue.context[0x206] = 0x43f;
     Require(!AgcDriver::Graphics::DecodeState(queue).windowSpacePosition, "homogeneous positions decoded as window space");
+    // Upstream f8f797282d: CLIP_DISABLE with homogeneous positions is accepted and does not clamp depth;
+    // only window-space positions turn it into depth clamping (above).
     queue.context[0x204] = clipControl | 0x10000u;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_CLIP_CNTL");
+    Require(!AgcDriver::Graphics::DecodeState(queue).depthClamp == ((clipControl & 0x0c000000u) == 0), "CLIP_DISABLE with homogeneous positions changed depth clamping");
     queue.context[0x204] = clipControl;
     for (const auto control : {0x100u, 0x200u, 0x700u, 0x301u, 0x33fu}) {
         queue.context[0x206] = control;
