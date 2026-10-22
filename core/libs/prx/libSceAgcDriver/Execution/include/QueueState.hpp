@@ -257,6 +257,19 @@ inline Registers InitialContextRegisters() {
     return initial;
 }
 
+// The context a CLEAR_STATE packet leaves: the starting context with SPI_PS_IN_CONTROL (0x1b6) at
+// NUM_INTERP = 2 like the GFX10 golden clear state, which radeonsi's si_set_tracked_regs_to_clear_state
+// assumes (after a CLEAR_STATE it skips writing SPI_PS_IN_CONTROL for a pixel shader with two
+// interpolants). The starting context and registration-time decoding keep 0.
+inline Registers ClearStateContextRegisters() {
+    static const Registers& cleared = *new Registers([] {
+        auto registers = BuildInitialContextRegisters();
+        registers[0x1b6] = 2;
+        return registers;
+    }());
+    return cleared;
+}
+
 struct Predication {
     std::uint64_t address = 0;
     std::uint32_t operation = 0;
@@ -279,13 +292,8 @@ struct QueueState {
     std::vector<std::string> markers;
     Predication predication;
 
-    // CLEAR_STATE: SPI_PS_IN_CONTROL (0x1b6) clears to NUM_INTERP = 2 like the GFX10 golden clear
-    // state, which radeonsi's si_set_tracked_regs_to_clear_state assumes: after a CLEAR_STATE it skips
-    // writing SPI_PS_IN_CONTROL for a pixel shader with two interpolants. The queue's starting context
-    // (and registration-time decoding) keep 0, as before.
     void ClearContext() {
-        context = InitialContextRegisters();
-        context[0x1b6] = 2;
+        context = ClearStateContextRegisters();
     }
 
     std::span<const std::uint32_t> ConstantRam() const {
