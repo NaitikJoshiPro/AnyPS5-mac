@@ -3669,7 +3669,23 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (images == nullptr || images->count != table.elementTextures.size()) return finish(fast, false);
             std::vector<std::shared_ptr<Texture>> cached;
             auto* reused = FindReusedTable(context.device, *images, CurrentTableState());
-            if (reused == nullptr || !TableCurrent(*reused) || !CachedTableTextures(*reused, cached)) return finish(fast, false);
+            if (reused == nullptr || !TableCurrent(*reused) || !CachedTableTextures(*reused, cached)) {
+                // No remembered table vouches for it: each element must still be the cache's texture
+                // for its descriptor (upstream's proof of an unremembered table, bde2a8f0af), or a
+                // fresh build resolves the table.
+                for (std::uint32_t element = 0; element < images->count; ++element) {
+                    const auto index = table.elementTextures[element];
+                    if (index == std::numeric_limits<std::size_t>::max()) continue;
+                    const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                    std::array<std::uint32_t, 8> narrowed{};
+                    const auto words = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
+                    if (Metal::MultisampledDescriptor(words)) return finish(fast, false);
+                    const auto resource = DecodeTextureResource(words);
+                    const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                    if (index >= textures.size() || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[index]) return finish(fast, false);
+                }
+                continue;
+            }
             auto next = cached.begin();
             for (std::uint32_t element = 0; element < images->count; ++element) {
                 const auto& entry = reused->elements[element];
