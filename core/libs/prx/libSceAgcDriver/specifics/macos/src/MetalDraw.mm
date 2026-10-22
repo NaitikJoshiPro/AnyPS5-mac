@@ -956,10 +956,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
 
     // Layered draws (upstream #3763, State::renderLayers) render into a resident 3D target's slice
-    // range; DecodeState already refuses a depth target and mixed slice counts.
+    // range or a resident 2D array's layer range (upstream deb0ba305f: the attachment view is a
+    // 2D-array view of the color view's layers); DecodeState already refuses a depth target and
+    // mixed slice counts.
     if (graphics.renderLayers > 1u) {
         for (const auto& attachment : colors) {
-            if (attachment.resident == nullptr || attachment.multisample != nil || attachment.target->depth <= 1u) Fail("a layered draw into a color target that is not a resident single-sample 3D image");
+            const auto& target = *attachment.target;
+            const bool volume = target.depth > 1u;
+            const bool array = target.arrayLastSlice != 0u && target.arraySlice + graphics.renderLayers - 1u <= target.arrayLastSlice;
+            if (attachment.resident == nullptr || attachment.multisample != nil || (!volume && !array)) Fail("a layered draw into a color target that is not a resident single-sample 3D image or 2D array");
         }
     }
 
@@ -1624,6 +1629,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 // index counts from it (upstream #3763; MoltenVK maps a 2D-array view of a 3D image the
                 // same way, depthPlane = baseArrayLayer).
                 if (texture.textureType == MTLTextureType3D) color.depthPlane = target.depthSlice;
+                // A 2D array target's attachment view holds only the color view's layers, so the
+                // pass starts at slice 0 of the view and the render target array index counts from
+                // the view's first layer (as Vulkan's 2D-array view with baseArrayLayer).
+                if (graphics.renderLayers > 1u && texture.textureType != MTLTextureType3D && (texture.textureType != MTLTextureType2DArray || texture.arrayLength < graphics.renderLayers)) Fail("a layered draw's attachment view is neither a 3D image nor a 2D array of " + std::to_string(graphics.renderLayers) + " layers");
                 if (attachment.multisample != nil) color.slice = slice;
                 color.loadAction = MTLLoadActionLoad;
                 color.storeAction = MTLStoreActionStore;
