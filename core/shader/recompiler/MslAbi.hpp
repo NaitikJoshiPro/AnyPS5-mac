@@ -206,7 +206,9 @@ namespace ShaderRecompiler::MslAbi {
 // Version 22: indexed rect lists (RectListIdsMacro): vertex functions take the TriangleVertices
 // slot's id table in the rect-list mode too; draws whose indirect records the GPU reads (MetalDraw.mm
 // GPU indirect draws) write the rect's table base and first vertex into DriverData on the GPU.
-inline constexpr std::uint32_t Version = 22u;
+// Version 23: a pixel interpolation parameter (v_interp_mov, barycentric v_interp_p1/p2) of an
+// interpolator past SPI_PS_IN_CONTROL.NUM_INTERP reads OFFSET 0x20's default (upstream c32c26edb2).
+inline constexpr std::uint32_t Version = 23u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;
