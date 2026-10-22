@@ -76,6 +76,10 @@ fragment void offset_rate_bare(BareIn in [[stage_in]], device atomic_uint* count
 fragment void offset_rate_none(device atomic_uint* counter [[buffer(0)]], device float* sink [[buffer(1)]]) {
     record(counter, sink, float2(0.0f));
 }
+fragment float4 offset_rate_colored(CenterIn in [[stage_in]], device atomic_uint* counter [[buffer(0)]], device float* sink [[buffer(1)]]) {
+    record(counter, sink, in.value);
+    return float4(in.value, 0.0f, 1.0f);
+}
 fragment void offset_rate_pull_center(PullIn in [[stage_in]], device atomic_uint* counter [[buffer(0)]], device float* sink [[buffer(1)]]) {
     record(counter, sink, in.value.interpolate_at_center());
 }
@@ -91,7 +95,7 @@ std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibra
     descriptor.rasterSampleCount = Samples;
     if (attached) {
         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
-        descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+        descriptor.colorAttachments[0].writeMask = std::string(fragment) == "offset_rate_colored" ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
     }
     NSError* error = nil;
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
@@ -142,11 +146,11 @@ int main() {
             id<MTLLibrary> library = [device newLibraryWithSource:@(Source) options:[MTLCompileOptions new] error:&error];
             Require(library != nil, "the probe MSL does not compile: " + Describe(error));
             id<MTLCommandQueue> queue = [device newCommandQueue];
-            const char* names[6] = {"offset_rate_offset", "offset_rate_center", "offset_rate_sample", "offset_rate_pull_center", "offset_rate_bare", "offset_rate_none"};
-            std::uint32_t counts[2][6] = {};
+            const char* names[7] = {"offset_rate_offset", "offset_rate_center", "offset_rate_sample", "offset_rate_pull_center", "offset_rate_bare", "offset_rate_none", "offset_rate_colored"};
+            std::uint32_t counts[2][7] = {};
             for (int attached = 0; attached < 2; ++attached) {
-                for (int i = 0; i < 6; ++i) counts[attached][i] = Count(device, queue, library, names[i], attached != 0);
-                std::printf("fragment invocations over %u pixels at %ux %s: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u, center input without [[position]] %u, no inputs %u\n", TargetSize * TargetSize, Samples, attached != 0 ? "with an unwritten color attachment" : "without attachments", counts[attached][0], counts[attached][1], counts[attached][2], counts[attached][3], counts[attached][4], counts[attached][5]);
+                for (int i = 0; i < 7; ++i) counts[attached][i] = Count(device, queue, library, names[i], attached != 0);
+                std::printf("fragment invocations over %u pixels at %ux %s: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u, center input without [[position]] %u, no inputs %u, color output %u\n", TargetSize * TargetSize, Samples, attached != 0 ? "with an unwritten color attachment" : "without attachments", counts[attached][0], counts[attached][1], counts[attached][2], counts[attached][3], counts[attached][4], counts[attached][5], counts[attached][6]);
             }
             const auto* rates = counts[1];
             Require(rates[1] == TargetSize * TargetSize, "a plain center_perspective function did not run once per pixel");
