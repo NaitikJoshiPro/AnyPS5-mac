@@ -85,6 +85,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -140,6 +141,22 @@ struct DepthClearCounters {
 DepthClearCounters& depthClearCounters() {
     static DepthClearCounters counters;
     return counters;
+}
+
+// Upstream f57bbc936a: depth plane stores, units and bytes (DepthPlaneStoreCounts).
+struct DepthPlaneStoreCounters {
+    std::atomic<std::uint64_t> stores{0};
+    std::atomic<std::uint64_t> units{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+DepthPlaneStoreCounters& depthPlaneStoreCounters() {
+    static DepthPlaneStoreCounters counters;
+    return counters;
+}
+
+bool anyUnit(const std::vector<bool>& units) {
+    return std::find(units.begin(), units.end(), true) != units.end();
 }
 
 thread_local DepthPlaneOverwrite* currentOverwrite = nullptr;
@@ -256,16 +273,106 @@ struct Surface {
     std::uint64_t depthMemory = 0;
     std::uint64_t stencilMemory = 0;
     // Upstream 84e3b73f16 132e69d595: a mirrorable surface (single-sample 32-bit float depth in the
-    // 64 KiB Z swizzle) keeps a storage image over its depth plane. memoryStale: a bind wrote or fast
-    // cleared depth that guest memory does not hold yet (FlushDepthPlanes stores it); syncedGeneration:
-    // the plane's write generation at the last bind, store or reload; scannedEpoch: the mirrorEpoch of
+    // 64 KiB Z swizzle) keeps a storage image over its depth plane. Upstream f57bbc936a tracks the plane
+    // as 64 KiB units (one unit when APS5_DEPTH_PLANE_WHOLE_STORE=1 or the plane is not 64 KiB aligned):
+    // staleUnits, units a bind wrote or fast cleared that guest memory does not hold yet
+    // (FlushDepthPlanes stores the ones a flush overlaps); unitGeneration, each unit's write generation
+    // at the last bind, store or reload; syncing: a reload is refreshing the mirror; scannedEpoch: the mirrorEpoch of
     // the last scan for older overlapping mirrors. `context`: the device's context of the last bind that
     // carried one (the stores and reloads record with it; upstream's surface holds its context).
     PlaneStorage mirrorPlane;
-    bool memoryStale = false;
+    std::vector<bool> staleUnits;
+    std::size_t staleCount = 0;
+    std::vector<std::uint64_t> unitGeneration;
+    std::uint64_t unitBytes = 0;
+    bool syncing = false;
     std::uint64_t scannedEpoch = 0;
-    std::uint64_t syncedGeneration = 0;
     std::optional<Context> context;
+
+    bool StoresUnits(const StorageTexture& mirror) const {
+        return mirror.BlockUnits() && mirror.TrackedUnits() == staleUnits.size();
+    }
+
+    void SizeUnits(std::uint64_t planeBytes) {
+        static const bool whole = std::getenv("APS5_DEPTH_PLANE_WHOLE_STORE") != nullptr;
+        const std::uint64_t bytes = !whole && target.address % 65536u == 0 ? std::uint64_t{65536} : std::max<std::uint64_t>(planeBytes, 1u);
+        const auto count = static_cast<std::size_t>(std::max<std::uint64_t>((planeBytes + bytes - 1u) / bytes, 1u));
+        if (unitBytes == bytes && staleUnits.size() == count) return;
+        unitBytes = bytes;
+        staleUnits.assign(count, false);
+        staleCount = 0;
+        unitGeneration.assign(count, 0);
+    }
+
+    bool AnyStale() const {
+        return staleCount != 0;
+    }
+
+    void MarkAllStale(std::uint64_t planeBytes) {
+        SizeUnits(planeBytes);
+        staleUnits.assign(staleUnits.size(), true);
+        staleCount = staleUnits.size();
+    }
+
+    void ClearStale() {
+        staleUnits.assign(staleUnits.size(), false);
+        staleCount = 0;
+    }
+
+    void ClearStale(const std::vector<bool>& units) {
+        for (std::size_t unit = 0; unit < units.size() && unit < staleUnits.size(); ++unit) {
+            if (!units[unit] || !staleUnits[unit]) continue;
+            staleUnits[unit] = false;
+            --staleCount;
+        }
+    }
+
+    std::vector<bool> StaleUnitsIn(std::uint64_t planeBytes, std::uint64_t begin, std::uint64_t end) const {
+        std::vector<bool> units(staleUnits.size(), false);
+        const auto plane = target.address;
+        if (units.empty() || unitBytes == 0 || begin >= end || begin >= plane + planeBytes || plane >= end) return units;
+        const auto from = std::max(begin, plane) - plane;
+        const auto to = std::min(end, plane + planeBytes) - plane;
+        const auto last = std::min<std::uint64_t>((to - 1u) / unitBytes, units.size() - 1u);
+        for (auto unit = from / unitBytes; unit <= last; ++unit) units[static_cast<std::size_t>(unit)] = staleUnits[static_cast<std::size_t>(unit)];
+        return units;
+    }
+
+    std::pair<std::uint64_t, std::uint64_t> UnitHull(const std::vector<bool>& units, std::uint64_t planeBytes) const {
+        std::uint64_t first = planeBytes;
+        std::uint64_t last = 0;
+        for (std::size_t unit = 0; unit < units.size(); ++unit) {
+            if (!units[unit]) continue;
+            first = std::min<std::uint64_t>(first, unit * unitBytes);
+            last = std::max<std::uint64_t>(last, std::min<std::uint64_t>(planeBytes, (unit + 1u) * unitBytes));
+        }
+        return {target.address + first, target.address + std::max(first, last)};
+    }
+
+    void NoteStored(const std::vector<bool>& units, std::uint64_t generation) {
+        for (std::size_t unit = 0; unit < units.size() && unit < unitGeneration.size(); ++unit) {
+            if (units[unit]) unitGeneration[unit] = generation;
+        }
+    }
+
+    // The units the guest wrote since their own generation (untracked memory counts as unwritten).
+    std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation) {
+        const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+        SizeUnits(bytes);
+        GuestMemory::CollectWrites(resource.baseAddress, bytes);
+        generation = GuestMemory::TrackerGeneration();
+        std::vector<bool> changed(unitGeneration.size(), false);
+        if (unitGeneration.size() == 1u) {
+            changed[0] = GuestMemory::WrittenSince(resource.baseAddress, bytes, unitGeneration[0]);
+            return changed;
+        }
+        const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
+        if (oldest != 0u && !GuestMemory::WrittenSince(resource.baseAddress, bytes, oldest)) return changed;
+        std::vector<std::uint8_t> stamped(unitGeneration.size(), GuestMemory::BlockUnchanged);
+        if (!GuestMemory::ChangedBlocks(resource.baseAddress, bytes, unitGeneration, stamped)) return changed;
+        for (std::size_t unit = 0; unit < changed.size(); ++unit) changed[unit] = unitGeneration[unit] != 0u && stamped[unit] == GuestMemory::BlockWritten;
+        return changed;
+    }
 
     std::uint64_t DepthBytes() const { return DepthSliceBytes(target.extent, D16() ? 2u : 4u); }
     std::uint64_t StencilBytes() const { return DepthSliceBytes(target.extent, 1u); }
@@ -487,6 +594,26 @@ void CopySurfacePlane(VkCommandBuffer commands, const Surface& surface, bool ste
     Metal::NoteImageCopy(surface.Image(), toBuffer);
 }
 
+// One rectangle of a plane (slice 0) to or from `buffer`, laid out as `region` says (bufferOffset,
+// bufferRowLength texels per row; upstream f57bbc936a's unit regions).
+void CopySurfaceRect(VkCommandBuffer commands, const Surface& surface, bool stencil, VkBuffer buffer, const VkBufferImageCopy& region, bool toBuffer) {
+    auto& stream = Metal::Stream(commands);
+    auto encoder = stream.Compute();
+    const NSUInteger bytesPerRow = NSUInteger{region.bufferRowLength} * surface.PlaneBytes(stencil);
+    const NSUInteger bytesPerImage = bytesPerRow * region.imageExtent.height;
+    const auto origin = MTLOriginMake(static_cast<NSUInteger>(region.imageOffset.x), static_cast<NSUInteger>(region.imageOffset.y), 0);
+    const auto size = MTLSizeMake(region.imageExtent.width, region.imageExtent.height, 1);
+    const auto options = surface.PlaneOption(stencil);
+    id<MTLBuffer> metalBuffer = Metal::BufferOf(buffer);
+    if (toBuffer) {
+        [encoder copyFromTexture:surface.texture sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:metalBuffer destinationOffset:region.bufferOffset destinationBytesPerRow:bytesPerRow destinationBytesPerImage:bytesPerImage options:options];
+    } else {
+        [encoder copyFromBuffer:metalBuffer sourceOffset:region.bufferOffset sourceBytesPerRow:bytesPerRow sourceBytesPerImage:bytesPerImage sourceSize:size toTexture:surface.texture destinationSlice:0 destinationLevel:0 destinationOrigin:origin options:options];
+    }
+    stream.CountCommand();
+    Metal::NoteImageCopy(surface.Image(), toBuffer);
+}
+
 // Upstream's ApplyFastClear: the pending HTILE/creation clears, as a clear-only render pass (one per
 // slice of an emulated multisample array).
 void ClearSurfaceValue(const Context& context, Surface& surface, VkImageAspectFlags aspects, float depth, std::uint8_t stencil);
@@ -539,7 +666,10 @@ void ClearSurfaceValue(const Context& context, Surface& surface, VkImageAspectFl
 // storage image or (StoreBackCovering, upstream a84afe931) another storage image covering the plane.
 // `ownBatch` (upstream 84e3b73f16): without an active recorder the copy goes through a batch of its
 // own, submitted and waited for (a depth plane store or reload from a flush outside recording).
-void CopyPlane(const Context& context, Surface& surface, PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage, bool ownBatch = false) {
+// `rects` (upstream f57bbc936a): only these rectangles of the plane (a depth plane store's units); none
+// copies nothing.
+void CopyPlane(const Context& context, Surface& surface, PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage, bool ownBatch = false, const std::vector<VkRect2D>* rects = nullptr) {
+    if (rects != nullptr && rects->empty()) return;
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr || ownBatch, "depth surface storage copies need an active recorder");
     std::unique_ptr<CommandBatch> batch;
@@ -553,20 +683,46 @@ void CopyPlane(const Context& context, Surface& surface, PlaneStorage& plane, co
         recorder->Keep(plane.staging);
     }
     const std::uint32_t timing = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::Copy) : 0u;
-    VkBufferImageCopy colorRegion{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+    const VkBufferImageCopy colorRegion{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+    const std::uint32_t texelBytes = surface.PlaneBytes(stencil);
+    std::vector<VkBufferImageCopy> colorRegions;
+    std::size_t moved = bytes;
+    if (rects == nullptr) {
+        colorRegions.push_back(colorRegion);
+    } else {
+        moved = 0;
+        for (const auto& rect : *rects) {
+            auto region = colorRegion;
+            region.bufferOffset = (static_cast<VkDeviceSize>(rect.offset.y) * target.extent.width + static_cast<VkDeviceSize>(rect.offset.x)) * texelBytes;
+            region.bufferRowLength = target.extent.width;
+            region.imageOffset = {rect.offset.x, rect.offset.y, 0};
+            region.imageExtent = {rect.extent.width, rect.extent.height, 1};
+            colorRegions.push_back(region);
+            moved += static_cast<std::size_t>(rect.extent.width) * rect.extent.height * texelBytes;
+        }
+    }
+    const auto count = static_cast<std::uint32_t>(colorRegions.size());
+    // The surface side: the whole plane, or each rectangle at its place in the tightly packed staging.
+    const auto copySurface = [&](bool toBuffer) {
+        if (rects == nullptr) {
+            CopySurfacePlane(commands, surface, stencil, plane.staging->Handle(), 0, toBuffer);
+            return;
+        }
+        for (const auto& region : colorRegions) CopySurfaceRect(commands, surface, stencil, plane.staging->Handle(), region, toBuffer);
+    };
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    if (toStorage) CopySurfacePlane(commands, surface, stencil, plane.staging->Handle(), 0, true);
-    else Metal::Vk::CmdCopyImageToBuffer(commands, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), 1, &colorRegion);
+    if (toStorage) copySurface(true);
+    else Metal::Vk::CmdCopyImageToBuffer(commands, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), count, colorRegions.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    if (toStorage) Metal::Vk::CmdCopyBufferToImage(commands, plane.staging->Handle(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &colorRegion);
-    else CopySurfacePlane(commands, surface, stencil, plane.staging->Handle(), 0, false);
+    if (toStorage) Metal::Vk::CmdCopyBufferToImage(commands, plane.staging->Handle(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, count, colorRegions.data());
+    else copySurface(false);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     if (batch) {
         batch->SubmitAndWait();
         return;
     }
     Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
-    recorder->EndGpuTiming(timing, bytes);
+    recorder->EndGpuTiming(timing, moved);
 }
 
 // Upstream's DepthSurface::StorageViewMatches: whether a storage view of the plane at the resource's
@@ -1221,50 +1377,113 @@ void retire(Surface& surface) {
     for (auto* owners : {&depthOwners(), &stencilOwners()}) {
         std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });
     }
-    if (!surface.memoryStale) return;
-    surface.memoryStale = false;
+    if (!surface.AnyStale()) return;
+    surface.ClearStale();
     const auto plane = stalePlaneRange(surface);
-    if (std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& other) { return other->memoryStale && stalePlaneRange(*other) == plane; })) return;
+    if (std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& other) { return other->AnyStale() && stalePlaneRange(*other) == plane; })) return;
     auto& planes = stalePlanes();
     std::lock_guard lock(planes.mutex);
     std::erase(planes.ranges, plane);
     publishStaleHull(planes);
 }
 
-// Upstream's DepthSurface::StoreDepthPlane (84e3b73f16): the surface's depth (after its pending clear)
-// copied into the plane's mirror storage image; the caller stores the image into guest memory.
-std::shared_ptr<StorageTexture> StoreDepthPlane(const Context& context, Surface& surface, const GuestTextureResource& resource) {
-    ApplyFastClear(context, surface);
+std::shared_ptr<StorageTexture> StoreDepthPlane(const Context& context, Surface& surface, const GuestTextureResource& resource, std::vector<bool>& units);
+std::shared_ptr<StorageTexture> Mirror(const Context& context, Surface& surface, const GuestTextureResource& resource);
+
+// Upstream f57bbc936a: the retire of an overwritten surface first stores its remaining stale units the
+// guest did not write.
+void retireStoringStale(Surface& surface) {
+    if (!surface.AnyStale() || !mirrorable(surface.target) || !surface.context) {
+        retire(surface);
+        return;
+    }
+    const auto& context = *surface.context;
+    const auto resource = mirrorResource(surface.target);
+    const auto planeBytes = DescribeSurface(resource).guestBytes;
+    std::uint64_t generation = 0;
+    const auto written = surface.WrittenUnits(resource, generation);
+    auto units = surface.staleUnits;
+    for (std::size_t unit = 0; unit < units.size() && unit < written.size(); ++unit) {
+        if (written[unit]) units[unit] = false;
+    }
+    std::shared_ptr<StorageTexture> mirror;
+    if (anyUnit(units) && (!anyUnit(written) || surface.StoresUnits(*Mirror(context, surface, resource)))) mirror = StoreDepthPlane(context, surface, resource, units);
+    retire(surface);
+    if (mirror == nullptr) return;
+    const auto [begin, end] = surface.UnitHull(units, planeBytes);
+    if (StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store")) surface.NoteStored(units, GuestMemory::TrackerGeneration());
+}
+
+// Upstream's DepthSurface::Mirror (f57bbc936a): the plane's mirror storage image, made on first use.
+std::shared_ptr<StorageTexture> Mirror(const Context& context, Surface& surface, const GuestTextureResource& resource) {
     if (surface.mirrorPlane.storage == nullptr) {
-        Require(context.detiler != nullptr, "a depth plane store needs the texture detiler");
+        Require(context.detiler != nullptr, "a depth plane mirror needs the texture detiler");
         surface.mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
         ++mirrorEpoch;
     }
-    CopyPlane(context, surface, surface.mirrorPlane, surface.mirrorPlane.storage, false, true, true);
     return surface.mirrorPlane.storage;
 }
 
-// Upstream's DepthSurface::SyncFromMemory (84e3b73f16): a plane someone else wrote since the surface's
-// previous bind, store or reload is reloaded from guest memory into the surface (so a guest write after a
-// depth draw is not overwritten by that draw's late store). A pending HTILE fast clear wins over it.
-bool SyncFromMemory(const Context& context, Surface& surface, const GuestTextureResource& resource) {
-    const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
-    GuestMemory::CollectWrites(resource.baseAddress, bytes);
-    if (surface.syncedGeneration == 0 || (surface.pendingClear & DepthAspect) != 0 || !GuestMemory::WrittenSince(resource.baseAddress, bytes, surface.syncedGeneration)) {
-        surface.syncedGeneration = GuestMemory::TrackerGeneration();
-        return false;
+// Upstream's DepthSurface::StoreDepthPlane (84e3b73f16, f57bbc936a): the surface's depth (after its
+// pending clear) in the units `units` copied into the plane's mirror storage image, which marks those
+// units written (all of them when the mirror has no block units); the caller stores the image into
+// guest memory.
+std::shared_ptr<StorageTexture> StoreDepthPlane(const Context& context, Surface& surface, const GuestTextureResource& resource, std::vector<bool>& units) {
+    ApplyFastClear(context, surface);
+    auto mirror = Mirror(context, surface, resource);
+    auto& counters = depthPlaneStoreCounters();
+    ++counters.stores;
+    const auto planeBytes = mirror->GuestBytes();
+    if (!surface.StoresUnits(*mirror)) {
+        units.assign(units.size(), true);
+        CopyPlane(context, surface, surface.mirrorPlane, mirror, false, true, true);
+        mirror->MarkWholeWritten();
+        counters.units += units.size();
+        counters.bytes += planeBytes;
+        return mirror;
     }
-    surface.memoryStale = false;
-    if (surface.mirrorPlane.storage == nullptr) {
-        Require(context.detiler != nullptr, "a depth plane reload needs the texture detiler");
-        surface.mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
-        ++mirrorEpoch;
+    const auto rects = mirror->UnitRects(units);
+    CopyPlane(context, surface, surface.mirrorPlane, mirror, false, true, true, &rects);
+    mirror->MarkUnitsWritten(units);
+    for (std::size_t unit = 0; unit < units.size(); ++unit) {
+        if (!units[unit]) continue;
+        ++counters.units;
+        counters.bytes += std::min<std::uint64_t>(surface.unitBytes, planeBytes - unit * surface.unitBytes);
     }
-    else static_cast<void>(surface.mirrorPlane.storage->Refresh());
-    surface.syncedGeneration = GuestMemory::TrackerGeneration();
-    CopyPlane(context, surface, surface.mirrorPlane, surface.mirrorPlane.storage, false, false, true);
+    return mirror;
+}
+
+// Upstream's DepthSurface::SyncFromMemory (84e3b73f16, f57bbc936a): the units of the plane someone else
+// wrote since their own generation are reloaded from guest memory into the surface (so a guest write
+// after a depth draw is not overwritten by that draw's late store); the other units keep the surface's
+// depth. A pending HTILE fast clear wins over it.
+void SyncFromMemory(const Context& context, Surface& surface, const GuestTextureResource& resource) {
+    std::uint64_t generation = 0;
+    const auto changed = surface.WrittenUnits(resource, generation);
+    if ((surface.pendingClear & DepthAspect) != 0 || !anyUnit(changed)) {
+        surface.unitGeneration.assign(surface.unitGeneration.size(), generation);
+        return;
+    }
+    surface.ClearStale(changed);
+    {
+        struct Syncing {
+            bool& flag;
+            ~Syncing() { flag = false; }
+        } guard{surface.syncing};
+        surface.syncing = true;
+        if (surface.mirrorPlane.storage == nullptr) static_cast<void>(Mirror(context, surface, resource));
+        else static_cast<void>(surface.mirrorPlane.storage->Refresh());
+    }
+    surface.unitGeneration.assign(surface.unitGeneration.size(), generation);
+    const auto mirror = surface.mirrorPlane.storage;
+    if (surface.StoresUnits(*mirror)) {
+        const auto rects = mirror->UnitRects(changed);
+        CopyPlane(context, surface, surface.mirrorPlane, mirror, false, false, true, &rects);
+    } else {
+        surface.ClearStale();
+        CopyPlane(context, surface, surface.mirrorPlane, mirror, false, false, true);
+    }
     surface.written = ++depthWrites;
-    return true;
 }
 
 // Upstream's expandedHtileWord (4ddff7c6e5): the HTILE word after the bind takes its fast clear
@@ -1533,7 +1752,7 @@ Surface* BindSurface(const Context* context, id<MTLDevice> device, const DepthTa
     if (context != nullptr && !surface->context) surface->context.emplace(*context);
     const bool mirrored = mirrorable(target) && surface->context.has_value();
     // Upstream 84e3b73f16: guest writes over the plane since the last bind, store or reload reload it.
-    if (mirrored) static_cast<void>(SyncFromMemory(*surface->context, *surface, mirrorResource(target)));
+    if (mirrored) SyncFromMemory(*surface->context, *surface, mirrorResource(target));
     // The draw writes it (upstream bumps the serial of a bound surface and names the drawn surface);
     // upstream 5a0a00f42 91be80b44 also bump the surface the previous draw attached, whose last writes
     // its plane copies have not seen while it was the drawn surface.
@@ -1549,15 +1768,15 @@ Surface* BindSurface(const Context* context, id<MTLDevice> device, const DepthTa
             if (other.get() == surface || other->device != key || other->written >= surface->written || !mirrorable(other->target)) continue;
             const auto otherPlane = stalePlaneRange(*other);
             if (otherPlane == plane || otherPlane.first >= plane.second || plane.first >= otherPlane.second) continue;
-            other->memoryStale = false;
+            other->ClearStale();
             other->mirrorPlane = {};
         }
     }
     static const bool trace = std::getenv("APS5_TRACE_DEPTH_PLANES") != nullptr;
     if (trace) std::fprintf(stderr, "[depth-plane] bind 0x%llx created=%d mirrorable=%d context=%d depthWritten=%d cleared=%d\n", static_cast<unsigned long long>(target.address), *created ? 1 : 0, mirrorable(target) ? 1 : 0, surface->context.has_value() ? 1 : 0, depthWritten ? 1 : 0, cleared ? 1 : 0);
     if ((depthWritten || cleared) && mirrored) {
-        surface->memoryStale = true;
         const auto [begin, end] = stalePlaneRange(*surface);
+        surface->MarkAllStale(end - begin);
         noteStalePlane(begin, end);
     }
     drawnDepth = surface;
@@ -1766,61 +1985,84 @@ bool DepthPlanesStale() {
     return planes.begin.load(std::memory_order_acquire) < planes.end.load(std::memory_order_acquire);
 }
 
-// Upstream 84e3b73f16 c505661ea9: the stale depth planes over [address, address + bytes) are stored into
-// guest memory (through their mirror storage images, written back whole), or reloaded from it when
-// someone else wrote the plane since the surface last saw it. Returns the stored planes (address, bytes).
-std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes) {
+// Upstream 84e3b73f16 c505661ea9 f57bbc936a: the stale units of the depth planes over [address, address +
+// bytes) are stored into guest memory through their mirror storage images (scope Whole: every stale unit
+// of an overlapped plane, for flushes a retire follows), after the units someone else wrote since the
+// surface last saw them are reloaded from it. Returns the stored ranges (address, bytes).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope) {
     static thread_local bool flushing = false;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     static const bool trace = std::getenv("APS5_TRACE_DEPTH_PLANES") != nullptr;
-    if (trace) std::fprintf(stderr, "[depth-plane] flush 0x%llx+0x%zx overlaps-stale=%d flushing=%d\n", static_cast<unsigned long long>(address), bytes, overlapsStalePlane(address, end) ? 1 : 0, flushing ? 1 : 0);
+    if (trace) std::fprintf(stderr, "[depth-plane] flush 0x%llx+0x%zx overlaps-stale=%d flushing=%d whole=%d\n", static_cast<unsigned long long>(address), bytes, overlapsStalePlane(address, end) ? 1 : 0, flushing ? 1 : 0, scope == DepthPlaneScope::Whole ? 1 : 0);
     if (flushing || !overlapsStalePlane(address, end)) return {};
+    if (scope == DepthPlaneScope::Overlapped) {
+        std::lock_guard lock(surfacesMutex());
+        const auto staleInRange = [&](const auto& surface) { return surface->AnyStale() && !surface->syncing && ((surface->pendingClear & DepthAspect) != 0 || anyUnit(surface->StaleUnitsIn(DescribeSurface(mirrorResource(surface->target)).guestBytes, address, end))); };
+        if (std::none_of(surfaces().begin(), surfaces().end(), staleInRange)) return {};
+    }
     flushing = true;
     struct Reset {
         ~Reset() { flushing = false; }
     } reset;
-    std::vector<std::pair<Surface*, std::shared_ptr<StorageTexture>>> stored;
+    struct Stored {
+        Surface* surface;
+        std::shared_ptr<StorageTexture> mirror;
+        std::vector<bool> units;
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool flushed;
+    };
+    std::vector<Stored> stored;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         std::lock_guard lock(surfacesMutex());
         std::vector<std::pair<std::uint64_t, std::uint64_t>> remaining;
         for (const auto& surface : surfaces()) {
-            if (!surface->memoryStale) continue;
+            if (!surface->AnyStale()) continue;
             const auto resource = mirrorResource(surface->target);
             const auto plane = surface->target.address;
             const auto planeBytes = DescribeSurface(resource).guestBytes;
-            if (plane >= end || address >= plane + planeBytes) {
-                remaining.emplace_back(plane, plane + planeBytes);
-                continue;
-            }
-            surface->memoryStale = false;
             // A plane is marked stale only once its surface has a context (BindSurface).
-            if (!surface->context) continue;
-            if (SyncFromMemory(*surface->context, *surface, resource)) {
-                if (trace) std::fprintf(stderr, "[depth-plane] 0x%llx reloaded from guest memory\n", static_cast<unsigned long long>(plane));
-                continue;
+            const bool overlapped = surface->context.has_value() && !surface->syncing && plane < end && address < plane + planeBytes;
+            if (overlapped && (surface->pendingClear & DepthAspect) != 0) surface->MarkAllStale(planeBytes);
+            if (overlapped && (scope == DepthPlaneScope::Whole || anyUnit(surface->StaleUnitsIn(planeBytes, address, end)))) {
+                SyncFromMemory(*surface->context, *surface, resource);
+                auto units = scope == DepthPlaneScope::Whole ? surface->staleUnits : surface->StaleUnitsIn(planeBytes, address, end);
+                if (anyUnit(units)) {
+                    auto mirror = StoreDepthPlane(*surface->context, *surface, resource, units);
+                    surface->ClearStale(units);
+                    const auto hull = surface->UnitHull(units, planeBytes);
+                    if (trace) std::fprintf(stderr, "[depth-plane] 0x%llx stored 0x%llx+0x%llx\n", static_cast<unsigned long long>(plane), static_cast<unsigned long long>(hull.first), static_cast<unsigned long long>(hull.second - hull.first));
+                    ranges.emplace_back(hull.first, hull.second - hull.first);
+                    stored.push_back({surface.get(), std::move(mirror), std::move(units), hull.first, hull.second, false});
+                }
             }
-            if (trace) std::fprintf(stderr, "[depth-plane] 0x%llx+0x%llx stored\n", static_cast<unsigned long long>(plane), static_cast<unsigned long long>(planeBytes));
-            stored.emplace_back(surface.get(), StoreDepthPlane(*surface->context, *surface, resource));
-            ranges.emplace_back(plane, planeBytes);
+            if (surface->AnyStale()) remaining.emplace_back(plane, plane + planeBytes);
         }
         auto& planes = stalePlanes();
         std::lock_guard staleLock(planes.mutex);
         planes.ranges = std::move(remaining);
         publishStaleHull(planes);
     }
-    for (const auto& entry : stored) entry.second->MarkWholeWritten();
-    for (const auto& [plane, planeBytes] : ranges) StorageTexture::FlushPending(plane, static_cast<std::size_t>(planeBytes), nullptr, "depth plane store");
+    for (auto& entry : stored) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
     const auto generation = GuestMemory::TrackerGeneration();
     std::lock_guard lock(surfacesMutex());
     for (const auto& entry : stored) {
-        if (std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& candidate) { return candidate.get() == entry.first; })) {
-            entry.first->syncedGeneration = generation;
-            entry.first->NoteMemory();
-        }
+        if (!entry.flushed || std::none_of(surfaces().begin(), surfaces().end(), [&](const auto& candidate) { return candidate.get() == entry.surface; })) continue;
+        entry.surface->NoteStored(entry.units, generation);
+        entry.surface->NoteMemory();
     }
     return ranges;
+}
+
+DepthPlaneStoreStatistics DepthPlaneStoreCounts() {
+    const auto& counters = depthPlaneStoreCounters();
+    DepthPlaneStoreStatistics statistics;
+    statistics.stores = counters.stores.load();
+    statistics.units = counters.units.load();
+    statistics.bytes = counters.bytes.load();
+    return statistics;
 }
 
 // Upstream 191c8a8d2b 120900a342 127aba3ed6: a DB depth copy (Draw.cpp RunDepthCopyPass) of one sample of
@@ -2029,7 +2271,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     // Upstream 626cff7d26: a read the surface cannot serve over memory the guest rewrote since the last
     // bind is a read of that memory, not of the surface: retire it and let the caller read guest memory.
     if (!(sampled ? accepts : planes) && found->OverwrittenInMemory()) {
-        retire(*found);
+        retireStoringStale(*found);
         return nullptr;
     }
     ApplyFastClear(context, *found);

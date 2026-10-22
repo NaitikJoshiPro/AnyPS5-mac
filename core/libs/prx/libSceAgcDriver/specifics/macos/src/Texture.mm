@@ -3130,6 +3130,17 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::unitRuns(co
     return runs;
 }
 
+// Upstream f57bbc936a: the image rectangles of the tracked units `units` (a depth plane store's units).
+std::vector<VkRect2D> StorageTexture::UnitRects(const std::vector<bool>& units) const {
+    std::vector<VkRect2D> rects;
+    if (units.size() != trackedLayers) return rects;
+    const auto runs = unitRuns(units);
+    for (const auto& window : sliceWindows(runs)) {
+        for (const auto& region : window.regions) rects.push_back({{region.imageOffset.x, region.imageOffset.y}, {region.imageExtent.width, region.imageExtent.height}});
+    }
+    return rects;
+}
+
 std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const {
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
@@ -5279,6 +5290,39 @@ void StorageTexture::MarkWholeWritten() {
     refreshGeneration();
     forgetBorrowed(0, trackedLayers);
     MarkDirty();
+}
+
+// Upstream f57bbc936a: MarkWholeWritten for the tracked units `units` alone (block units, no DCC).
+void StorageTexture::MarkUnitsWritten(const std::vector<bool>& units) {
+    if (!blockUnits || descriptor.dccAddress != 0 || units.size() != trackedLayers || std::all_of(units.begin(), units.end(), [](bool unit) { return unit; })) {
+        MarkWholeWritten();
+        return;
+    }
+    const auto runs = unitRuns(units);
+    if (runs.empty()) return;
+    if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (!units[unit]) continue;
+            layerOriginal[unit] = false;
+            cancelStoredSave(unit);
+        }
+    } else {
+        captureGuestBytes(&units);
+    }
+    uploadedKeys = DccKeys::Uncompressed;
+    for (const auto& [begin, end] : runs) {
+        const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
+        const auto count = static_cast<std::uint32_t>((end - begin + trackedLayerBytes - 1) / trackedLayerBytes);
+        const auto collected = GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
+        for (auto unit = first; unit < first + count; ++unit) layerGeneration[unit] = collected;
+    }
+    refreshGeneration();
+    for (const auto& [begin, end] : runs) {
+        const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
+        const auto count = static_cast<std::uint32_t>((end - begin + trackedLayerBytes - 1) / trackedLayerBytes);
+        forgetBorrowed(first, count);
+        markLayersPending(first, count);
+    }
 }
 
 // See AdjacentGenerationEnabled above.
