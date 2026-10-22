@@ -1705,7 +1705,12 @@ std::uint64_t VulkanDevice::State::WriteTable(const ShaderRecompiler::RecompileR
             std::shared_ptr<const GuestAllocations::Lease> lease;
             const auto& registered = AddressTableBytes(&lease);
             recorder.Keep(std::const_pointer_cast<GuestAllocations::Lease>(lease));
-            plan.writes.insert(plan.writes.end(), addressTable.writable.begin(), addressTable.writable.end());
+            // The writable ranges are pending writes of the command only when the shader stores or
+            // runs atomics through guest addresses (upstream ShaderAddressResources: bdaReadOnly).
+            // A shader that only reads through the table otherwise left every writable range
+            // pending, so the next draw's resident target refresh synced the batch and ended the
+            // render pass of two draws reading through the table (agc_driver_address_passes).
+            if (shader.msl.empty() || shader.msl.Reflection().storesThroughAddresses) plan.writes.insert(plan.writes.end(), addressTable.writable.begin(), addressTable.writable.end());
             // As upstream's GuestBufferMemory::AddressRanges: the registered ranges plus every
             // bound V# range (Write when the shader stores to it), GDS, and the captured
             // snapshots (live in place when wrappable, else their captured bytes read-only).
