@@ -606,7 +606,9 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         if (state.builtins.test(index)) parameters.push_back(BuiltinParameter(static_cast<MslBuiltin>(index)));
     }
     // PS_ITER_SAMPLE: a [[sample_id]] input makes Metal run the fragment function once per sample.
-    if (state.reflection.stage == MslAbi::Stage::Fragment && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psSampleShading) state.AddParameter("uint aps5_sample_id [[sample_id]]");
+    // An iterated program (PA_SC_MODE_CNTL_1 PS_ITER_SAMPLE, ShaderPixelStageInfo::iteratesSamples)
+    // runs per sample even when it reads nothing per sample, as Vulkan's sampleShadingEnable makes it.
+    if (state.reflection.stage == MslAbi::Stage::Fragment && state.inputInfo.pixel != nullptr && (state.inputInfo.pixel->psSampleShading || state.program.Metadata().pixelIteratesSamples)) state.AddParameter("uint aps5_sample_id [[sample_id]]");
     parameters.insert(parameters.end(), state.parameters.begin(), state.parameters.end());
 
     if (state.reflection.stage == MslAbi::Stage::Kernel) {

@@ -28,6 +28,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MetalSampleOrder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "MetalResidency.h"
@@ -794,6 +796,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // pixels that way (MslEntryPoint.cpp), so masked pixel programs with implicit-LOD sampling or cross-lane
             // reads run (agc_driver_quad_pixel_mask), where a Vulkan device without the feature refuses them.
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDemoteToHelperInvocation));
+            // InterpolateAtOffset (upstream's sampleRateShading devices, VulkanDevice.cpp): pull-model interpolant<>
+            // reads take interpolate_at_center/_offset (MSL specification 2.18), so exact barycentrics of PERSP/
+            // LINEAR_SAMPLE in a once-per-pixel program are read at sample 0's location without running per sample,
+            // and an iterated program's _CENTER at the pixel center (MslStageIo.cpp OffsetBarycentric,
+            // agc_driver_pixel_sample_iteration). The front end emits them only for the emulated barycentrics.
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityInterpolationFunction));
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
@@ -859,6 +867,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // backend has no remap, so the Metal device keeps passing the guest range to MTLViewport as it
             // did before (MetalDraw.mm) and Target().depthRangeRemap stays false.
             context.depthRangeUnrestricted = true;
+            // Upstream sets singlePassStorage when the device reads and writes storage images without a
+            // format (shaderStorageImageRead/WriteWithoutFormat, VulkanDevice.cpp). MSL textures are typed
+            // by component type, not format, and the detile kernels take the image with read access to
+            // retile and write access to detile (TextureDetiler.mm), which every color element format
+            // (R8/R16/R32/RG32/RGBA32 Uint) has on Apple7+, so storage moves go straight between the
+            // image and guest memory in one pass (Texture.mm StorageTexture::singlePass).
+            context.singlePassStorage = true;
             // Depth clamping is MTLDepthClipModeClamp (MetalDraw.mm, from the guest's DB_RENDER_CONTROL clamp), and
             // negative-one-to-one clip z is mapped in the vertex function (DepthNegativeOneToOneMacro): the features
             // VK_EXT_depth_clip_control and depthClamp promise (agc_driver_depth_range_remap_draw, its Metal twin).
@@ -878,11 +893,30 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // pixel format), and the D6 depth surfaces are 2D multisample textures of those formats.
             context.limits.framebufferDepthSampleCounts = colorSamples;
             context.limits.framebufferStencilSampleCounts = colorSamples;
+            // Passes without attachments rasterize at the same counts (MTL4RenderPassDescriptor
+            // defaultRasterSampleCount, MetalDraw.mm), and the draw sets the standard D3D/Vulkan positions
+            // itself whenever the guest names none (Graphics::SampleLocations, setSamplePositions), which is
+            // what VkPhysicalDeviceLimits::standardSampleLocations promises.
+            context.limits.framebufferNoAttachmentsSampleCounts = colorSamples;
+            context.limits.standardSampleLocations = state->device.programmableSamplePositionsSupported ? VK_TRUE : VK_FALSE;
             context.storageImageMultisample = true;
             // Per-sample shading is native: an MSL fragment function reading [[sample_id]] runs once per
             // sample (MSL spec 5.2.3.4), which the MSL backend emits for guest per-sample pixel programs.
-            // The guest sample order that upstream builds on it is not on Metal (TechnicalDebt metal-sample-order).
+            // The guest sample order builds on it (HostSampleOrder below, MetalSampleOrder.mm).
             context.sampleRateShading = true;
+            // Programmable sample positions (MTL4RenderPassDescriptor setSamplePositions) are VK_EXT_sample_locations
+            // without grids: every guest sample count takes custom locations (8x through HostSamplesOf's slices, each
+            // pass at its slice's positions, DECISIONS D28), and no count has a 2x2 location grid, so a grid whose
+            // pixels hold one set of positions in different orders is drawn at pixel (0,0)'s positions with the
+            // samples put in the guest's order at the render pass bounds (Graphics::MayReorderSamples, upstream
+            // 57ceb9e370). The shared code reading these counts on Metal: SampleOrder.cpp (order planning),
+            // DepthSurface.mm SampleLocationsCompatibleDepth and the pipeline keys; the Metal draw takes its positions
+            // from Graphics::SampleLocations itself.
+            if (state->device.programmableSamplePositionsSupported) context.sampleLocationSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+            context.sampleLocationGridSampleCounts = 0;
+            // MSL fragment functions export [[stencil]] (Apple GPUs; the reorder passes put stencil samples in order
+            // through it: Graphics::DepthSampleOrderMethod's DepthStencilExport).
+            context.shaderStencilExport = true;
             // The device-local heap (the recommended working set) and its VK_EXT_memory_budget report, which size the
             // sampled and storage texture caches (D5) and shrink them under OS memory pressure (MetalMemoryBudget.h).
             Graphics::Metal::DescribeMemory(context, state->device);
@@ -1066,21 +1100,17 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     return target;
 }
 
-// Upstream 57ceb9e370 / f8e8dc6f67: without a 2x2 sample location grid, pixel (0,0)'s locations stand
-// in for every pixel, and where every pixel holds one set of positions upstream keeps the guest's
-// sample order (the pixel shader permutes SampleID, masks and coverage; reorder passes at the
-// render pass bounds). Metal's setSamplePositions is one pattern for every pixel, so the Metal device
-// is always in the stand-in case; it has no reorder passes yet (TechnicalDebt metal-sample-order),
-// so it draws with the stand-in alone and names no order, as upstream does when it refuses one.
+// Upstream 57ceb9e370 / f8e8dc6f67 (VulkanDevice::HostSampleOrder): without a 2x2 sample location grid,
+// pixel (0,0)'s locations stand in for every pixel, and where every pixel holds one set of positions the
+// guest's sample order is kept: the pixel shader permutes SampleID, masks and coverage (MslStageIo.cpp
+// MslSampleOrderWord) and the draw puts the targets' samples in the host's order at the render pass's
+// start and back at its end (MetalDraw.mm, MetalSampleOrder.mm). Metal's setSamplePositions is one
+// pattern for every pixel (sampleLocationGridSampleCounts is 0), so every such grid takes this path;
+// HostSampleLocationsFor logs the stand-in once per sample count, and a refused order (pixels with
+// different positions, a target format with no exact move) keeps the stand-in alone, as upstream.
 Graphics::SampleOrder VulkanDevice::HostSampleOrder(const Graphics::State& graphics) const {
-    if (!graphics.sampleLocationGrid || graphics.samples <= 1u) return {};
-    static std::atomic<std::uint32_t> reported {0};
-    const auto bit = 1u << std::min(graphics.samples, 31u);
-    if ((reported.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u) {
-        const bool sameSet = Graphics::SameSetSampleOrder(graphics).has_value();
-        std::fprintf(stderr, "[gpu] no 2x2 sample location grid at sample count %u on Metal: pixel (0,0)'s sample locations stand in for every pixel (%s)\n", graphics.samples, sameSet ? "the guest's per-pixel sample order is not kept: the Metal device has no sample reorder passes" : "its pixels hold different locations");
-    }
-    return {};
+    if (!graphics.sampleLocationGrid || graphics.samples <= 1u || Graphics::Metal::SampleOrderSuppressed()) return {};
+    return Graphics::HostSampleLocationsFor(state->context, graphics).order;
 }
 
 const std::uint32_t* VulkanDevice::WorkGroupCountLimit() const {

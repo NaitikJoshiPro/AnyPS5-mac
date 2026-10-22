@@ -10,6 +10,11 @@
 // rendering itself is checked by agc_driver_pixel_barycentric_emulation and agc_driver_interpolation_f16.
 // MslAbi Version 14 (DECISIONS D69): the vertex function also links for points and lines
 // (APS5_PRIMITIVE_VERTICES 1 and 2).
+// InterpolationFunction (the Metal device advertises it): exact PERSP/LINEAR_SAMPLE I/J of a once-per-pixel
+// program are the weights at sample 0's location through interpolate_at_offset (no [[sample_id]]; a
+// 32-entry table when the locations vary per 2x2 pixel), an iterated program's at its guest sample's
+// location (8-entry table indexed by SampleId), and an iterated PERSP_CENTER's interpolate_at_center()
+// while the function runs per sample. The rendering is checked by agc_driver_pixel_sample_iteration.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -131,6 +136,13 @@ struct PixelCase {
     // Upstream 72518f64f/1ffc5f672: PA_SC_AA_MASK's quad pixels and per-pixel samples.
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    // Offset barycentrics (InterpolationFunction): PS_ITER_SAMPLE, the guest sample locations
+    // (ShaderPixelStageInfo::sampleLocations, 8 per pixel of the 2x2 grid), the weights read the case
+    // expects (empty: not an offset case) and the size of the offset table (0: none).
+    bool iterated = false;
+    std::array<std::uint8_t, 32> sampleLocations{};
+    const char* weightsRead = "";
+    std::uint32_t offsetTable = 0;
 };
 
 ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTarget& target, const PixelCase& test, std::uint32_t vertexPush) {
@@ -160,6 +172,8 @@ ShaderRecompiler::RecompileResult RecompilePixel(const ShaderRecompiler::SpirvTa
     pixel.ditheredAlphaToCoverage = test.ditheredAlphaToCoverage;
     pixel.quadPixelMask = test.quadPixelMask;
     pixel.quadSampleMask = test.quadSampleMask;
+    pixel.iteratesSamples = test.iterated;
+    pixel.sampleLocations = test.sampleLocations;
     pixel.targetExportMapping.fill(0xe4u);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(test.code.data()), std::as_bytes(test.code)}}};
     ShaderRecompiler::RecompileRequest request{
@@ -249,7 +263,15 @@ void Check(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target, co
             Require(Has(source, "float4 " + field + " [[user(aps5_" + field + "), flat]]"), name + ": no flat fragment input " + field);
         }
     }
-    if (test.pullModel && test.barycentrics != 0u) {
+    if (*test.weightsRead != '\0') {
+        const bool perspectiveWeights = (test.barycentrics & 1u) != 0u;
+        const std::string field = perspectiveWeights ? "aps5_bw" : "aps5_bwl";
+        Require(Has(source, "interpolant<float3, interpolation::" + std::string(perspectiveWeights ? "perspective" : "no_perspective") + "> " + field + " [[user(" + field + ")]]"), name + ": the weights read at an offset or the center are not an interpolant");
+        Require(Has(source, test.weightsRead) && Has(source, "aps5_in." + field + ".interpolate_at_"), name + ": the weights are not read with " + test.weightsRead);
+        Require(!Has(source, ".interpolate_at_sample("), name + ": an offset or center read went through the host's sample positions");
+        Require(reflection.perSample == test.iterated && Has(source, "[[sample_id]]") == test.iterated, name + (test.iterated ? ": an iterated program does not run per sample" : ": a once-per-pixel read at sample 0's location runs per sample"));
+        Require(test.offsetTable != 0u ? Has(source, "constant float2 aps5_sample_offsets[" + std::to_string(test.offsetTable) + "] = {") : !Has(source, "aps5_sample_offsets"), name + ": the sample offset table does not match the locations");
+    } else if (test.pullModel && test.barycentrics != 0u) {
         Require(Has(source, "interpolant<float3, interpolation::perspective> aps5_bw [[user(aps5_bw)]]") == ((test.barycentrics & 1u) != 0u), name + ": perspective weights are not an interpolant");
         Require(Has(source, "aps5_in.aps5_bw.interpolate_at_sample(aps5_sample_id)") && Has(source, "aps5_in.aps5_bw.interpolate_at_center()"), name + ": the weights are not read at the sample and the center");
     } else {
@@ -327,6 +349,31 @@ int main() {
             PixelCase quadSamples{"per-pixel sample mask", InterpolatedPixelCode, perspective, false, 64u, 0u, 0u};
             quadSamples.quadSampleMask = {0x3u, 0xffffu, 0xcu, 0xffffu};
             for (const auto& test : {dithered, quadPixels, quadSamples}) Check(metal, target, vertex, test);
+            // Offset barycentrics. 4x standard locations (x nibble low, y high, 1/16 pixel from the
+            // center): (-0.125, -0.375), (0.375, -0.125), (-0.375, 0.125), (0.125, 0.375);
+            // interpolate_at_offset takes them from the pixel's upper-left corner.
+            const std::array<std::uint8_t, 4> standard{0xaeu, 0xe6u, 0x2au, 0x62u};
+            PixelCase sampleZero{"exact PERSP_SAMPLE I/J once per pixel", BarycentricPixelCode, PixelInputBit(PixelInput::PerspectiveSample), false, 64u, 0u, 1u};
+            // Graphics::PixelSampleLocations carries sample 0 at every pixel of the 2x2 grid
+            // (index pixel * 8): the same location everywhere is a constant offset, not a table.
+            for (std::uint32_t quad = 0; quad < 4u; ++quad) sampleZero.sampleLocations[quad * 8u] = standard[0];
+            sampleZero.weightsRead = "aps5_bw_at_offset(float2(0.375000f, 0.125000f))";
+            PixelCase linearZero{"exact LINEAR_SAMPLE I/J once per pixel", BarycentricPixelCode, PixelInputBit(PixelInput::LinearSample), false, 64u, 0u, 2u};
+            linearZero.sampleLocations = sampleZero.sampleLocations;
+            linearZero.weightsRead = "aps5_bwl_at_offset(float2(0.375000f, 0.125000f))";
+            PixelCase iteratedSample{"exact PERSP_SAMPLE I/J iterated", BarycentricPixelCode, PixelInputBit(PixelInput::PerspectiveSample), false, 64u, 0u, 1u};
+            iteratedSample.iterated = true;
+            for (std::uint32_t index = 0; index < iteratedSample.sampleLocations.size(); ++index) iteratedSample.sampleLocations[index] = index % 8u < 4u ? standard[index % 8u] : 0u;
+            iteratedSample.weightsRead = "aps5_bw_at_offset(aps5_sample_offsets[(aps5_sample_id + APS5_SAMPLE_BASE)])";
+            iteratedSample.offsetTable = 8u;
+            PixelCase iteratedCenter{"exact PERSP_CENTER I/J iterated", BarycentricPixelCode, perspective, false, 64u, 0u, 1u};
+            iteratedCenter.iterated = true;
+            iteratedCenter.weightsRead = "aps5_bw_at_center";
+            PixelCase perPixel{"exact PERSP_SAMPLE I/J once per pixel, sample 0 varying per 2x2 pixel", BarycentricPixelCode, PixelInputBit(PixelInput::PerspectiveSample), false, 64u, 0u, 1u};
+            for (std::uint32_t quad = 0; quad < 4u; ++quad) perPixel.sampleLocations[quad * 8u] = static_cast<std::uint8_t>(quad << 4u);
+            perPixel.weightsRead = "aps5_bw_at_offset(aps5_sample_offsets[(0u | (((uint(aps5_in.aps5_position.x) & 1u) | ((uint(aps5_in.aps5_position.y) & 1u) << 1u)) << 3u))])";
+            perPixel.offsetTable = 32u;
+            for (const auto& test : {sampleZero, linearZero, iteratedSample, iteratedCenter, perPixel}) Check(metal, target, vertex, test);
             const std::array<PixelCase, 15> cases{{
                 {"perspective I/J", BarycentricPixelCode, perspective, false, 64u, 0u, 1u},
                 {"linear I/J", BarycentricPixelCode, linear, false, 64u, 0u, 2u},

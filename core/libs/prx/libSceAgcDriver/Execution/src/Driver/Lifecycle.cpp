@@ -257,6 +257,28 @@ void Driver::WaitIdle() {
     --idleWaiters;
     rethrowFailure();
     checkStopping();
+    lock.unlock();
+    // The end-of-pipe and flip interrupts those packets deferred to their GPU work (deferInterrupt) are
+    // raised when a reap finishes that work, possibly after the packets completed (a slow GPU, e.g. under
+    // Metal's shader validation): idle means they were raised too. The workers reap while such
+    // completions are pending; the wait is bounded by the GPU retire deadline so a batch that never
+    // retires surfaces through its own failure path rather than here.
+    std::unique_lock deferredLock(deferredInterruptMutex);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (deferredInterrupts != 0 && std::chrono::steady_clock::now() < deadline) {
+        deferredInterruptChanged.wait_for(deferredLock, std::chrono::milliseconds(20));
+        if (failed.load(std::memory_order_acquire) || stopping.load(std::memory_order_acquire)) break;
+    }
+    deferredLock.unlock();
+    CheckFailure();
+}
+
+void Driver::interruptDelivered() {
+    {
+        std::lock_guard lock(deferredInterruptMutex);
+        --deferredInterrupts;
+    }
+    deferredInterruptChanged.notify_all();
 }
 
 void Driver::CheckFailure() {

@@ -583,7 +583,14 @@ void testSmallCopyBehindPendingSource() {
     constexpr auto smallBytes = static_cast<std::uint32_t>(smallWords * 4);
     auto* produced = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
     auto* source = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
+#if defined(__APPLE__)
+    // The destination has to be importable: Metal imports guest memory as no-copy buffers over whole
+    // 16 KiB host pages (hostImportAlignment), so a lone 4 KiB allocation never gets an import and its
+    // copy runs on the CPU. The copy itself stays 4 KiB.
+    auto* destination = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, std::max<std::uint32_t>(smallBytes, 16384u)));
+#else
     auto* destination = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, smallBytes));
+#endif
     for (std::size_t i = 0; i < words; ++i) {
         produced[i] = 0xc3000000u | static_cast<std::uint32_t>(i);
         source[i] = 0x3c000000u | static_cast<std::uint32_t>(i);

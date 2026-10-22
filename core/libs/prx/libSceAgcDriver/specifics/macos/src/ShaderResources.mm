@@ -3502,9 +3502,21 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 TextureCounts().tablesReused.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            // macOS: a table no remembered table vouches for is resolved again by a fresh build
-            // (tablesVouched below), as upstream's dispatch build, seldom reusable, does.
-            return false;
+            // Upstream: a table no remembered table vouches for proves each element against the cache
+            // (the lookup log stays bounded, bde2a8f0af). An element the build placed elsewhere (a
+            // storage or multisampled table element on Metal) fails the comparison and the set is
+            // rebuilt, as before.
+            for (std::uint32_t element = 0; element < images->count; ++element) {
+                if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
+                const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                std::array<std::uint32_t, 8> narrowed{};
+                const auto words = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
+                if (Metal::MultisampledDescriptor(words)) return false;
+                const auto resource = DecodeTextureResource(words);
+                const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                if (textureIndex >= textures.size() || table.elementTextures[element] != textureIndex || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[textureIndex]) return false;
+                ++textureIndex;
+            }
         }
         if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
         // The walk proved every object current again: the records move to what it proved, or one
@@ -3656,8 +3668,31 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             const auto* images = tableImages(shaders, table.stage);
             if (images == nullptr || images->count != table.elementTextures.size()) return finish(fast, false);
             std::vector<std::shared_ptr<Texture>> cached;
-            auto* reused = FindReusedTable(context.device, *images, CurrentTableState());
-            if (reused == nullptr || !TableCurrent(*reused) || !CachedTableTextures(*reused, cached)) return finish(fast, false);
+            const auto tableState = CurrentTableState();
+            auto* reused = FindReusedTable(context.device, *images, tableState);
+            if (reused == nullptr || !TableCurrent(*reused) || !CachedTableTextures(*reused, cached)) {
+                // In a collect epoch a fresh build resolves the table (and remembers it for the
+                // epoch's next uses, resolveImageTables).
+                if (tableState.epoch != 0) return finish(fast, false);
+                // Without one nothing can vouch for the table: each element must still be the cache's
+                // texture for its descriptor (upstream's proof of an unremembered table, bde2a8f0af),
+                // or a fresh build resolves it.
+                for (std::uint32_t element = 0; element < images->count; ++element) {
+                    const auto index = table.elementTextures[element];
+                    if (index == std::numeric_limits<std::size_t>::max()) continue;
+                    const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                    std::array<std::uint32_t, 8> narrowed{};
+                    const auto words = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
+                    if (Metal::MultisampledDescriptor(words)) return finish(fast, false);
+                    const auto resource = DecodeTextureResource(words);
+                    const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                    if (index >= textures.size() || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[index]) return finish(fast, false);
+                }
+                // Each element was looked up in the cache again: the table was resolved (upstream's
+                // count for a table no epoch remembers), only the set around it was kept.
+                TextureCounts().tablesResolved.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             auto next = cached.begin();
             for (std::uint32_t element = 0; element < images->count; ++element) {
                 const auto& entry = reused->elements[element];

@@ -282,6 +282,88 @@ void CheckThreads() {
     Require(region.Collect().empty(), "writes are reported after the writers stopped");
 }
 
+// 4 KiB store precision on 16 KiB host pages (GuestWriteWatchTrackSubpages): a store beside a tracked
+// range in the same host page is reported on its own 4 KiB part, never on the range's part.
+std::set<std::size_t> CollectSubpages(Region& region) {
+    std::set<std::size_t> parts;
+    struct Sink {
+        Region* region;
+        std::set<std::size_t>* parts;
+    } sink{&region, &parts};
+    const bool complete = GuestWriteWatchCollect_nid_postfix(region.Address(0), region.bytes, [](void* context, std::uintptr_t begin, std::uintptr_t end) {
+        auto& target = *static_cast<Sink*>(context);
+        Require(begin % 4096 == 0 && end % 4096 == 0, "a collection reported a run that is not whole 4 KiB parts");
+        for (auto at = begin; at < end; at += 4096) target.parts->insert((at - target.region->Address(0)) / 4096);
+    }, &sink);
+    Require(complete, "collection of a watched range is incomplete");
+    return parts;
+}
+
+std::set<std::size_t> Parts(std::size_t first, std::size_t count) {
+    std::set<std::size_t> parts;
+    for (std::size_t index = first; index < first + count; ++index) parts.insert(index);
+    return parts;
+}
+
+void CheckSubpages() {
+    if (::getpagesize() <= 4096) {
+        std::puts("host pages are 4 KiB: nothing to narrow");
+        return;
+    }
+    Region region(4);
+    const std::size_t per = region.page / 4096;
+    auto* base = reinterpret_cast<volatile std::uint8_t*>(region.base);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    // A page written before it is tracked has no copy: reported whole.
+    GuestWriteWatchTrackSubpages_nid_postfix(region.Address(0), 4096);
+    Require(CollectSubpages(region) == Parts(0, 4 * per), "a new range is not reported in full");
+    // Tracked: [0, 4 KiB) of host page 0, and [host page 1 + 4 KiB, host page 3 + 8 KiB).
+    GuestWriteWatchTrackSubpages_nid_postfix(region.Address(1) + 4096, 2 * region.page + 4096);
+    base[4096 + 4] = 0x7c;
+    Require(CollectSubpages(region) == Parts(1, 1), "a store beside a tracked range is not reported on its own 4 KiB part alone");
+    base[0] = base[0];
+    Require(CollectSubpages(region) == Parts(0, 1), "a same-value first store into a tracked range is not reported");
+    base[2 * 4096] = 1;
+    base[16] = 1;
+    base[3 * 4096 + 8] = base[3 * 4096 + 8];
+    // The opening store's part and the parts whose bytes changed; the later same-value store to part 3
+    // lands on an open page and is not seen (the documented limit).
+    Require(CollectSubpages(region) == std::set<std::size_t>({0, 2}), "the stores of an opened tracked page are not reported per 4 KiB part");
+    std::memset(region.base + 4096 - 4, 9, 8);
+    Require(CollectSubpages(region) == Parts(0, 2), "a store across a 4 KiB boundary is not reported on both parts");
+    base[region.page + 2 * 4096] = 5;
+    Require(CollectSubpages(region) == Parts(per + 2, 1), "the far edge page of a tracked range is not narrowed");
+    base[2 * region.page + 5] = 5;
+    Require(CollectSubpages(region) == Parts(2 * per, per), "a host page inside a tracked range is not reported whole");
+    base[3 * region.page + 3 * 4096] = 6;
+    Require(CollectSubpages(region) == Parts(3 * per + 3, 1), "a store past the end of a tracked range is not reported on its own part");
+    // A host write reports the parts it opens; still open, its page is reported whole.
+    GuestWriteWatchBeginHostWrite_nid_postfix(region.base + 4096 + 256, 8);
+    Require(CollectSubpages(region) == Parts(0, per), "a tracked page under a host write is not reported whole");
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base + 4096 + 256, 8);
+    Require(CollectSubpages(region) == Parts(0, per), "a host write still open at the last collection is not reported whole");
+    GuestWriteWatchBeginHostWrite_nid_postfix(region.base + 4096 + 256, 8);
+    std::memset(region.base + 4096 + 256, 3, 8);
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base + 4096 + 256, 8);
+    Require(CollectSubpages(region) == Parts(1, 1), "a finished host write is not reported on the parts it opened");
+    // Registering again or changing the protection drops the copy: reported whole.
+    base[4096] = 1;
+    GuestWriteWatchProtectionChanged_nid_postfix(region.base, region.page, PROT_READ | PROT_WRITE);
+    Require(CollectSubpages(region) == Parts(0, per), "a tracked page whose protection changed is not reported whole");
+    // Untracked: whole host pages again.
+    GuestWriteWatchUntrackSubpages_nid_postfix(region.Address(0), 4096);
+    base[4096 + 4] = 1;
+    Require(CollectSubpages(region) == Parts(0, per), "an untracked page is still narrowed");
+    // Tracking nests per host page: the second range keeps host page 1 narrowed until it goes too.
+    GuestWriteWatchTrackSubpages_nid_postfix(region.Address(1), 4096);
+    GuestWriteWatchUntrackSubpages_nid_postfix(region.Address(1), 4096);
+    base[region.page] = 2;
+    Require(CollectSubpages(region) == Parts(per, 1), "untracking one range released a host page another range tracks");
+    GuestWriteWatchUntrackSubpages_nid_postfix(region.Address(1) + 4096, 2 * region.page + 4096);
+    base[region.page] = 3;
+    Require(CollectSubpages(region) == Parts(per, per), "a host page no range tracks is still narrowed");
+}
+
 // An ordered load crossing 16 bytes raises SIGBUS/BUS_ADRALN, as a protection fault does. On a watched page that a
 // write already unprotected, the watch must leave it to the next handler (FEX or the displaced stubs emulate it):
 // claiming it retried the load forever (ASTRO BOT's main thread spun in this loop, run astro3-s4).
@@ -328,7 +410,7 @@ void CheckAlignment() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads or alignment");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, alignment or subpages");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -341,6 +423,7 @@ int main(int argc, char** argv) {
         else if (mode == "overlaps") CheckOverlaps();
         else if (mode == "threads") CheckThreads();
         else if (mode == "alignment") CheckAlignment();
+        else if (mode == "subpages") CheckSubpages();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;

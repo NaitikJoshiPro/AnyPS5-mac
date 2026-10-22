@@ -33,6 +33,8 @@
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MetalSampleOrder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -651,8 +653,17 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     // the macro the function discards pixels whose covered samples the mask removes before its body
     // (a mask of 0 runs no body, as Vulkan runs no invocation) and tests late (MslAbi Version 15).
     // The remaining refusals are TechnicalDebt metal-pipeline-sample-mask.
+    // Upstream 57ceb9e370 (HostSampleOrder, the order DrawDecode compiled the pixel shader with): a 2x2
+    // location grid whose pixels hold one set of positions in different orders draws at pixel (0,0)'s
+    // positions, and its targets' samples are put in the host's order when the pass begins and back
+    // when it ends (MetalSampleOrder.mm; the pass key names the order, so passes merge only under it).
+    const Graphics::SampleOrder sampleOrder = graphics.samples > 1u && graphics.sampleLocationGrid && !Graphics::Metal::SampleOrderSuppressed() ? Graphics::HostSampleLocationsFor(state.context, graphics).order : Graphics::SampleOrder{};
+    bool reordersSamples = Graphics::ReordersSamples(sampleOrder);
     const bool partialSampleMask = Graphics::PartialSampleMask(graphics);
-    const bool hostSampleMask = partialSampleMask && Graphics::UniformSampleMask(graphics);
+    // Upstream Pipeline.cpp: a uniform mask the order would change per pixel is not the pipeline's
+    // (host) mask; DrawDecode put it in the quad masks (QuadSampleMasks), which the function applies
+    // to guest samples before the order.
+    const bool hostSampleMask = partialSampleMask && Graphics::UniformSampleMask(graphics) && !Graphics::SampleMaskFollowsOrder(graphics, sampleOrder);
     if (partialSampleMask) {
         if (fragmentReflection == nullptr) Fail("a sample mask (PA_SC_AA_MASK) that removes samples from a draw without a pixel program: Metal has no pipeline sample mask, the fragment function applies it (TechnicalDebt metal-pipeline-sample-mask)");
         const bool tested = graphics.depth.has_value() && (graphics.depthTest || graphics.stencilTest || graphics.depthBoundsTest);
@@ -956,10 +967,15 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
     }
 
     // Layered draws (upstream #3763, State::renderLayers) render into a resident 3D target's slice
-    // range; DecodeState already refuses a depth target and mixed slice counts.
+    // range or a resident 2D array's layer range (upstream deb0ba305f: the attachment view is a
+    // 2D-array view of the color view's layers); DecodeState already refuses a depth target and
+    // mixed slice counts.
     if (graphics.renderLayers > 1u) {
         for (const auto& attachment : colors) {
-            if (attachment.resident == nullptr || attachment.multisample != nil || attachment.target->depth <= 1u) Fail("a layered draw into a color target that is not a resident single-sample 3D image");
+            const auto& target = *attachment.target;
+            const bool volume = target.depth > 1u;
+            const bool array = target.arrayLastSlice != 0u && target.arraySlice + graphics.renderLayers - 1u <= target.arrayLastSlice;
+            if (attachment.resident == nullptr || attachment.multisample != nil || (!volume && !array)) Fail("a layered draw into a color target that is not a resident single-sample 3D image or 2D array");
         }
     }
 
@@ -1050,12 +1066,19 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         // as a VK_EXT_sample_locations 2x2 grid; Metal's setSamplePositions takes one pattern for
         // every pixel (docs/dev/TechnicalDebt.md). Pixel 0's pattern leads the array either way.
         // Upstream 57ceb9e370: without a 2x2 grid pixel (0,0)'s locations stand in for every pixel
-        // (HostSampleOrder logs it; TechnicalDebt metal-sample-order).
+        // (HostSampleLocationsFor logs it), with the guest's sample order kept by the reorder passes
+        // at the pass bounds (sampleOrder above).
         const auto locations = Graphics::SampleLocations(graphics);
         passKey = Mix(passKey, graphics.samples);
         for (std::uint32_t sample = 0; sample < graphics.samples; ++sample) {
             samplePositions[sample] = MTLSamplePositionMake(locations[sample].x, locations[sample].y);
             passKey = Mix(passKey, static_cast<std::uint64_t>(locations[sample].x * 16.0f) | (static_cast<std::uint64_t>(locations[sample].y * 16.0f) << 8u));
+        }
+        // A pass whose targets hold the host's order continues only under the same order (its end
+        // puts them back with that order's inverse).
+        if (reordersSamples) {
+            passKey = Mix(passKey, 0x6f72646572ull);
+            for (const auto word : sampleOrder) passKey = Mix(passKey, word);
         }
     }
     // Upstream 9bf98992ff: a multisampled rasterizer over one-sample targets draws one sample at sample
@@ -1551,6 +1574,24 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
         access.anyWrites = access.anyWrites || storesThroughAddresses || !addressReadPasses;
     }
     auto held = std::make_shared<Held>();
+    // The textures whose samples the order moves (upstream PlanSampleOrder: every multisampled color
+    // target and the depth target), held by `held` while the batch uses them.
+    std::vector<Graphics::Metal::SampleOrderTexture> reorderTextures;
+    if (reordersSamples) {
+        for (const auto& attachment : colors) {
+            if (attachment.multisample == nil) continue;
+            reorderTextures.push_back({reinterpret_cast<VkImage>((__bridge void*)attachment.multisample), attachment.target->elementBytes});
+            held->objects.push_back(attachment.multisample);
+        }
+        if (depth != nullptr) {
+            reorderTextures.push_back({reinterpret_cast<VkImage>((__bridge void*)depth->texture), 0u});
+            held->objects.push_back(depth->texture);
+        }
+        if (reorderTextures.empty()) reordersSamples = false;
+    }
+    const auto reorder = [reorderTextures, sampleOrder, region = graphics.renderExtent, samples = graphics.samples](VkCommandBuffer commands, bool toHost) {
+        Graphics::Metal::ReorderSamples(commands, reorderTextures, Graphics::Metal::SampleOrderMapFor(sampleOrder, toHost), region, samples);
+    };
     std::uint64_t recorded = 0;
     bool anyContinued = false;
     // One pass per slice of the targets (one unless the sample count is emulated, DECISIONS D28).
@@ -1572,6 +1613,9 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             // The occlusion counter slot of the pass's visibility buffer (an occlusion query open in
             // the guest's command stream: ASTRO BOT's first sampled draw threw "an occlusion segment
             // begins without a reset query slot", nothing on this path took a slot).
+            // The guest sample order: the targets take the host's order before the pass begins
+            // (its loads see them in the order the stand-in positions rasterize).
+            if (reordersSamples) reorder(start.commands, true);
             recorder.PrepareSamplePass();
             // Tiled targets load from guest memory (CPU detile into upload memory, then a copy).
             std::vector<id<MTLTexture>> textures;
@@ -1624,6 +1668,10 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                 // index counts from it (upstream #3763; MoltenVK maps a 2D-array view of a 3D image the
                 // same way, depthPlane = baseArrayLayer).
                 if (texture.textureType == MTLTextureType3D) color.depthPlane = target.depthSlice;
+                // A 2D array target's attachment view holds only the color view's layers, so the
+                // pass starts at slice 0 of the view and the render target array index counts from
+                // the view's first layer (as Vulkan's 2D-array view with baseArrayLayer).
+                if (graphics.renderLayers > 1u && texture.textureType != MTLTextureType3D && (texture.textureType != MTLTextureType2DArray || texture.arrayLength < graphics.renderLayers)) Fail("a layered draw's attachment view is neither a 3D image nor a 2D array of " + std::to_string(graphics.renderLayers) + " layers");
                 if (attachment.multisample != nil) color.slice = slice;
                 color.loadAction = MTLLoadActionLoad;
                 color.storeAction = MTLStoreActionStore;
@@ -1958,6 +2006,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
                     });
                 }
                 passStream.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            };
+        }
+        // ... and go back to the guest's order when the pass ends (before any other command sees them:
+        // the recorder ends an open pass before recording anything else).
+        if (!continued && reordersSamples) {
+            afterPass = [tiledCopies = std::move(afterPass), reorder](VkCommandBuffer commands) {
+                if (tiledCopies) tiledCopies(commands);
+                reorder(commands, false);
             };
         }
         recorder.LeaveRenderPassOpen(slicePassKey, Recorder::NoTiming, false, access, std::move(afterPass));

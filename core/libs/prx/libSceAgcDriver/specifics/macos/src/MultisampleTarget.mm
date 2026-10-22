@@ -349,6 +349,9 @@ public:
 
 private:
     std::vector<GuestMemory::UnchangedQuery> dccRanges;
+    // 16 KiB host pages: the color, DCC and CMASK ranges' edge pages report CPU stores per 4 KiB, so
+    // a store beside a range is no store over it (checkDccCurrent), as on 4 KiB hosts.
+    GuestMemory::TrackedStorePrecision dccStorePrecision;
     std::optional<std::uint32_t> dccFill;
     std::optional<std::uint32_t> cmaskFill;
 
@@ -391,6 +394,7 @@ private:
     }
 
     VkClearColorValue initialDccClear(const ColorTarget& use) {
+        dccStorePrecision.Clear();
         if (use.dccAddress == 0) return {};
         const auto dccBytes = MultisampledDccBytes(use);
         Require((use.dccAddress & 4095u) == 0, "multisampled DCC metadata base alignment is not implemented");
@@ -400,6 +404,9 @@ private:
         dccRanges.push_back({use.address, static_cast<std::size_t>(colorBytes), 0});
         dccRanges.push_back({use.dccAddress, dccBytes, 0});
         if (use.cmaskAddress != 0) dccRanges.push_back({use.cmaskAddress, use.cmaskBytes, 0});
+        std::vector<std::pair<std::uint64_t, std::size_t>> precise;
+        for (const auto& range : dccRanges) precise.emplace_back(range.address, range.bytes);
+        dccStorePrecision.Track(precise);
         for (auto& range : dccRanges) {
             GuestMemory::CheckRange(reinterpret_cast<const void*>(range.address), range.bytes, 256);
             Require(GuestMemory::Watched(range.address, range.bytes), "initial multisampled DCC contents require watched guest memory");

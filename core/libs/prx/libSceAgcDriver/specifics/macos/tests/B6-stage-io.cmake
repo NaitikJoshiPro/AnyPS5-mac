@@ -43,3 +43,15 @@ if(CMAKE_CXX_COMPILER_LAUNCHER)
 endif()
 add_test(NAME agc_metal_msl_upstream_parity COMMAND agc_metal_msl_upstream_parity_tests)
 set_tests_properties(agc_metal_msl_upstream_parity PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+# agc_metal_msl_offset_rate: whether a fragment function reading interpolant<>::interpolate_at_offset runs
+# once per pixel like a center_perspective one (OffsetBarycentric in once-per-pixel programs), counted in a
+# 2x2, 4x attachment-less pass. GPU, 4 tiny draws.
+add_test_executable(agc_metal_msl_offset_rate_tests ${agcMetalDir}/tests/MslOffsetRateCheck.mm)
+target_link_libraries(agc_metal_msl_offset_rate_tests PRIVATE "-framework Metal" "-framework Foundation")
+set_source_files_properties(${agcMetalDir}/tests/MslOffsetRateCheck.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+set_target_properties(agc_metal_msl_offset_rate_tests PROPERTIES CXX_EXTENSIONS OFF OBJCXX_STANDARD 20)
+if(CMAKE_CXX_COMPILER_LAUNCHER)
+    set_property(TARGET agc_metal_msl_offset_rate_tests PROPERTY OBJCXX_COMPILER_LAUNCHER ${CMAKE_CXX_COMPILER_LAUNCHER})
+endif()
+add_test(NAME agc_metal_msl_offset_rate COMMAND agc_metal_msl_offset_rate_tests)
+set_tests_properties(agc_metal_msl_offset_rate PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 LABELS "gpu")

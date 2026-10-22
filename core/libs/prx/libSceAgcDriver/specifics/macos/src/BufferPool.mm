@@ -28,6 +28,9 @@ struct PoolObjects {
     std::mutex residencyMutex;
     std::uint64_t made = 0;
     std::uint64_t destroyed = 0;
+    // The attached recorder timelines (BufferPool::AttachTimeline), under timelineMutex.
+    std::mutex timelineMutex;
+    std::vector<std::pair<id<MTLSharedEvent>, const std::atomic<std::uint64_t>*>> timelines;
     ~PoolObjects() {
         if (queue != nil && residency != nil) ::AgcDriver::Metal::Residency::Detach(queue, residency);
     }
@@ -97,6 +100,96 @@ BufferPool::~BufferPool() {
             for (const auto& slot : slots) destroy(slot.allocation);
         }
     }
+    for (const auto& image : pendingImages) destroy(image.allocation);
+}
+
+void BufferPool::AttachTimeline(const void* timeline, const std::atomic<std::uint64_t>* retireSerial) {
+    id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)timeline;
+    if (event == nil || retireSerial == nullptr) Metal::Fail("BufferPool::AttachTimeline needs a shared event and its retire serial");
+    std::lock_guard lock(metal->timelineMutex);
+    metal->timelines.emplace_back(event, retireSerial);
+}
+
+void BufferPool::DetachTimeline(const std::atomic<std::uint64_t>* retireSerial) noexcept {
+    {
+        std::lock_guard lock(metal->timelineMutex);
+        std::erase_if(metal->timelines, [&](const auto& entry) { return entry.second == retireSerial; });
+    }
+    // A detached timeline's batches all completed: the heaps that waited only for it are free now.
+    std::vector<BufferAllocation> evicted;
+    try {
+        std::lock_guard lock(mutex);
+        drainRetiredImages(evicted);
+    } catch (...) {
+    }
+    for (const auto& gone : evicted) destroy(gone);
+}
+
+std::size_t BufferPool::PendingImages() {
+    std::lock_guard lock(mutex);
+    return pendingImages.size();
+}
+
+// The serials a heap released now waits for: each attached timeline's retire serial that its event
+// has not reached yet (none: free at once).
+std::vector<std::pair<const std::atomic<std::uint64_t>*, std::uint64_t>> BufferPool::retireSerials() {
+    std::vector<std::pair<const std::atomic<std::uint64_t>*, std::uint64_t>> serials;
+    std::lock_guard lock(metal->timelineMutex);
+    for (const auto& [event, word] : metal->timelines) {
+        const auto serial = word->load(std::memory_order_acquire);
+        if (serial > event.signaledValue) serials.emplace_back(word, serial);
+    }
+    return serials;
+}
+
+bool BufferPool::retired(const PendingImage& image) {
+    std::lock_guard lock(metal->timelineMutex);
+    for (const auto& [word, serial] : image.serials) {
+        const auto found = std::find_if(metal->timelines.begin(), metal->timelines.end(), [&](const auto& entry) { return entry.second == word; });
+        if (found != metal->timelines.end() && found->first.signaledValue < serial) return false;
+    }
+    return true;
+}
+
+// Under `mutex`: the heaps whose batches all completed join the free list, oldest first (a heap
+// that waits keeps the younger ones behind it waiting too: they are checked again next time).
+void BufferPool::drainRetiredImages(std::vector<BufferAllocation>& evicted) {
+    while (!pendingImages.empty() && retired(pendingImages.front())) {
+        const auto allocation = pendingImages.front().allocation;
+        pendingImages.pop_front();
+        imageBytes -= allocation.allocationBytes;
+        retainImage(allocation, evicted);
+    }
+}
+
+// Under `mutex`: a released (and retired) heap joins its size's free list, evicting the oldest
+// retained heaps over the image and device-tier budgets.
+void BufferPool::retainImage(const BufferAllocation& allocation, std::vector<BufferAllocation>& evicted) {
+    const auto bytes = allocation.allocationBytes;
+    if (heapOverBudget()) {
+        while (imageSlots != 0 && evictOldestImage(evicted)) {
+        }
+        evicted.push_back(allocation);
+        return;
+    }
+    while (imageSlots != 0 && imageBytes + bytes > imageBudget && evictOldestImage(evicted)) {
+    }
+    while (deviceTier.slots != 0 && (deviceTier.retainedBytes + bytes > deviceTier.budget || deviceTier.slots >= maxSlots)) evictOldest(deviceTier, evicted);
+    const SlotKey imageKey{allocation.bytes, allocation.properties, allocation.memoryType, true};
+    auto& slots = deviceTier.free[imageKey];
+    slots.push_back({allocation, ++clock, {}});
+    try {
+        slots.back().order = imageOrder.insert(imageOrder.end(), &slots.back());
+    } catch (...) {
+        slots.pop_back();
+        if (slots.empty()) deviceTier.free.erase(imageKey);
+        evicted.push_back(allocation);
+        return;
+    }
+    ++deviceTier.slots;
+    deviceTier.retainedBytes += bytes;
+    ++imageSlots;
+    imageBytes += bytes;
 }
 
 BufferAllocation BufferPool::Allocate(std::size_t capacity, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
@@ -234,8 +327,15 @@ VkDeviceMemory BufferPool::allocateImageHeap(VkDeviceSize bytes, std::uint32_t m
 VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::uint32_t* allocatedType) {
     const auto type = allocation.memoryTypeIndex;
     if (imagePooled(allocation.allocationSize, type)) {
-        std::lock_guard lock(mutex);
+        std::vector<BufferAllocation> evicted;
+        std::unique_lock lock(mutex);
         ++clock;
+        drainRetiredImages(evicted);
+        if (!evicted.empty()) {
+            lock.unlock();
+            for (const auto& gone : evicted) destroy(gone);
+            lock.lock();
+        }
         const auto found = deviceTier.free.find({static_cast<std::size_t>(allocation.allocationSize), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, type, true});
         if (found != deviceTier.free.end() && !found->second.empty()) {
             auto& slots = found->second;
@@ -273,29 +373,21 @@ void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::
     }
     std::vector<BufferAllocation> evicted;
     try {
+        // Taken before the pool's mutex (the timelines have their own): a batch recorded or in
+        // flight now may still read the old image placed in this heap.
+        auto serials = retireSerials();
         std::lock_guard lock(mutex);
-        if (heapOverBudget()) {
-            while (imageSlots != 0 && evictOldestImage(evicted)) {
+        drainRetiredImages(evicted);
+        if (!serials.empty()) {
+            if (heapOverBudget()) {
+                evicted.push_back(allocation);
+            } else {
+                pendingImages.push_back({allocation, std::move(serials)});
+                // Counted in the image bytes, so the budget sees the heaps that wait.
+                imageBytes += bytes;
             }
-            evicted.push_back(allocation);
         } else {
-            while (imageSlots != 0 && imageBytes + bytes > imageBudget && evictOldestImage(evicted)) {
-            }
-            while (deviceTier.slots != 0 && (deviceTier.retainedBytes + bytes > deviceTier.budget || deviceTier.slots >= maxSlots)) evictOldest(deviceTier, evicted);
-            const SlotKey imageKey{allocation.bytes, allocation.properties, memoryType, true};
-            auto& slots = deviceTier.free[imageKey];
-            slots.push_back({allocation, ++clock, {}});
-            try {
-                slots.back().order = imageOrder.insert(imageOrder.end(), &slots.back());
-            } catch (...) {
-                slots.pop_back();
-                if (slots.empty()) deviceTier.free.erase(imageKey);
-                throw;
-            }
-            ++deviceTier.slots;
-            deviceTier.retainedBytes += bytes;
-            ++imageSlots;
-            imageBytes += bytes;
+            retainImage(allocation, evicted);
         }
     } catch (...) {
         destroy(allocation);
@@ -455,6 +547,7 @@ VkDeviceSize BufferPool::trim() {
     Tier retiredSmall;
     Tier retiredLarge;
     Tier retiredDevice;
+    std::vector<BufferAllocation> retiredPending;
     {
         std::lock_guard lock(mutex);
         for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}}) {
@@ -467,6 +560,9 @@ VkDeviceSize BufferPool::trim() {
         imageBytes = 0;
         imageSlots = 0;
         imageOrder.clear();
+        // Pending heaps are freed too: their old textures hold their own references.
+        for (auto& image : pendingImages) retiredPending.push_back(image.allocation);
+        pendingImages.clear();
     }
     VkDeviceSize bytes = 0;
     for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice}) {
@@ -474,6 +570,7 @@ VkDeviceSize BufferPool::trim() {
             for (const auto& slot : slots) bytes += destroy(slot.allocation);
         }
     }
+    for (const auto& allocation : retiredPending) bytes += destroy(allocation);
     return bytes;
 }
 

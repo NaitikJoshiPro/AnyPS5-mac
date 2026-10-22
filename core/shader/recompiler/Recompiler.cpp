@@ -1192,6 +1192,13 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 std::erase_if(moduleBindings, [&](std::uint32_t binding) {
                     return std::none_of(plan->bindings.bindings.begin(), plan->bindings.bindings.end(), [&](const auto& planned) { return planned.descriptor.binding == binding; });
                 });
+                // MSL reaches the fault buffer through DriverData (MslBda.cpp aps5_driver.faultBuffer),
+                // so it declares no table range for it; the host's BDA contract (bdaAbiVersion with one
+                // FaultBuffer binding, ShaderAddressResources prepareAddressBindings) still needs the
+                // role, so the plan's FaultBuffer binding survives the selection.
+                for (const auto& planned : plan->bindings.bindings) {
+                    if (planned.descriptor.role == DescriptorRole::FaultBuffer && std::find(moduleBindings.begin(), moduleBindings.end(), planned.descriptor.binding) == moduleBindings.end()) moduleBindings.push_back(planned.descriptor.binding);
+                }
             }
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, moduleBindings);
             entry->bindings = std::move(selected);
