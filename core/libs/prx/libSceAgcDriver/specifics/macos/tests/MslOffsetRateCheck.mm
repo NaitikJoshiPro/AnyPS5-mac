@@ -21,7 +21,7 @@
 namespace {
 
 constexpr int Skipped = 77;
-constexpr std::uint32_t Size = 2;
+constexpr std::uint32_t TargetSize = 2;
 constexpr std::uint32_t Samples = 4;
 
 void Require(bool condition, const std::string& message) {
@@ -85,8 +85,8 @@ std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibra
     id<MTLBuffer> sink = [device newBufferWithLength:64 * sizeof(float) options:MTLResourceStorageModeShared];
     *static_cast<std::uint32_t*>(counter.contents) = 0u;
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.renderTargetWidth = Size;
-    pass.renderTargetHeight = Size;
+    pass.renderTargetWidth = TargetSize;
+    pass.renderTargetHeight = TargetSize;
     pass.defaultRasterSampleCount = Samples;
     id<MTLCommandBuffer> commands = [queue commandBuffer];
     id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
@@ -119,9 +119,9 @@ int main() {
             const auto center = Count(device, queue, library, "offset_rate_center");
             const auto sample = Count(device, queue, library, "offset_rate_sample");
             const auto pullCenter = Count(device, queue, library, "offset_rate_pull_center");
-            std::printf("fragment invocations over %u pixels at %ux: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u\n", Size * Size, Samples, offset, center, sample, pullCenter);
-            Require(center == Size * Size, "a plain center_perspective function did not run once per pixel");
-            Require(sample == Size * Size * Samples, "an interpolate_at_sample([[sample_id]]) function did not run once per sample");
+            std::printf("fragment invocations over %u pixels at %ux: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u\n", TargetSize * TargetSize, Samples, offset, center, sample, pullCenter);
+            Require(center == TargetSize * TargetSize, "a plain center_perspective function did not run once per pixel");
+            Require(sample == TargetSize * TargetSize * Samples, "an interpolate_at_sample([[sample_id]]) function did not run once per sample");
             Require(offset == center, "an interpolate_at_offset function runs at a different rate than a center_perspective one");
         }
         std::puts("msl offset rate check passed");
