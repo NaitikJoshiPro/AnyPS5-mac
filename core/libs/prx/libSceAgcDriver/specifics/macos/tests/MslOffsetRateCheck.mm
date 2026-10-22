@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -29,6 +30,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 float lastSink = 0.0f;
+std::string sinkValues;
 
 std::string Describe(NSError* error) {
     return error != nil ? std::string(error.localizedDescription.UTF8String) : std::string("unknown error");
@@ -135,6 +137,9 @@ std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibra
     [commands waitUntilCompleted];
     Require(commands.status == MTLCommandBufferStatusCompleted, std::string(fragment) + ": the command buffer failed: " + Describe(commands.error));
     lastSink = static_cast<const float*>(sink.contents)[0];
+    sinkValues.clear();
+    const auto total = std::min<std::uint32_t>(*static_cast<const std::uint32_t*>(counter.contents), 64u);
+    for (std::uint32_t i = 0; i < total; ++i) sinkValues += std::to_string(static_cast<int>(static_cast<const float*>(sink.contents)[i])) + " ";
     return *static_cast<const std::uint32_t*>(counter.contents);
 }
 
@@ -153,11 +158,13 @@ int main() {
             Require(library != nil, "the probe MSL does not compile: " + Describe(error));
             id<MTLCommandQueue> queue = [device newCommandQueue];
             const char* names[8] = {"offset_rate_offset", "offset_rate_center", "offset_rate_sample", "offset_rate_pull_center", "offset_rate_bare", "offset_rate_none", "offset_rate_colored", "offset_rate_mask"};
+            (void)0;
             std::uint32_t counts[2][8] = {};
             for (int attached = 0; attached < 2; ++attached) {
                 for (int i = 0; i < 8; ++i) counts[attached][i] = Count(device, queue, library, names[i], attached != 0);
                 std::printf("fragment invocations over %u pixels at %ux %s: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u, center input without [[position]] %u, no inputs %u, color output %u, coverage mask read %u (first popcount %.0f)\n", TargetSize * TargetSize, Samples, attached != 0 ? "with an unwritten color attachment" : "without attachments", counts[attached][0], counts[attached][1], counts[attached][2], counts[attached][3], counts[attached][4], counts[attached][5], counts[attached][6], counts[attached][7], lastSink);
             }
+            std::printf("coverage popcounts of the last pass's invocations: %s\n", sinkValues.c_str());
             const auto* rates = counts[1];
             Require(rates[1] == TargetSize * TargetSize, "a plain center_perspective function did not run once per pixel");
             Require(rates[2] == TargetSize * TargetSize * Samples, "an interpolate_at_sample([[sample_id]]) function did not run once per sample");
