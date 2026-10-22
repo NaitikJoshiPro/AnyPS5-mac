@@ -582,3 +582,29 @@ Done by the M0 agent on `mac-native` (`b1c5aaf9`..`e65e3cf3`), exit criteria re-
   - Titles (`title_run.py prepare <ID>-owed7 --build build-owed7`, then `run <ID>-owed7 --tag val|noval --seconds N [--validation] --audio-file ...`, logs/owed7/gate/titles), 0 validation errors: DOOM 60 s alive 6 frames (both); Showcase 1.0.2 70 s alive 5/6 frames; UI Lab 60 s alive 6 frames (both); STK 90 s alive 1 frame (both), audio rms 0.06-0.07.
 - Disk: TOTAL used by project 31.76G of 100G.
 - Next: the fragment invocation rate under MSAA (measure with a triangle inside the target and per-pixel slots, then emulate once-per-pixel stores); agc_write_tracking import window; perf of the reorder passes for 2x2 checkerboard titles (M4).
+
+## 2026-10-22 — M4 PERF6: paused before the first measurement (branch perf6 on mac-native-metal 2258edea2d)
+- Stopped on the coordinator's pause order (project paused until 2026-10-27). No title run, no code change, no number taken: PERFORMANCE.md and TechnicalDebt are unchanged, and the D74 verdict is still open.
+- Set up: worktree wt/perf6, branch perf6, build dir wt/perf6/build-perf6 (arm64, Ninja, ccache, RelWithDebInfo, BUILD_TESTING=ON). The build was interrupted part way (1.2 GB); `ninja -C build-perf6` resumes it from ccache. Submodules: 18 are initialised from local object stores (`submodule.<name>.url` set to .git/modules/<name> or wt/sample8's modules). mbedtls (with framework/), zstd and ZArchive are plain copies of wt/sync5's checkouts, because their shallow sources refuse a fetch ("not our ref"); git therefore shows those three gitlinks as changed, so never `git add -A` here. mimalloc is not needed.
+- Title dirs: .mac-work/titles/{PPSA99666,PPSA99005-v102,PPSA99050,STKT00001}-perf6 are symlinks; run `title_run.py prepare <ID>-perf6 --build build-perf6` before profiling.
+- Run queue: .mac-work/logs/perf6/runq.sh `<queue-file> <log-dir>`. Each line is `TITLE TAG SECONDS START:LEN [profile_title args]`. Each run is silent (--audio-file, then a `title_run.py audio` report). The script waits at least 180 s between runs, until the thermal pressure is Nominal (at most 10 min), and logs the pressure, P clock and load before each run.
+- Env opt-outs for the task 2 A/Bs (inventory; file:line under core/libs/prx):
+  - D70: `APS5_WORKER_QOS=off` (ThreadPriority.cpp:282).
+  - Upstream sleep-wake: `APS5_NO_SLEEP_WAKE` (libkernel/Time/SleepWake.cpp:22).
+  - Pooled image heaps: `APS5_NO_IMAGE_HEAPS` (Texture.mm:65), or `APS5_IMAGE_POOL_MIB=0`.
+  - D81: `APS5_CPU_INDEX_EXPANSION=1`.
+  - D82: `APS5_CPU_TEXTURE_SNAPSHOT=1`.
+  - D74-related: `APS5_WRITE_WATCH_IMPORTS=probe|watch|unwatch` (GuestBufferMemory.mm:782) and `APS5_HOST_IMPORT_WINDOW_MIB`.
+- Features with no env opt-out: D73 yield back-off, D79 audio sleeps, D80 event waits (only tunable: `APS5_WAIT_SPIN_US`, `APS5_WAIT_POLL_US` down to 20 us, `APS5_COMPLETION_POLL_US` down to 100 us), upstream's hashed import windows (ed921e225f), D83. To A/B these, either add an opt-out env (small, one commit each) or build a revert.
+- Counters:
+  - `[progress]` events/waits/wakes come with APS5_PROFILE_GPU (profile_title's default).
+  - `[cpuwaits]`, `[recorder]` and `[bufferpool]` (image pool hits) need APS5_PROFILE_DRAW, which inflates frame time: use separate runs for those.
+  - profile_title reports context switches/s (csw_per_s).
+- PERF5 comparison sources: logs/perf5/PPSA99666-perf5-p0-profile.md (DOOM: 0.17 cores, presenter 17.6 ms work + 15.8 vblank/frame, worker 21.7 rendering_wait) and logs/waste1/PPSA99005v102-waste1-s0-profile.md (Showcase: EqualsCommittedUnsynced 1007 + copyCommitted 233 samples, queue 0 Recorder.Sync 54.2 ms/frame, WorkerWait 112 ms/frame, GPU 131.7 ms/frame). There is no STK or UI Lab baseline yet.
+- Next (on resume):
+  1. Finish the build; prepare the 4 titles.
+  2. Baseline profile runs, 90-120 s each: DOOM window 20:30, Showcase 50:40, STK and UI Lab (choose the windows after the first run).
+  3. A/Bs with the opt-outs above, 2 runs each, on DOOM + STK (+ Showcase where it applies).
+  4. D74: measure EqualsCommittedUnsynced/copyCommitted/compareUntracked per frame on Showcase and STK.
+  5. Fix the top common waste.
+- Disk: TOTAL 27.24G of 100G at start. Live build dirs: build-sync5, build-sample8, build-perf6.
