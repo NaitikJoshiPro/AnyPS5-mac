@@ -1623,6 +1623,13 @@ void VulkanDevice::State::SettleBindings(std::span<const StageBindings* const> p
     };
     if (recorder.HasQueuedKeyStores() && (addressBased || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (addressBased || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // Upstream 84e3b73f16 (ShaderResources/GuestBufferMemory UploadFinish): a stale depth plane under a
+    // range the command reads or writes as a buffer (a V#, a vertex fetch, an index buffer) is stored
+    // into guest memory first; it holds depth only its surface has. The Metal draw path binds its
+    // buffers here, not through ShaderResources, so draws flush here (dispatches also flush up front).
+    if (Graphics::DepthPlanesStale()) {
+        for (const auto& [begin, end] : ranges) static_cast<void>(Graphics::FlushDepthPlanes(begin, static_cast<std::size_t>(end - begin)));
+    }
     // Resident images (render targets, storage images of the upstream image path) whose results are
     // still on the GPU store them into guest memory before a command reads or writes that memory as
     // a buffer, as upstream's buffer bindings do.
