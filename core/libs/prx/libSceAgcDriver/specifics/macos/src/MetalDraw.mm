@@ -900,8 +900,14 @@ void VulkanDevice::State::RecordDraw(const Graphics::State& graphics, const Pm4:
             colors.push_back(attachment);
             continue;
         }
-        // Upstream 84e3b73f16 (Draw.cpp): a stale depth plane under the target's memory is stored first.
-        static_cast<void>(Graphics::FlushDepthPlanes(target.address, Graphics::ColorTargetLayout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor).Bytes()));
+        // Upstream 84e3b73f16 (Draw.cpp): a stale depth plane under the target's memory is stored first,
+        // whole, then the surfaces it overlaps are retired (626cff7d26 RetireDepthSurfaces: the colour
+        // target now writes that memory, so their contents no longer stand for it).
+        {
+            const auto targetBytes = Graphics::ColorTargetLayout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor).Bytes();
+            static_cast<void>(Graphics::FlushDepthPlanes(target.address, targetBytes, Graphics::DepthPlaneScope::Whole));
+            Graphics::RetireDepthSurfaces(reinterpret_cast<VkDevice>((__bridge void*)state.device), target.address, targetBytes);
+        }
         // Tiled targets are the image cache's resident images (upstream image path): their writes
         // stay on the GPU until a reader of the memory flushes them (StorageTexture::MarkDirty).
         std::shared_ptr<Graphics::StorageTexture> resident;

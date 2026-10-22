@@ -14,6 +14,7 @@
 #include "MetalCommandStream.h"
 #include "MetalPipelineCache.h"
 #include "MetalImages.h"
+#include "MetalVulkanImages.h"
 #include "MetalNoCopy.h"
 #include "MetalVmTrace.h"
 #include "BdaAbi.hpp"
@@ -967,6 +968,13 @@ std::string VulkanDevice::DriverInfo() const {
     std::string info = "Metal (macOS " + std::to_string(version.majorVersion) + "." + std::to_string(version.minorVersion) + "." + std::to_string(version.patchVersion) + ")";
     if ([state->device supportsFamily:MTLGPUFamilyMetal4]) info += " Metal 4";
     return info;
+}
+
+// Upstream 745ff15b80 (a test probe): whether a 2D optimal image of the format and usage can be made,
+// as the Metal image shim answers vkGetPhysicalDeviceImageFormatProperties.
+bool VulkanDevice::SupportsImageFormat(VkFormat format, VkImageUsageFlags usage) const {
+    VkImageFormatProperties properties{};
+    return Graphics::Metal::Vk::GetPhysicalDeviceImageFormatProperties(VK_NULL_HANDLE, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &properties) == VK_SUCCESS;
 }
 
 // Upstream calibrates through VK_KHR_calibrated_timestamps (device + CLOCK_MONOTONIC). Metal samples

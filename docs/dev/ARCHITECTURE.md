@@ -45,6 +45,18 @@ flowchart LR
 - [`core/relinker/main.cpp`](../../core/relinker/main.cpp) runs the steps in this order. `--to-intel` is optional, see [USAGE.md](../user/USAGE.md).
 - Each library in [`core/libs/prx`](../../core/libs/prx) builds as a shared library. After the build, `nid_patcher` ([`core/libs/nid`](../../core/libs/nid)) renames every export to its NID, computed from the function name. `APS5_EXPORT("<nid>", func)` sets the NID directly when the name is unknown. Every other library keeps the names libc exports; it reads them from `libc.exports`, which `nid_patcher --write-export-list` rewrites only when that list changes. On Windows the link writes each import library with `SOURCE_DATE_EPOCH=0` and `ranlib -D` and replaces it only when its bytes change. A source edit that keeps the exports therefore relinks and re-patches only its own library.
 
+## Main-module entry registers
+
+The host stubs that transfer control to the guest `e_entry` are not the same on every platform, and the console's register contract at that point is not measured here (#9048). What the stubs establish today:
+
+| Host | Source | `rdi` | `rsi` | `rdx` | `rbp` | Return from entry |
+|---|---|---|---|---|---|---|
+| Linux | [`EntryStubBuilder.cpp`](../../core/relinker/elfpatcher/src/general/EntryStubBuilder.cpp) | process stack: qword `argc`, then argv pointers, then a null | 0 | left as the host dynamic linker left it (often `rtld_fini`) | zero frame `{0, 0}` | `ud2` |
+| Windows | [`WindowsEntryStubBuilder.cpp`](../../core/relinker/elfpatcher/src/windows/WindowsEntryStubBuilder.cpp) | `VirtualAlloc` block: qword `argc`, UTF-8 argv pointers, null | address of an exit trampoline that finalizes guest modules and returns | not set by the stub (last host call is `FreeLibrary`) | zero frame in the stub's stack | `ExitProcess` with the entry's return code |
+| macOS | [`MacOsImage.cpp`](../../core/relinker/elfpatcher/src/macos/MacOsImage.cpp) | guest entry address into `_Aps5StartGuest_nid_no_patch` | stack block `{argc, argv…, 0, envp…, 0}` | — | — | `Aps5StartGuest` has no implementation on `main`, so the final guest-entry registers are unset |
+
+On Linux the argument block is the process stack itself (`mov rdi, rsp`). On Windows it is a separate allocation the stub fills with UTF-8 argument strings. Titles that read only `argc`/`argv` through `rdi` see the same layout shape on both; titles that call through `rsi` on Windows get a host exit path that Linux does not provide (`rsi` is zero there).
+
 ## Game patches
 
 [`GamePatch.cpp`](../../core/relinker/relinker/src/patching/GamePatch.cpp) parses the patch file, a strict subset of TOML. `Conversion::Convert` applies the entries of its own target to the executable bytes right after reading them, and to each bundled module before `GuestModuleBuilder` reads it, so every later stage sees patched bytes. Entry virtual addresses are translated through the `PT_LOAD` segments, and a range may not touch the ELF header or program header table, which the output writers rewrite. The patched file ranges are then checked against every in-place writer: the `--to-intel` reports and trampoline sites, `RelinkPatch` records and syscall trap ranges. The patched virtual address ranges are checked against the 8-byte targets of the `RelaData` and `RelaPltData` relocations, which the loader or the output writers overwrite. `main.cpp` builds the manifest text before it writes any output. `main.cpp` matches targets after the conversions, aggregates the applied records into `<output-stem>.patches.toml`, and runs `--verify-patches` through `GamePatch::VerifyPatches`, which reads only bytes.

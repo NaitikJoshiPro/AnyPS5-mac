@@ -117,6 +117,32 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+bool collectMappingHistoryTests() {
+    constexpr std::size_t bytes = 131072;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, 65536));
+    if (memory == nullptr) return false;
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, bytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto before = AgcDriver::GuestMemory::CollectWrites(address, bytes);
+    Require(before != 0, "the mapping fixture has no complete write history");
+    memory[4096] = 0x22;
+    GuestAllocations::Mutation().Remove(memory);
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    Require(AgcDriver::GuestMemory::CollectWrites(address, bytes) != 0, "the replacement mapping lost write tracking");
+    Require(!AgcDriver::GuestMemory::UnchangedSince(address, bytes, before), "a cached collect hid a CPU store across allocation replacement");
+    Require(memory[4096] == 0x22, "collecting the replacement mapping changed its CPU bytes");
+    return true;
+}
+
 bool partialWatchRestorationTests() {
 #ifdef _WIN32
     constexpr std::size_t bytes = 131072;
@@ -189,6 +215,41 @@ std::optional<std::size_t> selectDevice(std::span<const VkPhysicalDeviceProperti
         selectedRank = rank;
     }
     return selected;
+}
+
+bool hintMappingHistoryTests() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 131072;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, 65536));
+    if (memory == nullptr) return false;
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, bytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    AgcDriver::GuestMemory::Unwatch(address, bytes);
+    const auto before = AgcDriver::GuestMemory::UntrackedHint(address, bytes);
+    Require(before != 0, "the hint mapping fixture has no write hint");
+    Require(AgcDriver::GuestMemory::UntrackedHint(address, bytes) == before, "an unchanged hint range advanced its history");
+    memory[4096] = 0x22;
+    GuestAllocations::Mutation().Remove(memory);
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    const auto after = AgcDriver::GuestMemory::UntrackedHint(address, bytes);
+    Require(after > before, "a cached hint walk hid a CPU store across allocation replacement");
+    Require(memory[4096] == 0x22 && memory[bytes - 4096] == 0x11, "collecting replacement hints changed guest bytes");
+    GuestAllocations::Mutation().Remove(memory);
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    Require(AgcDriver::GuestMemory::UntrackedHint(address, bytes) == after, "allocation replacement invented a CPU write hint");
+    return true;
+#else
+    return false;
+#endif
 }
 
 void deviceSelectionTests() {
@@ -8948,8 +9009,8 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
         const std::array range{std::pair{address + unit, address + 2 * unit}};
         Require(StorageTexture::AnyPendingOverlaps(range), "the color producer did not leave GPU results pending");
     };
-    const auto attributeFor = [](std::uint64_t base, std::uint32_t stride, std::uint32_t fetchIndex) {
-        return ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) | (stride << 16u), static_cast<std::uint32_t>(bytes / 16), 77u << 12u}}, fetchIndex};
+    const auto attributeFor = [](std::uint64_t base, std::uint32_t stride, std::uint32_t fetchIndex, std::uint32_t outOfBoundsSelect = 0) {
+        return ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) | (stride << 16u), static_cast<std::uint32_t>(bytes / 16), (77u << 12u) | (outOfBoundsSelect << 28u)}}, fetchIndex};
     };
     const auto check = [&](std::uint32_t edge) {
         std::vector<std::byte> texels(64 * 64 * 4);
@@ -9020,9 +9081,12 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
             reject([&] { Draw(context, consumer, indexed, shaders); }, "index buffer aliases the render target");
         }
         reject([&] { Draw(context, consumer, triangle, shaders); }, "vertex buffer aliases the render target");
-        vertex.vertexAttributes = {attributeFor(address, 0, fetchIndex)};
+        vertex.vertexAttributes = {attributeFor(address, 0, fetchIndex, 3)};
         reject([&] { Draw(context, consumer, draw, shaders); }, "vertex buffer aliases the render target");
     }
+    vertex.vertexAttributes = {attributeFor(address, 0, 0)};
+    Draw(context, consumer, triangle, shaders);
+    WaitForOptimizedPipelines(context.device);
     std::cout << "Vertex range and pending color producer tests passed (" << (imported ? "imported" : "copied") << ")\n";
     return true;
 }
@@ -10027,6 +10091,16 @@ void Run(Context context) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--collect-mapping-history-only") {
+            if (!collectMappingHistoryTests()) return 77;
+            std::cout << "collect mapping history tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--hint-mapping-history-only") {
+            if (!hintMappingHistoryTests()) return 77;
+            std::cout << "hint mapping history tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--partial-watch-restoration-only") {
             if (!partialWatchRestorationTests()) return 77;
             std::cout << "partial private write-watch restoration tests passed\n";

@@ -60,6 +60,7 @@ public:
     VulkanDevice& operator=(const VulkanDevice&) = delete;
     std::string DeviceName() const;
     std::string DriverInfo() const;
+    bool SupportsImageFormat(VkFormat format, VkImageUsageFlags usage) const;
     bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
     // Upstream 57ceb9e370: the order the pixel shader puts each pixel's samples in when pixel (0,0)'s

@@ -123,14 +123,14 @@ ShaderRecompiler::RecompileResult FragmentProgram(const char* source, float valu
     return result;
 }
 
-ShaderRecompiler::VertexAttribute AttributeFor(std::uint64_t base, std::uint32_t stride, std::uint32_t fetchIndex) {
+ShaderRecompiler::VertexAttribute AttributeFor(std::uint64_t base, std::uint32_t stride, std::uint32_t fetchIndex, std::uint32_t outOfBoundsSelect = 0u) {
     ShaderRecompiler::VertexAttribute attribute{};
     attribute.location = 0u;
     attribute.components = 4u;
     attribute.formatComponents = 4u;
     attribute.fetchIndex = fetchIndex;
     // Format 77 (32_32_32_32 float), dst_sel xyzw; Bytes / 16 records as upstream.
-    attribute.resource.fields = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) | (stride << 16u), static_cast<std::uint32_t>(Bytes / 16u), 0x00000facu | (77u << 12u)};
+    attribute.resource.fields = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) | (stride << 16u), static_cast<std::uint32_t>(Bytes / 16u), 0x00000facu | (77u << 12u) | (outOfBoundsSelect << 28u)};
     return attribute;
 }
 
@@ -260,9 +260,13 @@ int Run(bool imported) {
                 reject([&] { drawWith(consumer, vertex, pixel, indexed); }, "index buffer aliases the render target");
             }
             reject([&] { drawWith(consumer, vertex, pixel, triangle); }, "vertex buffer aliases the render target");
-            vertex.vertexAttributes = {AttributeFor(address, 0, fetchIndex)};
+            // OOB_SELECT 3 (raw): a zero-stride fetch still reads its record (upstream bea48f5ee0, 58afce1ad1).
+            vertex.vertexAttributes = {AttributeFor(address, 0, fetchIndex, 3u)};
             reject([&] { drawWith(consumer, vertex, pixel, draw); }, "vertex buffer aliases the render target");
         }
+        // OOB_SELECT 0 with stride 0: RDNA 2's range check reads nothing, so the draw does not alias its target.
+        vertex.vertexAttributes = {AttributeFor(address, 0, 0)};
+        drawWith(consumer, vertex, pixel, triangle);
         device->WaitIdle();
         std::printf("Vertex range and pending color producer tests passed on Metal (%s: guest inputs are read in place)\n", imported ? "imported" : "copied");
     } catch (const std::exception& error) {

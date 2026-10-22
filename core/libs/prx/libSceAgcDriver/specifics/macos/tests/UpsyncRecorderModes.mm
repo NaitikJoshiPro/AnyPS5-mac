@@ -12,6 +12,8 @@
 //   upstream guards (the parked import must not block the unmap).
 // - --copied-direct-only (copiedDirectOrderingTests) is ported in CopiedDirectOrderingTwin.mm (an MSL kernel stands
 //   in for its SPIR-V pipeline).
+// - --collect-mapping-history-only (agc_collect_mapping_history_{map,ring,shared,uncached}, upstream b8f6d316a9 and
+//   c19dcecfec, UPSYNC6): collectMappingHistoryTests copied unchanged; it drives GuestMemory only, no device.
 
 #include "RecorderTwinHarness.h"
 #include "RecorderTwins.h"
@@ -34,6 +36,32 @@
 #include <vector>
 
 namespace {
+
+bool collectMappingHistoryTests() {
+    constexpr std::size_t bytes = 131072;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, 65536));
+    if (memory == nullptr) return false;
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, bytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto before = AgcDriver::GuestMemory::CollectWrites(address, bytes);
+    Require(before != 0, "the mapping fixture has no complete write history");
+    memory[4096] = 0x22;
+    GuestAllocations::Mutation().Remove(memory);
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, false);
+    Require(AgcDriver::GuestMemory::CollectWrites(address, bytes) != 0, "the replacement mapping lost write tracking");
+    Require(!AgcDriver::GuestMemory::UnchangedSince(address, bytes, before), "a cached collect hid a CPU store across allocation replacement");
+    Require(memory[4096] == 0x22, "collecting the replacement mapping changed its CPU bytes");
+    return true;
+}
 
 void integerClearTests(const Device& device) {
     const auto& context = device.GetContext();
@@ -391,6 +419,12 @@ const bool hostImportRetirement = AgcDriver::MetalTwins::RegisterRecorderMode("-
         hostImportRetirementTests(device);
         return 0;
     });
+});
+
+const bool collectMappingHistory = AgcDriver::MetalTwins::RegisterRecorderMode("--collect-mapping-history-only", [] {
+    if (!collectMappingHistoryTests()) return 77;
+    std::cout << "collect mapping history tests passed\n";
+    return 0;
 });
 
 }

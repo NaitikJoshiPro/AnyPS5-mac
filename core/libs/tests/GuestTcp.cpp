@@ -178,11 +178,47 @@ static void WaitAllReceivesTheWholeRequest() {
     for (const int descriptor : {datagram, client, accepted, listener}) Require(close_nid_postfix(descriptor) == 0);
 }
 
+static void ReceiveAnsweredWithoutTheHost() {
+    constexpr int DontWait = 0x80;
+    const int listener = socket_nid_postfix(2, 1, 0);
+    Require(listener >= 0);
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(bind_nid_postfix(listener, address.data(), address.size()) == 0 && listen_nid_postfix(listener, 4) == 0);
+    std::uint32_t size = address.size();
+    Require(getsockname_nid_postfix(listener, address.data(), &size) == 0);
+    const int unconnected = socket_nid_postfix(2, 1, 0);
+    char byte;
+    Require(recv_nid_postfix(unconnected, &byte, 0, DontWait) == -1 && *__error_nid_postfix() == 57);
+    const int client = socket_nid_postfix(2, 1, 0);
+    Require(connect_nid_postfix(client, address.data(), address.size()) == 0);
+    const int accepted = accept_nid_postfix(listener, nullptr, nullptr);
+    Require(accepted >= 0);
+
+    Require(recv_nid_postfix(accepted, &byte, 0, DontWait) == 0);
+    Require(recv_nid_postfix(accepted, &byte, 0, 0) == 0);
+    std::array<std::uint8_t, 16> sender;
+    sender.fill(0xaa);
+    std::uint32_t senderSize = sender.size();
+    Require(recvfrom_nid_postfix(accepted, &byte, 0, 0, sender.data(), &senderSize) == 0 && senderSize == 0);
+
+#ifdef _WIN32
+    Require(shutdown_nid_postfix(accepted, 0) == 0);
+    Require(send_nid_postfix(client, "x", 1, 0) == 1);
+    char received[4];
+    Require(recv_nid_postfix(accepted, received, sizeof(received), 0) == 0);
+    Require(recv_nid_postfix(accepted, received, sizeof(received), DontWait) == 0);
+    senderSize = sender.size();
+    Require(recvfrom_nid_postfix(accepted, received, sizeof(received), 0, sender.data(), &senderSize) == 0 && senderSize == 0);
+#endif
+    for (const int descriptor : {unconnected, client, accepted, listener}) Require(close_nid_postfix(descriptor) == 0);
+}
+
 int main() {
     StreamReceiveReportsNoSender();
     ListenersShareAPortAcrossFamilies();
     AcceptedSocketsFollowListenerBlocking();
     WaitAllReceivesTheWholeRequest();
+    ReceiveAnsweredWithoutTheHost();
     UnboundSocketNameIsZero();
     const int listener = socket_nid_postfix(2, 1, 6);
     Require(listener >= 0);

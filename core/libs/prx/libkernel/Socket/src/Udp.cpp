@@ -684,6 +684,18 @@ int SetNonBlocking(Socket& socket) {
     socket.options.nonblocking = true;
     return 0;
 }
+int ReceiveAnsweredHere(Socket& socket, std::uint64_t length) {
+#ifdef _WIN32
+    {
+        std::lock_guard lock(socket.modeMutex);
+        if (socket.receiveShut) return 0;
+    }
+#endif
+    if (length != 0 || socket.type != 1) return -1;
+    sockaddr_storage peer{};
+    socklen_t size = sizeof(peer);
+    return ::getpeername(socket.value, reinterpret_cast<sockaddr*>(&peer), &size) == 0 ? 0 : NativeError();
+}
 int SocketSendFlags(Socket& socket, int flags) {
     std::lock_guard lock(socket.modeMutex);
     return NativeSendFlags(socket.options.noSignal ? flags | GuestNoSignal : flags);
@@ -1283,6 +1295,7 @@ std::int64_t APS5_VABI recv_nid_postfix(int descriptor, void* buffer, std::uint6
     if (!buffer && length) return Fail(14);
     const GuestArena::HostWrite destination(length == 0 ? nullptr : buffer, static_cast<std::size_t>(length));
     if (!destination.Open()) return Fail(14);
+    if (const int answered = ReceiveAnsweredHere(*socket, length); answered >= 0) return answered == 0 ? 0 : Fail(answered);
     if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
     const auto result = ::recv(socket->value, static_cast<char*>(GuestArena::HostRange(buffer, length)), static_cast<int>(length),
         NativeReceiveFlags(flags, socket->type));
@@ -1416,6 +1429,11 @@ std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::u
     if ((!buffer && length) || (address && !addressLength)) return Fail(14);
     const GuestArena::HostWrite destination(length == 0 ? nullptr : buffer, static_cast<std::size_t>(length));
     if (!destination.Open()) return Fail(14);
+    if (const int answered = ReceiveAnsweredHere(*socket, length); answered >= 0) {
+        if (answered > 0) return Fail(answered);
+        if (address) *addressLength = 0;
+        return 0;
+    }
     sockaddr_storage native{};
     socklen_t size = sizeof(native);
     if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);

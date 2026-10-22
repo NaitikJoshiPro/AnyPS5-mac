@@ -478,8 +478,10 @@ void GetInterpolationParameter(MslEmitterState& state, const IrValue& instructio
     if (mode > 2u) state.Fail(instruction, "interpolation parameter mode is out of range");
     const auto& pixel = PixelInfo(state);
     if (!half) {
-        if (pixel.InputIsDefault(attribute)) {
-            state.Define(instruction, mode == 2u ? PixelAttribute(state, instruction, attribute, channel) : std::string("0u"));
+        // An interpolator past SPI_PS_IN_CONTROL.NUM_INTERP reads as OFFSET 0x20's default, as the
+        // SPIR-V path does (upstream c32c26edb2).
+        if (attribute >= pixel.inputNum || pixel.InputIsDefault(attribute)) {
+            state.Define(instruction, mode == 2u ? MslHex(pixel.InputDefaultBits(attribute, channel & 3u)) + "u" : std::string("0u"));
             return;
         }
         if (!InputIsPerVertex(state, attribute)) {

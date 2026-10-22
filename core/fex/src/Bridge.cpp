@@ -323,9 +323,12 @@ constexpr VariadicExport VariadicExports[] = {
     {"wprintf_nid_postfix", GuestList, 1},
     {"wscanf_nid_postfix", GuestList, 1},
     {"wscanf_s_nid_postfix", GuestList, 1},
+    {"sceAudioPropagationReportApi", GuestList, 6},
     {"_open_nid_postfix", Integers, 2},
     {"fcntl_nid_postfix", Integers, 2},
     {"_fcntl_nid_postfix", Integers, 2},
+    {"sceOpusCeltEncCtl", Integers, 2},
+    {"sceOpusSilkEncCtl", Integers, 2},
 };
 
 constexpr std::string_view X87Results[] = {"strtold_nid_postfix", "wcstold_nid_postfix", "__floatdixf_nid_postfix",
