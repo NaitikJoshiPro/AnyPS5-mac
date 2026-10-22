@@ -3502,9 +3502,21 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 TextureCounts().tablesReused.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            // macOS: a table no remembered table vouches for is resolved again by a fresh build
-            // (tablesVouched below), as upstream's dispatch build, seldom reusable, does.
-            return false;
+            // Upstream: a table no remembered table vouches for proves each element against the cache
+            // (the lookup log stays bounded, bde2a8f0af). An element the build placed elsewhere (a
+            // storage or multisampled table element on Metal) fails the comparison and the set is
+            // rebuilt, as before.
+            for (std::uint32_t element = 0; element < images->count; ++element) {
+                if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
+                const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                std::array<std::uint32_t, 8> narrowed{};
+                const auto words = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
+                if (Metal::MultisampledDescriptor(words)) return false;
+                const auto resource = DecodeTextureResource(words);
+                const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                if (textureIndex >= textures.size() || table.elementTextures[element] != textureIndex || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[textureIndex]) return false;
+                ++textureIndex;
+            }
         }
         if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
         // The walk proved every object current again: the records move to what it proved, or one
