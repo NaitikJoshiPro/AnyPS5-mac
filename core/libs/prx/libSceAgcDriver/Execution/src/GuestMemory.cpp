@@ -1360,9 +1360,10 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     ++runs.stamped;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
 #ifdef __APPLE__
-    // The import ran under a host write over its whole window (ImportWatched), which opens and
-    // reports every 16 KiB host page of it: whether a page was stored to is only known from its
-    // bytes, so only a 4 KiB page that no longer holds its window copy counts as a CPU store.
+    // The watch reports the 16 KiB host pages a store within the import window touched (the pages
+    // stay write-protected during it, ImportWatched): which 4 KiB parts were stored to is only known
+    // from their bytes, so only a 4 KiB page that no longer holds its window copy counts as a CPU
+    // store; the others of a reported host page are possibly touched (ImportWindow).
     const bool windowStores = runs.window != nullptr && kind != StampKind::Driver;
 #else
     const bool windowStores = false;
@@ -1634,6 +1635,11 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
+    // macOS: an import that ends watching its range (every Metal import, decideImportWatch) runs over
+    // writable pages, so newBufferWithBytesNoCopy can wire them; the range is unwatched afterwards
+    // anyway. An import that stays watched keeps its pages write-protected, as the Linux and Windows
+    // watches do: a CPU store within the window faults and reports its host page, and a page nothing
+    // stored to is not reported (an open window reported every page as possibly stored to).
     const auto runImport = [&] {
 #ifdef __APPLE__
         const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
@@ -1681,7 +1687,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         }
     }
     std::erase_if(spans, [&](const auto& span) { return !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true); });
-    if (!runImport()) return false;
+    if (!import()) return false;
     const WindowCopy window{hostFirst, hashes};
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
