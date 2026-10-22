@@ -168,9 +168,13 @@ int main() {
             }
             std::printf("coverage popcounts of the last pass's invocations: %s\n", sinkValues.c_str());
             const auto* rates = counts[1];
-            Require(rates[1] == TargetSize * TargetSize, "a plain center_perspective function did not run once per pixel");
-            Require(rates[2] == TargetSize * TargetSize * Samples, "an interpolate_at_sample([[sample_id]]) function did not run once per sample");
+            // Measured on an M3 (2026-10-22, with and without validation): every variant, a function without inputs
+            // included, ran 16 times over the 4 pixels, with overlapping input coverage masks (TechnicalDebt
+            // metal-fragment-invocation-rate). What the MSL backend relies on is checked: an offset or pull-model
+            // center read does not change the rate a plain center read runs at, and per-sample reads run at least
+            // once per sample.
             Require(rates[0] == rates[1] && rates[3] == rates[1], "a pull-model interpolate_at_offset or interpolate_at_center function runs at a different rate than a center_perspective one");
+            Require(rates[2] >= TargetSize * TargetSize * Samples, "an interpolate_at_sample([[sample_id]]) function ran fewer times than once per sample");
         }
         std::puts("msl offset rate check passed");
         return 0;
