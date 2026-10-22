@@ -208,7 +208,13 @@ namespace ShaderRecompiler::MslAbi {
 // GPU indirect draws) write the rect's table base and first vertex into DriverData on the GPU.
 // Version 23: a pixel interpolation parameter (v_interp_mov, barycentric v_interp_p1/p2) of an
 // interpolator past SPI_PS_IN_CONTROL.NUM_INTERP reads OFFSET 0x20's default (upstream c32c26edb2).
-inline constexpr std::uint32_t Version = 23u;
+// Version 24: fragment: a PS_ITER_SAMPLE program (ShaderPixelStageInfo::iteratesSamples) takes
+// [[sample_id]] and runs per sample even when it reads nothing per sample (Reflection::perSample);
+// with InterpolationFunction (the Metal device advertises it) exact PERSP/LINEAR_SAMPLE I/J are the
+// emulated weights at the guest sample's location through interpolate_at_offset (constant
+// aps5_sample_offsets table when iterated or varying per 2x2 pixel), and an iterated _CENTER's
+// through interpolate_at_center(). The bump drops disk-cached functions of the same requests.
+inline constexpr std::uint32_t Version = 24u;
 
 // Version 13: the triangle-vertices mode of mesh functions. Metal's mesh<> holds at most 256
 // vertices (MSL specification, set_index takes a uchar), so a mesh of unshared triangles holds 85;

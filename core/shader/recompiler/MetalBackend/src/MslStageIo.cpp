@@ -231,6 +231,54 @@ std::string EmulatedBarycentric(MslEmitterState& state, bool linear, Interpolati
     return std::string(linear ? "aps5_bwl_" : "aps5_bw_") + LocationName(location);
 }
 
+// MslEmitterState::barycentricLocations bits above the InterpolationLocation ones: the corner
+// weights read with interpolate_at_center() (an iterated PERSP/LINEAR_CENTER) and with
+// interpolate_at_offset() (a PERSP/LINEAR_SAMPLE at the guest's sample location). Either makes the
+// weights an interpolant<>.
+constexpr std::uint32_t BarycentricAtCenterBit = 1u << 3u;
+constexpr std::uint32_t BarycentricAtOffsetBit = 1u << 4u;
+
+// MSL's interpolate_at_offset takes its offset from the pixel's upper-left corner, in pixels and
+// unclamped (probe owed7, Apple M3, macOS 27: offset (0, 0) reads the corner, (0.75, 0.5) and
+// (-0.375, 0.4375) read corner + offset); the guest's sample locations are 1/16-pixel offsets from
+// the pixel center (SampleLocationOffset), as GLSL's InterpolateAtOffset takes them.
+std::string SampleOffsetLiteral(std::uint8_t location) {
+    return "float2(" + std::to_string(SampleLocationOffset(location, 0u) + 0.5f) + "f, " + std::to_string(SampleLocationOffset(location, 1u) + 0.5f) + "f)";
+}
+
+bool SampleOffsetsTabled(MslEmitterState& state) {
+    return state.program.Metadata().pixelIteratesSamples || PixelInfo(state).SampleLocationsVary();
+}
+
+std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component);
+
+// The offset of a PERSP/LINEAR_SAMPLE read (SpirvModuleEmitter EmitSampleOffset): sample 0's
+// location in a once-per-pixel program, which keeps it once per pixel (no [[sample_id]]); in an
+// iterated one the guest sample's location (SampleId, in the guest's order and past
+// APS5_SAMPLE_BASE); with locations varying per pixel of the 2x2 grid, the 32-entry table indexed
+// by guest | (quad pixel << 3) (aps5_sample_offsets, MslGraphicsInterfaceOf).
+std::string SampleOffset(MslEmitterState& state, const IrValue& instruction) {
+    const auto& pixel = PixelInfo(state);
+    if (!SampleOffsetsTabled(state)) return SampleOffsetLiteral(pixel.sampleLocations[0]);
+    std::string index = state.program.Metadata().pixelIteratesSamples ? GraphicsBuiltin(state, instruction, StageInputKind::SampleId, 0u) : std::string("0u");
+    if (pixel.SampleLocationsVary()) index = "(" + index + " | (((uint(aps5_in.aps5_position.x) & 1u) | ((uint(aps5_in.aps5_position.y) & 1u) << 1u)) << 3u))";
+    return "aps5_sample_offsets[" + index + "]";
+}
+
+// Upstream's offset barycentrics (SpirvModuleEmitter EmitOffsetBarycentricU32), which the front end
+// emits when the target has InterpolationFunction and the program reads exact barycentrics (on
+// Metal, the emulated ones, ProgramMetadata::barycentricEmulation): an iterated _CENTER read at the
+// pixel center, a _SAMPLE read at the guest's sample location.
+std::string OffsetBarycentric(MslEmitterState& state, const IrValue& instruction, StageInputKind kind, std::uint32_t component) {
+    const bool linear = BarycentricInputOf(kind) == StageInputKind::BaryCoordNoPerspective;
+    const bool center = kind == StageInputKind::BaryCoordSmoothCenter || kind == StageInputKind::BaryCoordNoPerspectiveCenter;
+    state.reflection.emulatedBarycentrics |= linear ? 2u : 1u;
+    state.barycentricLocations[linear ? 1u : 0u] |= center ? BarycentricAtCenterBit : BarycentricAtOffsetBit;
+    const std::string field = linear ? "aps5_bwl" : "aps5_bw";
+    const auto weights = center ? field + "_at_center" : field + "_at_offset(" + SampleOffset(state, instruction) + ")";
+    return "as_type<uint>(" + weights + "[" + std::to_string(component + 1u) + "])";
+}
+
 // One channel of corner `vertex`'s value of a per-vertex pixel parameter at Vulkan location
 // `location`, as a float (flat input user(aps5_pv<L>_<vertex>), zero when the vertex function does
 // not write the location).
@@ -370,11 +418,8 @@ std::string GraphicsBuiltin(MslEmitterState& state, const IrValue& instruction, 
         case StageInputKind::BaryCoordSmoothSample:
         case StageInputKind::BaryCoordNoPerspectiveCenter:
         case StageInputKind::BaryCoordNoPerspectiveSample:
-            // Upstream's offset barycentrics (InterpolateAtOffset at the pixel center or the guest
-            // sample location) come only from targets with InterpolationFunction, which the Metal
-            // device does not advertise; the read's location flag (center or sample, DECISIONS D38)
-            // selects the same host interpolation as the plain kinds. Custom guest sample locations
-            // are the host's only when the driver programs them.
+            if (component > 1u) state.Fail(instruction, "barycentric component is out of range");
+            return OffsetBarycentric(state, instruction, kind, component);
         case StageInputKind::BaryCoordSmooth:
         case StageInputKind::BaryCoordNoPerspective:
             // Exact barycentrics only exist in programs the recompiler translated for the emulated
@@ -1121,7 +1166,9 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         const std::string field = linear != 0u ? "aps5_bwl" : "aps5_bw";
         const std::string perspective = linear != 0u ? "no_perspective" : "perspective";
         const auto read = state.barycentricLocations[linear];
-        const bool pull = std::popcount(read) > 1;
+        // Reads at the pixel center of an iterated program, or at an offset, are pull-model reads
+        // (OffsetBarycentric).
+        const bool pull = std::popcount(read) > 1 || (read & (BarycentricAtCenterBit | BarycentricAtOffsetBit)) != 0u;
         if (pull) text += "    interpolant<float3, interpolation::" + perspective + "> " + field + " [[user(" + field + ")]];\n";
         for (const auto at : locations) {
             if ((read & (1u << static_cast<std::uint32_t>(at))) == 0u) continue;
@@ -1129,9 +1176,22 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
             const auto value = !pull ? "aps5_in." + field : at == InterpolationLocation::Sample ? "aps5_in." + field + ".interpolate_at_sample(aps5_sample_id)" : "aps5_in." + field + ".interpolate_at_" + LocationName(at) + "()";
             accessors += "#define " + field + "_" + LocationName(at) + " " + value + "\n";
         }
+        if ((read & BarycentricAtCenterBit) != 0u) accessors += "#define " + field + "_at_center aps5_in." + field + ".interpolate_at_center()\n";
+        if ((read & BarycentricAtOffsetBit) != 0u) accessors += "#define " + field + "_at_offset(o) aps5_in." + field + ".interpolate_at_offset(o)\n";
+    }
+    // The guest's sample locations as interpolate_at_offset offsets (SampleOffset): the 8 samples of
+    // an iterated program, or the 32 of the 2x2 grid (guest | quad pixel << 3) when they vary per
+    // pixel (SpirvModuleEmitter EmitSampleOffset's table).
+    std::string offsetTable;
+    if (((state.barycentricLocations[0] | state.barycentricLocations[1]) & BarycentricAtOffsetBit) != 0u && SampleOffsetsTabled(state)) {
+        const bool vary = pixel.SampleLocationsVary();
+        const auto count = vary ? static_cast<std::uint32_t>(pixel.sampleLocations.size()) : 8u;
+        offsetTable = "constant float2 aps5_sample_offsets[" + std::to_string(count) + "] = {";
+        for (std::uint32_t index = 0; index < count; ++index) offsetTable += std::string(index == 0u ? "" : ", ") + SampleOffsetLiteral(pixel.sampleLocations[index]);
+        offsetTable += "};\n";
     }
     text += "#if defined(APS5_CONSERVATIVE) && APS5_CONSERVATIVE\n" + MslConservative::FragmentInputFields() + "#endif\n";
-    text += "};\n" + accessors + "\n";
+    text += "};\n" + accessors + offsetTable + "\n";
     std::string members;
     for (const auto& output : state.program.Info().outputs) {
         switch (output.kind) {
@@ -1199,7 +1259,8 @@ MslGraphicsInterface MslGraphicsInterfaceOf(MslEmitterState& state) {
         result.outputType = "Aps5FragmentOut";
     }
     // PS_ITER_SAMPLE: the stage function takes [[sample_id]] (EmitMslEntryPoint).
-    if (pixel.psSampleShading) state.reflection.perSample = true;
+    // An iterated program runs per sample too (EmitMslEntryPoint), as Vulkan's sampleShadingEnable.
+    if (pixel.psSampleShading || state.program.Metadata().pixelIteratesSamples) state.reflection.perSample = true;
     // MslAbi Version 9: the guest mask's bits of this pass's host samples (APS5_SAMPLE_BASE,
     // DECISIONS D28).
     const std::string toHost = "#if APS5_SAMPLE_BASE\n    aps5_out.aps5_sample_mask = aps5_out.aps5_sample_mask >> APS5_SAMPLE_BASE;\n#endif\n";

@@ -794,6 +794,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             // pixels that way (MslEntryPoint.cpp), so masked pixel programs with implicit-LOD sampling or cross-lane
             // reads run (agc_driver_quad_pixel_mask), where a Vulkan device without the feature refuses them.
             state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityDemoteToHelperInvocation));
+            // InterpolateAtOffset (upstream's sampleRateShading devices, VulkanDevice.cpp): pull-model interpolant<>
+            // reads take interpolate_at_center/_offset (MSL specification 2.18), so exact barycentrics of PERSP/
+            // LINEAR_SAMPLE in a once-per-pixel program are read at sample 0's location without running per sample,
+            // and an iterated program's _CENTER at the pixel center (MslStageIo.cpp OffsetBarycentric,
+            // agc_driver_pixel_sample_iteration). The front end emits them only for the emulated barycentrics.
+            state->capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityInterpolationFunction));
             std::ranges::sort(state->capabilities);
             state->extensions = {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
             if (compileOnly) return;
