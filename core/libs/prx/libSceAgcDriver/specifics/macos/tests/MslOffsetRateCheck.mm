@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -90,6 +91,33 @@ fragment void offset_rate_mask(uint mask [[sample_mask]], device atomic_uint* co
 fragment void offset_rate_pull_center(PullIn in [[stage_in]], device atomic_uint* counter [[buffer(0)]], device float* sink [[buffer(1)]]) {
     record(counter, sink, in.value.interpolate_at_center());
 }
+struct SurveyOut {
+    float4 position [[position]];
+};
+vertex SurveyOut survey_vertex(uint vid [[vertex_id]], constant float2* corners [[buffer(0)]]) {
+    SurveyOut out;
+    out.position = float4(corners[vid], 0.5f, 1.0f);
+    return out;
+}
+// Per-pixel slots of 4 words: invocations, OR of coverage masks, sum of coverage popcounts, invocations whose
+// position is not the pixel center.
+static void survey(device atomic_uint* slots, float4 position, uint mask, uint width) {
+    const uint pixel = uint(position.y) * width + uint(position.x);
+    device atomic_uint* slot = slots + pixel * 4u;
+    atomic_fetch_add_explicit(slot, 1u, memory_order_relaxed);
+    atomic_fetch_or_explicit(slot + 1, mask, memory_order_relaxed);
+    atomic_fetch_add_explicit(slot + 2, popcount(mask), memory_order_relaxed);
+    if (fract(position.x) != 0.5f || fract(position.y) != 0.5f) atomic_fetch_add_explicit(slot + 3, 1u, memory_order_relaxed);
+}
+fragment void survey_mask(float4 position [[position]], uint mask [[sample_mask]], device atomic_uint* slots [[buffer(0)]], constant uint& width [[buffer(1)]]) {
+    survey(slots, position, mask, width);
+}
+fragment void survey_position(float4 position [[position]], device atomic_uint* slots [[buffer(0)]], constant uint& width [[buffer(1)]]) {
+    survey(slots, position, 0u, width);
+}
+fragment void survey_sample(float4 position [[position]], uint mask [[sample_mask]], uint sample [[sample_id]], device atomic_uint* slots [[buffer(0)]], constant uint& width [[buffer(1)]]) {
+    survey(slots, position, mask, width);
+}
 )";
 
 // `attached`: the pass has a memoryless 4x color attachment the function never writes (write mask none), versus a
@@ -145,6 +173,61 @@ std::uint32_t Count(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibra
     return *static_cast<const std::uint32_t*>(counter.contents);
 }
 
+struct SurveyResult {
+    std::uint32_t invocations = 0;
+    std::uint32_t pixels = 0;
+    std::uint32_t maxPerPixel = 0;
+    std::uint32_t popcounts = 0;
+    std::uint32_t offCenter = 0;
+};
+
+// One triangle (pixel-space corners) into a width x height target at `samples`, counting each pixel's invocations.
+SurveyResult Survey(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> library, const char* fragment, std::uint32_t samples, std::uint32_t width, std::uint32_t height, const float (&corners)[6]) {
+    MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.vertexFunction = [library newFunctionWithName:@"survey_vertex"];
+    descriptor.fragmentFunction = [library newFunctionWithName:@(fragment)];
+    descriptor.rasterSampleCount = samples;
+    NSError* error = nil;
+    id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    Require(pipeline != nil, std::string(fragment) + ": no pipeline: " + Describe(error));
+    const std::size_t slotBytes = std::size_t{width} * height * 4u * sizeof(std::uint32_t);
+    id<MTLBuffer> slots = [device newBufferWithLength:slotBytes options:MTLResourceStorageModeShared];
+    std::memset(slots.contents, 0, slotBytes);
+    float ndc[6];
+    for (int i = 0; i < 3; ++i) {
+        ndc[2 * i] = corners[2 * i] / float(width) * 2.0f - 1.0f;
+        ndc[2 * i + 1] = 1.0f - corners[2 * i + 1] / float(height) * 2.0f;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.renderTargetWidth = width;
+    pass.renderTargetHeight = height;
+    pass.defaultRasterSampleCount = samples;
+    id<MTLCommandBuffer> commands = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setViewport:(MTLViewport){0.0, 0.0, double(width), double(height), 0.0, 1.0}];
+    [encoder setScissorRect:(MTLScissorRect){0, 0, width, height}];
+    [encoder setVertexBytes:ndc length:sizeof(ndc) atIndex:0];
+    [encoder setFragmentBuffer:slots offset:0 atIndex:0];
+    [encoder setFragmentBytes:&width length:sizeof(width) atIndex:1];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    [commands commit];
+    [commands waitUntilCompleted];
+    Require(commands.status == MTLCommandBufferStatusCompleted, std::string(fragment) + ": the survey command buffer failed: " + Describe(commands.error));
+    SurveyResult result;
+    const auto* words = static_cast<const std::uint32_t*>(slots.contents);
+    for (std::uint32_t pixel = 0; pixel < width * height; ++pixel) {
+        const auto count = words[pixel * 4u];
+        result.invocations += count;
+        result.pixels += count != 0u ? 1u : 0u;
+        result.maxPerPixel = std::max(result.maxPerPixel, count);
+        result.popcounts += words[pixel * 4u + 2u];
+        result.offCenter += words[pixel * 4u + 3u];
+    }
+    return result;
+}
+
 }
 
 int main() {
@@ -167,6 +250,24 @@ int main() {
                 std::printf("fragment invocations over %u pixels at %ux %s: interpolate_at_offset %u, center_perspective %u, interpolate_at_sample %u, interpolate_at_center %u, center input without [[position]] %u, no inputs %u, color output %u, coverage mask read %u (first popcount %.0f)\n", TargetSize * TargetSize, Samples, attached != 0 ? "with an unwritten color attachment" : "without attachments", counts[attached][0], counts[attached][1], counts[attached][2], counts[attached][3], counts[attached][4], counts[attached][5], counts[attached][6], counts[attached][7], lastSink);
             }
             std::printf("coverage popcounts of the last pass's invocations: %s\n", sinkValues.c_str());
+            // Survey: per-pixel invocation counts of a triangle inside an 8x8 target and of one past its edges.
+            const float inside[6] = {1.0f, 1.0f, 7.0f, 1.0f, 1.0f, 7.0f};
+            const float full[6] = {-8.0f, -8.0f, 24.0f, -8.0f, -8.0f, 24.0f};
+            const float tiny[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+            struct Shape { const char* name; const float (*corners)[6]; std::uint32_t size; };
+            const Shape shapes[3] = {{"inside", &inside, 8u}, {"oversized", &full, 8u}, {"2x2 probe triangle", &tiny, 2u}};
+            // WIP probe: ctest truncates passed output, so the survey goes to a file under the main checkout's logs.
+            std::FILE* out = std::fopen("/Users/naitikjoshi/PS5/.mac-work/logs/sample8/offset-rate-survey.txt", "w");
+            if (out == nullptr) out = stdout;
+            for (const char* function : {"survey_position", "survey_mask", "survey_sample"}) {
+                for (const std::uint32_t samples : {1u, 2u, 4u}) {
+                    for (const auto& shape : shapes) {
+                        const auto r = Survey(device, queue, library, function, samples, shape.size, shape.size, *shape.corners);
+                        std::fprintf(out, "survey %s %ux %s %ux%u: %u invocations over %u pixels, at most %u per pixel, coverage popcount sum %u, %u off-center positions\n", function, samples, shape.name, shape.size, shape.size, r.invocations, r.pixels, r.maxPerPixel, r.popcounts, r.offCenter);
+                    }
+                }
+            }
+            if (out != stdout) std::fclose(out);
             const auto* rates = counts[1];
             // Measured on an M3 (2026-10-22, with and without validation): every variant, a function without inputs
             // included, ran 16 times over the 4 pixels, with overlapping input coverage masks (TechnicalDebt
