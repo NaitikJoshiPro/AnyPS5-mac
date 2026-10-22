@@ -56,4 +56,3 @@ agc_driver_multisample_retirement | the retirement fixture drives Vulkan device 
 agc_driver_multisample_fill_host_only | Metal devices on one GPU share one VkDevice handle | metal-shared-device-handle
 agc_driver_prepared_shaders_abi_deferred_rectangle_pairs | the MSL backend builds rectangle pairs | metal-vulkan-internal-tests
 agc_driver_rect_list_corner | device has no tessellation | metal-vulkan-internal-tests
-agc_driver_multisampled_pass_order | captures Vulkan pipeline barriers | metal-vulkan-internal-tests
