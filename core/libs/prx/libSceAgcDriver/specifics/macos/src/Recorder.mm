@@ -1682,6 +1682,19 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+
+// Whether the Metal debug layer wraps the device's command buffers (MTL_DEBUG_LAYER set and not 0).
+bool DebugLayerCommandBuffers() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MTL_DEBUG_LAYER");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
@@ -1691,6 +1704,15 @@ void Recorder::ensureOpen() {
                 // A completed batch's objects: its allocator was reset and its stream recycled.
                 batch->metal = std::move(metal->spare.back());
                 metal->spare.pop_back();
+                // Under the Metal debug layer a reused MTL4 command buffer keeps the heap usage of its
+                // earlier recordings: the next commit walks heaps freed since (a pooled image heap the
+                // buffer pool evicted, upstream 4513d47104) in HeapUsageTable::processHeapEntry from
+                // -[MTL4GPUDebugCommandBuffer preCommit:] (UI Lab under --validation, at any delay
+                // after the free; fresh command buffers run clean). So there each batch gets a new one.
+                if (DebugLayerCommandBuffers()) {
+                    batch->metal->commandBuffer = [metal->device newCommandBuffer];
+                    if (batch->metal->commandBuffer == nil) Metal::Fail("cannot create a command buffer");
+                }
             } else {
                 batch->metal.reset(new Metal::BatchObjects);
                 batch->metal->allocator = [metal->device newCommandAllocator];
