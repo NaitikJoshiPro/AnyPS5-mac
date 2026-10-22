@@ -350,6 +350,13 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
     NSError* error = nil;
     compiler = [device newCompilerWithDescriptor:compilerDescriptor error:&error];
     if (compiler == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no shader compiler: " + Describe(error));
+    plainCompiler = compiler;
+    if (serializer != nil) {
+        MTL4CompilerDescriptor* plainDescriptor = [MTL4CompilerDescriptor new];
+        plainDescriptor.label = @"aps5 unarchived";
+        plainCompiler = [device newCompilerWithDescriptor:plainDescriptor error:&error];
+        if (plainCompiler == nil) throw std::runtime_error("Metal pipeline cache (work package D5): no shader compiler for unarchived pipelines: " + Describe(error));
+    }
 
     // The library store (D55) and its prewarm thread: one thread at background QoS, so it neither
     // takes the pipeline workers from the guest's draws nor a performance core from the guest.
@@ -715,6 +722,25 @@ id<MTLRenderPipelineState> PipelineCache::obtainRender(const std::function<MTL4P
         }, true);
         if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled %s in %.1f ms\n", what, elapsed);
         requestSave();
+        return pipeline;
+    }
+}
+
+id<MTLRenderPipelineState> PipelineCache::obtainUnarchivedRender(MTL4PipelineDescriptor* descriptor, const char* what) {
+    @autoreleasepool {
+        const auto start = std::chrono::steady_clock::now();
+        const SlowCompileReport report(what, 0u);
+        NSError* error = nil;
+        id<MTLRenderPipelineState> pipeline = [plainCompiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+        if (pipeline == nil) throw std::runtime_error(std::string("Metal device: ") + what + " creation failed: " + Describe(error));
+        const auto elapsed = Milliseconds(start);
+        {
+            std::lock_guard lock(mutex);
+            ++statistics.pipelinesCompiled;
+            ++statistics.pipelinesUnarchived;
+            statistics.compileMilliseconds += elapsed;
+        }
+        if (Profile()) std::fprintf(stderr, "[metal-pipelines] compiled %s (not archived) in %.1f ms\n", what, elapsed);
         return pipeline;
     }
 }
@@ -1105,6 +1131,7 @@ bool PipelineCache::Save(bool waitForPipelines) {
                 // entryList:] on the saver thread; SuperTuxKart at ~50 s, GATE5-STK2).
                 std::lock_guard lock(mutex);
                 for (const auto index : replayed) archived[index].captured = true;
+                if (Profile()) std::fprintf(stderr, "[metal-pipelines] save skipped behind a pipeline creation (%zu replayed, kept for the next save)\n", replays.size());
                 return false;
             }
             stored = [serializer serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:@(temporary.c_str())] error:&failure];

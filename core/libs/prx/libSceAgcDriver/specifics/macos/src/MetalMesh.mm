@@ -1,7 +1,8 @@
 // Mesh render pipelines (B6 stage 5, owner SHD4; MetalMesh.h): a RenderPipelineRequest whose
 // `mesh` is set holds an MSL mesh function in `vertex` and becomes an MTL4MeshRenderPipelineDescriptor
-// (no object function). Mesh pipelines are compiled through the device's MTL4Compiler; the pipeline
-// archive does not serve them yet (TechnicalDebt metal-mesh-functions).
+// (no object function). Mesh pipelines are compiled through a compiler without the archive
+// serializer: the pipeline archive neither serves nor stores them (PipelineCache::
+// obtainUnarchivedRender; TechnicalDebt metal-mesh-functions).
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -58,7 +59,7 @@ MTL4PipelineDescriptor* PipelineCache::meshDescriptor(const RenderPipelineReques
 
 id<MTLRenderPipelineState> PipelineCache::buildMeshRender(const RenderPipelineRequest& request) {
     try {
-        return obtainRender([this, request] { return meshDescriptor(request); }, "a mesh render pipeline");
+        return obtainUnarchivedRender(meshDescriptor(request), "a mesh render pipeline");
     } catch (const std::runtime_error& error) {
         // Name the mesh function's configuration: its output records and the macros the draw set
         // (per-vertex locations, barycentrics, topology) decide its sizes and scalar counts.

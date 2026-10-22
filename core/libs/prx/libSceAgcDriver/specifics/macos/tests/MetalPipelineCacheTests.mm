@@ -12,6 +12,8 @@
 //   agc_metal_pipeline_cache_save_race  archive saves while other threads compile pipelines (the
 //                                       serializer's flush raced in-flight captures: Metal crashed in
 //                                       -[_MTLBinaryArchive newArchiverIdWithBinaryKey:...], ASTRO BOT)
+//   agc_metal_pipeline_cache_mesh       mesh render pipelines are compiled outside the archive (one
+//                                       captured crashed the serializer's flush, SuperTuxKart)
 // The `--pipeline-cache-only` mode of agc_driver_recorder_tests (agc_pipeline_cache) runs the
 // two-cache check in one process (D5RecorderModes.mm).
 #import <Foundation/Foundation.h>
@@ -265,6 +267,77 @@ int SaveRace() {
     return 0;
 }
 
+
+// A mesh render pipeline (no object function); `variant` is a function constant of its mesh function.
+RenderPipelineRequest MeshRequest(std::uint32_t variant) {
+    static const auto mesh = std::make_shared<const ShaderRecompiler::MslShader>(ShaderRecompiler::MslShader{
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "constant uint aps5_fc7 [[function_constant(7)]];\n"
+        "constant float aps5_scale = is_function_constant_defined(aps5_fc7) ? float(aps5_fc7) : 1.0;\n"
+        "struct Vertex { float4 position [[position]]; };\n"
+        "using Mesh = metal::mesh<Vertex, void, 3, 1, topology::triangle>;\n"
+        "[[mesh]] void aps5_main(Mesh output, uint lane [[thread_index_in_threadgroup]]) {\n"
+        "    if (lane < 3u) output.set_vertex(lane, Vertex{float4(float(lane & 1u) * aps5_scale, float(lane >> 1u), 0.0, 1.0)});\n"
+        "    if (lane < 3u) output.set_index(lane, uchar(lane));\n"
+        "    if (lane == 0u) output.set_primitive_count(1u);\n"
+        "}\n",
+        {}});
+    auto request = RenderRequest();
+    request.vertex.shader = mesh;
+    request.vertex.constants = {{7u, variant}};
+    request.mesh = true;
+    request.meshThreads = 32u;
+    request.topology = MTLPrimitiveTopologyClassUnspecified;
+    return request;
+}
+
+// --mesh: mesh render pipelines bypass the archive (a captured mesh pipeline crashed the
+// serializer's flush on macOS 27.0.1, SuperTuxKart, GATE5-STK3). Two caches stand for two runs over
+// one directory: the compute pipeline is archived and found by the second, the mesh pipelines are
+// compiled by both and never make a save due.
+int Mesh() {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil || ![device supportsFamily:MTLGPUFamilyMetal4]) {
+        std::printf("skipped, the machine has no Metal 4 device\n");
+        return 77;
+    }
+    char pattern[] = "/tmp/aps5-pipeline-mesh-XXXXXX";
+    const char* made = mkdtemp(pattern);
+    if (made == nullptr) return Fail("cannot create a temporary directory");
+    const std::filesystem::path directory(made);
+    const auto run = [&](PipelineCacheStatistics& statistics) -> std::string {
+        PipelineCache::ForgetSharedLibraries();
+        PipelineCache cache(device, directory);
+        for (std::uint32_t variant = 1; variant <= 2u; ++variant) {
+            if (cache.Render(MeshRequest(variant)) == nil) return "no mesh pipeline for variant " + std::to_string(variant);
+            cache.Save();
+        }
+        if (cache.Compute(ComputeFunction(3u)) == nil) return "no compute pipeline";
+        cache.Save();
+        statistics = cache.Statistics();
+        return {};
+    };
+    PipelineCacheStatistics first;
+    PipelineCacheStatistics second;
+    auto failure = run(first);
+    if (failure.empty()) failure = run(second);
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    if (!failure.empty()) return Fail(failure);
+    std::printf("first: %llu compiled (%llu unarchived), %llu hits, %llu saves; second: %llu compiled (%llu unarchived), %llu hits, %llu saves\n",
+        static_cast<unsigned long long>(first.pipelinesCompiled), static_cast<unsigned long long>(first.pipelinesUnarchived), static_cast<unsigned long long>(first.archiveHits), static_cast<unsigned long long>(first.archiveSaves),
+        static_cast<unsigned long long>(second.pipelinesCompiled), static_cast<unsigned long long>(second.pipelinesUnarchived), static_cast<unsigned long long>(second.archiveHits), static_cast<unsigned long long>(second.archiveSaves));
+    if (first.pipelinesUnarchived != 2u || second.pipelinesUnarchived != 2u) return Fail("both runs must compile both mesh pipelines outside the archive");
+    if (ShaderValidation()) {
+        std::printf("PASS: agc_metal_pipeline_cache_mesh (archive disabled under shader validation)\n");
+        return 0;
+    }
+    if (first.pipelinesCompiled != 3u || first.archiveSaves != 1u) return Fail("the first run must compile 3 pipelines and save once (for the compute pipeline)");
+    if (second.pipelinesCompiled != 2u || second.archiveHits != 1u || second.archiveSaves != 0u) return Fail("the second run must find the compute pipeline in the archive and save nothing");
+    std::printf("PASS: agc_metal_pipeline_cache_mesh\n");
+    return 0;
+}
 }
 
 int main(int argc, char** argv) {
@@ -276,8 +349,9 @@ int main(int argc, char** argv) {
             if (argc == 3 && std::strcmp(argv[1], "--child-final") == 0) return Extend(true, argv[2]);
             if (argc == 2 && std::strcmp(argv[1], "--background") == 0) return Background();
             if (argc == 2 && std::strcmp(argv[1], "--save-race") == 0) return SaveRace();
+            if (argc == 2 && std::strcmp(argv[1], "--mesh") == 0) return Mesh();
             if (argc == 1) return Parent(argv[0]);
-            return Fail("usage: agc_metal_pipeline_cache_tests [--background | --save-race]");
+            return Fail("usage: agc_metal_pipeline_cache_tests [--background | --save-race | --mesh]");
         } catch (const std::exception& error) {
             return Fail(error.what());
         }

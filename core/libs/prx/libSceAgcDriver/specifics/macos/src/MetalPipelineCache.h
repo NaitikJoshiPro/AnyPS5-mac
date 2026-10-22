@@ -53,6 +53,8 @@ struct PipelineCacheStatistics {
     // Pipelines the compiler built (archive misses) and pipelines served by the persisted archive.
     std::uint64_t pipelinesCompiled = 0;
     std::uint64_t archiveHits = 0;
+    // Of pipelinesCompiled, those the archive never stores (mesh render pipelines).
+    std::uint64_t pipelinesUnarchived = 0;
     // Requests served by a pipeline already in memory (or by a finished background task).
     std::uint64_t memoryHits = 0;
     // Background tasks started by Prepare*, and requests that waited for an unfinished task.
@@ -241,11 +243,18 @@ private:
     void noteArchived(std::function<void(NSArray<id<MTL4Archive>>*)> replay, bool captured);
     id<MTLComputePipelineState> obtainCompute(const std::function<MTL4ComputePipelineDescriptor*()>& describe, const char* what);
     id<MTLRenderPipelineState> obtainRender(const std::function<MTL4PipelineDescriptor*()>& describe, const char* what);
+    // Mesh render pipelines (MetalMesh.mm): compiled by `plainCompiler`, never looked up in nor
+    // captured into the archive. A captured mesh pipeline crashed the serializer's flush on macOS
+    // 27.0.1 (dispatch_retain(NULL) in -[_MTLBinaryArchive materializeAirNTFromOnlineForSlice:
+    // entryList:] on the saver thread; SuperTuxKart at ~40 s, GATE5-STK3).
+    id<MTLRenderPipelineState> obtainUnarchivedRender(MTL4PipelineDescriptor* descriptor, const char* what);
     MTL4PipelineDescriptor* renderDescriptor(const RenderPipelineRequest& request);
     MTL4PipelineDescriptor* meshDescriptor(const RenderPipelineRequest& request);
 
     id<MTLDevice> device = nil;
     id<MTL4Compiler> compiler = nil;
+    // A compiler without the serializer (obtainUnarchivedRender); `compiler` when there is no archive.
+    id<MTL4Compiler> plainCompiler = nil;
     id<MTL4PipelineDataSetSerializer> serializer = nil;
     // The archive generations this cache looks pipelines up in, newest first (empty: none). Every
     // cache of a process loads the same set: the newest generation of the last run together with

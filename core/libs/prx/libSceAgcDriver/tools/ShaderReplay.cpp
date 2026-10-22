@@ -67,6 +67,11 @@ bool Replay(const char* path) {
             std::printf("  mesh: input primitive %u, %u primitives / %u vertices per group, max %u vertices / %u primitives, %u threads, lds %u dwords, provoking %u, ESGS item %u\n", mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize);
         }
     }
+    if (request.request.context.pixel.has_value()) {
+        const auto& pixel = *request.request.context.pixel;
+        std::printf("  pixel: %u interpolators, input addr 0x%x, wave32 %d\n", pixel.interpolatorCount, pixel.inputAddr, pixel.wave32);
+        for (std::uint32_t i = 0; i < pixel.interpolatorCount && i < pixel.interpolatorSettings.size(); ++i) std::printf("  SPI_PS_INPUT_CNTL_%u = 0x%08x\n", i, pixel.interpolatorSettings[i]);
+    }
     if (g_memory) {
         // --mem: the captured inputs. User data words are printed; each memory region is written to
         // mem_<code address>_<guest address>.bin next to the request for inspection with other tools.
