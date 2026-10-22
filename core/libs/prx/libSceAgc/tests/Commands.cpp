@@ -57,6 +57,8 @@ extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, cons
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexIndirectArgs(CommandBuffer* buf, std::uint64_t attributeAddress, std::uint32_t attributeIndex);
+extern "C" std::uint32_t APS5_VABI sceAgcDcbSetIndexIndirectArgsGetSize();
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* buf, std::uint32_t shaderType, const volatile void* indirectBaseAddr);
 extern "C" std::uint32_t* APS5_VABI sceAgcSetNop(CommandBuffer* buf, std::uint32_t sizeDw);
 extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
@@ -334,6 +336,20 @@ void testIndexBuffer() {
     throw std::runtime_error("misaligned index buffer was accepted");
 }
 
+void testIndexIndirectArgs() {
+    Storage storage;
+    const auto* packet = sceAgcDcbSetIndexIndirectArgs(&storage.buffer, 0x1111111122222220u, 0x4444u);
+    const std::array<std::uint32_t, 4> expected{0xc0029100u, 0x22222220u, 0x11111111u, 0x4444u};
+    check(packet == storage.words.data() && std::equal(expected.begin(), expected.end(), packet), "index indirect args packet differs from the console's");
+    check(sceAgcDcbSetIndexIndirectArgsGetSize() == expected.size() * sizeof(std::uint32_t), "index indirect args size differs from its packet");
+    const auto* cleared = sceAgcDcbSetIndexIndirectArgs(&storage.buffer, 0, 0);
+    check(cleared == packet + expected.size() && cleared[0] == expected[0] && cleared[1] == 0 && cleared[2] == 0 && cleared[3] == 0, "null index attribute base was not written as 0");
+    const auto before = storage.words;
+    expectFailure([&] { sceAgcDcbSetIndexIndirectArgs(&storage.buffer, 0x1111111122222228u, 0); });
+    expectFailure([&] { sceAgcDcbSetIndexIndirectArgs(&storage.buffer, 0x1111111122222220u, 0x10000u); });
+    check(storage.words == before && storage.buffer.cursor_up == cleared + expected.size(), "rejected index indirect args modified the buffer");
+}
+
 void testIndirectBase() {
     Storage storage;
     alignas(8) std::uint32_t arguments[4]{};
@@ -483,8 +499,14 @@ void testRegisterRange() {
     check(packet == storage.words.data() + 6 && storage.buffer.cursor_up == storage.words.data() + 12, "incorrect populated register range allocation");
     check(storage.words == expected, "register values were not copied correctly");
     const auto* misaligned = reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const unsigned char*>(values.data()) + 1);
-    expectFailure([&] { sceAgcCbSetShRegisterRangeDirect(&storage.buffer, 0x8c, misaligned, 4); });
-    check(storage.words == expected && storage.buffer.cursor_up == storage.words.data() + 12, "misaligned register values modified command buffer");
+    packet = sceAgcCbSetShRegisterRangeDirect(&storage.buffer, 0x8c, misaligned, 3);
+    expected[12] = 0xc0037600u;
+    expected[13] = 0x8c;
+    expected[14] = 0x02000000u;
+    expected[15] = 0x03000000u;
+    expected[16] = 0x04000000u;
+    check(packet == storage.words.data() + 12 && storage.buffer.cursor_up == storage.words.data() + 17, "incorrect misaligned register range allocation");
+    check(storage.words == expected, "misaligned register values were not read byte for byte");
 }
 
 void testPacketPayloadAddress() {
@@ -855,6 +877,7 @@ int main(int argc, char** argv) {
         testWorkloads();
         testWorkloadStreams();
         testIndexBuffer();
+        testIndexIndirectArgs();
         testIndirectBase();
         testContextState();
         testFlip();

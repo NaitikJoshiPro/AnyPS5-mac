@@ -9,6 +9,12 @@
 //   DECISIONS D24) and the tessellator core bounds the factors by it (MslTessellatorCore.inc: 63 for fractional_odd,
 //   64 otherwise, D26). The twin links the draw's stages for the patch draw's configuration and checks that call
 //   and that bound instead. Every draw and pixel check after them is upstream's.
+// Upstream f95471ec6a (a domain program reading control points at a computed index) and 8b8219dcef (registered merged
+// hull programs, binary type 3: refusals, two merged draws and the registered merged stages) run as upstream.
+// RequireMergedHullWithoutSubgroups reads OpCapability GroupNonUniform in the SPIR-V hull: upstream runs a merged hull
+// at one lane per invocation so a device whose tessellation stages lack subgroup operations (lavapipe) takes it. A
+// Metal hull is a function of the linked mesh function (D24), where SIMD-group functions always exist, so the twin
+// requires that the merged hull compiles to MSL and links into the patch draw's mesh function instead.
 
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -25,9 +31,11 @@
 #define RequireIntegerPartitioning UpstreamRequireIntegerPartitioning
 #define RequireFractionalEvenPartitioning UpstreamRequireFractionalEvenPartitioning
 #define RequireSingleControlPointHulls UpstreamRequireSingleControlPointHulls
+#define RequireMergedHullWithoutSubgroups UpstreamRequireMergedHullWithoutSubgroups
 #define main AgcDriverTessellationVulkanMain
 #include "../../../tests/execution/Tessellation.cpp"
 #undef main
+#undef RequireMergedHullWithoutSubgroups
 #undef RequireSingleControlPointHulls
 #undef RequireFractionalEvenPartitioning
 #undef RequireIntegerPartitioning
@@ -70,6 +78,21 @@ void RequireCompareBranches(const ShaderRecompiler::SpirvTarget& target) {
 void RequireSingleControlPointHulls(const ShaderRecompiler::SpirvTarget& target) {
     Require(Compiled(CompileHull(target, HullSingleInput, {1u, 3u, 1u, 2u, 2u})), "a hull that reads only the one input control point of its patch was not compiled");
     Require(Compiled(CompileHull(target, HullSingleOutput, {1u, 1u, 1u, 2u, 2u})), "a hull with one output control point and unguarded patch outputs was not compiled");
+}
+
+// Upstream 8b8219dcef's RequireMergedHullWithoutSubgroups on Metal (see the header): the merged hull compiles to MSL and
+// links with the local and domain parts into the patch draw's mesh function.
+void RequireMergedHullWithoutSubgroups(const ShaderRecompiler::SpirvTarget& target) {
+    std::uint32_t cursor = 0;
+    const Stages stages{
+        Compile(target, ShaderStage::Local, MergedHullCode, cursor, MergedTriangles),
+        Compile(target, ShaderStage::TessellationControl, MergedHullCode, cursor, MergedTriangles),
+        Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor, MergedTriangles),
+        Compile(target, ShaderStage::Fragment, PixelCode, cursor, MergedTriangles),
+    };
+    Require(Compiled(stages.hull), "the hull stage of a merged hull program was not compiled to MSL");
+    const auto linked = ShaderRecompiler::LinkMslTessellation(TwinProgram(stages.local), TwinProgram(stages.hull), TwinProgram(stages.domain), MergedTriangles.configuration);
+    Require(!linked.mesh.source.empty(), "the merged hull program did not link into a tessellation mesh function");
 }
 
 // Upstream's RequireLevelClamps, RequireIntegerPartitioning and RequireFractionalEvenPartitioning with their
@@ -148,9 +171,18 @@ int main() {
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
         RequirePatches(*device, target, HullNextInput, "hull program reading the next of 4 input control points of 24 bytes", NextInputTriangles, LocalCodeStride24);
         RequirePatches(*device, target, HullDynamicIndex, "hull program reading a control point at a computed index");
+        RequirePatches(*device, target, HullCode, "domain program reading control points at a computed index", Triangles, LocalCode, DomainComputedPoint);
         RequirePatches(*device, target, HullAndSaveexec, "hull program narrowing exec with s_and_saveexec_b64");
         RequirePatches(*device, target, HullSaveexecLoop, "hull program restoring exec through loop phis");
         RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 128-patch groups", {{3u, 3u, 1u, 2u, 2u, 128u}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationControl, MergedHullCode, "more input than output control points", {{4u, 3u, 1u, 2u, 2u, 256u, 0u, false, 0u, false, true}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationControl, MergedHullForeignRecord, "outside its own control point's record", MergedTriangles);
+        ExpectRefusal(target, ShaderStage::TessellationControl, MergedHullDivergentBarrier, "s_barrier that some invocations do not reach", MergedTriangles);
+        ExpectRefusal(target, ShaderStage::TessellationControl, MergedHullOutsidePatch, "reads LDS outside its patch's control point records", MergedTriangles);
+        ExpectRefusal(target, ShaderStage::TessellationControl, MergedHullReadLane, "another lane's register", MergedTriangles);
+        RequireMergedHullWithoutSubgroups(target);
+        RequirePatches(*device, target, MergedHullCode, "merged hull program", MergedTriangles, MergedHullCode);
+        RequirePatches(*device, target, MergedHullRegisters, "merged hull program storing its local part's registers", MergedTriangles, MergedHullRegisters);
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireIntegerPartitioning(*device, target);
@@ -162,6 +194,7 @@ int main() {
         RequireHullBdaReads(*device, target);
         RequireCompareBranches(target);
         device.reset();
+        RequireRegisteredMergedStages();
         RequireRegisteredStages();
         std::puts("Tessellation tests passed");
         return 0;

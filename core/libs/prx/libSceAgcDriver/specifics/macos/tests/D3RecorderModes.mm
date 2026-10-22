@@ -584,6 +584,81 @@ void settledBaselineTests(const Device& device, Recorder& recorder) {
     std::cout << "generation baseline over a pending store: ok\n";
 }
 
+// db3af40970 (--idle-publish-wait-only): the idle flush waits for its unit-shadow publish before returning, so a CPU
+// store made after it survives; a label flush's publish stays recorded. Upstream's check unchanged over Metal buffers.
+void idlePublishWaitTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 8 * unit;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the idle publish test block refused or not watched: idle publish wait not tested\n";
+        return;
+    }
+    recorder.Sync();
+    CollectWritesUncached(address, bytes);
+    auto* words = static_cast<std::uint8_t*>(block);
+    const auto copyBuffer = Metal::Vk::CmdCopyBuffer;
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value) {
+        auto destination = ShadowDestinationFor(context, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole-unit retile piece has no destination");
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, destination->offset, unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+        Require(AnyShadowedOverlaps(begin, unit), "the retiled unit is not shadowed");
+    };
+    retile(address + 2 * unit, 0x22);
+    retile(address + 3 * unit, 0x33);
+    StorageTexture::FlushAllPending("idle");
+    Require(!AnyShadowedOverlaps(address + 2 * unit, static_cast<std::size_t>(2 * unit)), "the idle flush did not publish the shadowed units");
+    Require(!recorder.PendingWriteOverlaps(address + 2 * unit, static_cast<std::size_t>(2 * unit)), "the idle flush returned before its publish's copies completed");
+    words[2 * unit] = 0x44;
+    words[4 * unit - 1] = 0x45;
+    recorder.Sync();
+    Require(words[2 * unit] == 0x44 && words[4 * unit - 1] == 0x45, "a CPU store made after the idle flush returned was overwritten by its publish");
+    Require(words[2 * unit + 1] == 0x22 && words[3 * unit - 1] == 0x22 && words[3 * unit] == 0x33 && words[1 * unit] == 0x11 && words[4 * unit] == 0x11, "the idle publish's bytes are wrong");
+    retile(address + 5 * unit, 0x55);
+    StorageTexture::FlushAllPending("label");
+    Require(recorder.PendingWriteOverlaps(address + 5 * unit, unit), "a publish of a flush other than the idle one was waited");
+    recorder.Sync();
+    Require(words[5 * unit] == 0x55 && words[6 * unit - 1] == 0x55, "the label flush's publish did not land");
+    std::cout << "idle publish wait verified\n";
+}
+
 template <typename Test>
 int Run(Test test, bool unlocked = false, bool shadows = false) {
     @autoreleasepool {
@@ -613,6 +688,7 @@ const bool registered = [] {
     AgcDriver::MetalTwins::RegisterRecorderMode("--settled-baseline-only", [] { return Run(settledBaselineTests); });
     AgcDriver::MetalTwins::RegisterRecorderMode("--host-import-unmap-only", [] { return Run(hostImportUnmapTests, true); });
     AgcDriver::MetalTwins::RegisterRecorderMode("--unit-shadow-only", [] { return Run(unitShadowTests, false, true); });
+    AgcDriver::MetalTwins::RegisterRecorderMode("--idle-publish-wait-only", [] { return Run(idlePublishWaitTests, false, true); });
     return true;
 }();
 

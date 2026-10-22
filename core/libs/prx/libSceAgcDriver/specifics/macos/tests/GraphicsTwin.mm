@@ -24,9 +24,15 @@
 // runs upstream's multisampleDccStateTests as it is (State decoding and the draw precheck); --descriptor-cache
 // (agc_descriptor_cache) runs the Metal twin of descriptorCacheTests; --pipeline-journal (agc_pipeline_journal),
 // --pipeline-library-clear-waits-for-build and --pipeline-store-lazy-buffer-pool skip as Vulkan-only (the VkPipeline
-// journal, library part builds and store of Graphics/src/Pipeline*.cpp, which the Metal draw path does not use).
-// Of upstream's 119 checks (the 117 of Checks() plus RunBdaResourceTests and RunTextureDetilerTests), 103 run on
-// Metal, 6 of them through Metal twins; 16 are listed in VulkanOnly.
+// journal, library part builds and store of Graphics/src/Pipeline*.cpp, which the Metal draw path does not use);
+// so do --pipeline-journal-long-paths and --pipeline-journal-extended-paths (upstream 61fa2d2221); --unused-viewport-depth
+// (agc_driver_unused_viewport_depth) and --depth-bounds-state (agc_driver_depth_bounds_state) run upstream's checks as
+// they are (State decoding and the depth remap); --sample-order (agc_driver_sample_order_planning) runs the Metal twin
+// of sampleOrderTests; --sample-location-grid-fallback and --command-batch-fence-failure skip as Vulkan-only
+// (VK_EXT_sample_locations grids, VkFence creation); --copy-input-kept-bytes, --depth-copy-kept-bytes and the
+// --heap-mirror-* modes skip with their Metal twins not written (TechnicalDebt metal-graphics-twin-pending-modes).
+// Of upstream's 135 checks (the 133 of Checks() plus RunBdaResourceTests and RunTextureDetilerTests), 116 run on
+// Metal, 8 of them through Metal twins; 19 are listed in VulkanOnly.
 
 #define main AgcDriverGraphicsVulkanMain
 #include "../../../tests/Graphics.cpp"
@@ -112,14 +118,18 @@ std::vector<Check> Checks() {
         {"retainedPixelStageTests", retainedPixelStageTests},
         {"pipelineLibrarySetTests", pipelineLibrarySetTests},
         {"pipelineLibraryClearWaitsForBuildTests", pipelineLibraryClearWaitsForBuildTests},
+        {"framebufferOwnerTests", framebufferOwnerTests},
         {"hdrComponentSwapTests", hdrComponentSwapTests},
         {"depthMaintenanceTests", depthMaintenanceTests},
         {"hardwareScreenOffsetTests", hardwareScreenOffsetTests},
         {"srgb8TargetTests", srgb8TargetTests},
         {"DepthClipTests", DepthClipTests},
+        {"DepthRemapTests", DepthRemapTests},
+        {"UnusedViewportDepthTests", UnusedViewportDepthTests},
         {"DepthStencilTests", DepthStencilTests},
         {"OneDimensionalColorTests", OneDimensionalColorTests},
         {"htileDepthClearTests", htileDepthClearTests},
+        {"multisampledSingleClearTests", multisampledSingleClearTests},
         {"memoryValueFillTests", memoryValueFillTests},
         {"ZExportTests", ZExportTests},
         {"unorm10_11_11TargetTests", unorm10_11_11TargetTests},
@@ -132,6 +142,7 @@ std::vector<Check> Checks() {
         {"stencilReferenceUnusedTests", stencilReferenceUnusedTests},
         {"aliasedBufferViewTests", aliasedBufferViewTests},
         {"LineStripTests", LineStripTests},
+        {"ShaderModuleKeyTests", ShaderModuleKeyTests},
         {"ProvokingVertexTests", ProvokingVertexTests},
         {"ProvokingVertexRenderPassTests", ProvokingVertexRenderPassTests},
         {"ConservativeRasterizationTests", ConservativeRasterizationTests},
@@ -149,18 +160,25 @@ std::vector<Check> Checks() {
         {"DualSourceBlendTests", DualSourceBlendTests},
         {"ReversedBlendShaderTests", ReversedBlendShaderTests},
         {"metadataPassTests", metadataPassTests},
+        {"depthCopyPassTests", depthCopyPassTests},
         {"cmaskTests", cmaskTests},
         {"uint16ExportTests", uint16ExportTests},
+        {"uint8x2TargetTests", uint8x2TargetTests},
         {"uint8x4TargetTests", uint8x4TargetTests},
+        {"msaaEnableClearDepthTests", msaaEnableClearDepthTests},
         {"multisampleTests", multisampleTests},
         {"MsaaEnableSingleSampleTests", MsaaEnableSingleSampleTests},
         {"multisampledDepthTests", multisampledDepthTests},
         {"clipDistanceTests", clipDistanceTests},
         {"framebufferLayerTests", framebufferLayerTests},
+        {"msaaEnableClearOneSampleTargetTests", msaaEnableClearOneSampleTargetTests},
         {"UnwrittenSampleLocationTests", UnwrittenSampleLocationTests},
+        {"sampleLocationGridFallbackTests", sampleLocationGridFallbackTests},
+        {"sampleOrderTests", sampleOrderTests},
         {"depthCopyFormatTests", depthCopyFormatTests},
         {"quadPixelMaskTests", quadPixelMaskTests},
         {"ShaderStageTests", ShaderStageTests},
+        {"UnsupportedTessellationFieldTests", UnsupportedTessellationFieldTests},
         {"NggVertexWorkgroupTests", NggVertexWorkgroupTests},
         {"inactiveVertexPointSizeTests", inactiveVertexPointSizeTests},
         {"PolygonPrimitiveTests", PolygonPrimitiveTests},
@@ -187,8 +205,10 @@ std::vector<Check> Checks() {
         {"imageTableSnapshotAllocationTests", imageTableSnapshotAllocationTests},
         {"samplerTableNonSeamlessCubeTests", samplerTableNonSeamlessCubeTests},
         {"samplerTableDeviceLimitTests", [] { samplerTableDeviceLimitTests(); }},
+        {"tableUpdateAfterBindTests", tableUpdateAfterBindTests},
         {"misalignedShaderDataTests", misalignedShaderDataTests},
         {"debugBranchTests", debugBranchTests},
+        {"hostImportBudgetTests", hostImportBudgetTests},
         {"textureCacheBudgetTests", textureCacheBudgetTests},
         {"sampledTextureBudgetTests", sampledTextureBudgetTests},
         {"storageTextureBudgetTests", storageTextureBudgetTests},
@@ -203,10 +223,12 @@ std::vector<Check> Checks() {
         {"storeAtLabelTests", storeAtLabelTests},
         {"nullVertexDescriptorTests", nullVertexDescriptorTests},
         {"vertexZeroFillTests", vertexZeroFillTests},
+        {"vertexOverhangTests", vertexOverhangTests},
         {"vertexZeroFillMergeTests", vertexZeroFillMergeTests},
         {"parallelCompareTests", parallelCompareTests},
         {"pixelParameterSlotTests", pixelParameterSlotTests},
         {"rectListTests", rectListTests},
+        {"quadListTests", quadListTests},
         {"floatControlsModeTests", floatControlsModeTests},
         {"barycentricEmulationTests", barycentricEmulationTests},
         {"copiedWriterIndirectOverlapTests", copiedWriterIndirectOverlapTests},
@@ -742,6 +764,16 @@ const std::vector<SkippedMode> SkippedModes{
     {"--sampler-table-anisotropy", "skipped, the Metal twin of --sampler-table-anisotropy (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
     {"--sampler-table-reduction-compare", "skipped, the Metal twin of --sampler-table-reduction-compare (samplerTableDeviceLimitTests) is not written: it checks vkCreateSampler limits on MockVulkan, while Metal's sampler tables are MslAbi v15 MTLResourceID arrays (ImageTable* execution tests)"},
     {"--pipeline-journal", "skipped, the Metal device keeps no pipeline journal: upstream's journal (Graphics/src/PipelineJournal.cpp) records the VkPipelines a run builds and replays them through Graphics::CachedPipeline and VulkanDevice's compute hook, which the Metal driver does not run; the MTL4Archive of PipelineCache.mm persists every Metal pipeline and its prewarm thread rebuilds them at startup (TechnicalDebt metal-pipeline-journal)"},
+    {"--pipeline-journal-long-paths", "skipped, the Metal device keeps no pipeline journal: upstream's long and external journal paths (61fa2d2221) are paths of Graphics/src/PipelineJournal.cpp, which the Metal driver does not run; the MTL4Archive of PipelineCache.mm persists every Metal pipeline (TechnicalDebt metal-pipeline-journal)"},
+    {"--pipeline-journal-extended-paths", "skipped, the Metal device keeps no pipeline journal: upstream's long and external journal paths (61fa2d2221) are paths of Graphics/src/PipelineJournal.cpp, which the Metal driver does not run; the MTL4Archive of PipelineCache.mm persists every Metal pipeline (TechnicalDebt metal-pipeline-journal)"},
+    {"--sample-location-grid-fallback", "skipped, sampleLocationGridFallbackTests is Vulkan-only: it checks the VK_EXT_sample_locations grid a VkPipeline and a render pass take on MockVulkan; Metal's setSamplePositions sets one pixel's positions and MetalDraw.mm draws pixel (0,0)'s as the stand-in (TechnicalDebt metal-sample-location-grid)"},
+    {"--command-batch-fence-failure", "skipped, commandBatchFenceFailureTests is Vulkan-only: it injects vkCreateFence and vkBeginCommandBuffer failures into a CommandBatch on MockVulkan; a Metal CommandBatch records MTL4 command buffers and creates no VkFence, as agc_command_batch_failure skips for the same reason (TechnicalDebt metal-vulkan-internal-tests)"},
+    {"--copy-input-kept-bytes", "skipped, the Metal twin of --copy-input-kept-bytes (copyInputKeptBytesTests) is not written: it counts the GPU copies and fence waits of misaligned host-import input snapshots on MockVulkan (TechnicalDebt metal-graphics-twin-pending-modes)"},
+    {"--depth-copy-kept-bytes", "skipped, the Metal twin of --depth-copy-kept-bytes (depthCopyKeptBytesTests) is not written: it counts the kept bytes of detiled depth copies through MockVulkan's copy records (TechnicalDebt metal-graphics-twin-pending-modes)"},
+    {"--heap-mirror-unwatch", "skipped, the Metal twin of --heap-mirror-unwatch (RunHeapMirrorUnwatchTests) is not written: it reads the bytes a BDA range's device address serves, which needs a Metal gpuAddress-to-contents lookup (TechnicalDebt metal-graphics-twin-pending-modes)"},
+    {"--heap-mirror-unwatched-import", "skipped, the Metal twin of --heap-mirror-unwatched-import (RunHeapMirrorUnwatchTests through an import) is not written: it reads the bytes a BDA range's device address serves, which needs a Metal gpuAddress-to-contents lookup (TechnicalDebt metal-graphics-twin-pending-modes)"},
+    {"--sparse-heap-mirror-unwatch", "skipped, the Metal twin of --sparse-heap-mirror-unwatch (RunSparseHeapMirrorUnwatchTests) is not written: it reads the bytes a BDA range's device address serves, which needs a Metal gpuAddress-to-contents lookup (TechnicalDebt metal-graphics-twin-pending-modes)"},
+    {"--heap-mirror-run-unwatch", "skipped, the Metal twin of --heap-mirror-run-unwatch (RunHeapMirrorRunUnwatchTests) is not written: it reads the bytes a BDA range's device address serves, which needs a Metal gpuAddress-to-contents lookup (TechnicalDebt metal-graphics-twin-pending-modes)"},
     {"--pipeline-library-clear-waits-for-build", "skipped, graphics pipeline libraries are unavailable on Metal: pipelineLibraryClearWaitsForBuildTests checks that ClearCachedPipelines waits for a VkPipeline library part build on MockVulkan, while Metal builds whole render pipelines (TechnicalDebt metal-graphics-pipeline-libraries)"},
     {"--pipeline-store-lazy-buffer-pool", "skipped, the device has no Vulkan pipeline store: pipelineStoreLazyBufferPoolTests checks that the VkPipeline store of Graphics/src/Pipeline.cpp keeps its entries when the device's BufferPool is created lazily; Metal pipelines are cached per MTLDevice by PipelineCache.mm and never keyed by the buffer pool (TechnicalDebt metal-vulkan-internal-tests)"},
 };
@@ -797,6 +829,237 @@ void MetalEarlyFragmentTestsTests() {
     }
 }
 
+// sampleOrderTests on Metal (upstream 57ceb9e370, 2b4db6a3a2, f8e8dc6f67, d9bd0f9b4d, 3d2d8e5305, e030401916): upstream's
+// checks without its two MockVulkan sections, the reordering VkPipeline's sample locations and static sample masks
+// (sampleOrderProc) and RecordSampleOrder's depth swap transitions (depthOrderProc). They run as upstream: the guest
+// order decode (SameSetSampleOrder, InvertSampleOrder, HostSampleBits), the order shaders' constant indexing, the
+// host planning of SampleOrder.cpp over a Context's capabilities (HostSampleLocationsFor, SampleOrderRefusal,
+// PlanSampleOrder), the sample mask moved to the pixel shader and ValidateSampleMask, and the pixel shader's key and
+// serialized request. The Metal draw names no order and draws the stand-in (TechnicalDebt metal-sample-order,
+// metal-sample-order-targets), so the dropped sections have no Metal counterpart yet.
+void MetalSampleOrderTests() {
+    using namespace AgcDriver::Graphics;
+    auto queue = makeState();
+    queue.context[0x2f8] = 0x00100001;
+    queue.context[0x292] = 3;
+    queue.context[0x3b8] = 0x0dc00000u;
+    queue.context[0x31d] = 0x9000;
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    const auto decode = [&](std::array<std::uint32_t, 4> words) {
+        for (std::uint32_t pixel = 0; pixel < 4; ++pixel) queue.context[0x2fe + pixel * 4u] = words[pixel];
+        return DecodeState(queue);
+    };
+    const auto village = decode({0x0c04u, 0x0c04u, 0x040cu, 0x040cu});
+    const auto residentEvil4 = decode({0x040cu, 0x040cu, 0x0c04u, 0x0c04u});
+    const auto uniform = decode({0x0c04u, 0x0c04u, 0x0c04u, 0x0c04u});
+    const auto moved = decode({0x0c04u, 0x0c04u, 0x040bu, 0x040bu});
+    const SampleOrder rowSwap{KeptSampleOrder, KeptSampleOrder, 0x76543201u, 0x76543201u};
+    Require(SameSetSampleOrder(village) == rowSwap, "the 2x checkerboard (PPSA01556) did not reorder only its odd rows' two samples");
+    Require(SameSetSampleOrder(residentEvil4) == rowSwap, "the 2x checkerboard with its rows swapped (PPSA07411) did not reorder only its odd rows' two samples");
+    Require(!SameSetSampleOrder(uniform) && !SameSetSampleOrder(moved), "a uniform pattern or one whose odd rows hold other positions was taken as a reordering of one set");
+    State four{};
+    four.samples = 4;
+    four.customSampleLocations = true;
+    four.sampleLocationGrid = true;
+    const std::array<std::uint8_t, 4> positions{0x2eu, 0xe6u, 0x2au, 0x62u};
+    const std::array<std::array<std::uint32_t, 4>, 4> placed{{{0, 1, 2, 3}, {1, 0, 3, 2}, {2, 3, 1, 0}, {3, 2, 0, 1}}};
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        for (std::uint32_t sample = 0; sample < 4; ++sample) four.sampleLocations[pixel * 8u + placed[pixel][sample]] = positions[sample];
+    }
+    const SampleOrder fourOrder{KeptSampleOrder, 0x76542301u, 0x76540132u, 0x76541023u};
+    Require(SameSetSampleOrder(four) == fourOrder, "a 4x pattern whose pixels hold one set of positions in four orders did not give each pixel its order");
+    Require(InvertSampleOrder(0x76543201u) == 0x76543201u && InvertSampleOrder(0x76540132u) == 0x76541023u && InvertSampleOrder(KeptSampleOrder) == KeptSampleOrder, "inverting a sample order did not undo it");
+    Require(HostSampleBits(0x1u, 0x76543201u) == 0x2u && HostSampleBits(0x1u, 0x76540132u) == 0x8u && HostSampleBits(0xffffffffu, 0x76540132u) == 0xffffffffu, "a guest sample mask did not move to the host samples at its guest samples' locations");
+    Require(ReordersSamples(rowSwap) && !ReordersSamples(SampleOrder{}) && !ReordersSamples(SampleOrder{KeptSampleOrder, KeptSampleOrder, KeptSampleOrder, KeptSampleOrder}), "a sample order that keeps every index counted as a reordering");
+    Require(!HostsSampleLocationGrid({0, 0}) && !HostsSampleLocationGrid({1, 1}) && !HostsSampleLocationGrid({2, 1}) && !HostsSampleLocationGrid({3, 2}) && HostsSampleLocationGrid({2, 2}) && HostsSampleLocationGrid({4, 2}), "a device's largest sample location grid was taken for one that holds a 2x2 grid, or not, wrongly");
+    std::size_t module = 0;
+    for (const auto code : SampleOrderShaderModules()) {
+        const auto varying = varyingIndex(code);
+        Require(varying.empty(), "sample order shader " + std::to_string(module) + " picks a pixel's order word or a held sample through " + varying);
+        ++module;
+    }
+
+    const auto capable = [] {
+        auto context = mockContext();
+        context.physical = makeHandle<VkPhysicalDevice>();
+        context.device = makeHandle<VkDevice>();
+        context.deviceProc = sampleOrderProc;
+        context.imageFormatProperties = sampleOrderImageProperties;
+        context.formatProperties = sampleOrderFormatProperties;
+        context.sampleLocationSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        context.sampleLocationGridSampleCounts = 0;
+        context.storageImageMultisample = true;
+        context.sampleRateShading = true;
+        context.shaderStencilExport = true;
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        context.limits.framebufferDepthSampleCounts = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        context.limits.framebufferColorSampleCounts = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        context.limits.maxColorAttachments = 8;
+        context.limits.maxFramebufferWidth = 64;
+        context.limits.maxFramebufferHeight = 64;
+        context.limits.maxFramebufferLayers = 1;
+        return context;
+    };
+    const auto attached = [](const State& decoded, VkFormat depthFormat, bool stencil) {
+        State state = decoded;
+        ColorTarget color{};
+        color.address = 0x100000u;
+        color.extent = {64, 64};
+        color.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        color.elementBytes = 8;
+        color.samples = state.samples;
+        state.colors = {color};
+        state.color = color;
+        state.hasColorTarget = true;
+        VkPipelineColorBlendAttachmentState blend{};
+        blend.colorWriteMask = 0xf;
+        state.blends = {blend};
+        state.renderExtent = {64, 64};
+        if (depthFormat != VK_FORMAT_UNDEFINED) {
+            state.depth = DepthTarget{0x200000u, stencil ? 0x300000u : 0u, {64, 64}, depthFormat, 1.0f, 0};
+            state.depth->samples = state.samples;
+        }
+        return state;
+    };
+    const auto withStencil = attached(village, VK_FORMAT_D32_SFLOAT_S8_UINT, true);
+    {
+        const auto context = capable();
+        const auto host = HostSampleLocationsFor(context, withStencil);
+        Require(host.grid.width == 1 && host.grid.height == 1 && host.order == rowSwap, "a 2x checkerboard on a device without a 2x2 grid that can reorder samples did not take the stand-in with its odd rows reordered");
+        auto gridded = context;
+        gridded.sampleLocationGridSampleCounts = VK_SAMPLE_COUNT_2_BIT;
+        const auto native = HostSampleLocationsFor(gridded, withStencil);
+        Require(native.grid.width == 2 && native.grid.height == 2 && !ReordersSamples(native.order), "a 2x checkerboard on a device with a 2x2 grid was reordered");
+        Require(!ReordersSamples(HostSampleLocationsFor(context, attached(uniform, VK_FORMAT_D32_SFLOAT, false)).order) && !ReordersSamples(HostSampleLocationsFor(context, attached(moved, VK_FORMAT_D32_SFLOAT, false)).order), "a uniform pattern, or one whose pixels hold other positions, was reordered");
+        const auto refused = [&](Context device, const State& state, std::string_view reason, const std::string& what) {
+            Require(!ReordersSamples(HostSampleLocationsFor(device, state).order), what + " was reordered");
+            Require(SampleOrderRefusal(device, state).find(reason) != std::string::npos, what + " was not refused for " + std::string(reason) + ": " + SampleOrderRefusal(device, state));
+        };
+        auto noStorage = context;
+        noStorage.storageImageMultisample = false;
+        auto depthOnly = withStencil;
+        depthOnly.colors.clear();
+        depthOnly.blends.clear();
+        depthOnly.hasColorTarget = false;
+        Require(ReordersSamples(HostSampleLocationsFor(context, depthOnly).order), "a depth-only pass on a device with multisampled storage images was not reordered");
+        refused(noStorage, depthOnly, "lacks shaderStorageImageMultisample", "a depth-only pass on a device without multisampled storage images");
+        Require(HostSampleLocationsFor(noStorage, depthOnly).order == HostSampleLocationsFor(noStorage, withStencil).order, "a depth-only pass and a color pass on one depth target took different sample orders on a device without multisampled storage images");
+        refused(noStorage, withStencil, "lacks shaderStorageImageMultisample", "a color target on a device without multisampled storage images");
+        auto noSampleShading = context;
+        noSampleShading.sampleRateShading = false;
+        refused(noSampleShading, withStencil, "sampleRateShading", "a device without sample-rate shading");
+        orderStorageCounts = VK_SAMPLE_COUNT_4_BIT;
+        refused(context, withStencil, "has no storage view at 2 samples", "a color format without 2x storage");
+        orderStorageCounts = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        auto twentyFour = context;
+        twentyFour.physical = makeHandle<VkPhysicalDevice>();
+        orderSixteenBitStencil = false;
+        refused(twentyFour, attached(village, VK_FORMAT_D16_UNORM_S8_UINT, true), "is not written back exactly", "16-bit depth with stencil kept as 24-bit depth");
+        orderSixteenBitStencil = true;
+        auto sixteen = context;
+        sixteen.physical = makeHandle<VkPhysicalDevice>();
+        Require(ReordersSamples(HostSampleLocationsFor(sixteen, attached(village, VK_FORMAT_D16_UNORM_S8_UINT, true)).order), "16-bit depth with stencil kept as 16-bit depth was not reordered");
+
+        using Method = SampleOrderMethod;
+        const auto steps = [](const std::vector<SampleOrderStep>& plan, std::initializer_list<SampleOrderStep> expected, const std::string& what) {
+            Require(plan.size() == expected.size(), what + " planned " + std::to_string(plan.size()) + " attachments");
+            std::size_t index = 0;
+            for (const auto& step : expected) {
+                const auto& planned = plan[index++];
+                Require(planned.attachment == step.attachment && planned.method == step.method && planned.toHost == step.toHost && planned.toGuest == step.toGuest, what + " planned attachment " + std::to_string(planned.attachment) + " differently");
+            }
+        };
+        steps(PlanSampleOrder(context, withStencil, rowSwap), {{0, Method::Storage, true, true}, {1, Method::DepthStencilExport, true, true}}, "a color and depth-stencil pass with stencil export");
+        auto noExport = context;
+        noExport.shaderStencilExport = false;
+        steps(PlanSampleOrder(noExport, withStencil, rowSwap), {{0, Method::Storage, true, true}, {1, Method::DepthStencilBits, true, true}}, "a color and depth-stencil pass without stencil export");
+        steps(PlanSampleOrder(context, attached(village, VK_FORMAT_D32_SFLOAT, false), rowSwap), {{0, Method::Storage, true, true}, {1, Method::Depth, true, true}}, "a color and depth pass");
+        steps(PlanSampleOrder(context, attached(village, VK_FORMAT_D32_SFLOAT_S8_UINT, false), rowSwap), {{0, Method::Storage, true, true}, {1, Method::Depth, true, true}}, "a depth target whose host format has stencil but the guest's has none");
+        steps(PlanSampleOrder(context, withStencil, rowSwap, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE), {{0, Method::Storage, false, true}, {1, Method::DepthStencilExport, false, true}}, "a pass that clears its attachments");
+        steps(PlanSampleOrder(context, withStencil, rowSwap, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_DONT_CARE), {{0, Method::Storage, true, false}, {1, Method::DepthStencilExport, true, false}}, "a pass that discards its attachments");
+        steps(PlanSampleOrder(context, withStencil, rowSwap, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE), {}, "a pass that neither loads nor stores");
+        steps(PlanSampleOrder(context, withStencil, SampleOrder{}), {}, "a pass that keeps the guest's order");
+        auto single = withStencil;
+        single.samples = 1;
+        single.colors[0].samples = 1;
+        single.depth->samples = 1;
+        steps(PlanSampleOrder(context, single, rowSwap), {}, "a single-sampled pass");
+    }
+
+    auto masked = attached(village, VK_FORMAT_UNDEFINED, false);
+    masked.quadSampleMask = {1, 1, 1, 1};
+    Require(SampleMaskFollowsOrder(masked, rowSwap) && QuadSampleMasks(masked, rowSwap) == std::array<std::uint16_t, 4>{1, 1, 1, 1} && QuadSampleMasks(masked) == std::array<std::uint16_t, 4>{0xffffu, 0xffffu, 0xffffu, 0xffffu}, "a uniform mask of sample 0 did not move to the pixel shader under the checkerboard's order");
+    auto empty = masked;
+    empty.quadSampleMask = {0, 0, 0, 0};
+    Require(!SampleMaskFollowsOrder(empty, rowSwap) && !SampleMaskFollowsOrder(masked, SampleOrder{}), "an empty mask, or a mask without a reordering, moved to the pixel shader");
+    {
+        auto earlyTested = attached(village, VK_FORMAT_D32_SFLOAT, false);
+        earlyTested.quadSampleMask = {1, 1, 1, 1};
+        earlyTested.pixelEarlyZ = true;
+        earlyTested.depthTest = true;
+        ShaderRecompiler::RecompileResult memoryWriter, memoryKeeper;
+        memoryWriter.spirv = makeModule({.fragment = true});
+        memoryKeeper.spirv = memoryWriter.spirv;
+        ShaderRecompiler::DescriptorBinding written{};
+        written.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        written.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        written.count = 1;
+        written.bufferWritten = {true};
+        memoryWriter.bindings.push_back(written);
+        const std::array<CompiledShader, 1> writing{{{ShaderRecompiler::ShaderStage::Fragment, &memoryWriter, 0}}};
+        const std::array<CompiledShader, 1> notWriting{{{ShaderRecompiler::ShaderStage::Fragment, &memoryKeeper, 0}}};
+        const auto context = capable();
+        Require(SampleMaskFollowsOrder(earlyTested, HostSampleLocationsFor(context, earlyTested).order), "a uniform mask of sample 0 with a depth target did not move to the pixel shader under the checkerboard's order");
+        expectFailure([&] { ValidateSampleMask(context, earlyTested, writing); }, "from a pixel program with early depth or stencil tests that writes memory, is unsupported");
+        ValidateSampleMask(context, earlyTested, notWriting);
+        auto gridded = context;
+        gridded.sampleLocationGridSampleCounts = VK_SAMPLE_COUNT_2_BIT;
+        ValidateSampleMask(gridded, earlyTested, writing);
+    }
+
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x20000u, {}, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
+    const auto keptHash = ShaderRecompiler::RecompileCacheKey::ContextHash(request);
+    request.context.pixel->sampleOrder = rowSwap;
+    Require(ShaderRecompiler::RecompileCacheKey::ContextHash(request) != keptHash, "the pixel shader's sample order did not key its variant");
+    const ShaderRecompiler::RequestSerializer serializer;
+    const auto back = serializer.Deserialize(serializer.Serialize(request));
+    Require(back.request.context.pixel.has_value() && back.request.context.pixel->sampleOrder == rowSwap, "the recompile request lost the pixel shader's sample order");
+}
+
+// vertexOverhangTests on Metal (upstream d01548e81b): the same guest pages and checks over the Metal device's Context;
+// CopyZeroPaddedDrawInput's buffer is a Metal Buffer (MockVulkan's Context has no Metal device to make one).
+void MetalVertexOverhangTests() {
+    using AgcDriver::Graphics::CopyZeroPaddedDrawInput;
+    constexpr std::size_t page = 65536;
+    constexpr std::size_t stride = 44;
+    constexpr std::size_t overhang = 8;
+    void* mapped = mmap(nullptr, page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(mapped != MAP_FAILED && mprotect(mapped, page, PROT_READ | PROT_WRITE) == 0, "cannot reserve the guest pages of the overhang test");
+    auto* block = static_cast<std::byte*>(mapped);
+    constexpr std::size_t offset = 0x650;
+    const auto readable = page - offset;
+    std::fill(block + offset, block + page, std::byte{0x7a});
+    const auto address = reinterpret_cast<std::uint64_t>(block) + offset;
+    @autoreleasepool {
+        MetalGraphicsDevice device;
+        const auto& context = device.Attach();
+        {
+            const auto copy = CopyZeroPaddedDrawInput(context, address, readable + overhang, readable + overhang, stride);
+            const auto bytes = copy.buffer->Bytes();
+            Require(bytes.size() == readable + overhang, "an overhanging vertex fetch changed its size");
+            Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(readable), [](std::byte value) { return value == std::byte{0x7a}; }), "an overhanging vertex fetch did not copy the readable bytes");
+            Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(readable), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "an overhanging vertex fetch did not zero its last record");
+        }
+        expectFailure([&] { CopyZeroPaddedDrawInput(context, address, readable + stride, readable + stride, stride); }, "is not readable");
+        expectFailure([&] { CopyZeroPaddedDrawInput(context, address, readable + overhang, readable + overhang, 0); }, "is not readable");
+    }
+    munmap(block, page * 2);
+}
+
 struct Twin {
     const char* name;
     const char* what;
@@ -811,6 +1074,8 @@ const std::vector<Twin> MetalTwins{
     {"earlyFragmentTestsTests", "[[early_fragment_tests]] in the MSL stage function, late with a depth export or a quad pixel mask", MetalEarlyFragmentTestsTests},
     {"oversizedDescriptorTests", "a V# past the range limit bound up to its registered allocation, refused at the limit, empty when unregistered", MetalOversizedDescriptorTests},
     {"dispatchMoveTests", "moved read-only dispatch buffers listed at their clamped ranges, written, over-budget, unmapped, overlapping and reshaped moves refused, over Metal host imports and a Metal recorder", MetalDispatchMoveTests},
+    {"sampleOrderTests", "guest sample order decode, host order planning, moved sample masks and the pixel shader key, without the reordering VkPipeline and depth swap", MetalSampleOrderTests},
+    {"vertexOverhangTests", "an overhanging vertex fetch zero-fills its last record in a Metal buffer, unreadable fetches refused", MetalVertexOverhangTests},
 };
 
 const Twin* TwinOf(const std::string& name) {
@@ -839,6 +1104,9 @@ const std::vector<std::pair<std::string, std::string>> VulkanOnly{
     {"samplerTableDeviceLimitTests", "sampler table entries refused by device limits on MockVulkan; Vulkan samplers only (Metal tables: MslAbi v15 arrays)"},
     {"pipelineStoreLazyBufferPoolTests", "Vulkan-only: the VkPipeline store of Graphics/src/Pipeline.cpp ties its entries to the device's BufferPool; the Metal draw path does not use that store (Metal pipelines are cached per device by PipelineCache.mm, keyed by MSL library and render state, never by the buffer pool), and the Metal BufferPool refuses MockVulkan's Context (TechnicalDebt metal-vulkan-internal-tests)"},
     {"pipelineLibraryClearWaitsForBuildTests", "graphics pipeline library part builds on MockVulkan: Metal has no pipeline libraries (TechnicalDebt metal-graphics-pipeline-libraries)"},
+    {"framebufferOwnerTests", "Vulkan-only: the VkFramebuffer cache of Graphics/src/Pipeline.cpp keyed by image-view owners on MockVulkan; a Metal render pass takes its attachments per MTLRenderPassDescriptor and caches no framebuffer objects"},
+    {"sampleLocationGridFallbackTests", "Vulkan-only: VK_EXT_sample_locations grids in the VkPipeline and render pass begin info on MockVulkan; Metal's setSamplePositions sets one pixel's positions and MetalDraw.mm draws pixel (0,0)'s as the stand-in (TechnicalDebt metal-sample-location-grid, metal-sample-order)"},
+    {"tableUpdateAfterBindTests", "update-after-bind image and sampler table layouts and pools on MockVulkan; Vulkan descriptor sets only (Metal tables: MslAbi v15 arrays)"},
 };
 
 bool Listed(const std::string& name) {
@@ -909,6 +1177,16 @@ int main(int argc, char** argv) {
         }
     }
     if (mode == "--address-space-teardown") return RunMode({"addressSpaceTeardownTests", MetalAddressSpaceTeardownTests}, "address-space device teardown releases cached guest allocations (Metal device)");
+    // agc_driver_unused_viewport_depth (upstream 538b63ef4c): State decoding and the depth remap only, as upstream. Silent.
+    if (mode == "--unused-viewport-depth") {
+        return RunMode({"unusedViewportDepth", [] {
+            UnusedViewportDepthTests();
+            DepthClipTests();
+        }}, nullptr);
+    }
+    if (mode == "--depth-bounds-state") return RunMode({"DepthBoundsBiasTests", DepthBoundsBiasTests}, "Depth bounds state checks passed");
+    // agc_driver_sample_order_planning: the Metal twin of sampleOrderTests (no reordering VkPipeline or depth swap).
+    if (mode == "--sample-order") return RunMode({"sampleOrderTests", MetalSampleOrderTests}, "Sample order checks passed on Metal (without the Vulkan reordering pipeline and depth swap)");
     if (mode == "--undithered-alpha-to-coverage-state") return RunMode({"UnditheredAlphaToCoverageTests", UnditheredAlphaToCoverageTests}, "Existing undithered alpha-to-coverage states passed");
     if (mode == "--resource-content-key" || mode == "--benchmark-resource-content-key") {
         const bool benchmark = mode == "--benchmark-resource-content-key";
@@ -939,7 +1217,7 @@ int main(int argc, char** argv) {
     if (mode == "--descriptor-cache") return RunMode({"descriptorCacheTests", MetalDescriptorCacheTests}, nullptr);
     if (mode == "--probe") return Probe();
     if (argc != 1) {
-        std::cerr << "usage: " << argv[0] << " [--probe | --unused-stencil-reference | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key | --multisample-dcc-state | --descriptor-cache";
+        std::cerr << "usage: " << argv[0] << " [--probe | --unused-stencil-reference | --descriptor-layout-flags | --descriptor-pool-reset-failure | --sparse-buffer-holes | --covered-centroid-state | --address-space-teardown | --alpha-to-coverage-state | --undithered-alpha-to-coverage-state | --resource-content-key | --benchmark-resource-content-key | --multisample-dcc-state | --descriptor-cache | --unused-viewport-depth | --depth-bounds-state | --sample-order";
         for (const auto& skipped : SkippedModes) std::cerr << " | " << skipped.flag;
         std::cerr << "]\n";
         return 2;

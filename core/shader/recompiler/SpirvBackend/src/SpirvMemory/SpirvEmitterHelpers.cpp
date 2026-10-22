@@ -479,7 +479,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
         case DescriptorBindingKind::Buffers:
             state.storageBufferVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers");
             if (state.requirements.coherentBufferAlias) state.storageBufferCoherentVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers_coherent");
-            if (state.requirements.bufferInt64Atomics) state.storageBufferU64Variable = Define(ArrayType(StorageBufferU64BlockType(state)), "buffers_u64");
+            if (state.requirements.bufferU64View) state.storageBufferU64Variable = Define(ArrayType(StorageBufferU64BlockType(state)), "buffers_u64");
             if (state.storageBufferU64Variable != 0u || state.storageBufferCoherentVariable != 0u) {
                 for (const auto variable : {state.storageBufferVariable, state.storageBufferCoherentVariable, state.storageBufferU64Variable}) {
                     if (variable != 0u) state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);

@@ -35,6 +35,7 @@ class StorageTexture;
 namespace AgcDriver::Graphics::Metal {
 struct TessellationStages;
 class CommandStream;
+struct Upload;
 class PipelineCache;
 class ImageCache;
 class ImageBindings;
@@ -251,7 +252,11 @@ struct VulkanDevice::State {
     void RequireDispatchable(const ShaderRecompiler::RecompileResult& shader) const;
     // The bound V# ranges, GDS and snapshots a dispatch adds to the BDA page table.
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressExtras(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream);
-    void RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
+    // `threadGroup` (upstream 612b41e4f3, DISPATCH_INDIRECT with USE_THREAD_DIMENSIONS): the indirect
+    // arguments are thread counts, turned into group counts on the GPU by the recorder's argument
+    // kernel, which also writes them into the ShaderData thread limit. `threadLimit` (a direct
+    // dispatch of counts read on the CPU): the thread counts written into that limit.
+    void RecordCompute(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, const std::array<std::uint32_t, 3>* threadGroup = nullptr, const std::array<std::uint32_t, 3>* threadLimit = nullptr);
 
     // The MslAbi bindings of one shader function (a kernel, or one stage of a draw), built around
     // taking the open batch's stream: before it PlanBindings (guest ranges), SettleBindings, PlanImages
@@ -277,7 +282,8 @@ struct VulkanDevice::State {
     // Writes the shader's descriptor table into the stream (0: the shader has none). `push` is the
     // shader's own push constants inside the 256-byte block (the memory-offset bytes of bound V#s
     // are zeroed there, as the guest-buffer contract says).
-    std::uint64_t WriteTable(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream, StageBindings& plan, std::span<std::byte> push);
+    // `shaderData`, when given, receives the stream copy of the ShaderData words (buffer nil: none).
+    std::uint64_t WriteTable(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, Graphics::Metal::CommandStream& stream, StageBindings& plan, std::span<std::byte> push, Graphics::Metal::Upload* shaderData = nullptr);
     // The DriverData record of a function of the batch (workgroupBase as given).
     std::uint64_t WriteDriverData(Graphics::Metal::CommandStream& stream, std::array<std::uint32_t, 3> workgroupBase);
     // After the command was recorded: pending reads and writes of the planned ranges, and the

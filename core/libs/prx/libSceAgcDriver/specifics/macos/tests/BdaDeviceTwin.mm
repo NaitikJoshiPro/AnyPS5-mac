@@ -14,6 +14,20 @@
 //    Metal::DisjointRanges) read and written through the same helpers: in-place loads and stores,
 //    the permissions of registered and bound ranges, Permission and Unmapped faults, written pages.
 // The upstream device test also runs RunColorTransferTests; on Metal that is agc_metal_color_transfer.
+// GPU selection (upstream 4cb397a4c9, 8c301fb5c7, 3bac1f0b43): the Metal driver picks its MTLDevice as
+// MetalDevice.mm's SelectDevice does (ANYPS5_GPU: the first device whose name contains it, case-insensitive; unset:
+// the system default), so SelectMetalDevice below states that rule over device names and DeviceSelectionChecks
+// checks it with upstream's cases (--device-selection-cpu, agc_driver_bda_device_selection_cpu). Metal devices have
+// no Vulkan API version or device type: upstream's discrete-over-integrated ranking is the system default here and
+// its Vulkan 1.1 filter has no counterpart. The execution checks run on the selected device, the driver's device
+// must carry the requested name, and a requested GPU that is missing fails instead of skipping, as upstream.
+// --host-import-failures (upstream 89bd3f19b6, agc_driver_host_import_failure_handles) skips: it injects
+// vkCreateBuffer/vkAllocateMemory/vkBindBufferMemory failures through the device resolver, which a Metal import never
+// calls; the Metal form of the check (an import over unreadable pages publishes nothing, a retry imports) is
+// HostImportRetireTwin.mm's FailedImportPublishesNothing (agc_host_import_retire; TechnicalDebt
+// metal-host-import-failure-seams). BdaExecution.cpp's RunBdaAnchorTests (with a20968ee25's halfword anchor case)
+// runs SPIR-V anchored-read programs (MakeBdaAnchoredReadTestShader, SpirvBdaRead.cpp); the MSL Bda prelude has no
+// anchored read, so it has no Metal counterpart here.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -26,6 +40,7 @@
 #include "MetalBackend/MslEmitterState.hpp"
 #include "MslAbi.hpp"
 #include "Recompiler.hpp"
+#include "../src/MetalCommandStream.h"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -33,15 +48,18 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace MetalBdaTwin {
@@ -699,15 +717,71 @@ void DeviceChecks(AgcDriver::VulkanDevice& device) {
     std::puts("device faults: Permission for read-only memory, Unmapped for unknown addresses, bound V# ranges merged with registered ones");
 }
 
+// MetalDevice.mm's SelectDevice over device names: with a request the first name containing it (case-insensitive),
+// without one the system default.
+std::optional<std::size_t> SelectMetalDevice(const std::vector<std::string>& names, std::optional<std::size_t> systemDefault, std::string_view request) {
+    if (request.empty()) return systemDefault;
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        const std::string_view name(names[index]);
+        if (std::search(name.begin(), name.end(), request.begin(), request.end(), [](char left, char right) {
+            return std::tolower(static_cast<unsigned char>(left)) == std::tolower(static_cast<unsigned char>(right));
+        }) != name.end()) return index;
+    }
+    return std::nullopt;
+}
+
+// Upstream's canSkipVulkanFailure: only an unrequested, optional device may be missing.
+bool CanSkipDeviceFailure(const char* requestedName, const char* requireDevice) {
+    return (requestedName == nullptr || *requestedName == '\0') && requireDevice == nullptr;
+}
+
+// Upstream's deviceSelectionTests over SelectMetalDevice (the ranking by device type is the system default here).
+void DeviceSelectionChecks() {
+    const std::vector<std::string> devices{"AMD Radeon(TM) Graphics", "NVIDIA GeForce RTX 5080"};
+    Check(!SelectMetalDevice({}, std::nullopt, {}).has_value(), "an empty Metal device list selected a device");
+    Check(SelectMetalDevice(devices, 1u, {}) == 1u, "default selection did not take the system default device");
+    Check(SelectMetalDevice(devices, 1u, "AMD") == 0u, "an AMD request lost to the system default device");
+    Check(SelectMetalDevice(devices, 1u, "aMd rAdEoN") == 0u, "GPU name matching was not case-insensitive");
+    Check(SelectMetalDevice(devices, 0u, "RTX 5080") == 1u, "partial GPU name matching failed");
+    Check(!SelectMetalDevice(devices, 0u, "missing device").has_value(), "an unmatched GPU request selected another device");
+    Check(CanSkipDeviceFailure(nullptr, nullptr), "an optional device test without a device request cannot skip");
+    Check(CanSkipDeviceFailure("", nullptr), "an empty GPU request prevents an optional device skip");
+    Check(!CanSkipDeviceFailure("missing device", nullptr), "an unmatched GPU request can be reported as a skip");
+    Check(!CanSkipDeviceFailure(nullptr, "1"), "a required device test can be reported as a skip");
+    std::puts("BDA device selection CPU tests passed");
+}
+
+// The MTLDevice the driver selects (SelectMetalDevice over MTLCopyAllDevices), or nil without a usable one; a
+// requested name that no device carries throws, listing the devices.
+id<MTLDevice> SelectedDevice() {
+    const char* requested = std::getenv("ANYPS5_GPU");
+    const std::string_view request = requested != nullptr ? requested : "";
+    if (request.empty()) return MTLCreateSystemDefaultDevice();
+    NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
+    std::vector<std::string> names;
+    for (id<MTLDevice> candidate in all) names.emplace_back(candidate.name.UTF8String);
+    const auto selected = SelectMetalDevice(names, std::nullopt, request);
+    if (!selected.has_value()) {
+        std::string candidates;
+        for (const auto& name : names) candidates += (candidates.empty() ? "" : ", ") + name;
+        throw std::runtime_error("no Metal device whose name contains ANYPS5_GPU=\"" + std::string(request) + "\"; devices: " + candidates);
+    }
+    return all[*selected];
+}
+
 int Run() {
+    DeviceSelectionChecks();
     RunBdaContractTests();
     RunWrittenRangeDecodeTests();
     std::puts("BDA contract and written-page decode tests passed");
-    id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+    const bool canSkip = CanSkipDeviceFailure(std::getenv("ANYPS5_GPU"), std::getenv("ANYPS5_REQUIRE_VULKAN"));
+    id<MTLDevice> metal = SelectedDevice();
     if (metal == nil) {
+        if (!canSkip) throw std::runtime_error("no usable Metal device");
         std::puts("skipped, no usable Metal device");
         return Skipped;
     }
+    std::printf("Using \"%s\"\n", metal.name.UTF8String);
     {
         Gpu gpu(metal);
         ReadChecks(gpu);
@@ -720,8 +794,13 @@ int Run() {
     try {
         device = std::make_unique<AgcDriver::VulkanDevice>();
     } catch (const std::exception& error) {
+        if (!canSkip) throw;
         std::printf("skipped, no usable Metal device: %s\n", error.what());
         return Skipped;
+    }
+    // The driver's device is the one the execution checks ran on (MetalDevice.mm's SelectDevice).
+    if (id<MTLDevice> driver = AgcDriver::Graphics::Metal::DeviceOf(device->graphicsContext())) {
+        Check(driver.registryID == metal.registryID, std::string("the driver selected \"") + driver.name.UTF8String + "\", not \"" + metal.name.UTF8String + "\"");
     }
     try {
         DeviceChecks(*device);
@@ -739,8 +818,16 @@ int Run() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--device-selection-cpu") {
+            MetalBdaTwin::DeviceSelectionChecks();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-failures") {
+            std::puts("skipped, Metal host imports have no vkCreateBuffer/vkAllocateMemory/vkBindBufferMemory steps to fail; the Metal form of the check runs in agc_host_import_retire (HostImportRetireTwin.mm FailedImportPublishesNothing)");
+            return MetalBdaTwin::Skipped;
+        }
         return MetalBdaTwin::Run();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

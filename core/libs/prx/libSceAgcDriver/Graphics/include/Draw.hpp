@@ -103,6 +103,9 @@ struct DrawPassCounts {
     std::uint64_t storeFlushes = 0;
 };
 std::array<DrawPassCounts, 2> DrawPassTotals();
+// Counts one recorded draw into DrawPassTotals (APS5_PROFILE_DRAW) for a draw path that does not go
+// through Draw (the Metal draw path, specifics/macos/src/MetalDraw.mm).
+void CountDrawPass(bool addressDraw, bool passBegun, bool keyStoresFlushed = false, bool storesFlushed = false);
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
@@ -127,6 +130,7 @@ void CountDrawSkip(DrawSkip kind, double us);
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
+void RunDepthCopyPass(const Context& context, const DepthCopyPass& pass);
 
 }
 

@@ -14,6 +14,7 @@
 #include "MetalVmTrace.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -2462,6 +2463,7 @@ LeaseState& Leases() {
 struct SnapshotStats {
     std::atomic<std::uint64_t> checked{0};
     std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> mismatched{0};
 };
 
 SnapshotStats& Snapshots() {
@@ -2474,20 +2476,34 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     bool synced = false;
     bool drained = false;
     bool retiredImport = false;
+    bool droppedAddressSpace = false;
     // A range pinned only by the cached address space is released by dropping the cache's
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
-    // back here and finishes lease batches below.
+    // back here and finishes lease batches below. A host import over the range still wraps its
+    // pages after the drop, so it retires below before the cut (upstream 787a7bc39d).
     if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr) {
         Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
         Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
         dropped.reset();
-        auto& state = Leases();
-        std::lock_guard lock(state.mutex);
-        ++state.stats.contentionWaits;
-        ++state.stats.cacheDrops;
-        state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        return true;
+        droppedAddressSpace = true;
+        auto& imports = Imports();
+        const auto end = static_cast<std::uint64_t>(address) + bytes;
+        bool overlapsImport = false;
+        {
+            std::lock_guard importsLock(imports.mutex);
+            const auto next = imports.imports.lower_bound(address);
+            const auto previous = next == imports.imports.begin() ? imports.imports.end() : std::prev(next);
+            overlapsImport = (next != imports.imports.end() && next->first < end) || (previous != imports.imports.end() && previous->first + previous->second.bytes > address);
+        }
+        if (!overlapsImport) {
+            auto& state = Leases();
+            std::lock_guard lock(state.mutex);
+            ++state.stats.contentionWaits;
+            ++state.stats.cacheDrops;
+            state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            return true;
+        }
     }
     if (Recorder::InCompletion()) throw std::runtime_error("guest allocation mutation cannot wait for an active GPU completion");
     if (GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -2591,6 +2607,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     auto& state = Leases();
     std::lock_guard lock(state.mutex);
     ++state.stats.contentionWaits;
+    if (droppedAddressSpace) ++state.stats.cacheDrops;
     if (synced) ++state.stats.contentionSyncs;
     if (drained) ++state.stats.contentionDrains;
     state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -2688,6 +2705,10 @@ MirrorStats MirrorCounters() {
     MirrorStats stats{0, state.heapBytes, state.rebuilds, state.blocksCopied, state.heapRefills, state.sweeps, state.heapChecks, state.sparseBinds};
     for (const auto& [base, mirror] : state.entries) stats.heapMirrors += mirror->heap ? 1 : 0;
     return stats;
+}
+
+std::uint64_t SnapshotMismatches() {
+    return Snapshots().mismatched.load(std::memory_order_relaxed);
 }
 
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own) {
@@ -2933,6 +2954,15 @@ std::uint64_t HostImportLiveBytes() {
     return state.liveBytes;
 }
 
+// The bytes more host imports may wrap before eviction (Metal: the D42 wired budget, lowered by the
+// unified heap report) (upstream c566d31d1f).
+std::uint64_t HostImportBudgetRemaining(const Context& context) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    const auto budget = effectiveBudget(context, state);
+    return budget > state.liveBytes ? budget - state.liveBytes : 0;
+}
+
 const char* ImportRequesterName(ImportRequester requester) {
     switch (requester) {
         case ImportRequester::Map: return "map";
@@ -3037,10 +3067,9 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
                     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{run.base, run.base + run.bytes}}};
                     if (wouldRetireImport(state, run) || StorageTexture::AnyPendingOverlaps(span)) return false;
                 }
-                if (importAllocation(context, state, cursor, current, ImportRequester::Map, 0, false) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) {
-                    state.failed.erase(run.base);
-                    state.failed.erase(cursor);
-                }
+                // A failure stays remembered across unrelated mappings: refreshImports drops it when its own
+                // range changes (upstream d2eeb4931c).
+                importAllocation(context, state, cursor, current, ImportRequester::Map, 0, false);
                 cursor = run.base + run.bytes;
             }
         } catch (const std::exception& error) {
@@ -3651,10 +3680,9 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
             static const bool fatal = std::getenv("APS5_SNAPSHOT_CHECK_FATAL") != nullptr;
             if (!live || fatal) throw std::runtime_error(text);
             static std::mutex reportMutex;
-            static std::uint64_t mismatches = 0;
             static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
             std::lock_guard lock(reportMutex);
-            ++mismatches;
+            const auto mismatches = Snapshots().mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();
             if (now - lastReport >= std::chrono::seconds(10)) {
                 lastReport = now;
@@ -4075,6 +4103,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
+    // A depth plane in an uploaded region is stored into guest memory from its surface first
+    // (upstream 84e3b73f16; FlushDepthPlanes is the DepthSurface twin's).
+    for (const auto& region : regions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
@@ -4156,12 +4187,6 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             refreshMirror(*region.mirror, region.begin, bytes);
             if (profile) refreshUs += microsecondsSince(refreshStart);
             continue;
-        }
-        if (sparseHeapCandidate(region)) {
-            const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const bool bound = bindSparseMirror(region, importRanges());
-            if (profile) refreshUs += microsecondsSince(refreshStart);
-            if (bound) continue;
         }
         bool copyOnGpu = false;
         if (context.hostImportAlignment != 0) {
@@ -4248,6 +4273,14 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
             continue;
+        }
+        // An imported prefix (or a whole import) serves the region before a sparse heap mirror does
+        // (upstream 53b73b5dae).
+        if (sparseHeapCandidate(region)) {
+            const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool bound = bindSparseMirror(region, importRanges());
+            if (profile) refreshUs += microsecondsSince(refreshStart);
+            if (bound) continue;
         }
         if (region.deviceLocal) {
             // The staging shadow UploadPrepare made cannot take the CPU copy (no host mapping): the

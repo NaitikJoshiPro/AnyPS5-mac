@@ -1,6 +1,7 @@
 // Work package D5: Metal twin of Graphics/src/PipelineCache.cpp (see MetalPipelineCache.h).
 #include "MetalPipelineCache.h"
 #include "ShaderCacheDirectory.hpp"
+#include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 #include <sys/sysctl.h>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -26,6 +28,50 @@ namespace {
 
 std::string Describe(NSError* error) {
     return error != nil ? std::string(error.localizedDescription.UTF8String) : std::string("unknown error");
+}
+
+// MTL4Archive files are fat containers: big-endian magic 0xcbfebabe, a slice count and per slice
+// {gpu type, subtype, offset, size, alignment}. newArchiveWithURL does not refuse a file that is
+// not one: on macOS 27.0.1 (AGXMetalG15G) a short text file crashes MTL4ArchiveImpl::loadFromURL
+// (agc_pipeline_cache_file, SIGSEGV at 0x8f), so the cache checks the container before Metal
+// opens it and treats a malformed file like an unreadable archive.
+bool ArchiveContainerIntact(const std::filesystem::path& path, std::string& why) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) {
+        why = "cannot stat: " + error.message();
+        return false;
+    }
+    std::ifstream stream(path, std::ios::binary);
+    unsigned char header[8];
+    if (!stream.read(reinterpret_cast<char*>(header), sizeof(header))) {
+        why = "shorter than an archive header";
+        return false;
+    }
+    const auto word = [](const unsigned char* bytes) { return (std::uint32_t{bytes[0]} << 24u) | (std::uint32_t{bytes[1]} << 16u) | (std::uint32_t{bytes[2]} << 8u) | std::uint32_t{bytes[3]}; };
+    if (word(header) != 0xcbfebabeu) {
+        why = "not an archive container (magic)";
+        return false;
+    }
+    const auto slices = word(header + 4);
+    if (slices == 0u || slices > 64u) {
+        why = "implausible slice count " + std::to_string(slices);
+        return false;
+    }
+    for (std::uint32_t slice = 0; slice < slices; ++slice) {
+        unsigned char entry[20];
+        if (!stream.read(reinterpret_cast<char*>(entry), sizeof(entry))) {
+            why = "truncated slice table";
+            return false;
+        }
+        const std::uint64_t offset = word(entry + 8);
+        const std::uint64_t bytes = word(entry + 12);
+        if (offset < 8u + 20u * slices || bytes == 0u || offset + bytes > size) {
+            why = "slice " + std::to_string(slice) + " lies outside the file";
+            return false;
+        }
+    }
+    return true;
 }
 
 // Reports a Metal compile still running after 5, 10, 15... s on stderr, as the recorder reports a
@@ -98,7 +144,12 @@ std::filesystem::path DefaultDirectory() {
     if (const char* directory = std::getenv("APS5_METAL_PIPELINE_CACHE"); directory != nullptr && *directory != '\0') return directory;
     const auto shaders = ShaderRecompiler::ShaderCacheDirectory();
     if (shaders.empty()) return {};
-    return shaders / "metal";
+    // Upstream 907c9cd1b6: the pipeline cache sits in the directory of the current shader cache source
+    // version, next to the variants it was built from, so archives (and library sources) of earlier
+    // recompiler versions are not loaded and do not grow without bound.
+    char version[17];
+    std::snprintf(version, sizeof(version), "%016llx", static_cast<unsigned long long>(ShaderRecompiler::ShaderDiskCache::SourceVersion()));
+    return shaders / version / "metal";
 }
 
 void AppendColor(std::string& key, const ColorAttachmentState& color) {
@@ -240,6 +291,10 @@ PipelineCache::PipelineCache(id<MTLDevice> device, std::filesystem::path directo
         // nothing. Every written generation is a superset of its hits from all loaded generations.
         NSMutableArray<id<MTL4Archive>>* opened = [NSMutableArray array];
         auto openGeneration = [&](const std::filesystem::path& path) {
+            if (std::string why; !ArchiveContainerIntact(path, why)) {
+                std::fprintf(stderr, "[metal-pipelines] ignoring the unreadable archive %s: %s\n", path.c_str(), why.c_str());
+                return false;
+            }
             NSError* failure = nil;
             id<MTL4Archive> generation = [device newArchiveWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&failure];
             if (generation == nil) {

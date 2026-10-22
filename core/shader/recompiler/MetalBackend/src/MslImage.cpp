@@ -219,6 +219,9 @@ struct Access {
     const MemoryInfo& mem;
     const ImageResource& image;
     const IrValue& address;
+    // The mode whose heap binding holds the texture when `image` is a view of it with another
+    // dimension (a remapped 1D depth-comparison image, OneDimensionalView); null: `image`.
+    const ImageResource* binding = nullptr;
 };
 
 bool HasFlag(const MemoryInfo& mem, std::uint32_t flag) {
@@ -341,18 +344,19 @@ std::string HeapElement(MslEmitterState& state, DescriptorBindingKind kind, std:
 // reads element tableAccess.element of the image table's array, typed as the mode's heap binding;
 // a storage table mode (Version 18, upstream 603dc01db) the same element of the storage table's.
 std::string Texture(MslEmitterState& state, const Access& access, std::uint32_t elementOffset = 0u) {
-    const auto kind = DescriptorBindingForImage(access.image);
+    const auto& bound = access.binding != nullptr ? *access.binding : access.image;
+    const auto kind = DescriptorBindingForImage(bound);
     if (access.image.table != NoTable) {
         if (!state.tableAccess.active) state.Fail(access.inst, "reads an image table texture outside a table access");
         const auto binding = static_cast<std::uint32_t>(kind);
         if (access.image.resourceClass == ImageResourceClass::Storage) {
             // Float (29-35) and uint (36-42) storage views; atomic modes are never table modes.
             constexpr auto storageEnd = RuntimeAbi::FirstStorageImageBinding + 14u;
-            if (elementOffset != 0u || access.image.mipMode == ImageMipMode::DynamicStorage || binding < RuntimeAbi::FirstStorageImageBinding || binding >= storageEnd || !TableModeEmitted(access.image)) state.Fail(access.inst, "selects an image table storage mode that is not a non-atomic, single-sampled, static-mip storage view (an image table store to a multisampled image or through dynamic mips is not implemented)");
+            if (elementOffset != 0u || access.image.mipMode == ImageMipMode::DynamicStorage || binding < RuntimeAbi::FirstStorageImageBinding || binding >= storageEnd || !TableModeEmitted(bound)) state.Fail(access.inst, "selects an image table storage mode that is not a non-atomic, single-sampled, static-mip storage view (an image table store to a multisampled image or through dynamic mips is not implemented)");
             static_cast<void>(state.TableResource(DescriptorBindingKind::ImageStorageTable, 0u));
             return "aps5_table." + MslTableField(DescriptorBindingKind::ImageStorageTable) + ".k" + std::to_string(binding) + ".address[" + state.tableAccess.element + "].value";
         }
-        if (elementOffset != 0u || access.image.resourceClass != ImageResourceClass::Sampled || binding < RuntimeAbi::FirstImageBinding || binding >= RuntimeAbi::FirstStorageImageBinding || !TableModeEmitted(access.image)) state.Fail(access.inst, "selects an image table mode that is not a sampled, single-sampled heap view");
+        if (elementOffset != 0u || access.image.resourceClass != ImageResourceClass::Sampled || binding < RuntimeAbi::FirstImageBinding || binding >= RuntimeAbi::FirstStorageImageBinding || !TableModeEmitted(bound)) state.Fail(access.inst, "selects an image table mode that is not a sampled, single-sampled heap view");
         static_cast<void>(state.TableResource(DescriptorBindingKind::ImageTable, 0u));
         return "aps5_table." + MslTableField(DescriptorBindingKind::ImageTable) + ".k" + std::to_string(binding) + ".address[" + state.tableAccess.element + "].value";
     }
@@ -715,7 +719,7 @@ void EmitByRead(MslEmitterState& state, const Access& access) {
     texelMemory.dmask = (1u << components) - 1u;
     texelMemory.dataDwords = components;
     texelMemory.componentCount = components;
-    const Access texelAccess{access.inst, texelMemory, access.image, access.address};
+    const Access texelAccess{access.inst, texelMemory, access.image, access.address, access.binding};
     std::array<std::string, 4> words{"0u", "0u", "0u", "0u"};
     const auto numeric = access.image.numericClass;
     for (std::uint32_t element = 0; element < elements; ++element) {
@@ -1538,11 +1542,27 @@ const IrValue& ImageAddress(MslEmitterState& state, const IrValue& inst, const I
     return *resolved;
 }
 
-void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& mode) {
+// Upstream c97e5e0338: a depth-comparison 1D (array) image is a 2D (array) binding with
+// ImageResource::remappedDepth1D, so Vulkan drivers without 1D depth images can back it. MSL heaps
+// already hold 1D images as 2D textures one texel high (depth2d, depth2d_array; MslEntryPoint
+// DepthShapes), so the function samples it as the 1D view it was: y at the centre of row 0, the
+// slice from the second address component, the offset's y 0, no gather (MslAbi Version 21).
+ImageResource OneDimensionalView(const ImageResource& mode) {
+    auto view = mode;
+    if (mode.remappedDepth1D) {
+        if (mode.dimension == RdnaImageDimension::Dim2D) view.dimension = RdnaImageDimension::Dim1D;
+        else if (mode.dimension == RdnaImageDimension::Dim2DArray) view.dimension = RdnaImageDimension::Dim1DArray;
+    }
+    return view;
+}
+
+void EmitMode(MslEmitterState& state, const IrValue& inst, const ImageResource& resource) {
     const auto& mem = state.Memory(inst);
     const auto info = ImageOpcodeInfoOf(inst.Opcode());
     const auto& address = ImageAddress(state, inst, inst.Argument(info.needsSampler ? 2 : 1));
-    const Access access{inst, mem, mode, address};
+    const auto view = OneDimensionalView(resource);
+    const auto& mode = resource.remappedDepth1D ? view : resource;
+    const Access access{inst, mem, mode, address, &resource};
     // Upstream caae92c12: FMASK images are uint images read from guest memory (Fmask32_S8_F8); the
     // identity Fmask8_S2_F1 mode is gone.
     if (mode.depthBits && mem.dataBits == 16u) state.Fail(inst, "depth bits require a 32-bit image result");

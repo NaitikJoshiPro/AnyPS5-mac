@@ -3,8 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MetalObjects.hpp"
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,6 +29,10 @@ struct BufferAllocation {
     std::size_t bytes;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // Image memory retained by the pool (upstream 4513d47104; `buffer` is null then): a retained
+    // id<MTLHeap> (see AllocateImageMemory) and its Metal image memory type.
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint32_t memoryType = 0;
 };
 
 // Released buffer allocations kept for reuse, since creating a buffer and adding it to a residency
@@ -69,6 +75,22 @@ public:
     BufferAllocation Allocate(std::size_t capacity, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
+    // Image memory (upstream 4513d47104, bafc97bb1e). On Metal an image's memory is a placement
+    // MTLHeap of `allocationSize` bytes (the size [MTLDevice heapTextureSizeAndAlignWithDescriptor:]
+    // gives), and the VkDeviceMemory handle is the retained heap: (__bridge id<MTLHeap>)handle. Its
+    // memory type is one of the two below. Every heap is resident on the context's queue through the
+    // pool's residency set from its creation to its destruction. Released private heaps are retained
+    // in the device tier, keyed by type and size, and handed to the next image of that type and size;
+    // they are evicted oldest first (a list, constant time) under the image budget (a quarter of the
+    // device tier's, APS5_IMAGE_POOL_MIB=<n> overrides, 0 disables) and the device tier's own budget
+    // and slot count, and freed at once while the device's allocated bytes exceed its recommended
+    // working set (upstream: the heap's VK_EXT_memory_budget report).
+    static constexpr std::uint32_t PrivateImageMemory = 0;
+    static constexpr std::uint32_t SharedImageMemory = 1;
+    static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
+    VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::uint32_t* allocatedType = nullptr);
+    void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
+    std::size_t RetainedImages();
     // Counters (cumulative) for tests and the [bufferpool] line.
     struct TierCounts {
         std::uint64_t hits, misses, evictions;
@@ -77,6 +99,9 @@ public:
     };
     struct Statistics {
         TierCounts small, large, device;
+        // The device tier's image memory: hits, misses, evictions, retained heaps, their bytes and the
+        // image budget.
+        TierCounts images;
         // Allocations made and destroyed, and the allocations the residency set holds now.
         std::uint64_t made, destroyed;
         std::size_t resident;
@@ -87,15 +112,18 @@ private:
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
+        std::list<Slot*>::iterator order;
     };
     struct SlotKey {
         std::size_t bytes;
         VkMemoryPropertyFlags properties;
+        std::uint32_t memoryType = 0;
+        bool image = false;
         bool operator==(const SlotKey&) const = default;
     };
     struct SlotKeyHash {
         std::size_t operator()(const SlotKey& key) const noexcept {
-            return std::hash<std::size_t>{}(key.bytes) ^ (static_cast<std::size_t>(key.properties) << 48u);
+            return std::hash<std::size_t>{}(key.bytes) ^ (static_cast<std::size_t>(key.properties) << 48u) ^ (static_cast<std::size_t>(key.memoryType) << 56u) ^ (static_cast<std::size_t>(key.image) << 60u);
         }
     };
     struct Tier {
@@ -114,6 +142,10 @@ private:
     VkDeviceSize destroy(const BufferAllocation& allocation) noexcept;
     VkDeviceSize trim();
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
+    bool evictOldestImage(std::vector<BufferAllocation>& evicted);
+    bool imagePooled(VkDeviceSize bytes, std::uint32_t memoryType) const;
+    bool heapOverBudget();
+    VkDeviceMemory allocateImageHeap(VkDeviceSize bytes, std::uint32_t memoryType, const char* operation);
     static std::size_t MaxSlots();
     std::size_t maxSlots;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes);
@@ -122,6 +154,15 @@ private:
     Tier smallTier;
     Tier largeTier;
     Tier deviceTier;
+    std::chrono::steady_clock::time_point heapRead{};
+    bool heapOver = false;
+    VkDeviceSize imageBudget = 0;
+    VkDeviceSize imageBytes = 0;
+    std::size_t imageSlots = 0;
+    std::uint64_t imageHits = 0;
+    std::uint64_t imageMisses = 0;
+    std::uint64_t imageEvictions = 0;
+    std::list<Slot*> imageOrder;
     std::uint64_t clock = 0;
     // The Metal device, the queue the residency set is attached to, and the set (BufferPool.mm).
     std::unique_ptr<Metal::PoolObjects, Metal::ObjectsDeleter> metal;
@@ -133,6 +174,13 @@ private:
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
+// Upstream 4513d47104's image memory entry points (see BufferPool::TakeImageMemory). `mask` is the
+// image's memoryTypeBits (unused on Metal: one heap); `allocation.memoryTypeIndex` is
+// BufferPool::PrivateImageMemory or SharedImageMemory, and `allocatedType` receives it. Release hands
+// the heap back with the bytes and type it was allocated with, once the GPU work using its image
+// completed; an unknown size (0) frees it.
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, std::uint32_t* allocatedType = nullptr);
+void ReleaseImageMemory(const Context& context, VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
 
 }
 

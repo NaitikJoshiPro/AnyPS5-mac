@@ -1,6 +1,8 @@
 // Metal twin of tests/execution/PartiallyResidentSnapshot.cpp (agc_driver_partially_resident_snapshot with no
-// arguments, agc_driver_partially_resident_pending_stores with --pending-stores), swapped in by a twins/*.cmake line.
-// The upstream file is compiled here unchanged with its main renamed, and its Run and PendingStores run as written:
+// arguments, agc_driver_partially_resident_pending_stores with --pending-stores, agc_driver_large_tracked_snapshot
+// with --large-tracked), swapped in by a twins/*.cmake line.
+// The upstream file is compiled here unchanged with its main renamed, and its Run, PendingStores and LargeTracked
+// (6849eeaec0: a large write-tracked surface keeps no guest byte snapshot, so a driver store re-uploads it) run as written:
 // the snapshot cache of a sampled texture over a partially committed surface (CollectCommittedWrites, write stamps
 // over the committed runs, Recorder::SnapshotWriteOverlaps) is backend-neutral code over the Metal image path
 // (ShaderResources.mm, Texture.mm, MetalTextures.mm), and the reserved surface is committed, decommitted and
@@ -90,9 +92,13 @@ int main(int argc, char** argv) {
             device.emplace();
             {
                 auto context = device->GetContext();
-                ReservedSurface surface;
+                const bool large = argc == 2 && std::string_view(argv[1]) == "--large-tracked";
+                ReservedSurface surface(large ? LargeSurfaceBytes : SurfaceBytes);
                 std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-                if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
+                if (large) {
+                    LargeTracked(context, surface, LargeSurfaceBytes);
+                    LargeTracked(context, surface, BlockBytes);
+                } else if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
                 else if (argc == 2 && std::string_view(argv[1]) == "--untracked-hint") {
 #ifdef _WIN32
                     UntrackedHint(context, surface);

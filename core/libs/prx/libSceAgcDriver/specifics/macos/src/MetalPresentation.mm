@@ -36,6 +36,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HalfFloatScanout.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "MetalResidency.h"
 #import <MetalFX/MetalFX.h>
@@ -251,17 +253,24 @@ public:
         if (worker.joinable()) worker.join();
     }
 
-    void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::vector<std::byte> pixels) {
+    // `screenshot` (upstream e3125e43af): the frame is the screenshot key's PNG, written whether or not
+    // frame dumps are on.
+    void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::vector<std::byte> pixels, bool screenshot = false) {
         std::lock_guard lock(mutex);
         if (stopping) Fail("frame dump writer has stopped");
         if (pixels.size() > MaxBytes - queuedBytes) Fail("frame dump queue exceeded 64 MiB");
-        if (!frameDumpOutput.Enabled_nid_no_patch()) return;
+        if (!screenshot && !frameDumpOutput.Enabled_nid_no_patch()) return;
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp queued (%ux%u)\n", index, width, height);
         const auto bytes = pixels.size();
-        pending.push_back({index, width, height, std::move(pixels)});
+        pending.push_back({index, width, height, screenshot, std::move(pixels)});
         queuedBytes += bytes;
         changed.notify_one();
+    }
+
+    bool Idle() {
+        std::lock_guard lock(mutex);
+        return queuedBytes == 0u;
     }
 
 private:
@@ -269,6 +278,7 @@ private:
         int index;
         std::uint32_t width;
         std::uint32_t height;
+        bool screenshot;
         std::vector<std::byte> pixels;
     };
 
@@ -283,6 +293,12 @@ private:
                     batch.swap(pending);
                 }
                 for (const auto& frame : batch) {
+                    if (frame.screenshot) {
+                        std::fprintf(stderr, "[gpu] screenshot saved: %s\n", Screenshot::Write(GetAppTitleId_nid_postfix().value, frame.width, frame.height, frame.pixels).string().c_str());
+                        std::lock_guard lock(mutex);
+                        queuedBytes -= frame.pixels.size();
+                        continue;
+                    }
                     WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, 1u);
                     if (std::getenv("APS5_METAL_TRACE") != nullptr) std::fprintf(stderr, "[metal] frame_%03d.bmp written (%ux%u)\n", frame.index, frame.width, frame.height);
                     std::lock_guard lock(mutex);
@@ -872,8 +888,12 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     auto& dumps = Dumps();
     int dumpIndex = -1;
     if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0u) dumpIndex = dumps.dumped++;
-    // D66: decoded on the GPU from the host import; a dump frame needs the pixels on the CPU.
-    if (dumpIndex < 0 && GpuDecodeRequested()) {
+    // Upstream e3125e43af: the screenshot key saves the displayed frame as a PNG at full size, taken
+    // when no dump is queued; a frame that is not presented asks again (Screenshot::Request).
+    auto* presenter = state->presenter.get();
+    const bool screenshot = dumpIndex < 0 && presenter != nullptr && presenter->dumpWriter.Idle() && Screenshot::Take();
+    // D66: decoded on the GPU from the host import; a dump or screenshot frame needs the pixels on the CPU.
+    if (dumpIndex < 0 && !screenshot && GpuDecodeRequested()) {
         const auto size = DisplayBufferSize(buffer);
         std::uint64_t offset = 0;
         if (id<MTLBuffer> import = state->ImportOf(buffer.address, size, &offset); import != nil) {
@@ -900,8 +920,10 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     if (!present(buffer.width, buffer.height, true, pixels)) {
         // A dropped frame keeps the dump numbering contiguous.
         if (dumpIndex >= 0) --dumps.dumped;
+        if (screenshot) Screenshot::Request();
         return false;
     }
+    if (screenshot) presenter->dumpWriter.Enqueue(0, buffer.width, buffer.height, std::vector<std::byte>(pixels.begin(), pixels.end()), true);
     if (dumpIndex >= 0) {
         std::uint32_t dumpWidth = 0;
         std::uint32_t dumpHeight = 0;

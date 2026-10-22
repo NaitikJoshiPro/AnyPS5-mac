@@ -36,11 +36,6 @@ constexpr Pending Tests[] = {
     // UPSYNC4 (upstream 661f8b7171). Vulkan-only behaviours (allowlisted):
     {"agc_driver_indirect_arguments_pending_producer_tests", "agc_driver_indirect_arguments_pending_producer*", nullptr,
      "skipped, Recorder::HoldNextSubmit holds a Vulkan timeline-semaphore submit: Metal command buffers commit through MTL4 queues with no held submit"},
-    // Metal driver features not written yet (not allowlisted):
-    {"agc_driver_address_passes_tests", "agc_driver_address_passes*", nullptr, nullptr,
-     "skipped, the Metal draw path does not report render pass totals (DrawPassTotals): TechnicalDebt metal-draw-pass-totals"},
-    {"agc_driver_rect_list_indirect_tests", "agc_driver_rect_list_indirect", nullptr, nullptr,
-     "skipped, indirect draws read their records on the CPU on Metal (no GPU indirect path yet): TechnicalDebt metal-d6-indirect"},
 };
 
 }

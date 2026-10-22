@@ -696,9 +696,9 @@ std::string MslEmitterState::LdsMemoryFlags() const {
     return LdsInDeviceMemory() ? "mem_flags::mem_device | mem_flags::mem_threadgroup" : "mem_flags::mem_threadgroup";
 }
 
-// Upstream #4470: vertex and local programs of a target without vertexSubgroups are laid out as
-// one-lane waves (Recompiler.cpp HostSubgroupSize 1), as SpirvSubgroup.cpp's single-lane helpers
-// emit them: a ballot is the invocation's own bit, a shuffle, broadcast or reduction its own value,
+// Upstream #4470: vertex and local programs of a target without vertexSubgroups, and merged hull
+// programs (upstream 8b8219dcef), are laid out as one-lane waves (Recompiler.cpp HostSubgroupSize
+// 1), as SpirvSubgroup.cpp's single-lane helpers emit them: a ballot is the invocation's own bit, a shuffle, broadcast or reduction its own value,
 // an election true, the lane 0. The library maps the SIMD-group functions it calls to those values
 // (prelude helpers included) and drops the mapping at its end, so a linked tessellation library's
 // other programs keep the real functions (MslAbi Version 10).
@@ -768,7 +768,11 @@ MslShader MslEmitter::Emit(const IrProgram& program, const ShaderStageInputInfo&
     // across two SIMD groups throw, instead of shuffling lanes 32-63 that do not exist (undefined in
     // MSL; they read 0 on the M3).
     state.hostSubgroupSize = std::min(target.subgroupSize, AppleSimdWidth);
-    if (state.hostSubgroupSize == 1u && stage != IrShaderStage::Vertex && stage != IrShaderStage::Local) state.Fail("one-lane waves are only laid out for vertex and local programs (a target without vertexSubgroups)");
+    // Upstream 8b8219dcef also runs the hull stage of a merged hull program (binary type 3) at one
+    // lane per invocation on every device: its lanes are the output control points, so the
+    // SingleLaneDefines apply to the hull program alone and the linked object function keeps the
+    // real SIMD-group functions.
+    if (state.hostSubgroupSize == 1u && stage != IrShaderStage::Vertex && stage != IrShaderStage::Local && stage != IrShaderStage::TessellationControl) state.Fail("one-lane waves are only laid out for vertex, local and merged hull programs");
     state.workgroup = WorkgroupInput(program, inputInfo);
     state.laneCount = state.workgroup != nullptr && program.WaveSize() == 64u && state.workgroup->hostSubgroupSize == 32u ? 2u : 1u;
     if (state.laneCount == 2u && stage == IrShaderStage::Compute && (target.wave64LaneLocal || std::getenv("APS5_MSL_LANE_SURVEY") != nullptr)) {

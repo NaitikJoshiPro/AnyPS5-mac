@@ -691,7 +691,8 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
     if (!fragment) {
         text += "struct Aps5TriangleVertices {\n    float4 viewport;\n    float2 depthRange;\n    uint triangles;\n    uint flags;\n};\n";
         text += "static_assert(sizeof(Aps5TriangleVertices) == 32, \"MslAbi::TriangleVerticesHeader\");\n\n";
-        parameters.back() += "\n#if " + TriangleVerticesCondition() + "\n    , device const uint* aps5_triangles [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::TriangleVertices)) + ")]]\n#endif\n";
+        // Version 22: indexed rect lists (RectListIdsMacro) read their guest vertex ids at the same slot.
+        parameters.back() += "\n#if (" + TriangleVerticesCondition() + ") || (defined(" + std::string(MslAbi::RectListIdsMacro) + ") && " + std::string(MslAbi::RectListIdsMacro) + ")\n    , device const uint* aps5_triangles [[buffer(" + std::to_string(MslAbi::Index(MslAbi::BufferIndex::TriangleVertices)) + ")]]\n#endif\n";
     }
     text += "static void aps5_body(";
     for (std::size_t index = 0; index < helperParameters.size(); ++index) text += (index == 0u ? "\n    " : ",\n    ") + helperParameters[index];
@@ -741,9 +742,18 @@ std::string EmitMslEntryPoint(MslEmitterState& state) {
         text += "    constexpr uint aps5_corners[6] = {0u, 1u, 2u, 2u, 1u, 3u};\n";
         text += "    const uint aps5_corner = aps5_corners[aps5_vertex_id % 6u];\n";
         text += "    Aps5VertexOut aps5_v[3] = {};\n";
+        // Indexed rect lists (Version 22, RectListIdsMacro): the guest vertex ids are a table at the
+        // TriangleVertices slot, the rect's three from entry workgroupBase[0] + rect * 3 on.
+        const std::string ids = MslAbi::RectListIdsMacro;
+        text += "#if defined(" + ids + ") && " + ids + "\n";
+        for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
+            text += "    " + call("aps5_triangles[aps5_driver.workgroupBase[0] + aps5_rect * 3u + " + std::to_string(vertex) + "u]", "aps5_v[" + std::to_string(vertex) + "]", vertex) + "\n";
+        }
+        text += "#else\n";
         for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) {
             text += "    " + call("aps5_driver.workgroupBase[0] + aps5_rect * 3u + " + std::to_string(vertex) + "u", "aps5_v[" + std::to_string(vertex) + "]", vertex) + "\n";
         }
+        text += "#endif\n";
         text += "    bool aps5_edge[3];\n    float aps5_weight[3];\n    uint aps5_edges = 0u;\n";
         text += "    for (uint i = 0u; i < 3u; ++i) {\n";
         text += "        const uint next = (i + 1u) % 3u, previous = (i + 2u) % 3u;\n";

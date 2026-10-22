@@ -13,8 +13,16 @@ u64 sceKernelGetProcessTimeCounterFrequency();
 int scePthreadCreate(void** thread, const void* attributes, void* (*entry)(void*), void* argument, const char* name);
 int scePthreadJoin(void* thread, void** value);
 
+// The process time counter ticks at the TSC frequency (measured at startup, near but not exactly 1 GHz):
+// nanoseconds for the timings.
+// A plain global, not a function static: the guest links no C++ runtime (no __cxa_guard_*).
+u64 counterFrequency = 0;
+
 u64 BenchNow() {
-    return sceKernelGetProcessTimeCounter();
+    if (counterFrequency == 0) counterFrequency = sceKernelGetProcessTimeCounterFrequency();
+    const u64 frequency = counterFrequency;
+    const u64 ticks = sceKernelGetProcessTimeCounter();
+    return ticks / frequency * 1000000000ULL + ticks % frequency * 1000000000ULL / frequency;
 }
 
 u64 BenchCpuNow() {
@@ -40,8 +48,9 @@ void BenchSort(void* base, unsigned long count, unsigned long size, int (*compar
     qsort(base, count, size, compare);
 }
 
+// One bridge call per use; the result is the native program's constant whatever the measured frequency is.
 u64 BenchTrivial() {
-    return sceKernelGetProcessTimeCounterFrequency();
+    return sceKernelGetProcessTimeCounterFrequency() != 0 ? 1000000000ULL : 0;
 }
 
 bool BenchSpawn(void** thread, void* (*entry)(void*), void* argument) {

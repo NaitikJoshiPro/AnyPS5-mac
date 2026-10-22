@@ -284,6 +284,7 @@ mlock	address	hand	guest address identity: DirectMemory and the arena translate 
 mmap	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 modf	userspace	none	
 modff	userspace	none	
+modfl	userspace	none	libc modfl_nid_postfix on arm64: integral part into a host stack long double, copied to the guest's x87 value by GuestLongDoubleFromDouble
 mprotect	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 munlock	address	hand	guest address identity: DirectMemory and the arena translate by hand (D31, D33)
 munlockall	scalar	none	kernel call without a pointer argument
@@ -311,6 +312,7 @@ powf	userspace	none
 pread	buffer	shim	buffer, length given
 preadv	buffer	shim	iovec array and its bases (copied when a base needs translating)
 printf	stdio	shim	formatted into a host buffer, then written: a long %s argument would otherwise reach write(2) from guest memory
+proc_pidfdinfo	buffer	none	host-internal: libkernel NativeListening reads socket_fdinfo into a host stack variable
 pthread_attr_destroy	userspace	none	
 pthread_attr_init	userspace	none	
 pthread_attr_setdetachstate	userspace	none	

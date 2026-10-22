@@ -18,6 +18,7 @@
 #include "prx/libc/include/GuestDisplaced.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -45,6 +46,8 @@
 #include <tuple>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "MetalResidency.h"
+#include <execinfo.h>
+#include <dlfcn.h>
 
 namespace AgcDriver::Graphics {
 
@@ -354,7 +357,9 @@ void FailNextRecorderSubmit(const char* what, bool beforeCommit) {
 namespace {
 
 // One listener for every recorder's timeline notifications (D80), on a serial user-interactive queue: its blocks only
-// raise a progress event.
+// raise a progress event and end the guest's short (<= 1 ms) sleeps (SleepWake.hpp; upstream's ProgressWatcher thread,
+// 82dd286192: here the listener the timeline already notifies is that thread). Both are lock-free or take only their
+// own small mutex, never GuestMemory::GpuMutex.
 MTLSharedEventListener* ProgressListener() {
     static MTLSharedEventListener* listener = [[MTLSharedEventListener alloc]
         initWithDispatchQueue:dispatch_queue_create("aps5.gpu-progress", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0))];
@@ -362,7 +367,10 @@ MTLSharedEventListener* ProgressListener() {
 }
 
 MTLSharedEventNotificationBlock ProgressBlock() {
-    static MTLSharedEventNotificationBlock block = ^(MetalEvent, uint64_t) { ::AgcDriver::Progress::Notify(); };
+    static MTLSharedEventNotificationBlock block = ^(MetalEvent, uint64_t) {
+        ::AgcDriver::Progress::Notify();
+        KernelWakeSleepers_nid_no_patch();
+    };
     return block;
 }
 
@@ -1525,10 +1533,35 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+namespace {
+// APS5_TRACE_PASS_ENDS=1: why a render pass ended (the caller's return addresses, unslid for atos).
+bool TracePassEnds() {
+    static const bool trace = std::getenv("APS5_TRACE_PASS_ENDS") != nullptr;
+    return trace;
+}
+
+void TracePassEnd(const char* what) {
+    if (!TracePassEnds()) return;
+    void* frames[12];
+    const int count = backtrace(frames, 12);
+    std::string line = std::string("[pass-end] ") + what + ":";
+    for (int i = 1; i < count; ++i) {
+        Dl_info info{};
+        const auto address = reinterpret_cast<std::uintptr_t>(frames[i]);
+        const auto base = dladdr(frames[i], &info) != 0 ? reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0u;
+        char text[48];
+        std::snprintf(text, sizeof(text), " %s+0x%llx", base != 0u && info.dli_fname != nullptr && std::strstr(info.dli_fname, ".prx") != nullptr ? "prx" : "exe", static_cast<unsigned long long>(address - base));
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        if (TracePassEnds()) std::fprintf(stderr, "[pass-end] draw pass begins: open %d, forced %d\n", pass.open ? 1 : 0, forced ? 1 : 0);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
@@ -1536,6 +1569,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {CommandsOf(open->metal), true, false};
+    if (TracePassEnds()) std::fprintf(stderr, "[pass-end] draw pass breaks: hazard %d, same key %d\n", static_cast<int>(hazard), pass.key == key ? 1 : 0);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
@@ -1558,8 +1592,14 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     open->passHazards.Add(access);
 }
 
+// 12d720f743: a guest flush seals the open pass's write-only stores (PacketExecution -> device -> here).
+void Recorder::SealPassWriteOnly() {
+    if (open != nullptr) open->passHazards.SealWriteOnly();
+}
+
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    TracePassEnd("render pass ended");
     if (open->segmentActive) endSegment(*open);
     // macOS: the pass is the stream's render encoder (the draw that began it opened it).
     open->metal->stream->EndEncoder();
@@ -1642,6 +1682,19 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+
+// Whether the Metal debug layer wraps the device's command buffers (MTL_DEBUG_LAYER set and not 0).
+bool DebugLayerCommandBuffers() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MTL_DEBUG_LAYER");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
@@ -1651,6 +1704,15 @@ void Recorder::ensureOpen() {
                 // A completed batch's objects: its allocator was reset and its stream recycled.
                 batch->metal = std::move(metal->spare.back());
                 metal->spare.pop_back();
+                // Under the Metal debug layer a reused MTL4 command buffer keeps the heap usage of its
+                // earlier recordings: the next commit walks heaps freed since (a pooled image heap the
+                // buffer pool evicted, upstream 4513d47104) in HeapUsageTable::processHeapEntry from
+                // -[MTL4GPUDebugCommandBuffer preCommit:] (UI Lab under --validation, at any delay
+                // after the free; fresh command buffers run clean). So there each batch gets a new one.
+                if (DebugLayerCommandBuffers()) {
+                    batch->metal->commandBuffer = [metal->device newCommandBuffer];
+                    if (batch->metal->commandBuffer == nil) Metal::Fail("cannot create a command buffer");
+                }
             } else {
                 batch->metal.reset(new Metal::BatchObjects);
                 batch->metal->allocator = [metal->device newCommandAllocator];
@@ -1844,6 +1906,19 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         std::vector<QueuedWrite> writes;
         writes.reserve(stores.size());
         for (const auto& store : stores) writes.push_back({store.address, store.End(), store.dumpTarget != 0});
+        // eef987ae7b: the run's occlusion dumps move together (QueuedWriteOrder) so they fold once.
+        if (const auto order = QueuedWriteOrder(writes); !std::is_sorted(order.begin(), order.end())) {
+            std::vector<Batch::StoreRun::Queued> ordered;
+            std::vector<QueuedWrite> orderedWrites;
+            ordered.reserve(stores.size());
+            orderedWrites.reserve(writes.size());
+            for (const auto index : order) {
+                ordered.push_back(std::move(stores[index]));
+                orderedWrites.push_back(writes[index]);
+            }
+            stores = std::move(ordered);
+            writes = std::move(orderedWrites);
+        }
         const bool dumps = std::any_of(writes.begin(), writes.end(), [](const QueuedWrite& write) { return write.computed; });
         if (dumps) recordQueuedDumps(commands, stores);
         std::size_t first = 0;
@@ -2234,6 +2309,56 @@ std::uint64_t Recorder::Batch::StoreRun::Queued::End() const {
     return address + (dumpTarget != 0 ? SampleDumpBytes : bytes.size());
 }
 
+std::vector<std::size_t> Recorder::QueuedWriteOrder(std::span<const QueuedWrite> writes) {
+    std::vector<std::size_t> order(writes.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::vector<bool> coveredLater(writes.size()), overLater(writes.size());
+    std::map<std::uint64_t, std::uint64_t> later;
+    for (auto i = writes.size(); i-- > 0;) {
+        const auto& write = writes[i];
+        if (!write.computed) {
+            const auto after = later.upper_bound(write.begin);
+            coveredLater[i] = after != later.begin() && std::prev(after)->second >= write.end;
+            const auto last = later.lower_bound(write.end);
+            overLater[i] = last != later.begin() && std::prev(last)->second > write.begin;
+            continue;
+        }
+        auto begin = write.begin, end = write.end;
+        auto at = later.lower_bound(begin);
+        if (at != later.begin() && std::prev(at)->second >= begin) --at;
+        while (at != later.end() && at->first <= end) {
+            begin = std::min(begin, at->first);
+            end = std::max(end, at->second);
+            at = later.erase(at);
+        }
+        later.emplace(begin, end);
+    }
+    std::vector<std::size_t> before, dumps, after;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> earlier, delayed;
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        const auto& write = writes[i];
+        const auto over = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+            return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return write.begin < range.second && range.first < write.end; });
+        };
+        if (write.computed) {
+            dumps.push_back(i);
+            earlier.emplace_back(write.begin, write.end);
+        } else if (dumps.empty()) {
+            before.push_back(i);
+        } else if (overLater[i]) {
+            if (over(delayed) || (!coveredLater[i] && over(earlier))) return order;
+            before.push_back(i);
+        } else {
+            after.push_back(i);
+            delayed.emplace_back(write.begin, write.end);
+        }
+    }
+    order = std::move(before);
+    order.insert(order.end(), dumps.begin(), dumps.end());
+    order.insert(order.end(), after.begin(), after.end());
+    return order;
+}
+
 std::vector<std::size_t> Recorder::QueuedWriteGroups(std::span<const QueuedWrite> writes) {
     std::vector<std::size_t> ends;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> computed;
@@ -2521,8 +2646,11 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
 // e54d2f35fe: an indirect dispatch's group counts checked against the device limit on the GPU
 // (DispatchArguments in RecorderKernels.h); the caller dispatches from `arguments` (12 bytes). False:
 // the kernel did not build, and the caller reads the counts from the import unchecked, as before.
-bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments) {
-    constexpr std::uint32_t PushBytes = 32;
+// 612b41e4f3: with `threadGroup` the source holds thread counts; the kernel turns them into group
+// counts and keeps the counts at `arguments` + 12 (24 bytes), which the caller then copies (a blit,
+// hence the transfer reader below) into the ShaderData thread limit.
+bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup) {
+    constexpr std::uint32_t PushBytes = 48;
     MetalPipeline pipeline = nil;
     if (dispatchArgumentState >= 0) {
         try {
@@ -2540,10 +2668,17 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
         VkDeviceAddress source;
         VkDeviceAddress arguments;
         std::array<std::uint32_t, 4> limits;
-    } parameters{source, arguments, {limit[0], limit[1], limit[2], 0u}};
+        std::array<std::uint32_t, 4> group;
+    } parameters{source, arguments, {limit[0], limit[1], limit[2], threadGroup != nullptr ? 1u : 0u}, {1u, 1u, 1u, 0u}};
+    if (threadGroup != nullptr) {
+        Require(std::none_of(threadGroup->begin(), threadGroup->end(), [](std::uint32_t size) { return size == 0; }), "Metal dispatch: a thread-dimension indirect dispatch has an empty thread group");
+        std::copy(threadGroup->begin(), threadGroup->end(), parameters.group.begin());
+    }
     static_assert(sizeof(parameters) == PushBytes);
     Metal::Stream(commands).DispatchHelper(pipeline, std::as_bytes(std::span(&parameters, 1)), MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
-    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    const VkPipelineStageFlags readers = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | (threadGroup != nullptr ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u);
+    const VkAccessFlags reads = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | (threadGroup != nullptr ? VK_ACCESS_TRANSFER_READ_BIT : 0u);
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, readers, VK_ACCESS_SHADER_WRITE_BIT, reads);
     CountBarriers(CommandClass::DispatchLeading, 2);
     return true;
 }
@@ -4153,6 +4288,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         }
     }
+    if (!batch->completions.empty()) KernelWakeSleepers_nid_no_patch();
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and

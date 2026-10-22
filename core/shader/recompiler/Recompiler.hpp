@@ -193,6 +193,7 @@ struct ShaderPixelStageInfo {
     bool iteratesSamples = false;
     PixelPositionLocation positionLocation = PixelPositionLocation::Center;
     std::array<std::uint8_t, 32> sampleLocations{};
+    std::array<std::uint32_t, 4> sampleOrder{};
 };
 
 struct ShaderVertexBufferResource {
@@ -331,6 +332,8 @@ struct SpirvTarget {
     bool mslNanTestElimination = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;
+    bool waveLdsMemoryBarriers = false;
+    bool float32DenormPreserve = false;
 };
 
 struct BindingLayout {
@@ -381,6 +384,7 @@ struct TessellationConfiguration {
     bool breakAtInstance = false;
     std::uint32_t instancePatches = 0;
     bool drawParameters = false;
+    bool mergedHull = false;
 };
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
@@ -746,6 +750,7 @@ struct ShaderInvocation {
     std::vector<std::byte> pushConstants;
     bool readsDepthRemapPush = false;
     std::vector<VertexAttribute> vertexAttributes;
+    std::uint64_t userDataRegisterReads = 0;
     std::uint32_t poisonedSrtReads = 0;
     std::vector<ImageTableEntryPoison> imageTablePoison;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
@@ -849,7 +854,7 @@ struct BarycentricTessellationShaders {
     RecompileResult evaluation;
 };
 
-[[nodiscard]] BarycentricTessellationShaders BuildBarycentricTessellationShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, std::uint32_t maxFragmentInputComponents);
+[[nodiscard]] BarycentricTessellationShaders BuildBarycentricTessellationShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, std::uint32_t maxFragmentInputComponents, std::uint32_t provokingVertex);
 
 }
 

@@ -36,12 +36,14 @@ inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
 inline constexpr std::uint32_t WorkgroupOffsetWords = 3u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
+inline constexpr std::uint32_t StoreQuantizeBase = 12288u;
+inline constexpr std::uint32_t StoreQuantizeWords = 4u;
 // Multisampled storage images on MSL backends (MslAbi Version 6): Metal shaders cannot write
 // multisampled textures, so a storage view of a 2D MSAA (array) image is a 2D-array texture of
 // layers * samples slices (slice = layer * samples + sample). Per direct image resource i, the sample
 // count (1 << T# word 3 LAST_LEVEL) is constant SampleCountBase + i; SPIR-V modules have no such
-// constants.
-inline constexpr std::uint32_t SampleCountBase = 12288u;
+// constants. (12288 was upstream's StoreQuantizeBase since 3e5499310c; moved in MslAbi Version 21.)
+inline constexpr std::uint32_t SampleCountBase = 14336u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;
 inline constexpr std::uint32_t DescriptorIndexStride = 128u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;

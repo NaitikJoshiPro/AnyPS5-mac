@@ -80,6 +80,7 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    void SealPassWriteOnly();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -232,7 +233,7 @@ public:
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
     // e54d2f35fe: copies an indirect dispatch's three group counts from `source` into the 12 bytes
     // at `arguments`, all 0 when one exceeds the device limit (DispatchArguments helper kernel).
-    bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments);
+    bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup = nullptr);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -263,6 +264,7 @@ public:
         std::uint64_t end;
         bool computed;
     };
+    static std::vector<std::size_t> QueuedWriteOrder(std::span<const QueuedWrite> writes);
     static std::vector<std::size_t> QueuedWriteGroups(std::span<const QueuedWrite> writes);
     // Waits only for the batches up to the newest one that writes the range (submitting the open
     // batch when it is that one); later batches stay in flight. Fences of one queue signal in

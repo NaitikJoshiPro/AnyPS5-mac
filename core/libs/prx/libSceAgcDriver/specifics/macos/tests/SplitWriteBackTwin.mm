@@ -80,8 +80,13 @@ void splitWriteBackTests(const Device& device, Recorder& recorder) {
         std::size_t texelCount = 0;
         for (const auto& mip : geometry.mips) texelCount += static_cast<std::size_t>(mip.width) * mip.height;
         const auto bytes = (static_cast<std::size_t>(test.offset) + surfaceBytes + 65535) / 65536 * 65536 + 65536;
-        void* block = std::aligned_alloc(65536, bytes);
-        Require(block != nullptr, "cannot allocate the split write-back block");
+        // The block sits at an odd multiple of 64 KiB: two ranges that fill an aligned power-of-two block are
+        // imported as that one block (upstream a24aafb75c), so a block of 512 KiB that macOS malloc happened to
+        // place 512 KiB-aligned imported both ranges at once and the case failed on the address alone (the
+        // 144 KiB case's ranges fill 512 KiB). Upstream's 4 KiB-page allocations do not land that way.
+        void* allocation = std::aligned_alloc(65536, bytes + 65536);
+        Require(allocation != nullptr, "cannot allocate the split write-back block");
+        void* block = static_cast<std::uint8_t*>(allocation) + ((reinterpret_cast<std::uintptr_t>(allocation) / 65536u) % 2u == 0u ? 65536u : 0u);
         auto* memory = static_cast<std::uint8_t*>(block);
         for (std::size_t i = 0; i < bytes; ++i) memory[i] = pattern(i);
         const auto blockAddress = reinterpret_cast<std::uint64_t>(block);
@@ -98,6 +103,7 @@ void splitWriteBackTests(const Device& device, Recorder& recorder) {
         }
         struct Unregister {
             const Context& context;
+            void* allocation;
             void* block;
             std::uint64_t address;
             std::size_t bytes;
@@ -109,9 +115,9 @@ void splitWriteBackTests(const Device& device, Recorder& recorder) {
                     if (second != nullptr) mutation.Remove(second);
                 }
                 HostImportFor(context, address, bytes);
-                std::free(block);
+                std::free(allocation);
             }
-        } unregister{base, block, blockAddress, bytes, test.twoAllocations ? static_cast<void*>(memory + test.split) : nullptr};
+        } unregister{base, allocation, block, blockAddress, bytes, test.twoAllocations ? static_cast<void*>(memory + test.split) : nullptr};
         Require(HostImportFor(base, address, surfaceBytes) == nullptr, std::string(test.name) + ": one import covers both ranges");
         TextureDetiler detiler(base);
         auto context = base;

@@ -24,6 +24,11 @@
 // Upstream sync UPSYNC4 (MslAbi Version 19):
 // - b0558ce95: ds_ordered_count with offset1 bit 4 exchanges the first active lane's operand into
 //   the counter.
+// Upstream sync UPSYNC5 (MslAbi Version 21):
+// - 57ceb9e370: a request with a sample order maps the coverage the pixel function reads and writes
+//   between the guest's and the host's sample order of its quad pixel;
+// - e5b4bd72dd: a GLC buffer_store_dwordx2 is one 64-bit store under the lock table (a plain
+//   dwordx2 store stays two dword stores).
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -111,6 +116,11 @@ alignas(256) constexpr std::array<std::uint32_t, 8> GdsAddF32Code{0x34000082u, 0
 alignas(256) constexpr std::array<std::uint32_t, 10> OrderedCountCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe0310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
 // The same with offset1 bit 4 set: ds_ordered_count swap (upstream b0558ce95, offset1:0x13).
 alignas(256) constexpr std::array<std::uint32_t, 10> OrderedSwapCode{0x34060082u, 0x4a020083u, 0xbefc03ffu, 0x0000ffffu, 0xd8fe1310u, 0x05000001u, 0xbf8cc07fu, 0xe0702000u, 0x80000503u, 0xbf810000u};
+
+// v_mov_b32 v5, v0; v_mov_b32 v6, v0; buffer_store_dwordx2 v[5:6], off, s[0:3], 0 offset:8 (glc in
+// the coherent form).
+alignas(256) constexpr std::array<std::uint32_t, 5> CoherentPairCode{0x7e0a0300u, 0x7e0c0300u, 0xe0744008u, 0x80000500u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 5> PlainPairCode{0x7e0a0300u, 0x7e0c0300u, 0xe0740008u, 0x80000500u, 0xbf810000u};
 
 alignas(256) std::array<std::uint32_t, 64> Backing{};
 
@@ -392,6 +402,41 @@ void OrderedSwap(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& targ
     std::puts("ds_ordered_count swap: first active lane's operand exchanged into the GDS counter");
 }
 
+// Upstream 57ceb9e370: Village's 2x checkerboard swaps its two samples on odd rows; with pixel
+// (0,0)'s locations standing in, the function reads and writes coverage in each pixel's guest order.
+void SampleOrder(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto inputs = PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::LinearCenter);
+    constexpr std::array<std::uint32_t, 4> rowSwap{0x76543210u, 0x76543210u, 0x76543201u, 0x76543201u};
+    const auto ordered = RecompilePixel(target, F16PixelCode, 0u, inputs, [&](auto& pixel) {
+        pixel.alphaToCoverage = true;
+        pixel.sampleOrder = rowSwap;
+        pixel.quadSampleMask = {1u, 1u, 1u, 1u};
+    });
+    const std::string source(ordered.msl.Source());
+    const std::string toHost = "aps5_out.aps5_sample_mask = aps5_samples_to_host(";
+    Require(Has(source, toHost) && Has(source, std::to_string(0x76543201u) + "u"), "sample order: the written coverage is not mapped to the host's order");
+    Require(Has(source, "if (((aps5_samples_to_guest(") && source.find(toHost) > source.find("aps5_out.aps5_sample_mask &= aps5_quad_coverage"), "sample order: the quad coverage is not taken in the guest's order before the coverage goes to the host's");
+    static_cast<void>(MustCompile(device, "sample order", ordered, @{}));
+    static_cast<void>(MustCompile(device, "sample order, two samples", ordered, @{@"APS5_SAMPLE_COUNT": @"2u", @"APS5_SAMPLE_MASK": @"3u"}));
+    const auto kept = RecompilePixel(target, F16PixelCode, 0u, inputs, [&](auto& pixel) {
+        pixel.alphaToCoverage = true;
+        pixel.sampleOrder = {0x76543210u, 0u, 0x76543210u, 0u};
+    });
+    Require(!Has(kept.msl.Source(), "aps5_samples_to_host") && !Has(kept.msl.Source(), "aps5_guest_sample"), "sample order: a kept order maps samples");
+    std::puts("sample order: coverage in the guest's order of each quad pixel");
+}
+
+void CoherentPairStore(id<MTLDevice> device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto coherent = RecompileCompute(target, CoherentPairCode);
+    const std::string source(coherent.msl.Source());
+    Require(Has(source, "aps5_atomic64_lock(") && Has(source, "atomic_max_explicit(reinterpret_cast<device atomic_ulong*>") && Has(source, "aps5_driver.atomicLocks != 0ul"), "coherent dwordx2 store: the pair is not one 64-bit store under the lock table");
+    static_cast<void>(MustCompile(device, "coherent dwordx2 store", coherent, @{}));
+    const auto plain = RecompileCompute(target, PlainPairCode);
+    Require(!Has(plain.msl.Source(), "aps5_atomic64_lock("), "plain dwordx2 store: takes the 64-bit lock");
+    static_cast<void>(MustCompile(device, "plain dwordx2 store", plain, @{}));
+    std::puts("coherent dwordx2 store: one 64-bit store under the lock table");
+}
+
 }
 
 int main() {
@@ -417,6 +462,8 @@ int main() {
             GdsAddF32(metal, target);
             OrderedCount(metal, target);
             OrderedSwap(metal, target);
+            SampleOrder(metal, target);
+            CoherentPairStore(metal, target);
         }
         std::puts("msl upstream parity check passed");
         return 0;

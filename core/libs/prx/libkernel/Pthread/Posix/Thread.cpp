@@ -21,12 +21,19 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
 int APS5_VABI scePthreadRename(Pthread thread, const char* name);
 int APS5_VABI scePthreadGetname(Pthread thread, char* name);
 Pthread APS5_VABI scePthreadSelf();
+int APS5_VABI scePthreadEqual(Pthread thread1, Pthread thread2);
+int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void));
+int APS5_VABI scePthreadKeyCreate(PthreadKey* key, pthread_key_destructor_func_t destructor);
+int APS5_VABI scePthreadKeyDelete(PthreadKey key);
+void* APS5_VABI scePthreadGetspecific(PthreadKey key);
+int APS5_VABI scePthreadSetspecific(PthreadKey key, void* value);
 int APS5_VABI scePthreadCancel(Pthread thread);
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state);
 int APS5_VABI scePthreadSetcanceltype(int type, int* old_type);
 void APS5_VABI scePthreadTestcancel();
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio);
 int APS5_VABI scePthreadGetprio(Pthread thread, int* prio);
+void APS5_VABI scePthreadYield();
 }
 
 static constexpr int GUEST_SCHED_FIFO = 1;
@@ -194,6 +201,15 @@ int APS5_VABI pthread_getschedparam_nid_postfix(Pthread thread, int* policy, Ker
     return PosixThread::ToErrno(scePthreadGetschedparam(thread, policy, param));
 }
 
+int APS5_VABI pthread_getprio_nid_postfix(Pthread thread) {
+    const auto lock = LockLiveGuestThread(thread);
+    if (!lock.owns_lock()) {
+        *__error_nid_postfix() = PosixThread::GUEST_ESRCH;
+        return -1;
+    }
+    return thread->priority.load(std::memory_order_relaxed);
+}
+
 int APS5_VABI pthread_getaffinity_np_nid_postfix(Pthread thread, std::size_t cpusetSize, void* cpuset) {
     if (!thread) return PosixThread::GUEST_EINVAL;
     if (cpusetSize != GUEST_CPUSET_BYTES) return GUEST_ERANGE;
@@ -223,6 +239,28 @@ int APS5_VABI pthread_setaffinity_np_nid_postfix(Pthread thread, std::size_t cpu
 
 int APS5_VABI pthread_join_nid_postfix(Pthread thread, void** value) {
     return PosixThread::ToErrno(scePthreadJoin(thread, value));
+}
+
+namespace {
+struct RegisterPthreadOnLoad {
+    RegisterPthreadOnLoad() {
+        RegisterPthreadCreate_nid_no_patch(reinterpret_cast<PthreadCreateFn_nid_no_patch>(pthread_create_nid_postfix));
+        RegisterPthreadJoin_nid_no_patch(reinterpret_cast<PthreadJoinFn_nid_no_patch>(pthread_join_nid_postfix));
+        RegisterPthreadDetach_nid_no_patch(reinterpret_cast<PthreadDetachFn_nid_no_patch>(pthread_detach_nid_postfix));
+        static const ThreadForwards_nid_no_patch forwards{
+            reinterpret_cast<decltype(forwards.once)>(scePthreadOnce),
+            reinterpret_cast<decltype(forwards.keyCreate)>(scePthreadKeyCreate),
+            scePthreadKeyDelete,
+            scePthreadGetspecific,
+            scePthreadSetspecific,
+            reinterpret_cast<decltype(forwards.equal)>(scePthreadEqual),
+            reinterpret_cast<decltype(forwards.self)>(scePthreadSelf),
+            scePthreadExit,
+        };
+        RegisterThreadForwards_nid_no_patch(&forwards);
+    }
+};
+const RegisterPthreadOnLoad gRegisterPthread;
 }
 
 int APS5_VABI pthread_rename_np_nid_postfix(Pthread thread, const char* name) {

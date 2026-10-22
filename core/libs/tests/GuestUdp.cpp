@@ -202,9 +202,10 @@ int main() {
     Require(*__error_nid_postfix() == 35);
     const char message[] = "guest UDP loopback";
 #ifdef __APPLE__
+    // XNU refuses an address on a connected datagram socket (EISCONN).
     Require(sendto_nid_postfix(sender, message, sizeof(message), 0x20000, destination.data(), destination.size()) == -1 && *__error_nid_postfix() == 56);
 #endif
-    Require(sendto_nid_postfix(addressed, message, sizeof(message), 0x20000, destination.data(), destination.size()) == sizeof(message));
+    Require(send_nid_postfix(sender, message, sizeof(message), 0x20000) == sizeof(message));
     int queued = 0;
     for (int i = 0; i < 100 && queued == 0; ++i) {
         Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == 0);
